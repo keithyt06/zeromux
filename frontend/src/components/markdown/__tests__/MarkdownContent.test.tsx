@@ -46,4 +46,12 @@ describe('MarkdownContent — code highlighting', () => {
     const pending = container.querySelector('pre.mermaid-pending')
     expect(pending?.querySelector('span.hljs-keyword')).toBeNull()
   })
+
+  it('highlights dockerfile blocks (registered explicitly)', () => {
+    const text = '```dockerfile\nFROM node:20\nRUN npm ci\n```'
+    const { container } = render(<MarkdownContent text={text} isComplete />)
+    const code = container.querySelector('code.language-dockerfile')
+    expect(code).toBeInTheDocument()
+    expect(code?.querySelector('span.hljs-keyword')).toBeInTheDocument()
+  })
 })

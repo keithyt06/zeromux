@@ -74,11 +74,6 @@ export default function AcpChatView({ sessionId, active, agentType = 'claude' }:
     scrollBottom()
   }, [scrollBottom])
 
-  const updateAssistant = useCallback(() => {
-    setMessages(prev => [...prev])
-    scrollBottom()
-  }, [scrollBottom])
-
   useEffect(() => {
     const ws = new WebSocket(wsUrl(`/ws/acp/${sessionId}`))
     wsRef.current = ws
@@ -107,38 +102,48 @@ export default function AcpChatView({ sessionId, active, agentType = 'claude' }:
       }
 
       case 'content_block': {
+        const delta = evt.text || ''
+        // Ensure there's an active assistant message
         if (!currentAssistant.current) {
           const msg: AssistantMsg = { id: newId(), kind: 'assistant', blocks: [], complete: false }
           currentAssistant.current = msg
           setMessages(prev => [...prev, msg])
         }
-        const blocks = currentAssistant.current.blocks
-        // Streaming delta: append text to the last text block instead of creating new
-        if (evt.streaming && evt.block_type === 'text' && blocks.length > 0) {
-          const last = blocks[blocks.length - 1]
-          if (last.type === 'text') {
-            last.text = (last.text || '') + (evt.text || '')
-            setBusy(true)
-            updateAssistant()
-            break
+        const activeId = currentAssistant.current.id
+        setMessages(prev => prev.map(m => {
+          if (m.kind !== 'assistant' || m.id !== activeId) return m   // reference stable, memo skips
+          const blocks = [...m.blocks]
+          if (evt.streaming && evt.block_type === 'text' && blocks.length > 0
+              && blocks[blocks.length - 1].type === 'text') {
+            const last = blocks[blocks.length - 1]
+            blocks[blocks.length - 1] = { ...last, text: (last.text || '') + delta }
+          } else {
+            blocks.push({
+              type: (evt.block_type as ContentBlock['type']) || 'text',
+              text: evt.text,
+              name: evt.name,
+              input: evt.input,
+            })
           }
-        }
-        const block: ContentBlock = {
-          type: (evt.block_type as ContentBlock['type']) || 'text',
-          text: evt.text,
-          name: evt.name,
-          input: evt.input,
-        }
-        blocks.push(block)
+          // Mirror onto the ref so subsequent events still see the latest blocks.
+          const next = { ...m, blocks }
+          currentAssistant.current = next
+          return next
+        }))
         setBusy(true)
-        updateAssistant()
+        scrollBottom()
         break
       }
 
       case 'result': {
-        if (currentAssistant.current && evt.cost_usd) {
-          currentAssistant.current.cost = evt.cost_usd
-          updateAssistant()
+        const activeId = currentAssistant.current?.id
+        if (activeId) {
+          const cost = evt.cost_usd
+          setMessages(prev => prev.map(m =>
+            m.kind === 'assistant' && m.id === activeId
+              ? { ...m, complete: true, ...(cost ? { cost } : {}) }
+              : m
+          ))
         }
         currentAssistant.current = null
         setBusy(false)
@@ -146,6 +151,12 @@ export default function AcpChatView({ sessionId, active, agentType = 'claude' }:
       }
 
       case 'error': {
+        const activeId = currentAssistant.current?.id
+        if (activeId) {
+          setMessages(prev => prev.map(m =>
+            m.kind === 'assistant' && m.id === activeId ? { ...m, complete: true } : m
+          ))
+        }
         pushMessage({ id: newId(), kind: 'error', text: evt.message || 'Unknown error' })
         currentAssistant.current = null
         setBusy(false)
@@ -153,6 +164,12 @@ export default function AcpChatView({ sessionId, active, agentType = 'claude' }:
       }
 
       case 'exit': {
+        const activeId = currentAssistant.current?.id
+        if (activeId) {
+          setMessages(prev => prev.map(m =>
+            m.kind === 'assistant' && m.id === activeId ? { ...m, complete: true } : m
+          ))
+        }
         pushMessage({ id: newId(), kind: 'system', text: `Process exited (code: ${evt.code || 0})` })
         currentAssistant.current = null
         setBusy(false)
@@ -160,13 +177,18 @@ export default function AcpChatView({ sessionId, active, agentType = 'claude' }:
       }
 
       case 'replay_done': {
-        // Scrollback replay finished — close any open assistant turn and reset busy
+        const activeId = currentAssistant.current?.id
+        if (activeId) {
+          setMessages(prev => prev.map(m =>
+            m.kind === 'assistant' && m.id === activeId ? { ...m, complete: true } : m
+          ))
+        }
         currentAssistant.current = null
         setBusy(false)
         break
       }
     }
-  }, [pushMessage, updateAssistant])
+  }, [pushMessage, scrollBottom])
 
   const sendPrompt = useCallback(() => {
     const text = input.trim()

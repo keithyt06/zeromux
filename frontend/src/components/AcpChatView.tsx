@@ -7,16 +7,23 @@ import { markdownComponents } from './markdownStyles'
 
 // ── Message types ──
 
-interface SystemMsg { kind: 'system'; text: string }
-interface UserMsg { kind: 'user'; text: string }
-interface AssistantMsg {
+interface BaseMsg { id: string }
+interface SystemMsg    extends BaseMsg { kind: 'system'; text: string }
+interface UserMsg      extends BaseMsg { kind: 'user'; text: string }
+interface AssistantMsg extends BaseMsg {
   kind: 'assistant'
   blocks: ContentBlock[]
   cost?: number
+  complete: boolean
 }
-interface ErrorMsg { kind: 'error'; text: string }
+interface ErrorMsg     extends BaseMsg { kind: 'error'; text: string }
 
 type ChatMessage = SystemMsg | UserMsg | AssistantMsg | ErrorMsg
+
+const newId = () =>
+  (typeof crypto !== 'undefined' && 'randomUUID' in crypto)
+    ? crypto.randomUUID()
+    : Math.random().toString(36).slice(2) + Date.now().toString(36)
 
 interface ContentBlock {
   type: 'text' | 'thinking' | 'tool_use'
@@ -95,13 +102,13 @@ export default function AcpChatView({ sessionId, active, agentType = 'claude' }:
       case 'system': {
         const label = evt.subtype || 'system'
         const sid = evt.session_id ? ` ${evt.session_id.substring(0, 8)}...` : ''
-        pushMessage({ kind: 'system', text: `${label}${sid}` })
+        pushMessage({ id: newId(), kind: 'system', text: `${label}${sid}` })
         break
       }
 
       case 'content_block': {
         if (!currentAssistant.current) {
-          const msg: AssistantMsg = { kind: 'assistant', blocks: [] }
+          const msg: AssistantMsg = { id: newId(), kind: 'assistant', blocks: [], complete: false }
           currentAssistant.current = msg
           setMessages(prev => [...prev, msg])
         }
@@ -139,14 +146,14 @@ export default function AcpChatView({ sessionId, active, agentType = 'claude' }:
       }
 
       case 'error': {
-        pushMessage({ kind: 'error', text: evt.message || 'Unknown error' })
+        pushMessage({ id: newId(), kind: 'error', text: evt.message || 'Unknown error' })
         currentAssistant.current = null
         setBusy(false)
         break
       }
 
       case 'exit': {
-        pushMessage({ kind: 'system', text: `Process exited (code: ${evt.code || 0})` })
+        pushMessage({ id: newId(), kind: 'system', text: `Process exited (code: ${evt.code || 0})` })
         currentAssistant.current = null
         setBusy(false)
         break
@@ -164,7 +171,7 @@ export default function AcpChatView({ sessionId, active, agentType = 'claude' }:
   const sendPrompt = useCallback(() => {
     const text = input.trim()
     if (!text || !wsRef.current || wsRef.current.readyState !== WebSocket.OPEN) return
-    pushMessage({ kind: 'user', text })
+    pushMessage({ id: newId(), kind: 'user', text })
     wsRef.current.send(JSON.stringify({ type: 'prompt', text }))
     setInput('')
     setBusy(true)

@@ -1,9 +1,7 @@
 import { useState, useEffect, useRef, useCallback, memo, type KeyboardEvent } from 'react'
-import ReactMarkdown from 'react-markdown'
-import remarkGfm from 'remark-gfm'
 import { wsUrl } from '../lib/api'
 import { Send, ChevronDown, Wrench, Brain, AlertCircle } from 'lucide-react'
-import { markdownComponents } from './markdownStyles'
+import MarkdownContent from './markdown/MarkdownContent'
 
 // ── Message types ──
 
@@ -257,16 +255,6 @@ export default function AcpChatView({ sessionId, active, agentType = 'claude' }:
   )
 }
 
-// ── Markdown ──
-
-function Markdown({ children }: { children: string }) {
-  return (
-    <ReactMarkdown remarkPlugins={[remarkGfm]} components={markdownComponents}>
-      {children}
-    </ReactMarkdown>
-  )
-}
-
 // ── Message rendering ──
 
 function MessageBubbleImpl({ msg, agentName = 'Claude' }: { msg: ChatMessage; agentName?: string }) {
@@ -286,7 +274,7 @@ function MessageBubbleImpl({ msg, agentName = 'Claude' }: { msg: ChatMessage; ag
       return (
         <div className="space-y-2">
           <p className="text-[11px] font-semibold text-[var(--accent-purple)] mb-0.5">{agentName}</p>
-          {msg.blocks.map((b, i) => <BlockView key={i} block={b} />)}
+          {msg.blocks.map((b, i) => <BlockView key={i} block={b} isComplete={msg.complete} />)}
           {msg.cost != null && (
             <p className="text-[10px] text-[var(--text-muted)] border-t border-[var(--border-light)] pt-1 mt-1">
               cost: ${msg.cost.toFixed(4)}
@@ -310,12 +298,12 @@ const MessageBubble = memo(
   (prev, next) => prev.msg === next.msg && prev.agentName === next.agentName
 )
 
-function BlockView({ block }: { block: ContentBlock }) {
+function BlockView({ block, isComplete }: { block: ContentBlock; isComplete: boolean }) {
   switch (block.type) {
     case 'text':
       return (
         <div className="text-sm text-[var(--text-primary)] leading-relaxed">
-          <Markdown>{block.text || ''}</Markdown>
+          <MarkdownContent text={block.text || ''} isComplete={isComplete} />
         </div>
       )
 
@@ -328,7 +316,7 @@ function BlockView({ block }: { block: ContentBlock }) {
             <ChevronDown size={12} />
           </summary>
           <div className="mt-1 leading-relaxed">
-            <Markdown>{block.text || ''}</Markdown>
+            <MarkdownContent text={block.text || ''} isComplete={isComplete} />
           </div>
         </details>
       )

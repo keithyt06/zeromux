@@ -1,7 +1,5 @@
 import { useState, useEffect, useCallback, useRef } from 'react'
-import ReactMarkdown from 'react-markdown'
-import remarkGfm from 'remark-gfm'
-import { markdownComponents } from './markdownStyles'
+import MarkdownContent from './markdown/MarkdownContent'
 import {
   listSessionFiles, getSessionFile, writeSessionFile, deleteSessionFile,
   renameSessionFile, uploadSessionFile, createSessionDir, deleteSessionDir, renameSessionDir
@@ -492,9 +490,7 @@ export default function MarkdownViewer({ sessionId, sessionType }: Props) {
             ) : (
               <div className="p-6 max-w-3xl mx-auto">
                 <article className="text-sm text-[var(--text-primary)] leading-relaxed">
-                  <ReactMarkdown remarkPlugins={[remarkGfm]} components={markdownComponents}>
-                    {content}
-                  </ReactMarkdown>
+                  <MarkdownContent text={content} isComplete={true} />
                 </article>
               </div>
             )

@@ -7,8 +7,8 @@ type CodeProps = {
 
 export default function CodeBlock({ className, children, ...props }: CodeProps) {
   const { isComplete } = useMarkdownContext()
-  const isBlock = className?.startsWith('language-') ?? false
-  const lang = className?.replace('language-', '') ?? ''
+  const isBlock = className?.includes('language-') ?? false
+  const lang = className?.match(/language-(\S+)/)?.[1] ?? ''
 
   if (!isBlock) {
     return (

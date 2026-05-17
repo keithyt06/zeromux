@@ -29,3 +29,21 @@ describe('MarkdownContent — codeblock dispatch', () => {
     expect(code.tagName).toBe('CODE')
   })
 })
+
+describe('MarkdownContent — code highlighting', () => {
+  it('applies hljs class to fenced rust code block', () => {
+    const text = '```rust\nfn main() { println!("hi"); }\n```'
+    const { container } = render(<MarkdownContent text={text} isComplete />)
+    const code = container.querySelector('code.language-rust')
+    expect(code).toBeInTheDocument()
+    // rehype-highlight wraps tokens in spans
+    expect(code?.querySelector('span.hljs-keyword')).toBeInTheDocument()
+  })
+
+  it('leaves non-subset language untouched (no hljs spans)', () => {
+    const text = '```mermaid\ngraph TD; A-->B\n```'
+    const { container } = render(<MarkdownContent text={text} isComplete={false} />)
+    const pending = container.querySelector('pre.mermaid-pending')
+    expect(pending?.querySelector('span.hljs-keyword')).toBeNull()
+  })
+})

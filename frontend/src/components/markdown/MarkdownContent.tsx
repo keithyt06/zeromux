@@ -1,9 +1,17 @@
 import { useDeferredValue } from 'react'
 import ReactMarkdown from 'react-markdown'
 import remarkGfm from 'remark-gfm'
+import rehypeHighlight from 'rehype-highlight'
+import 'highlight.js/styles/github-dark.css'
 import { markdownComponents } from '../markdownStyles'
 import { MarkdownContext } from './context'
 import CodeBlock from './CodeBlock'
+
+const HLJS_LANGS = [
+  'bash', 'json', 'yaml',
+  'typescript', 'javascript', 'tsx',
+  'rust', 'python', 'go', 'java', 'sql', 'dockerfile',
+]
 
 interface Props {
   text: string
@@ -16,7 +24,17 @@ export default function MarkdownContent({ text, isComplete, className }: Props) 
   return (
     <MarkdownContext.Provider value={{ isComplete }}>
       <div className={className}>
-        <ReactMarkdown remarkPlugins={[remarkGfm]} components={{ ...markdownComponents, code: CodeBlock }}>
+        <ReactMarkdown
+          remarkPlugins={[remarkGfm]}
+          rehypePlugins={[
+            [rehypeHighlight, {
+              subset: HLJS_LANGS,
+              detect: true,
+              ignoreMissing: true,
+            }],
+          ]}
+          components={{ ...markdownComponents, code: CodeBlock }}
+        >
           {deferredText}
         </ReactMarkdown>
       </div>

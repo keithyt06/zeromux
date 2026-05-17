@@ -3,6 +3,7 @@ import ReactMarkdown from 'react-markdown'
 import remarkGfm from 'remark-gfm'
 import { markdownComponents } from '../markdownStyles'
 import { MarkdownContext } from './context'
+import CodeBlock from './CodeBlock'
 
 interface Props {
   text: string
@@ -15,7 +16,7 @@ export default function MarkdownContent({ text, isComplete, className }: Props) 
   return (
     <MarkdownContext.Provider value={{ isComplete }}>
       <div className={className}>
-        <ReactMarkdown remarkPlugins={[remarkGfm]} components={markdownComponents}>
+        <ReactMarkdown remarkPlugins={[remarkGfm]} components={{ ...markdownComponents, code: CodeBlock }}>
           {deferredText}
         </ReactMarkdown>
       </div>

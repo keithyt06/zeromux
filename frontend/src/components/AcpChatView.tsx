@@ -1,4 +1,4 @@
-import { useState, useEffect, useRef, useCallback, type KeyboardEvent } from 'react'
+import { useState, useEffect, useRef, useCallback, memo, type KeyboardEvent } from 'react'
 import ReactMarkdown from 'react-markdown'
 import remarkGfm from 'remark-gfm'
 import { wsUrl } from '../lib/api'
@@ -191,8 +191,8 @@ export default function AcpChatView({ sessionId, active, agentType = 'claude' }:
   return (
     <div className="flex flex-col h-full">
       <div ref={scrollRef} className="flex-1 overflow-y-auto px-4 py-3 space-y-3">
-        {messages.map((msg, i) => (
-          <MessageBubble key={i} msg={msg} agentName={agentType === 'kiro' ? 'Kiro' : 'Claude'} />
+        {messages.map(msg => (
+          <MessageBubble key={msg.id} msg={msg} agentName={agentType === 'kiro' ? 'Kiro' : 'Claude'} />
         ))}
       </div>
 
@@ -237,7 +237,7 @@ function Markdown({ children }: { children: string }) {
 
 // ── Message rendering ──
 
-function MessageBubble({ msg, agentName = 'Claude' }: { msg: ChatMessage; agentName?: string }) {
+function MessageBubbleImpl({ msg, agentName = 'Claude' }: { msg: ChatMessage; agentName?: string }) {
   switch (msg.kind) {
     case 'system':
       return <p className="text-[11px] text-[var(--text-muted)] italic">{msg.text}</p>
@@ -272,6 +272,11 @@ function MessageBubble({ msg, agentName = 'Claude' }: { msg: ChatMessage; agentN
       )
   }
 }
+
+const MessageBubble = memo(
+  MessageBubbleImpl,
+  (prev, next) => prev.msg === next.msg && prev.agentName === next.agentName
+)
 
 function BlockView({ block }: { block: ContentBlock }) {
   switch (block.type) {

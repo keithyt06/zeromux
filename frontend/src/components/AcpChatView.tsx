@@ -85,7 +85,17 @@ export default function AcpChatView({ sessionId, active, agentType = 'claude' }:
       } catch { /* ignore */ }
     }
 
-    ws.onclose = () => { wsRef.current = null }
+    ws.onclose = () => {
+      wsRef.current = null
+      const activeId = currentAssistant.current?.id
+      if (activeId) {
+        setMessages(prev => prev.map(m =>
+          m.kind === 'assistant' && m.id === activeId ? { ...m, complete: true } : m
+        ))
+      }
+      currentAssistant.current = null
+      setBusy(false)
+    }
     ws.onerror = () => { ws.close() }
 
     return () => { ws.close() }

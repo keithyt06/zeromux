@@ -2,6 +2,7 @@ mod acp;
 mod admin;
 mod auth;
 mod db;
+mod event_stream;
 mod logger;
 mod notes;
 mod oauth;

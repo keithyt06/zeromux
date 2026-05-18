@@ -34,7 +34,7 @@ describe('MarkdownContent — codeblock dispatch', () => {
     expect(pending?.textContent).toContain('graph TD; A-->B')
   })
 
-  it('renders mermaid block as pending pre when isComplete=true (until Task 12)', () => {
+  it('renders mermaid block as pending pre on initial paint (before useEffect resolves)', () => {
     const text = '```mermaid\ngraph TD; A-->B\n```'
     const { container } = render(<MarkdownContent text={text} isComplete={true} />)
     expect(container.querySelector('pre.mermaid-pending')).toBeInTheDocument()

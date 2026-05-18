@@ -2,6 +2,8 @@ import { useState, useEffect, useRef, useCallback, memo, type KeyboardEvent } fr
 import { wsUrl } from '../lib/api'
 import { Send, ChevronDown, Wrench, Brain, AlertCircle } from 'lucide-react'
 import MarkdownContent from './markdown/MarkdownContent'
+import { MicButton } from './MicButton'
+import { useTranscribe } from '../lib/transcribe'
 
 // ── Message types ──
 
@@ -60,6 +62,21 @@ export default function AcpChatView({ sessionId, active, agentType = 'claude' }:
   const scrollRef = useRef<HTMLDivElement>(null)
   const inputRef = useRef<HTMLTextAreaElement>(null)
   const currentAssistant = useRef<AssistantMsg | null>(null)
+
+  const autoResize = (t: HTMLTextAreaElement) => {
+    t.style.height = 'auto'
+    t.style.height = Math.min(t.scrollHeight, 120) + 'px'
+  }
+
+  const transcribe = useTranscribe({
+    language: 'zh-CN',
+    onFinal: (text) => {
+      setInput(prev => prev + text)
+      requestAnimationFrame(() => {
+        if (inputRef.current) autoResize(inputRef.current)
+      })
+    },
+  })
 
   const scrollBottom = useCallback(() => {
     requestAnimationFrame(() => {
@@ -226,30 +243,41 @@ export default function AcpChatView({ sessionId, active, agentType = 'claude' }:
         ))}
       </div>
 
-      <div className="flex gap-2 px-4 py-3 border-t border-[var(--border)] bg-[var(--bg-secondary)]">
-        <textarea
-          ref={inputRef}
-          value={input}
-          onChange={e => setInput(e.target.value)}
-          onKeyDown={handleKeyDown}
-          placeholder={`Send a message to ${agentType === 'kiro' ? 'Kiro' : 'Claude'}...`}
-          rows={1}
-          className="flex-1 px-3 py-2 bg-[var(--bg-primary)] border border-[var(--border)] rounded-lg text-sm text-[var(--text-primary)] placeholder-[var(--text-muted)] outline-none focus:border-[var(--accent-blue)] resize-none min-h-[40px] max-h-[120px]"
-          style={{ height: 'auto', overflow: 'hidden' }}
-          onInput={e => {
-            const t = e.target as HTMLTextAreaElement
-            t.style.height = 'auto'
-            t.style.height = Math.min(t.scrollHeight, 120) + 'px'
-          }}
-        />
-        <button
-          onClick={sendPrompt}
-          disabled={busy || !input.trim()}
-          className="self-end p-2 bg-[var(--accent-green)] hover:bg-[var(--accent-green-hover)] disabled:bg-[var(--btn-disabled-bg)] disabled:text-[var(--btn-disabled-text)] text-white rounded-lg transition-colors"
-          title="Send"
-        >
-          <Send size={16} />
-        </button>
+      <div className="flex flex-col px-4 py-3 border-t border-[var(--border)] bg-[var(--bg-secondary)]">
+        {(transcribe.partial || transcribe.error) && (
+          <div className="px-2 pb-1 text-xs italic text-[var(--text-muted)]">
+            {transcribe.error
+              ? <span className="text-[var(--accent-red)]">⚠ {transcribe.error}</span>
+              : transcribe.partial}
+          </div>
+        )}
+        <div className="flex gap-2">
+          <textarea
+            ref={inputRef}
+            value={input}
+            onChange={e => setInput(e.target.value)}
+            onKeyDown={handleKeyDown}
+            placeholder={`Send a message to ${agentType === 'kiro' ? 'Kiro' : 'Claude'}...`}
+            rows={1}
+            className="flex-1 px-3 py-2 bg-[var(--bg-primary)] border border-[var(--border)] rounded-lg text-sm text-[var(--text-primary)] placeholder-[var(--text-muted)] outline-none focus:border-[var(--accent-blue)] resize-none min-h-[40px] max-h-[120px]"
+            style={{ height: 'auto', overflow: 'hidden' }}
+            onInput={e => autoResize(e.target as HTMLTextAreaElement)}
+          />
+          <MicButton
+            isRecording={transcribe.isRecording}
+            supported={transcribe.supported}
+            onPressStart={transcribe.start}
+            onPressEnd={transcribe.stop}
+          />
+          <button
+            onClick={sendPrompt}
+            disabled={busy || !input.trim()}
+            className="self-end p-2 bg-[var(--accent-green)] hover:bg-[var(--accent-green-hover)] disabled:bg-[var(--btn-disabled-bg)] disabled:text-[var(--btn-disabled-text)] text-white rounded-lg transition-colors"
+            title="Send"
+          >
+            <Send size={16} />
+          </button>
+        </div>
       </div>
     </div>
   )

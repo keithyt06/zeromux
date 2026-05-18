@@ -60,7 +60,12 @@ pub fn presign_transcribe_url(
 
     let canonical_headers = format!("host:{host}\n");
     let signed_headers = "host";
-    let payload_hash = "UNSIGNED-PAYLOAD";
+    // Transcribe Streaming presigned URLs use SHA256 of an EMPTY payload — NOT
+    // "UNSIGNED-PAYLOAD". The body is the EventStream WS frames after the handshake,
+    // but at presign time the GET request has no body. AWS expects:
+    //   e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855
+    // (= sha256_hex(""))
+    let payload_hash = sha256_hex(b"");
     let canonical_request = format!(
         "GET\n{path}\n{canonical_query}\n{canonical_headers}\n{signed_headers}\n{payload_hash}"
     );

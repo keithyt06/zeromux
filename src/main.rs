@@ -9,6 +9,7 @@ mod notes;
 mod oauth;
 mod pty_bridge;
 mod session_manager;
+mod transcribe;
 mod web;
 mod ws_handler;
 

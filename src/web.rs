@@ -80,6 +80,10 @@ pub fn build_router(state: Arc<AppState>) -> Router {
         .route(
             "/ws/acp/{session_id}",
             get(crate::acp::ws_handler::ws_acp),
+        )
+        .route(
+            "/ws/transcribe",
+            get(crate::transcribe::transcribe_ws),
         );
 
     Router::new()

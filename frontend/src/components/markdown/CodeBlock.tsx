@@ -1,4 +1,5 @@
 import { useMarkdownContext } from './context'
+import MermaidBlock from './MermaidBlock'
 
 type CodeProps = {
   className?: string
@@ -27,12 +28,7 @@ export default function CodeBlock({ className, children, ...props }: CodeProps) 
         </pre>
       )
     }
-    // MermaidBlock added in Task 12; for now show raw with a "rendered when implemented" marker
-    return (
-      <pre className="mermaid-pending bg-[var(--bg-secondary)] border border-[var(--border)] rounded-md p-3 my-2 overflow-x-auto text-[12px] text-[var(--text-secondary)] font-mono">
-        {raw}
-      </pre>
-    )
+    return <MermaidBlock code={raw} />
   }
 
   // Generic block code (will be picked up by hljs via rehype-highlight in Task 10)

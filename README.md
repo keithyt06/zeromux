@@ -8,6 +8,7 @@ ZeroMux lets you manage multiple terminal sessions, Claude Code agents, and Kiro
 
 - **Web Terminal** — Full xterm.js terminal with PTY backend, WebGL rendering, 2MB scrollback persistence across reconnects
 - **AI Agent Sessions** — Run Claude Code (stream-json ACP) and Kiro CLI (JSON-RPC 2.0) side by side
+- **Voice Input** — Push-to-talk microphone next to the chat input streams audio to AWS Transcribe Streaming for real-time Chinese transcription; results populate the textarea, never auto-send
 - **Multi-Client WebSocket** — Broadcast architecture allows multiple browser tabs/devices to view the same session simultaneously
 - **Session Notes** — Per-working-directory note timeline with markdown files as source of truth and SQLite index, stored centrally in `~/.zeromux/notes/`
 - **Git Viewer** — Branch/merge graph visualization with commit diffs, file stats, and ref badges (HEAD, branches, tags)
@@ -101,6 +102,18 @@ For multi-user setups with GitHub authentication:
 ```
 
 The first user to log in is automatically promoted to admin.
+
+### AWS Credentials (optional, required for voice input)
+
+The voice input feature calls AWS Transcribe Streaming using the default AWS credential chain:
+
+1. Env vars: `AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY` / `AWS_SESSION_TOKEN` / `AWS_REGION`
+2. Shared config: `~/.aws/credentials [default]` + `~/.aws/config [default]`
+3. EC2 IAM instance role (recommended deployment)
+
+Required IAM permission: `transcribe:StartStreamTranscription`.
+
+Voice input is the only feature that uses AWS — without credentials, the rest of ZeroMux works normally; pressing the mic button surfaces an "AWS credentials not configured" error.
 
 ## Architecture
 

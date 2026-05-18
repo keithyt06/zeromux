@@ -8,6 +8,7 @@ ZeroMux 让你在浏览器中管理多个终端会话、Claude Code 代理和 Ki
 
 - **Web 终端** — 基于 xterm.js 的完整终端，PTY 后端，WebGL 渲染，2MB 滚动缓冲区，断线重连后自动恢复
 - **AI Agent 会话** — 并行运行 Claude Code（stream-json ACP）和 Kiro CLI（JSON-RPC 2.0）
+- **语音输入** — AcpChatView 输入框旁的麦克风按钮，按住说话调用 AWS Transcribe Streaming 实时转写中文，松开停止；结果填进输入框，需手动点 Send 才发送
 - **多客户端 WebSocket** — 广播架构允许多个浏览器标签页/设备同时查看同一会话
 - **会话笔记** — 按工作目录聚合的笔记时间线，markdown 文件为数据源，SQLite 为查询索引，集中存储在 `~/.zeromux/notes/`
 - **Git 查看器** — 分支/合并图形化展示，支持 commit diff、文件统计、分支标签（HEAD、分支、标签）
@@ -101,6 +102,18 @@ docker run -p 8080:8080 -v zeromux-data:/root/.zeromux zeromux --password "my-se
 ```
 
 第一个登录的用户自动成为管理员。
+
+### AWS 凭证（可选，启用语音输入需要）
+
+语音输入功能调用 AWS Transcribe Streaming，沿用 AWS SDK 默认 credential chain：
+
+1. 环境变量：`AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY` / `AWS_SESSION_TOKEN` / `AWS_REGION`
+2. 共享配置：`~/.aws/credentials [default]` + `~/.aws/config [default]`
+3. EC2 IAM Instance Role（推荐部署模式）
+
+需要的 IAM 权限：`transcribe:StartStreamTranscription`。
+
+未配置 AWS 凭证不影响其他功能，仅麦克风按钮在使用时显示 "AWS credentials not configured" 错误。
 
 ## 架构
 

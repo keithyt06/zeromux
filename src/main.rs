@@ -1,6 +1,7 @@
 mod acp;
 mod admin;
 mod auth;
+mod aws_sigv4;
 mod db;
 mod event_stream;
 mod logger;

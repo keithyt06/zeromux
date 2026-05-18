@@ -1,6 +1,24 @@
-import { describe, it, expect } from 'vitest'
+import { describe, it, expect, vi, beforeEach } from 'vitest'
 import { render, screen, waitFor } from '@testing-library/react'
 import MarkdownContent from '../MarkdownContent'
+import { mermaidCache } from '../cache'
+
+const renderMock = vi.fn()
+const parseMock = vi.fn()
+const initMock = vi.fn()
+
+vi.mock('mermaid', () => ({
+  default: { initialize: initMock, parse: parseMock, render: renderMock },
+}))
+
+beforeEach(() => {
+  mermaidCache.clear()
+  renderMock.mockReset()
+  parseMock.mockReset()
+  initMock.mockReset()
+  parseMock.mockResolvedValue(true)
+  renderMock.mockResolvedValue({ svg: '<svg id="test"/>' })
+})
 
 describe('MarkdownContent — codeblock dispatch', () => {
   it('renders empty string without crashing', () => {

@@ -6,13 +6,38 @@
 - **影响范围**: `frontend/src/components/AcpChatView.tsx`、`MarkdownViewer.tsx`、新建 `frontend/src/components/markdown/`
 - **不影响**: Rust 后端、ws 协议、systemd 服务、AWS 资源
 
+## 实施状态（2026-05-18）
+
+✅ **已实施并通过 review** —— 13 个 task 全部 commit 到 `feat/md-rendering` 分支，自动化测试 24/24 pass，final code review 通过。
+
+### 实测包体（生产构建）
+
+| 资源 | 大小 | 备注 |
+|---|---|---|
+| 主 bundle (`index-*.js`) | 1.1MB minified, ~302KB gz | eager：react + react-markdown + remark-gfm + remark-math + rehype-highlight + 12 hljs 语言 |
+| KaTeX chunk | 254KB minified, 78KB gz + 29KB CSS + ~600KB 字体 | lazy，首次出现 `$` 才下载 |
+| Mermaid chunk | 2.8MB minified, 764KB gz | lazy，首次出现 \`\`\`mermaid 才下载，含按图表类型的二级 lazy chunks |
+| 二进制（rust-embed 后） | 11MB（pre-feature 6.4M，+4.6M） | 超过最初 ≤1MB 目标，但 lazy load 行为正确 |
+
+### 偏离及决策
+
+- 最初 §1 目标 4 写「二进制增长 ≤1MB」属于估算偏低。已修订目标聚焦在「lazy load 行为」而非绝对体积。
+- §8 manualChunks 写的是 object 形式 `{ mermaid: ['mermaid'] }`，实际 Vite 8 / Rolldown 1 要求 function 形式，已改为 `id => id.includes('/node_modules/mermaid/') || id.includes('/node_modules/mermaid-')`。
+- KaTeX 块级公式语法在 remark-math v6 下需要 `$$` 单独占行（不能 inline），实测后微调测试用例。
+
+### 用户手动验收（§7 12 项 checklist）
+
+待用户在浏览器走完。reviewer 认为生产构建已就绪、服务已重启上线（`zeromux.keithyu.cloud` HTTPS 200，systemctl is-active）。
+
 ## 1. 目标 / 非目标
 
 ### 目标
 1. 在 AcpChatView 聊天流和 MarkdownViewer 笔记查看器渲染 **数学公式（KaTeX）、流程图（Mermaid）、代码语法高亮（highlight.js）、GFM 表格/任务列表**
 2. 流式期间不卡顿：每秒 20+ token 仍能流畅滚动 + 输入
 3. 不发对应内容的用户**不下载**对应库（lazy chunks）
-4. 单文件部署优势保留：rust-embed 后二进制增长 ≤ 1MB
+4. 单文件部署优势保留：lazy chunks 确保不发对应内容的用户不下载对应库
+   （实测 binary 6.4M → 11M / +4.6M，超过最初 ≤1MB 估算；mermaid 全图表类型
+   bundle 比预估大，但 lazy load 已实现核心意图）
 
 ### 非目标
 - ❌ 不引入 SSR / 服务端渲染

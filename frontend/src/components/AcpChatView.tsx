@@ -1,22 +1,27 @@
-import { useState, useEffect, useRef, useCallback, type KeyboardEvent } from 'react'
-import ReactMarkdown from 'react-markdown'
-import remarkGfm from 'remark-gfm'
+import { useState, useEffect, useRef, useCallback, memo, type KeyboardEvent } from 'react'
 import { wsUrl } from '../lib/api'
 import { Send, ChevronDown, Wrench, Brain, AlertCircle } from 'lucide-react'
-import { markdownComponents } from './markdownStyles'
+import MarkdownContent from './markdown/MarkdownContent'
 
 // ── Message types ──
 
-interface SystemMsg { kind: 'system'; text: string }
-interface UserMsg { kind: 'user'; text: string }
-interface AssistantMsg {
+interface BaseMsg { id: string }
+interface SystemMsg    extends BaseMsg { kind: 'system'; text: string }
+interface UserMsg      extends BaseMsg { kind: 'user'; text: string }
+interface AssistantMsg extends BaseMsg {
   kind: 'assistant'
   blocks: ContentBlock[]
   cost?: number
+  complete: boolean
 }
-interface ErrorMsg { kind: 'error'; text: string }
+interface ErrorMsg     extends BaseMsg { kind: 'error'; text: string }
 
 type ChatMessage = SystemMsg | UserMsg | AssistantMsg | ErrorMsg
+
+const newId = () =>
+  (typeof crypto !== 'undefined' && 'randomUUID' in crypto)
+    ? crypto.randomUUID()
+    : Math.random().toString(36).slice(2) + Date.now().toString(36)
 
 interface ContentBlock {
   type: 'text' | 'thinking' | 'tool_use'
@@ -67,11 +72,6 @@ export default function AcpChatView({ sessionId, active, agentType = 'claude' }:
     scrollBottom()
   }, [scrollBottom])
 
-  const updateAssistant = useCallback(() => {
-    setMessages(prev => [...prev])
-    scrollBottom()
-  }, [scrollBottom])
-
   useEffect(() => {
     const ws = new WebSocket(wsUrl(`/ws/acp/${sessionId}`))
     wsRef.current = ws
@@ -83,7 +83,17 @@ export default function AcpChatView({ sessionId, active, agentType = 'claude' }:
       } catch { /* ignore */ }
     }
 
-    ws.onclose = () => { wsRef.current = null }
+    ws.onclose = () => {
+      wsRef.current = null
+      const activeId = currentAssistant.current?.id
+      if (activeId) {
+        setMessages(prev => prev.map(m =>
+          m.kind === 'assistant' && m.id === activeId ? { ...m, complete: true } : m
+        ))
+      }
+      currentAssistant.current = null
+      setBusy(false)
+    }
     ws.onerror = () => { ws.close() }
 
     return () => { ws.close() }
@@ -95,43 +105,53 @@ export default function AcpChatView({ sessionId, active, agentType = 'claude' }:
       case 'system': {
         const label = evt.subtype || 'system'
         const sid = evt.session_id ? ` ${evt.session_id.substring(0, 8)}...` : ''
-        pushMessage({ kind: 'system', text: `${label}${sid}` })
+        pushMessage({ id: newId(), kind: 'system', text: `${label}${sid}` })
         break
       }
 
       case 'content_block': {
+        const delta = evt.text || ''
+        // Ensure there's an active assistant message
         if (!currentAssistant.current) {
-          const msg: AssistantMsg = { kind: 'assistant', blocks: [] }
+          const msg: AssistantMsg = { id: newId(), kind: 'assistant', blocks: [], complete: false }
           currentAssistant.current = msg
           setMessages(prev => [...prev, msg])
         }
-        const blocks = currentAssistant.current.blocks
-        // Streaming delta: append text to the last text block instead of creating new
-        if (evt.streaming && evt.block_type === 'text' && blocks.length > 0) {
-          const last = blocks[blocks.length - 1]
-          if (last.type === 'text') {
-            last.text = (last.text || '') + (evt.text || '')
-            setBusy(true)
-            updateAssistant()
-            break
+        const activeId = currentAssistant.current.id
+        setMessages(prev => prev.map(m => {
+          if (m.kind !== 'assistant' || m.id !== activeId) return m   // reference stable, memo skips
+          const blocks = [...m.blocks]
+          if (evt.streaming && evt.block_type === 'text' && blocks.length > 0
+              && blocks[blocks.length - 1].type === 'text') {
+            const last = blocks[blocks.length - 1]
+            blocks[blocks.length - 1] = { ...last, text: (last.text || '') + delta }
+          } else {
+            blocks.push({
+              type: (evt.block_type as ContentBlock['type']) || 'text',
+              text: evt.text,
+              name: evt.name,
+              input: evt.input,
+            })
           }
-        }
-        const block: ContentBlock = {
-          type: (evt.block_type as ContentBlock['type']) || 'text',
-          text: evt.text,
-          name: evt.name,
-          input: evt.input,
-        }
-        blocks.push(block)
+          // Mirror onto the ref so subsequent events still see the latest blocks.
+          const next = { ...m, blocks }
+          currentAssistant.current = next
+          return next
+        }))
         setBusy(true)
-        updateAssistant()
+        scrollBottom()
         break
       }
 
       case 'result': {
-        if (currentAssistant.current && evt.cost_usd) {
-          currentAssistant.current.cost = evt.cost_usd
-          updateAssistant()
+        const activeId = currentAssistant.current?.id
+        if (activeId) {
+          const cost = evt.cost_usd
+          setMessages(prev => prev.map(m =>
+            m.kind === 'assistant' && m.id === activeId
+              ? { ...m, complete: true, ...(cost ? { cost } : {}) }
+              : m
+          ))
         }
         currentAssistant.current = null
         setBusy(false)
@@ -139,32 +159,49 @@ export default function AcpChatView({ sessionId, active, agentType = 'claude' }:
       }
 
       case 'error': {
-        pushMessage({ kind: 'error', text: evt.message || 'Unknown error' })
+        const activeId = currentAssistant.current?.id
+        if (activeId) {
+          setMessages(prev => prev.map(m =>
+            m.kind === 'assistant' && m.id === activeId ? { ...m, complete: true } : m
+          ))
+        }
+        pushMessage({ id: newId(), kind: 'error', text: evt.message || 'Unknown error' })
         currentAssistant.current = null
         setBusy(false)
         break
       }
 
       case 'exit': {
-        pushMessage({ kind: 'system', text: `Process exited (code: ${evt.code || 0})` })
+        const activeId = currentAssistant.current?.id
+        if (activeId) {
+          setMessages(prev => prev.map(m =>
+            m.kind === 'assistant' && m.id === activeId ? { ...m, complete: true } : m
+          ))
+        }
+        pushMessage({ id: newId(), kind: 'system', text: `Process exited (code: ${evt.code || 0})` })
         currentAssistant.current = null
         setBusy(false)
         break
       }
 
       case 'replay_done': {
-        // Scrollback replay finished — close any open assistant turn and reset busy
+        const activeId = currentAssistant.current?.id
+        if (activeId) {
+          setMessages(prev => prev.map(m =>
+            m.kind === 'assistant' && m.id === activeId ? { ...m, complete: true } : m
+          ))
+        }
         currentAssistant.current = null
         setBusy(false)
         break
       }
     }
-  }, [pushMessage, updateAssistant])
+  }, [pushMessage, scrollBottom])
 
   const sendPrompt = useCallback(() => {
     const text = input.trim()
     if (!text || !wsRef.current || wsRef.current.readyState !== WebSocket.OPEN) return
-    pushMessage({ kind: 'user', text })
+    pushMessage({ id: newId(), kind: 'user', text })
     wsRef.current.send(JSON.stringify({ type: 'prompt', text }))
     setInput('')
     setBusy(true)
@@ -184,8 +221,8 @@ export default function AcpChatView({ sessionId, active, agentType = 'claude' }:
   return (
     <div className="flex flex-col h-full">
       <div ref={scrollRef} className="flex-1 overflow-y-auto px-4 py-3 space-y-3">
-        {messages.map((msg, i) => (
-          <MessageBubble key={i} msg={msg} agentName={agentType === 'kiro' ? 'Kiro' : 'Claude'} />
+        {messages.map(msg => (
+          <MessageBubble key={msg.id} msg={msg} agentName={agentType === 'kiro' ? 'Kiro' : 'Claude'} />
         ))}
       </div>
 
@@ -218,19 +255,9 @@ export default function AcpChatView({ sessionId, active, agentType = 'claude' }:
   )
 }
 
-// ── Markdown ──
-
-function Markdown({ children }: { children: string }) {
-  return (
-    <ReactMarkdown remarkPlugins={[remarkGfm]} components={markdownComponents}>
-      {children}
-    </ReactMarkdown>
-  )
-}
-
 // ── Message rendering ──
 
-function MessageBubble({ msg, agentName = 'Claude' }: { msg: ChatMessage; agentName?: string }) {
+function MessageBubbleImpl({ msg, agentName = 'Claude' }: { msg: ChatMessage; agentName?: string }) {
   switch (msg.kind) {
     case 'system':
       return <p className="text-[11px] text-[var(--text-muted)] italic">{msg.text}</p>
@@ -247,7 +274,7 @@ function MessageBubble({ msg, agentName = 'Claude' }: { msg: ChatMessage; agentN
       return (
         <div className="space-y-2">
           <p className="text-[11px] font-semibold text-[var(--accent-purple)] mb-0.5">{agentName}</p>
-          {msg.blocks.map((b, i) => <BlockView key={i} block={b} />)}
+          {msg.blocks.map((b, i) => <BlockView key={i} block={b} isComplete={msg.complete} />)}
           {msg.cost != null && (
             <p className="text-[10px] text-[var(--text-muted)] border-t border-[var(--border-light)] pt-1 mt-1">
               cost: ${msg.cost.toFixed(4)}
@@ -266,12 +293,17 @@ function MessageBubble({ msg, agentName = 'Claude' }: { msg: ChatMessage; agentN
   }
 }
 
-function BlockView({ block }: { block: ContentBlock }) {
+const MessageBubble = memo(
+  MessageBubbleImpl,
+  (prev, next) => prev.msg === next.msg && prev.agentName === next.agentName
+)
+
+function BlockView({ block, isComplete }: { block: ContentBlock; isComplete: boolean }) {
   switch (block.type) {
     case 'text':
       return (
         <div className="text-sm text-[var(--text-primary)] leading-relaxed">
-          <Markdown>{block.text || ''}</Markdown>
+          <MarkdownContent text={block.text || ''} isComplete={isComplete} />
         </div>
       )
 
@@ -284,7 +316,7 @@ function BlockView({ block }: { block: ContentBlock }) {
             <ChevronDown size={12} />
           </summary>
           <div className="mt-1 leading-relaxed">
-            <Markdown>{block.text || ''}</Markdown>
+            <MarkdownContent text={block.text || ''} isComplete={isComplete} />
           </div>
         </details>
       )

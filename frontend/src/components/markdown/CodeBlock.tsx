@@ -31,7 +31,7 @@ export default function CodeBlock({ className, children, ...props }: CodeProps) 
     return <MermaidBlock code={raw} />
   }
 
-  // Generic block code (will be picked up by hljs via rehype-highlight in Task 10)
+  // Generic block code; rehype-highlight has already coloured the children.
   return (
     <code className={`text-[12px] ${className ?? ''}`} {...props}>
       {children}

@@ -97,6 +97,172 @@ fn sha256_hex(bytes: &[u8]) -> String {
     hex::encode(h.finalize())
 }
 
+/// Load AWS credentials and region using the default chain:
+///   1. Environment variables
+///   2. Shared config (`~/.aws/credentials [default]` + `~/.aws/config`)
+///   3. IMDSv2 (EC2 instance metadata)
+pub async fn load_default_credentials() -> Result<(AwsCredentials, String), String> {
+    if let Some(creds) = load_from_env() {
+        let region = resolve_region_from_env_or_config().await?;
+        return Ok((creds, region));
+    }
+    if let Some(creds) = load_from_shared_config().await {
+        let region = resolve_region_from_env_or_config().await?;
+        return Ok((creds, region));
+    }
+    if let Some((creds, imds_region)) = load_from_imdsv2().await {
+        let region = match resolve_region_from_env_or_config().await {
+            Ok(r) => r,
+            Err(_) => imds_region,
+        };
+        return Ok((creds, region));
+    }
+    Err("AWS credentials not configured (env, ~/.aws/credentials, IMDS all empty)".to_string())
+}
+
+fn load_from_env() -> Option<AwsCredentials> {
+    let access = std::env::var("AWS_ACCESS_KEY_ID").ok()?;
+    let secret = std::env::var("AWS_SECRET_ACCESS_KEY").ok()?;
+    let token = std::env::var("AWS_SESSION_TOKEN").ok();
+    Some(AwsCredentials {
+        access_key_id: access,
+        secret_access_key: secret,
+        session_token: token,
+    })
+}
+
+async fn resolve_region_from_env_or_config() -> Result<String, String> {
+    if let Ok(r) = std::env::var("AWS_REGION") {
+        if !r.is_empty() {
+            return Ok(r);
+        }
+    }
+    if let Ok(r) = std::env::var("AWS_DEFAULT_REGION") {
+        if !r.is_empty() {
+            return Ok(r);
+        }
+    }
+    if let Some(r) = read_shared_config_region().await {
+        return Ok(r);
+    }
+    Err("AWS region not configured (set AWS_REGION env or [default] region in ~/.aws/config)"
+        .to_string())
+}
+
+async fn read_shared_config_region() -> Option<String> {
+    let path = home_dir()?.join(".aws").join("config");
+    let text = tokio::fs::read_to_string(path).await.ok()?;
+    parse_ini_default_section(&text).get("region").cloned()
+}
+
+async fn load_from_shared_config() -> Option<AwsCredentials> {
+    let path = home_dir()?.join(".aws").join("credentials");
+    let text = tokio::fs::read_to_string(path).await.ok()?;
+    let kv = parse_ini_default_section(&text);
+    let access = kv.get("aws_access_key_id")?.clone();
+    let secret = kv.get("aws_secret_access_key")?.clone();
+    let token = kv.get("aws_session_token").cloned();
+    Some(AwsCredentials {
+        access_key_id: access,
+        secret_access_key: secret,
+        session_token: token,
+    })
+}
+
+fn parse_ini_default_section(text: &str) -> std::collections::HashMap<String, String> {
+    let mut out = std::collections::HashMap::new();
+    let mut in_default = false;
+    for line in text.lines() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') || line.starts_with(';') {
+            continue;
+        }
+        if line.starts_with('[') {
+            in_default = line == "[default]";
+            continue;
+        }
+        if !in_default {
+            continue;
+        }
+        if let Some((k, v)) = line.split_once('=') {
+            out.insert(k.trim().to_string(), v.trim().to_string());
+        }
+    }
+    out
+}
+
+fn home_dir() -> Option<std::path::PathBuf> {
+    std::env::var_os("HOME").map(std::path::PathBuf::from)
+}
+
+async fn load_from_imdsv2() -> Option<(AwsCredentials, String)> {
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_millis(1000))
+        .build()
+        .ok()?;
+    let token = client
+        .put("http://169.254.169.254/latest/api/token")
+        .header("X-aws-ec2-metadata-token-ttl-seconds", "60")
+        .send()
+        .await
+        .ok()?
+        .text()
+        .await
+        .ok()?;
+
+    let role = client
+        .get("http://169.254.169.254/latest/meta-data/iam/security-credentials/")
+        .header("X-aws-ec2-metadata-token", &token)
+        .send()
+        .await
+        .ok()?
+        .text()
+        .await
+        .ok()?;
+    if role.trim().is_empty() {
+        return None;
+    }
+
+    let creds_url = format!(
+        "http://169.254.169.254/latest/meta-data/iam/security-credentials/{}",
+        role.trim()
+    );
+    let body: serde_json::Value = client
+        .get(&creds_url)
+        .header("X-aws-ec2-metadata-token", &token)
+        .send()
+        .await
+        .ok()?
+        .json()
+        .await
+        .ok()?;
+
+    let access = body.get("AccessKeyId")?.as_str()?.to_string();
+    let secret = body.get("SecretAccessKey")?.as_str()?.to_string();
+    let session = body.get("Token")?.as_str()?.to_string();
+
+    let region: String = client
+        .get("http://169.254.169.254/latest/meta-data/placement/region")
+        .header("X-aws-ec2-metadata-token", &token)
+        .send()
+        .await
+        .ok()?
+        .text()
+        .await
+        .ok()?
+        .trim()
+        .to_string();
+
+    Some((
+        AwsCredentials {
+            access_key_id: access,
+            secret_access_key: secret,
+            session_token: Some(session),
+        },
+        region,
+    ))
+}
+
 /// AWS-style URI encoding: RFC3986 unreserved set is left untouched. Used for both query
 /// keys and values. `encode_slash=true` encodes `/`; for path segments pass false.
 fn uri_encode(input: &str, encode_slash: bool) -> String {
@@ -165,6 +331,26 @@ mod tests {
         assert!(url.contains("X-Amz-Expires=300"));
         assert!(url.contains("X-Amz-SignedHeaders=host"));
         assert!(url.contains("X-Amz-Signature="));
+    }
+
+    #[test]
+    fn parses_ini_default_section() {
+        let text = "\
+[default]
+aws_access_key_id = AKIDEXAMPLE
+aws_secret_access_key = secret-with-equals=in-it
+# comment
+aws_session_token = TOKEN
+
+[other-profile]
+aws_access_key_id = OTHERKEY
+";
+        let kv = parse_ini_default_section(text);
+        assert_eq!(kv.get("aws_access_key_id").unwrap(), "AKIDEXAMPLE");
+        // Note: split_once('=') keeps the rest of the line in the value, but our value is stored as-is
+        assert!(kv.contains_key("aws_secret_access_key"));
+        assert_eq!(kv.get("aws_session_token").unwrap(), "TOKEN");
+        assert!(!kv.contains_key("OTHERKEY"));
     }
 
     #[test]

@@ -16,10 +16,13 @@ export interface UseTranscribeReturn {
   stop: () => void
 }
 
+// Touch only globals — never `AudioContext.prototype.audioWorklet`, which is an
+// instance getter and throws "Illegal invocation" when read off the prototype.
+// AudioWorkletNode being a global is the cleanest proxy for AudioWorklet support.
 const SUPPORTED =
   typeof window !== 'undefined' &&
-  typeof (window as unknown as { AudioContext?: typeof AudioContext }).AudioContext !== 'undefined' &&
-  typeof (window.AudioContext.prototype as AudioContext).audioWorklet === 'object' &&
+  typeof window.AudioContext !== 'undefined' &&
+  typeof window.AudioWorkletNode !== 'undefined' &&
   !!navigator.mediaDevices?.getUserMedia
 
 export function useTranscribe(opts: UseTranscribeOptions): UseTranscribeReturn {

@@ -1,4 +1,4 @@
-export type SessionType = 'tmux' | 'claude' | 'kiro'
+export type SessionType = 'tmux' | 'claude' | 'kiro' | 'codex'
 
 export type SessionMetaStatus = 'running' | 'done' | 'blocked' | 'idle'
 

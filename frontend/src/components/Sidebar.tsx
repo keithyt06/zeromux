@@ -2,7 +2,7 @@ import { useState, useCallback } from 'react'
 import type { SessionInfo, SessionType, DirEntry, UserInfo, TmuxSession } from '../lib/api'
 import { listDirectories, listTmuxSessions } from '../lib/api'
 import type { Theme } from '../lib/theme'
-import { Terminal, Bot, Plus, X, PanelLeftClose, PanelLeft, Sun, Moon, Sparkles, Folder, FolderGit2, ChevronLeft, Home, LogOut, Users, MonitorUp, Link } from 'lucide-react'
+import { Terminal, Bot, Plus, X, PanelLeftClose, PanelLeft, Sun, Moon, Sparkles, Folder, FolderGit2, ChevronLeft, Home, LogOut, Users, MonitorUp, Link, Cpu } from 'lucide-react'
 import AdminPanel from './AdminPanel'
 import { StatusDot } from './SessionInfoBar'
 
@@ -133,7 +133,7 @@ export default function Sidebar({ sessions, activeId, onSelect, onCreate, onDele
             }`}
             title={s.name}
           >
-            {s.type === 'claude' ? <Bot size={14} /> : s.type === 'kiro' ? <Sparkles size={14} /> : <Terminal size={14} />}
+            {s.type === 'claude' ? <Bot size={14} /> : s.type === 'kiro' ? <Sparkles size={14} /> : s.type === 'codex' ? <Cpu size={14} /> : <Terminal size={14} />}
           </button>
         ))}
         <div className="mt-auto flex flex-col items-center gap-1">
@@ -233,7 +233,7 @@ export default function Sidebar({ sessions, activeId, onSelect, onCreate, onDele
             }`}
           >
             <StatusDot status={s.status} />
-            {s.type === 'claude' ? <Bot size={13} className="shrink-0" /> : s.type === 'kiro' ? <Sparkles size={13} className="shrink-0" /> : <Terminal size={13} className="shrink-0" />}
+            {s.type === 'claude' ? <Bot size={13} className="shrink-0" /> : s.type === 'kiro' ? <Sparkles size={13} className="shrink-0" /> : s.type === 'codex' ? <Cpu size={13} className="shrink-0" /> : <Terminal size={13} className="shrink-0" />}
             <div className="flex-1 min-w-0">
               <div className="truncate">{s.name}</div>
               {s.description && (
@@ -296,6 +296,16 @@ export default function Sidebar({ sessions, activeId, onSelect, onCreate, onDele
                     <div className="text-left">
                       <div className="font-medium">Kiro</div>
                       <div className="text-[10px] text-[var(--text-secondary)]">AI coding agent (ACP)</div>
+                    </div>
+                  </button>
+                  <button
+                    onClick={() => selectType('codex')}
+                    className="flex items-center gap-2.5 w-full px-3 py-2 text-xs text-[var(--text-primary)] hover:bg-[var(--bg-hover)] transition-colors"
+                  >
+                    <Cpu size={14} className="text-[var(--accent-blue)] shrink-0" />
+                    <div className="text-left">
+                      <div className="font-medium">Codex</div>
+                      <div className="text-[10px] text-[var(--text-secondary)]">AI coding agent (MCP)</div>
                     </div>
                   </button>
                 </>

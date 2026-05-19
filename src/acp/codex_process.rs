@@ -155,14 +155,127 @@ impl Drop for CodexProcess {
 
 async fn run_event_loop(
     service: RunningService<RoleClient, Handler>,
-    mut _cmd_rx: mpsc::Receiver<Cmd>,
-    mut _notify_rx: mpsc::Receiver<Notify>,
+    mut cmd_rx: mpsc::Receiver<Cmd>,
+    mut notify_rx: mpsc::Receiver<Notify>,
     event_tx: mpsc::Sender<AcpEvent>,
-    _work_dir: String,
+    work_dir: String,
     _drop_guard: Arc<()>,
 ) {
-    // PLACEHOLDER: handshake-only behaviour. Holding `service` keeps the child
-    // process alive. Task 7 replaces this with the real prompt/response loop.
-    let _ = service.waiting().await;
+    use rmcp::model::CallToolRequestParams;
+    use serde_json::json;
+
+    let mut thread_id: Option<String> = None;
+
+    loop {
+        tokio::select! {
+            cmd = cmd_rx.recv() => {
+                match cmd {
+                    Some(Cmd::Prompt(text)) => {
+                        // Drain any stale progress chunks left from a previous turn.
+                        while notify_rx.try_recv().is_ok() {}
+
+                        let (tool_name, args) = match &thread_id {
+                            None => (
+                                "codex",
+                                json!({
+                                    "prompt": text,
+                                    "cwd": work_dir,
+                                    "sandbox": "danger-full-access",
+                                    "approval-policy": "never",
+                                }),
+                            ),
+                            Some(tid) => (
+                                "codex-reply",
+                                json!({
+                                    "prompt": text,
+                                    "threadId": tid,
+                                }),
+                            ),
+                        };
+
+                        let mut params = CallToolRequestParams::new(tool_name);
+                        if let Some(obj) = args.as_object().cloned() {
+                            params = params.with_arguments(obj);
+                        }
+
+                        let result = service.peer().call_tool(params).await;
+
+                        match result {
+                            Ok(resp) => {
+                                let (tid, content) = parse_codex_tool_result(&resp);
+                                if let Some(t) = tid.clone() {
+                                    thread_id = Some(t);
+                                }
+                                let _ = event_tx
+                                    .send(AcpEvent::Result {
+                                        text: content.unwrap_or_default(),
+                                        session_id: tid.unwrap_or_default(),
+                                        cost_usd: None,
+                                    })
+                                    .await;
+                            }
+                            Err(e) => {
+                                let msg = format!("{e}");
+                                if msg.contains("thread") && msg.contains("not found") {
+                                    thread_id = None;
+                                }
+                                let _ = event_tx
+                                    .send(AcpEvent::Error {
+                                        message: format!("Codex error: {msg}"),
+                                    })
+                                    .await;
+                            }
+                        }
+                    }
+                    Some(Cmd::Cancel) | Some(Cmd::Stop) | None => {
+                        break;
+                    }
+                }
+            }
+
+            // Drain progress notifications while idle. Task 8 wires them into AcpEvent.
+            Some(_n) = notify_rx.recv() => {
+                // intentionally dropped in Task 7
+            }
+        }
+    }
+
     let _ = event_tx.send(AcpEvent::Exit { code: 0 }).await;
+}
+
+/// Parse a CallToolResult from `tools/call("codex" | "codex-reply")` into
+/// `(threadId, content)`. Returns (None, None) on unexpected shape.
+fn parse_codex_tool_result(
+    result: &rmcp::model::CallToolResult,
+) -> (Option<String>, Option<String>) {
+    // Strategy 1: structured_content (preferred when present)
+    if let Some(structured) = &result.structured_content {
+        let tid = structured
+            .get("threadId")
+            .and_then(|v| v.as_str())
+            .map(String::from);
+        let content = structured
+            .get("content")
+            .and_then(|v| v.as_str())
+            .map(String::from);
+        if tid.is_some() || content.is_some() {
+            return (tid, content);
+        }
+    }
+    // Strategy 2: first text content block contains a JSON-encoded {threadId, content}
+    for block in &result.content {
+        if let Some(text) = block.as_text() {
+            if let Ok(v) = serde_json::from_str::<serde_json::Value>(&text.text) {
+                let tid = v.get("threadId").and_then(|x| x.as_str()).map(String::from);
+                let content = v
+                    .get("content")
+                    .and_then(|x| x.as_str())
+                    .map(String::from);
+                if tid.is_some() || content.is_some() {
+                    return (tid, content);
+                }
+            }
+        }
+    }
+    (None, None)
 }

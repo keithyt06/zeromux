@@ -45,6 +45,7 @@ pub enum SessionType {
     Tmux,
     Claude,
     Kiro,
+    Codex,
 }
 
 impl std::fmt::Display for SessionType {
@@ -53,6 +54,7 @@ impl std::fmt::Display for SessionType {
             SessionType::Tmux => write!(f, "tmux"),
             SessionType::Claude => write!(f, "claude"),
             SessionType::Kiro => write!(f, "kiro"),
+            SessionType::Codex => write!(f, "codex"),
         }
     }
 }
@@ -400,6 +402,62 @@ impl SessionManager {
         Ok(id)
     }
 
+    pub async fn create_codex_session(
+        &self,
+        name: String,
+        codex_path: &str,
+        work_dir: &str,
+        cols: u16,
+        rows: u16,
+        owner_id: &str,
+    ) -> Result<String, String> {
+        let id = uuid::Uuid::new_v4().to_string();
+        let (effective_dir, worktree_path) = resolve_work_dir(work_dir, &id);
+
+        let process = crate::acp::codex_process::CodexProcess::spawn(
+            codex_path,
+            effective_dir.to_str().unwrap_or("."),
+        )
+        .await
+        .map_err(|e| {
+            if let Some(wt) = &worktree_path {
+                let base = PathBuf::from(work_dir);
+                remove_worktree(&base, wt);
+            }
+            format!("Failed to spawn Codex: {}", e)
+        })?;
+
+        let (event_tx, _) = broadcast::channel(BROADCAST_CAPACITY);
+        let (input_tx, input_rx) = mpsc::channel::<SessionInput>(64);
+
+        let event_tx_clone = event_tx.clone();
+        let sid = id.clone();
+
+        // Spawn fan-out task for Codex process
+        spawn_codex_fanout(sid, process, event_tx_clone, input_rx);
+
+        let session = Session {
+            id: id.clone(),
+            name,
+            session_type: SessionType::Codex,
+            cols,
+            rows,
+            work_dir: effective_dir.to_string_lossy().to_string(),
+            owner_id: owner_id.to_string(),
+            description: String::new(),
+            status: SessionMeta::Running,
+            event_tx,
+            input_tx,
+            worktree_path,
+            pty_pid: None,
+            scrollback: VecDeque::new(),
+            scrollback_bytes: 0,
+        };
+
+        self.sessions.lock().unwrap().insert(id.clone(), session);
+        Ok(id)
+    }
+
     /// List sessions, optionally filtered by owner. Pass None for all (admin).
     pub fn list_sessions(&self, owner_filter: Option<&str>) -> Vec<SessionInfo> {
         self.sessions
@@ -614,5 +672,46 @@ fn spawn_kiro_fanout(
             }
         }
         tracing::info!("Kiro fan-out task ended for session {}", sid);
+    });
+}
+
+fn spawn_codex_fanout(
+    sid: String,
+    mut process: crate::acp::codex_process::CodexProcess,
+    event_tx: broadcast::Sender<String>,
+    mut input_rx: mpsc::Receiver<SessionInput>,
+) {
+    tokio::spawn(async move {
+        loop {
+            tokio::select! {
+                event = process.event_rx.recv() => {
+                    match event {
+                        Some(evt) => {
+                            let json = match serde_json::to_string(&evt) {
+                                Ok(j) => j,
+                                Err(_) => continue,
+                            };
+                            let _ = event_tx.send(json);
+                        }
+                        None => break,
+                    }
+                }
+                input = input_rx.recv() => {
+                    match input {
+                        Some(SessionInput::Prompt(text)) => {
+                            if let Err(e) = process.send_prompt(&text).await {
+                                tracing::warn!("Codex send_prompt failed for {}: {}", sid, e);
+                            }
+                        }
+                        Some(SessionInput::Cancel) => {
+                            process.kill().await;
+                        }
+                        None => break,
+                        _ => {}
+                    }
+                }
+            }
+        }
+        tracing::info!("Codex fan-out task ended for session {}", sid);
     });
 }

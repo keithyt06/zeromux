@@ -19,7 +19,11 @@ export function MicButton({ isRecording, supported, onPressStart, onPressEnd }: 
   }
   const handleUp = (e: PointerEvent<HTMLButtonElement>) => {
     if (disabled) return
-    if (isRecording) onPressEnd()
+    // Always call onPressEnd, even if isRecording=false — user may release
+    // before getUserMedia/ws-open finishes. onPressEnd (stop) is idempotent;
+    // calling it during that startup window is what tears the in-flight
+    // start() down so the mic doesn't end up permanently captured.
+    onPressEnd()
     ;(e.target as HTMLElement).releasePointerCapture?.(e.pointerId)
   }
 

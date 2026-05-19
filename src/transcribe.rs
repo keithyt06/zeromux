@@ -114,6 +114,17 @@ async fn handle_socket(mut browser_ws: WebSocket) {
                 return;
             }
         },
+        Some(Ok(_)) => {
+            // First frame was binary or other type — protocol violation
+            let _ = send_server_frame(
+                &mut browser_ws,
+                &ServerFrame::Error {
+                    message: "first frame must be a start text frame".into(),
+                },
+            )
+            .await;
+            return;
+        }
         _ => return,
     };
 
@@ -182,10 +193,12 @@ async fn handle_socket(mut browser_ws: WebSocket) {
                     }
                     Some(Ok(Message::Text(t))) => {
                         if matches!(serde_json::from_str::<ClientFrame>(&t), Ok(ClientFrame::Stop)) {
-                            // Send empty AudioEvent to flush, then close AWS side. Drain
-                            // the rest in the AWS arm before exiting.
+                            // Send empty AudioEvent to flush, then close AWS side, then exit.
+                            // Without break, any subsequent binary the browser sends
+                            // would call send() on a closed sink and surface a spurious error.
                             let _ = aws_sink.send(TtMessage::Binary(event_stream::encode_audio_event(&[]).into())).await;
                             let _ = aws_sink.close().await;
+                            break;
                         }
                     }
                     Some(Ok(Message::Close(_))) | None => {
@@ -204,25 +217,38 @@ async fn handle_socket(mut browser_ws: WebSocket) {
                     Some(Ok(TtMessage::Binary(b))) => {
                         match event_stream::decode_event_message(&b) {
                             Ok(event_stream::DecodedFrame::TranscriptEvent { payload }) => {
-                                if let Ok(evt) = serde_json::from_slice::<TranscriptEvent>(&payload) {
-                                    for r in evt.transcript.results {
-                                        if let Some(alt) = r.alternatives.first() {
-                                            let frame = if r.is_partial {
-                                                ServerFrame::Partial { text: alt.transcript.clone() }
-                                            } else {
-                                                ServerFrame::Final { text: alt.transcript.clone() }
-                                            };
-                                            if send_server_frame(&mut browser_ws, &frame).await.is_err() {
-                                                break;
+                                match serde_json::from_slice::<TranscriptEvent>(&payload) {
+                                    Ok(evt) => {
+                                        for r in evt.transcript.results {
+                                            if let Some(alt) = r.alternatives.first() {
+                                                let frame = if r.is_partial {
+                                                    ServerFrame::Partial { text: alt.transcript.clone() }
+                                                } else {
+                                                    ServerFrame::Final { text: alt.transcript.clone() }
+                                                };
+                                                if send_server_frame(&mut browser_ws, &frame).await.is_err() {
+                                                    break;
+                                                }
                                             }
                                         }
+                                    }
+                                    Err(e) => {
+                                        // AWS schema may have evolved — log so we notice; don't crash the stream.
+                                        tracing::warn!("TranscriptEvent JSON parse failed: {e}");
                                     }
                                 }
                             }
                             Ok(event_stream::DecodedFrame::Exception { exception_type, payload }) => {
-                                let msg = std::str::from_utf8(&payload).unwrap_or("unknown");
-                                tracing::error!("AWS exception {}: {}", exception_type, msg);
-                                let _ = send_server_frame(&mut browser_ws, &ServerFrame::Error { message: format!("AWS {}: {}", exception_type, msg) }).await;
+                                // Full payload may contain access key IDs or other privileged details
+                                // (e.g. InvalidSignatureException dumps the whole canonical-request hash
+                                // including X-Amz-Credential). Log internally; surface only the type to
+                                // the browser so we don't leak operator credentials to the client.
+                                let detail = std::str::from_utf8(&payload).unwrap_or("(non-utf8 payload)");
+                                tracing::error!("AWS exception {}: {}", exception_type, detail);
+                                let _ = send_server_frame(
+                                    &mut browser_ws,
+                                    &ServerFrame::Error { message: format!("AWS {}", exception_type) },
+                                ).await;
                                 break;
                             }
                             Ok(event_stream::DecodedFrame::Other { .. }) => { /* ignore unknown */ }

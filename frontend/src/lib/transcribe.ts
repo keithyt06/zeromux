@@ -41,7 +41,17 @@ export function useTranscribe(opts: UseTranscribeOptions): UseTranscribeReturn {
   const isRecordingRef = useRef(isRecording)
   isRecordingRef.current = isRecording
 
+  // Marks that user-initiated stop is in progress, so ws.onclose doesn't
+  // surface a spurious "连接已断开" while we're tearing down voluntarily.
+  const userStopRef = useRef(false)
+
+  // Synchronous re-entry guard for start(). isRecordingRef only flips to true
+  // inside ws.onopen, so a second start() during the getUserMedia/connect
+  // window would otherwise create a parallel stream.
+  const startingRef = useRef(false)
+
   const cleanup = useCallback(() => {
+    userStopRef.current = true
     workletNodeRef.current?.disconnect()
     workletNodeRef.current = null
     streamRef.current?.getTracks().forEach((t) => t.stop())
@@ -63,13 +73,16 @@ export function useTranscribe(opts: UseTranscribeOptions): UseTranscribeReturn {
     }
     setIsRecording(false)
     setPartial('')
+    startingRef.current = false
   }, [])
 
   useEffect(() => () => cleanup(), [cleanup])
 
   const start = useCallback(async () => {
     if (!SUPPORTED) return
-    if (isRecordingRef.current) return
+    if (isRecordingRef.current || startingRef.current) return
+    startingRef.current = true
+    userStopRef.current = false
     setError(null)
     setPartial('')
 
@@ -108,6 +121,13 @@ export function useTranscribe(opts: UseTranscribeOptions): UseTranscribeReturn {
     wsRef.current = ws
 
     ws.onopen = () => {
+      // If user already stopped before WS opened (very short tap), do not
+      // start the audio graph — cleanup() has marked userStopRef and will
+      // close ws shortly. This prevents the mic from being captured then
+      // immediately torn down with a brief flash of recording state.
+      if (userStopRef.current) {
+        return
+      }
       ws.send(
         JSON.stringify({
           type: 'start',
@@ -115,6 +135,7 @@ export function useTranscribe(opts: UseTranscribeOptions): UseTranscribeReturn {
         }),
       )
       setIsRecording(true)
+      startingRef.current = false
 
       const source = ctx.createMediaStreamSource(stream)
       const node = new AudioWorkletNode(ctx, 'pcm-worklet')
@@ -152,7 +173,10 @@ export function useTranscribe(opts: UseTranscribeOptions): UseTranscribeReturn {
       cleanup()
     }
     ws.onclose = (ev) => {
-      if (isRecordingRef.current && ev.code !== 1000) {
+      // Only show an error when the close was NOT user-initiated (cleanup
+      // sets userStopRef before close()). Otherwise normal push-to-talk
+      // release would surface a spurious "连接已断开".
+      if (!userStopRef.current && isRecordingRef.current && ev.code !== 1000) {
         setError('连接已断开')
       }
       cleanup()

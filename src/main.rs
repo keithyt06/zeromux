@@ -43,6 +43,10 @@ struct Args {
     #[arg(long, default_value = "kiro-cli")]
     kiro_path: String,
 
+    /// Path to codex CLI binary
+    #[arg(long, default_value = "codex")]
+    codex_path: String,
+
     /// Working directory for spawned sessions
     #[arg(long, default_value = ".")]
     work_dir: String,
@@ -90,6 +94,7 @@ pub struct AppState {
     pub shell: String,
     pub claude_path: String,
     pub kiro_path: String,
+    pub codex_path: String,
     pub work_dir: String,
     pub default_cols: u16,
     pub default_rows: u16,
@@ -201,6 +206,7 @@ async fn main() {
         shell: args.shell,
         claude_path: args.claude_path,
         kiro_path: args.kiro_path,
+        codex_path: args.codex_path,
         work_dir: args.work_dir,
         default_cols: args.cols,
         default_rows: args.rows,

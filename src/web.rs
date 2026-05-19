@@ -333,6 +333,12 @@ async fn create_session(
                 .await
                 .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?
         }
+        crate::session_manager::SessionType::Codex => {
+            state.sessions
+                .create_codex_session(name.clone(), &state.codex_path, &work_dir, state.default_cols, state.default_rows, &owner_id)
+                .await
+                .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?
+        }
     };
 
     Ok(Json(serde_json::json!({

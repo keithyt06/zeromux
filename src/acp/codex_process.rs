@@ -24,7 +24,14 @@ enum Cmd {
 /// into the event loop.
 #[derive(Debug)]
 enum Notify {
-    ProgressText(String),
+    /// A streaming text delta with the thread_id Codex carried in the event,
+    /// so the event loop can stash thread_id mid-flight and preserve it
+    /// across a cancel (where the call_tool future is dropped before the
+    /// final result containing threadId can arrive).
+    ProgressText {
+        text: String,
+        thread_id: Option<String>,
+    },
 }
 
 #[derive(Clone)]
@@ -41,7 +48,9 @@ impl ClientHandler for Handler {
         let tx = self.notify_tx.clone();
         async move {
             if let Some(text) = extract_progress_text(&params) {
-                let _ = tx.send(Notify::ProgressText(text)).await;
+                let _ = tx
+                    .send(Notify::ProgressText { text, thread_id: None })
+                    .await;
             } else {
                 tracing::debug!("codex: progress without text: {:?}", params);
             }
@@ -55,8 +64,8 @@ impl ClientHandler for Handler {
     ) -> impl std::future::Future<Output = ()> + Send + '_ {
         let tx = self.notify_tx.clone();
         async move {
-            if let Some(text) = extract_codex_event_delta(&notification) {
-                let _ = tx.send(Notify::ProgressText(text)).await;
+            if let Some((text, thread_id)) = extract_codex_event_delta(&notification) {
+                let _ = tx.send(Notify::ProgressText { text, thread_id }).await;
             }
         }
     }
@@ -89,10 +98,13 @@ fn extract_progress_text(params: &ProgressNotificationParam) -> Option<String> {
     None
 }
 
-/// Extract a streaming text chunk from a Codex `codex/event` custom notification.
+/// Extract a streaming text chunk from a Codex `codex/event` custom notification,
+/// along with the thread_id Codex stamps into each event.
 /// Codex sends incremental output as `params.msg.type == "agent_message_content_delta"`
-/// with the text in `params.msg.delta`.
-fn extract_codex_event_delta(notification: &CustomNotification) -> Option<String> {
+/// with the text in `params.msg.delta` and the thread id in `params.msg.thread_id`.
+fn extract_codex_event_delta(
+    notification: &CustomNotification,
+) -> Option<(String, Option<String>)> {
     if notification.method != "codex/event" {
         return None;
     }
@@ -106,7 +118,11 @@ fn extract_codex_event_delta(notification: &CustomNotification) -> Option<String
     if delta.is_empty() {
         return None;
     }
-    Some(delta.to_string())
+    let thread_id = msg
+        .get("thread_id")
+        .and_then(|v| v.as_str())
+        .map(String::from);
+    Some((delta.to_string(), thread_id))
 }
 
 pub struct CodexProcess {
@@ -225,16 +241,98 @@ async fn run_event_loop(
                                 }),
                             ),
                         };
+                        tracing::debug!(
+                            "codex: send_prompt tool={} thread_id={:?}",
+                            tool_name,
+                            thread_id
+                        );
 
                         let mut params = CallToolRequestParams::new(tool_name);
                         if let Some(obj) = args.as_object().cloned() {
                             params = params.with_arguments(obj);
                         }
 
-                        let result = service.peer().call_tool(params).await;
+                        // Race the call_tool future against an interleaved
+                        // Cmd::Cancel and against notify_rx so streaming chunks
+                        // emit in real time instead of after the result.
+                        //
+                        // Dropping the call_tool future on cancel discards the
+                        // RequestHandle without sending notifications/cancelled
+                        // to Codex (rmcp 1.7 only sends that on explicit
+                        // RequestHandle::cancel or on timeout). For our purposes
+                        // this is acceptable: thread_id is preserved (Codex
+                        // finishes the turn server-side; we just stop reading),
+                        // and the next prompt continues via codex-reply.
+                        let mut call_fut = Box::pin(service.peer().call_tool(params));
 
-                        match result {
-                            Ok(resp) => {
+                        // Outer Result wraps cancel-vs-completion;
+                        // inner Result is rmcp's call_tool return.
+                        let outcome: Result<
+                            Result<rmcp::model::CallToolResult, rmcp::ServiceError>,
+                            String,
+                        > = loop {
+                            tokio::select! {
+                                biased;
+                                cmd = cmd_rx.recv() => {
+                                    match cmd {
+                                        Some(Cmd::Cancel) => {
+                                            tracing::info!(
+                                                "codex: cancelling in-flight call_tool"
+                                            );
+                                            drop(call_fut);
+                                            let _ = event_tx
+                                                .send(AcpEvent::Error {
+                                                    message: "已取消".to_string(),
+                                                })
+                                                .await;
+                                            break Err("cancelled by user".to_string());
+                                        }
+                                        Some(Cmd::Stop) | None => {
+                                            drop(call_fut);
+                                            return;
+                                        }
+                                        Some(Cmd::Prompt(_)) => {
+                                            // The UI should disable Send while
+                                            // a turn is in flight; if a prompt
+                                            // arrives anyway, drop it and warn.
+                                            tracing::warn!(
+                                                "codex: prompt received during \
+                                                 in-flight turn; dropping"
+                                            );
+                                        }
+                                    }
+                                }
+                                Some(notify) = notify_rx.recv() => {
+                                    match notify {
+                                        Notify::ProgressText { text, thread_id: tid } => {
+                                            // Stash thread_id eagerly from streaming
+                                            // events so that a mid-flight cancel still
+                                            // leaves us with the thread Codex created
+                                            // for this turn — the next prompt can then
+                                            // continue via codex-reply.
+                                            if let Some(t) = tid {
+                                                if thread_id.as_deref() != Some(t.as_str()) {
+                                                    thread_id = Some(t);
+                                                }
+                                            }
+                                            let _ = event_tx
+                                                .send(AcpEvent::ContentBlock {
+                                                    block_type: "text".to_string(),
+                                                    text: Some(text),
+                                                    name: None,
+                                                    input: None,
+                                                    streaming: Some(true),
+                                                })
+                                                .await;
+                                        }
+                                    }
+                                }
+                                r = &mut call_fut => break Ok(r),
+                            }
+                        };
+
+                        match outcome {
+                            Ok(Ok(resp)) => {
                                 let (tid, content) = parse_codex_tool_result(&resp);
                                 if let Some(t) = tid.clone() {
                                     thread_id = Some(t);
@@ -247,7 +345,7 @@ async fn run_event_loop(
                                     })
                                     .await;
                             }
-                            Err(e) => {
+                            Ok(Err(e)) => {
                                 let msg = format!("{e}");
                                 if msg.contains("thread") && msg.contains("not found") {
                                     thread_id = None;
@@ -258,6 +356,11 @@ async fn run_event_loop(
                                     })
                                     .await;
                             }
+                            Err(_cancel_msg) => {
+                                // Cancel path: the AcpEvent::Error{"已取消"} was
+                                // already sent above. thread_id is intentionally
+                                // preserved so the next prompt can codex-reply.
+                            }
                         }
                     }
                     Some(Cmd::Cancel) | Some(Cmd::Stop) | None => {
@@ -266,20 +369,13 @@ async fn run_event_loop(
                 }
             }
 
+            // Outer notify_rx arm only fires between turns (the inner select
+            // drains during turns). A chunk arriving here is stale — likely the
+            // tail end of a previous turn's stream landing after we processed
+            // its result. Drop it rather than emitting a phantom ContentBlock
+            // that would double-render content the user already saw via Result.
             Some(notify) = notify_rx.recv() => {
-                match notify {
-                    Notify::ProgressText(text) => {
-                        let _ = event_tx
-                            .send(AcpEvent::ContentBlock {
-                                block_type: "text".to_string(),
-                                text: Some(text),
-                                name: None,
-                                input: None,
-                                streaming: Some(true),
-                            })
-                            .await;
-                    }
-                }
+                tracing::debug!("codex: progress between turns (dropped): {:?}", notify);
             }
         }
     }

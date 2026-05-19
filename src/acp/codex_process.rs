@@ -3,8 +3,8 @@
 use crate::acp::process::AcpEvent;
 use rmcp::ErrorData as McpError;
 use rmcp::model::{
-    CreateElicitationRequestParams, CreateElicitationResult, ElicitationAction,
-    ProgressNotificationParam,
+    CreateElicitationRequestParams, CreateElicitationResult, CustomNotification,
+    ElicitationAction, ProgressNotificationParam,
 };
 use rmcp::service::{NotificationContext, RequestContext, RoleClient, RunningService};
 use rmcp::transport::child_process::TokioChildProcess;
@@ -48,6 +48,19 @@ impl ClientHandler for Handler {
         }
     }
 
+    fn on_custom_notification(
+        &self,
+        notification: CustomNotification,
+        _context: NotificationContext<RoleClient>,
+    ) -> impl std::future::Future<Output = ()> + Send + '_ {
+        let tx = self.notify_tx.clone();
+        async move {
+            if let Some(text) = extract_codex_event_delta(&notification) {
+                let _ = tx.send(Notify::ProgressText(text)).await;
+            }
+        }
+    }
+
     fn create_elicitation(
         &self,
         request: CreateElicitationRequestParams,
@@ -74,6 +87,26 @@ fn extract_progress_text(params: &ProgressNotificationParam) -> Option<String> {
         }
     }
     None
+}
+
+/// Extract a streaming text chunk from a Codex `codex/event` custom notification.
+/// Codex sends incremental output as `params.msg.type == "agent_message_content_delta"`
+/// with the text in `params.msg.delta`.
+fn extract_codex_event_delta(notification: &CustomNotification) -> Option<String> {
+    if notification.method != "codex/event" {
+        return None;
+    }
+    let params = notification.params.as_ref()?;
+    let msg = params.get("msg")?;
+    let msg_type = msg.get("type").and_then(|v| v.as_str())?;
+    if msg_type != "agent_message_content_delta" {
+        return None;
+    }
+    let delta = msg.get("delta").and_then(|v| v.as_str())?;
+    if delta.is_empty() {
+        return None;
+    }
+    Some(delta.to_string())
 }
 
 pub struct CodexProcess {
@@ -233,9 +266,20 @@ async fn run_event_loop(
                 }
             }
 
-            // Drain progress notifications while idle. Task 8 wires them into AcpEvent.
-            Some(_n) = notify_rx.recv() => {
-                // intentionally dropped in Task 7
+            Some(notify) = notify_rx.recv() => {
+                match notify {
+                    Notify::ProgressText(text) => {
+                        let _ = event_tx
+                            .send(AcpEvent::ContentBlock {
+                                block_type: "text".to_string(),
+                                text: Some(text),
+                                name: None,
+                                input: None,
+                                streaming: Some(true),
+                            })
+                            .await;
+                    }
+                }
             }
         }
     }

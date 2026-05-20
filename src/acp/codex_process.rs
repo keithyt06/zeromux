@@ -173,10 +173,14 @@ fn codex_config_overrides(reasoning_effort: Option<&str>) -> serde_json::Value {
 
 /// Extract a reasoning/thinking text delta from a Codex `codex/event`
 /// custom notification. Codex emits the model's reasoning trace via
-/// `params.msg.type == "agent_reasoning_delta"` (or
-/// `agent_reasoning_content_delta`) with the chunk in `params.msg.delta` or
-/// `params.msg.text`. Returns the text + the thread_id Codex stamped on the
-/// event so the event loop can preserve thread_id across mid-flight cancels.
+/// several event shapes depending on model and version:
+///   - `msg.type == "agent_reasoning"` (one-shot, e.g. Bedrock Anthropic
+///     batches the full reasoning summary into a single event)
+///   - `msg.type == "agent_reasoning_delta"` (streaming chunk)
+///   - `msg.type == "agent_reasoning_content_delta"` (older alias)
+/// The text lives in either `msg.delta` or `msg.text`. Returns the text + the
+/// thread_id Codex stamped on the event so the event loop can preserve
+/// thread_id across mid-flight cancels.
 fn extract_codex_event_reasoning(
     notification: &CustomNotification,
 ) -> Option<(String, Option<String>)> {
@@ -185,10 +189,12 @@ fn extract_codex_event_reasoning(
     }
     let msg = notification.params.as_ref()?.get("msg")?;
     let msg_type = msg.get("type").and_then(|v| v.as_str())?;
-    if msg_type != "agent_reasoning_delta" && msg_type != "agent_reasoning_content_delta" {
+    if !matches!(
+        msg_type,
+        "agent_reasoning" | "agent_reasoning_delta" | "agent_reasoning_content_delta"
+    ) {
         return None;
     }
-    // Codex has used both `delta` and `text` field names across versions.
     let text = msg
         .get("delta")
         .and_then(|v| v.as_str())
@@ -761,6 +767,25 @@ mod tests {
         }));
         let got = extract_codex_event_reasoning(&n);
         assert_eq!(got, Some(("still thinking".to_string(), None)));
+    }
+
+    #[test]
+    fn extract_reasoning_handles_one_shot_agent_reasoning() {
+        // For Bedrock Anthropic, Codex batches reasoning into a single
+        // `agent_reasoning` event with the text in `msg.text`. No streaming.
+        let n = codex_event(json!({
+            "type": "agent_reasoning",
+            "text": "The user wants a proof of irrationality.",
+            "thread_id": "t-42",
+        }));
+        let got = extract_codex_event_reasoning(&n);
+        assert_eq!(
+            got,
+            Some((
+                "The user wants a proof of irrationality.".to_string(),
+                Some("t-42".to_string())
+            ))
+        );
     }
 
     #[test]

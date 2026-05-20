@@ -164,11 +164,26 @@ export default function AcpChatView({ sessionId, active, agentType = 'claude' }:
         const activeId = currentAssistant.current?.id
         if (activeId) {
           const cost = evt.cost_usd
-          setMessages(prev => prev.map(m =>
-            m.kind === 'assistant' && m.id === activeId
-              ? { ...m, complete: true, ...(cost ? { cost } : {}) }
-              : m
-          ))
+          const finalText = (evt.text || '').trim()
+          setMessages(prev => prev.map(m => {
+            if (!(m.kind === 'assistant' && m.id === activeId)) return m
+            // If the agent didn't stream any visible text (e.g. Codex with
+            // Bedrock thinking returns the answer in a single batch instead
+            // of agent_message_content_delta chunks), promote the result's
+            // text into a content block so it actually shows up in the UI.
+            // Compare against the accumulated streamed text in non-thinking
+            // blocks; if they match (within trim), the streamed version is
+            // already complete and the result is just a duplicate.
+            const streamedText = m.blocks
+              .filter(b => b.type === 'text')
+              .map(b => b.text || '')
+              .join('')
+              .trim()
+            const blocks = (finalText && finalText !== streamedText)
+              ? [...m.blocks, { type: 'text', text: finalText } as ContentBlock]
+              : m.blocks
+            return { ...m, blocks, complete: true, ...(cost ? { cost } : {}) }
+          }))
         }
         currentAssistant.current = null
         setBusy(false)

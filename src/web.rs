@@ -335,7 +335,7 @@ async fn create_session(
         }
         crate::session_manager::SessionType::Codex => {
             state.sessions
-                .create_codex_session(name.clone(), &state.codex_path, &work_dir, state.default_cols, state.default_rows, &owner_id)
+                .create_codex_session(name.clone(), &state.codex_path, &state.codex_reasoning, &work_dir, state.default_cols, state.default_rows, &owner_id)
                 .await
                 .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?
         }

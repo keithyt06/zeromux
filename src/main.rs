@@ -47,6 +47,15 @@ struct Args {
     #[arg(long, default_value = "codex")]
     codex_path: String,
 
+    /// Codex model reasoning effort. One of: off | low | medium | high.
+    /// Off (default) leaves the model catalog's default; low/medium/high are
+    /// passed as `model_reasoning_effort` config override on each tools/call.
+    /// Requires the underlying model + provider (e.g. LiteLLM → Bedrock Claude)
+    /// to support and propagate the `thinking` parameter — without that
+    /// support, this flag has no effect.
+    #[arg(long, default_value = "off")]
+    codex_reasoning: String,
+
     /// Working directory for spawned sessions
     #[arg(long, default_value = ".")]
     work_dir: String,
@@ -95,6 +104,7 @@ pub struct AppState {
     pub claude_path: String,
     pub kiro_path: String,
     pub codex_path: String,
+    pub codex_reasoning: String,
     pub work_dir: String,
     pub default_cols: u16,
     pub default_rows: u16,
@@ -207,6 +217,7 @@ async fn main() {
         claude_path: args.claude_path,
         kiro_path: args.kiro_path,
         codex_path: args.codex_path,
+        codex_reasoning: args.codex_reasoning,
         work_dir: args.work_dir,
         default_cols: args.cols,
         default_rows: args.rows,

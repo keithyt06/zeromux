@@ -168,12 +168,33 @@ fn translate_event(val: &serde_json::Value) -> Vec<AcpEvent> {
 
             blocks
                 .iter()
-                .map(|b| AcpEvent::ContentBlock {
-                    block_type: b.get("type").and_then(|v| v.as_str()).unwrap_or("text").to_string(),
-                    text: b.get("text").and_then(|v| v.as_str()).map(String::from),
-                    name: b.get("name").and_then(|v| v.as_str()).map(String::from),
-                    input: b.get("input").cloned(),
-                    streaming: None,
+                .map(|b| {
+                    let block_type = b
+                        .get("type")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("text")
+                        .to_string();
+                    // Claude stream-json sends extended-thinking blocks with
+                    // `{"type":"thinking","thinking":"..."}` (the prose lives in
+                    // a `thinking` field, not `text`). Read the right field so
+                    // the frontend gets non-empty text on thinking blocks.
+                    let text = if block_type == "thinking" {
+                        b.get("thinking")
+                            .and_then(|v| v.as_str())
+                            .map(String::from)
+                            .or_else(|| {
+                                b.get("text").and_then(|v| v.as_str()).map(String::from)
+                            })
+                    } else {
+                        b.get("text").and_then(|v| v.as_str()).map(String::from)
+                    };
+                    AcpEvent::ContentBlock {
+                        block_type,
+                        text,
+                        name: b.get("name").and_then(|v| v.as_str()).map(String::from),
+                        input: b.get("input").cloned(),
+                        streaming: None,
+                    }
                 })
                 .collect()
         }

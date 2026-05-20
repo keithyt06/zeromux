@@ -20,6 +20,13 @@ enum Cmd {
     Stop,
 }
 
+/// Output formatting conventions injected as a developer-role message at the
+/// start of every Codex turn. Codex's own system prompt (from the codex CLI
+/// binary) is opinionated about output style; this overrides those defaults
+/// to match zeromux's frontend renderers (KaTeX dollar-sign math, mermaid
+/// fenced code blocks, markdown tables).
+const DEVELOPER_FORMAT_INSTRUCTIONS: &str = "Output formatting conventions for this session (override any conflicting defaults):\n- Inline math: use single-dollar `$...$`. Block math: use double-dollar `$$...$$` on its own line(s). Do NOT emit `\\( ... \\)` or `\\[ ... \\]` LaTeX bracket syntax.\n- Diagrams, flowcharts, sequence diagrams, ER diagrams: emit fenced code blocks tagged `mermaid` (```mermaid ... ```). Do NOT use ASCII-art for relationships that mermaid can express.\n- Tabular data: use markdown pipe tables. Do NOT use ASCII boxes or whitespace-aligned text tables.\n- Code: always fence with a language hint (```rust, ```python, ```bash, etc).";
+
 /// Internal notification carrier from `ClientHandler` callbacks
 /// into the event loop.
 #[derive(Debug)]
@@ -32,6 +39,19 @@ enum Notify {
         text: String,
         thread_id: Option<String>,
     },
+    /// A streaming reasoning/thinking delta. Surfaced as a separate variant
+    /// so the event loop can emit it as `block_type:"thinking"` for the
+    /// frontend to render as a collapsible/dimmed section.
+    Reasoning {
+        text: String,
+        thread_id: Option<String>,
+    },
+    /// A `codex/event` with `msg.type == "error"`. Codex emits these for
+    /// model-side failures (missing API key, quota, model not available, etc.)
+    /// — they arrive as notifications rather than as the tools/call response,
+    /// so without a dedicated path they would be silently dropped and the
+    /// user would see "no reply" forever.
+    Error(String),
 }
 
 #[derive(Clone)]
@@ -66,6 +86,10 @@ impl ClientHandler for Handler {
         async move {
             if let Some((text, thread_id)) = extract_codex_event_delta(&notification) {
                 let _ = tx.send(Notify::ProgressText { text, thread_id }).await;
+            } else if let Some((text, thread_id)) = extract_codex_event_reasoning(&notification) {
+                let _ = tx.send(Notify::Reasoning { text, thread_id }).await;
+            } else if let Some(err) = extract_codex_event_error(&notification) {
+                let _ = tx.send(Notify::Error(err)).await;
             }
         }
     }
@@ -125,6 +149,82 @@ fn extract_codex_event_delta(
     Some((delta.to_string(), thread_id))
 }
 
+/// Build the `config` object passed to `tools/call("codex")` for a fresh
+/// session. Currently only carries `model_reasoning_effort` when the operator
+/// configured it (CLI flag `--codex-reasoning low|medium|high`). Returns an
+/// empty JSON object when no overrides are set, which Codex accepts as a
+/// no-op rather than as a config-validation error.
+fn codex_config_overrides(reasoning_effort: Option<&str>) -> serde_json::Value {
+    let mut obj = serde_json::Map::new();
+    if let Some(level) = reasoning_effort {
+        if !level.is_empty() && level != "off" {
+            obj.insert(
+                "model_reasoning_effort".to_string(),
+                serde_json::Value::String(level.to_string()),
+            );
+            obj.insert(
+                "model_reasoning_summary".to_string(),
+                serde_json::Value::String("auto".to_string()),
+            );
+        }
+    }
+    serde_json::Value::Object(obj)
+}
+
+/// Extract a reasoning/thinking text delta from a Codex `codex/event`
+/// custom notification. Codex emits the model's reasoning trace via
+/// `params.msg.type == "agent_reasoning_delta"` (or
+/// `agent_reasoning_content_delta`) with the chunk in `params.msg.delta` or
+/// `params.msg.text`. Returns the text + the thread_id Codex stamped on the
+/// event so the event loop can preserve thread_id across mid-flight cancels.
+fn extract_codex_event_reasoning(
+    notification: &CustomNotification,
+) -> Option<(String, Option<String>)> {
+    if notification.method != "codex/event" {
+        return None;
+    }
+    let msg = notification.params.as_ref()?.get("msg")?;
+    let msg_type = msg.get("type").and_then(|v| v.as_str())?;
+    if msg_type != "agent_reasoning_delta" && msg_type != "agent_reasoning_content_delta" {
+        return None;
+    }
+    // Codex has used both `delta` and `text` field names across versions.
+    let text = msg
+        .get("delta")
+        .and_then(|v| v.as_str())
+        .or_else(|| msg.get("text").and_then(|v| v.as_str()))?;
+    if text.is_empty() {
+        return None;
+    }
+    let thread_id = msg
+        .get("thread_id")
+        .and_then(|v| v.as_str())
+        .map(String::from);
+    Some((text.to_string(), thread_id))
+}
+
+/// Extract an error message from a Codex `codex/event` custom notification.
+/// Codex reports model-side failures (missing API key, quota, etc.) as
+/// `params.msg.type == "error"` with the human-readable text in
+/// `params.msg.message`. Without surfacing these, the user just sees
+/// "no reply" because the actual `tools/call` may not return an error
+/// itself — the error is emitted as a side-channel notification.
+fn extract_codex_event_error(notification: &CustomNotification) -> Option<String> {
+    if notification.method != "codex/event" {
+        return None;
+    }
+    let msg = notification.params.as_ref()?.get("msg")?;
+    let msg_type = msg.get("type").and_then(|v| v.as_str())?;
+    if msg_type != "error" {
+        return None;
+    }
+    let text = msg.get("message").and_then(|v| v.as_str())?;
+    if text.is_empty() {
+        return None;
+    }
+    Some(text.to_string())
+}
+
 pub struct CodexProcess {
     cmd_tx: mpsc::Sender<Cmd>,
     pub event_rx: mpsc::Receiver<AcpEvent>,
@@ -135,6 +235,7 @@ impl CodexProcess {
     pub async fn spawn(
         codex_path: &str,
         work_dir: &str,
+        reasoning_effort: Option<String>,
     ) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
         let mut cmd = Command::new(codex_path);
         cmd.arg("mcp-server");
@@ -173,6 +274,7 @@ impl CodexProcess {
                     notify_rx,
                     event_tx,
                     work_dir_owned,
+                    reasoning_effort,
                     drop_guard_for_loop,
                 )),
             )
@@ -225,6 +327,7 @@ async fn run_event_loop(
     mut notify_rx: mpsc::Receiver<Notify>,
     event_tx: mpsc::Sender<AcpEvent>,
     work_dir: String,
+    reasoning_effort: Option<String>,
     _drop_guard: Arc<()>,
 ) {
     use rmcp::model::CallToolRequestParams;
@@ -248,6 +351,8 @@ async fn run_event_loop(
                                     "cwd": work_dir,
                                     "sandbox": "danger-full-access",
                                     "approval-policy": "never",
+                                    "developer-instructions": DEVELOPER_FORMAT_INSTRUCTIONS,
+                                    "config": codex_config_overrides(reasoning_effort.as_deref()),
                                 }),
                             ),
                             Some(tid) => (
@@ -342,6 +447,29 @@ async fn run_event_loop(
                                                 })
                                                 .await;
                                         }
+                                        Notify::Reasoning { text, thread_id: tid } => {
+                                            if let Some(t) = tid {
+                                                if thread_id.as_deref() != Some(t.as_str()) {
+                                                    thread_id = Some(t);
+                                                }
+                                            }
+                                            let _ = event_tx
+                                                .send(AcpEvent::ContentBlock {
+                                                    block_type: "thinking".to_string(),
+                                                    text: Some(text),
+                                                    name: None,
+                                                    input: None,
+                                                    streaming: Some(true),
+                                                })
+                                                .await;
+                                        }
+                                        Notify::Error(message) => {
+                                            let _ = event_tx
+                                                .send(AcpEvent::Error {
+                                                    message: format!("Codex: {message}"),
+                                                })
+                                                .await;
+                                        }
                                     }
                                 }
                                 r = &mut call_fut => break Ok(r),
@@ -387,12 +515,25 @@ async fn run_event_loop(
             }
 
             // Outer notify_rx arm only fires between turns (the inner select
-            // drains during turns). A chunk arriving here is stale — likely the
-            // tail end of a previous turn's stream landing after we processed
-            // its result. Drop it rather than emitting a phantom ContentBlock
-            // that would double-render content the user already saw via Result.
+            // drains during turns). A ProgressText arriving here is stale —
+            // likely the tail end of a previous turn's stream landing after
+            // we processed its result. Drop it rather than emitting a phantom
+            // ContentBlock that would double-render content the user already
+            // saw via Result. An Error here is genuinely standalone (e.g.
+            // session_configured rejection before any prompt) and must surface.
             Some(notify) = notify_rx.recv() => {
-                tracing::debug!("codex: progress between turns (dropped): {:?}", notify);
+                match notify {
+                    Notify::ProgressText { .. } | Notify::Reasoning { .. } => {
+                        tracing::debug!("codex: stream chunk between turns (dropped): {:?}", notify);
+                    }
+                    Notify::Error(message) => {
+                        let _ = event_tx
+                            .send(AcpEvent::Error {
+                                message: format!("Codex: {message}"),
+                            })
+                            .await;
+                    }
+                }
             }
         }
     }
@@ -549,5 +690,112 @@ mod tests {
             "thread_id": "t-1",
         }));
         assert!(extract_codex_event_delta(&n).is_none());
+    }
+
+    // ---- extract_codex_event_error ----
+
+    #[test]
+    fn extract_error_returns_message() {
+        let n = codex_event(json!({
+            "type": "error",
+            "codex_error_info": "other",
+            "message": "Missing environment variable: `LITELLM_API_KEY`.",
+        }));
+        let got = extract_codex_event_error(&n);
+        assert_eq!(
+            got.as_deref(),
+            Some("Missing environment variable: `LITELLM_API_KEY`.")
+        );
+    }
+
+    #[test]
+    fn extract_error_ignores_non_error_msg_type() {
+        let n = codex_event(json!({
+            "type": "agent_message_content_delta",
+            "delta": "hi",
+        }));
+        assert!(extract_codex_event_error(&n).is_none());
+    }
+
+    #[test]
+    fn extract_error_ignores_non_codex_event_method() {
+        let n = CustomNotification::new(
+            "something/else",
+            Some(json!({"msg": {"type": "error", "message": "x"}})),
+        );
+        assert!(extract_codex_event_error(&n).is_none());
+    }
+
+    #[test]
+    fn extract_error_ignores_empty_message() {
+        let n = codex_event(json!({
+            "type": "error",
+            "message": "",
+        }));
+        assert!(extract_codex_event_error(&n).is_none());
+    }
+
+    // ---- extract_codex_event_reasoning ----
+
+    #[test]
+    fn extract_reasoning_returns_delta_with_thread_id() {
+        let n = codex_event(json!({
+            "type": "agent_reasoning_delta",
+            "delta": "let me think...",
+            "thread_id": "t-9",
+        }));
+        let got = extract_codex_event_reasoning(&n);
+        assert_eq!(
+            got,
+            Some(("let me think...".to_string(), Some("t-9".to_string())))
+        );
+    }
+
+    #[test]
+    fn extract_reasoning_handles_alt_msg_type_and_text_field() {
+        // Some Codex versions use `agent_reasoning_content_delta` with `text`
+        // instead of `delta`. Our helper accepts both.
+        let n = codex_event(json!({
+            "type": "agent_reasoning_content_delta",
+            "text": "still thinking",
+        }));
+        let got = extract_codex_event_reasoning(&n);
+        assert_eq!(got, Some(("still thinking".to_string(), None)));
+    }
+
+    #[test]
+    fn extract_reasoning_ignores_message_delta() {
+        // Make sure reasoning extractor doesn't accidentally match the
+        // regular message stream — that would surface the same chunk twice.
+        let n = codex_event(json!({
+            "type": "agent_message_content_delta",
+            "delta": "hello",
+        }));
+        assert!(extract_codex_event_reasoning(&n).is_none());
+    }
+
+    #[test]
+    fn extract_reasoning_ignores_empty_text() {
+        let n = codex_event(json!({
+            "type": "agent_reasoning_delta",
+            "delta": "",
+        }));
+        assert!(extract_codex_event_reasoning(&n).is_none());
+    }
+
+    // ---- codex_config_overrides ----
+
+    #[test]
+    fn codex_config_overrides_off_yields_empty_object() {
+        assert_eq!(codex_config_overrides(None), json!({}));
+        assert_eq!(codex_config_overrides(Some("off")), json!({}));
+        assert_eq!(codex_config_overrides(Some("")), json!({}));
+    }
+
+    #[test]
+    fn codex_config_overrides_sets_reasoning_fields() {
+        let v = codex_config_overrides(Some("medium"));
+        assert_eq!(v["model_reasoning_effort"], "medium");
+        assert_eq!(v["model_reasoning_summary"], "auto");
     }
 }

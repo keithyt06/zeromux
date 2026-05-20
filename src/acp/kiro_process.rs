@@ -370,6 +370,27 @@ fn parse_session_update(
                 vec![]
             }
         }
+        "agent_thought_chunk" => {
+            // ACP standard: thinking/reasoning trace, separate from the main
+            // message stream. Surface as block_type="thinking" so the frontend
+            // can render it collapsed/dimmed and the chunks don't pollute the
+            // main reply text or get accumulated into pending_text.
+            let text = update
+                .get("content")
+                .and_then(|c| c.get("text"))
+                .and_then(|t| t.as_str());
+            if let Some(text) = text {
+                vec![AcpEvent::ContentBlock {
+                    block_type: "thinking".to_string(),
+                    text: Some(text.to_string()),
+                    name: None,
+                    input: None,
+                    streaming: Some(true),
+                }]
+            } else {
+                vec![]
+            }
+        }
         "tool_call" => {
             let title = update
                 .get("title")

@@ -406,6 +406,7 @@ impl SessionManager {
         &self,
         name: String,
         codex_path: &str,
+        codex_reasoning: &str,
         work_dir: &str,
         cols: u16,
         rows: u16,
@@ -414,9 +415,16 @@ impl SessionManager {
         let id = uuid::Uuid::new_v4().to_string();
         let (effective_dir, worktree_path) = resolve_work_dir(work_dir, &id);
 
+        let reasoning = if codex_reasoning.is_empty() || codex_reasoning == "off" {
+            None
+        } else {
+            Some(codex_reasoning.to_string())
+        };
+
         let process = crate::acp::codex_process::CodexProcess::spawn(
             codex_path,
             effective_dir.to_str().unwrap_or("."),
+            reasoning,
         )
         .await
         .map_err(|e| {

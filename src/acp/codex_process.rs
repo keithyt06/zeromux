@@ -436,3 +436,118 @@ fn parse_codex_tool_result(
     }
     (None, None)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use rmcp::model::{Annotated, CallToolResult, CustomNotification, RawContent};
+    use serde_json::json;
+
+    fn text_block(s: &str) -> Annotated<RawContent> {
+        Annotated::new(RawContent::text(s), None)
+    }
+
+    // ---- parse_codex_tool_result ----
+
+    #[test]
+    fn parse_result_prefers_structured_content() {
+        let mut result = CallToolResult::default();
+        result.structured_content = Some(json!({
+            "threadId": "t-abc",
+            "content": "Hello world",
+        }));
+        let (tid, content) = parse_codex_tool_result(&result);
+        assert_eq!(tid.as_deref(), Some("t-abc"));
+        assert_eq!(content.as_deref(), Some("Hello world"));
+    }
+
+    #[test]
+    fn parse_result_falls_back_to_text_block_json() {
+        let mut result = CallToolResult::default();
+        result.content = vec![text_block(
+            r#"{"threadId":"t-xyz","content":"reply text"}"#,
+        )];
+        let (tid, content) = parse_codex_tool_result(&result);
+        assert_eq!(tid.as_deref(), Some("t-xyz"));
+        assert_eq!(content.as_deref(), Some("reply text"));
+    }
+
+    #[test]
+    fn parse_result_returns_none_for_unparseable_text() {
+        let mut result = CallToolResult::default();
+        result.content = vec![text_block("plain text not json")];
+        let (tid, content) = parse_codex_tool_result(&result);
+        assert!(tid.is_none());
+        assert!(content.is_none());
+    }
+
+    #[test]
+    fn parse_result_returns_none_for_empty_result() {
+        let result = CallToolResult::default();
+        let (tid, content) = parse_codex_tool_result(&result);
+        assert!(tid.is_none());
+        assert!(content.is_none());
+    }
+
+    // ---- extract_codex_event_delta ----
+
+    fn codex_event(msg: serde_json::Value) -> CustomNotification {
+        CustomNotification::new("codex/event", Some(json!({ "msg": msg })))
+    }
+
+    #[test]
+    fn extract_delta_with_thread_id() {
+        let n = codex_event(json!({
+            "type": "agent_message_content_delta",
+            "delta": "hello",
+            "thread_id": "t-1",
+        }));
+        let got = extract_codex_event_delta(&n);
+        assert_eq!(got, Some(("hello".to_string(), Some("t-1".to_string()))));
+    }
+
+    #[test]
+    fn extract_delta_without_thread_id() {
+        let n = codex_event(json!({
+            "type": "agent_message_content_delta",
+            "delta": "world",
+        }));
+        let got = extract_codex_event_delta(&n);
+        assert_eq!(got, Some(("world".to_string(), None)));
+    }
+
+    #[test]
+    fn extract_delta_ignores_non_codex_event_method() {
+        let n = CustomNotification::new(
+            "something/else",
+            Some(json!({
+                "msg": {
+                    "type": "agent_message_content_delta",
+                    "delta": "x",
+                    "thread_id": "t-1",
+                }
+            })),
+        );
+        assert!(extract_codex_event_delta(&n).is_none());
+    }
+
+    #[test]
+    fn extract_delta_ignores_empty_delta() {
+        let n = codex_event(json!({
+            "type": "agent_message_content_delta",
+            "delta": "",
+            "thread_id": "t-1",
+        }));
+        assert!(extract_codex_event_delta(&n).is_none());
+    }
+
+    #[test]
+    fn extract_delta_ignores_other_msg_type() {
+        let n = codex_event(json!({
+            "type": "agent_thinking",
+            "delta": "hmm",
+            "thread_id": "t-1",
+        }));
+        assert!(extract_codex_event_delta(&n).is_none());
+    }
+}

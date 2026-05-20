@@ -53,7 +53,7 @@ struct Args {
     /// Requires the underlying model + provider (e.g. LiteLLM → Bedrock Claude)
     /// to support and propagate the `thinking` parameter — without that
     /// support, this flag has no effect.
-    #[arg(long, default_value = "off")]
+    #[arg(long, default_value = "off", value_parser = ["off", "low", "medium", "high"])]
     codex_reasoning: String,
 
     /// Working directory for spawned sessions

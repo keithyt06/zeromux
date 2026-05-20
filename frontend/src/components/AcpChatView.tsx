@@ -167,19 +167,20 @@ export default function AcpChatView({ sessionId, active, agentType = 'claude' }:
           const finalText = (evt.text || '').trim()
           setMessages(prev => prev.map(m => {
             if (!(m.kind === 'assistant' && m.id === activeId)) return m
-            // If the agent didn't stream any visible text (e.g. Codex with
-            // Bedrock thinking returns the answer in a single batch instead
-            // of agent_message_content_delta chunks), promote the result's
-            // text into a content block so it actually shows up in the UI.
-            // Compare against the accumulated streamed text in non-thinking
-            // blocks; if they match (within trim), the streamed version is
-            // already complete and the result is just a duplicate.
-            const streamedText = m.blocks
-              .filter(b => b.type === 'text')
-              .map(b => b.text || '')
-              .join('')
-              .trim()
-            const blocks = (finalText && finalText !== streamedText)
+            // Codex with Bedrock thinking returns the answer in a single
+            // batch instead of agent_message_content_delta chunks. In that
+            // case `m.blocks` has no `text`-type entries (only thinking,
+            // maybe tool_use). Promote the result's text into a final
+            // text block so the answer actually renders.
+            //
+            // We MUST NOT inject when streaming text already arrived, even
+            // if the strings differ slightly (Codex re-formats whitespace
+            // server-side). Bit-equality comparison was a duplicate-render
+            // hazard. Use "any text block already exists" as the gate.
+            const hasStreamedText = m.blocks.some(
+              b => b.type === 'text' && (b.text || '').length > 0,
+            )
+            const blocks = (finalText && !hasStreamedText)
               ? [...m.blocks, { type: 'text', text: finalText } as ContentBlock]
               : m.blocks
             return { ...m, blocks, complete: true, ...(cost ? { cost } : {}) }

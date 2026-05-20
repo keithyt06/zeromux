@@ -9,7 +9,6 @@ use rmcp::model::{
 use rmcp::service::{NotificationContext, RequestContext, RoleClient, RunningService};
 use rmcp::transport::child_process::TokioChildProcess;
 use rmcp::{ClientHandler, ServiceExt};
-use std::sync::Arc;
 use tokio::process::Command;
 use tokio::sync::mpsc;
 
@@ -59,6 +58,26 @@ struct Handler {
     notify_tx: mpsc::Sender<Notify>,
 }
 
+/// Push a Notify into the event loop without ever blocking the caller.
+/// Used by ClientHandler callbacks because awaiting on a full channel
+/// would stall rmcp's transport reader (same task that delivers the
+/// in-flight tools/call response — would deadlock).
+fn send_notify_nonblocking(tx: &mpsc::Sender<Notify>, n: Notify) {
+    if let Err(e) = tx.try_send(n) {
+        match e {
+            mpsc::error::TrySendError::Full(_) => {
+                tracing::warn!(
+                    "codex: notify channel full; dropping a chunk. \
+                     Increase channel capacity if this fires repeatedly."
+                );
+            }
+            mpsc::error::TrySendError::Closed(_) => {
+                // Event loop has exited; nothing actionable.
+            }
+        }
+    }
+}
+
 impl ClientHandler for Handler {
     fn on_progress(
         &self,
@@ -68,9 +87,7 @@ impl ClientHandler for Handler {
         let tx = self.notify_tx.clone();
         async move {
             if let Some(text) = extract_progress_text(&params) {
-                let _ = tx
-                    .send(Notify::ProgressText { text, thread_id: None })
-                    .await;
+                send_notify_nonblocking(&tx, Notify::ProgressText { text, thread_id: None });
             } else {
                 tracing::debug!("codex: progress without text: {:?}", params);
             }
@@ -84,12 +101,18 @@ impl ClientHandler for Handler {
     ) -> impl std::future::Future<Output = ()> + Send + '_ {
         let tx = self.notify_tx.clone();
         async move {
+            // try_send (via send_notify_nonblocking) instead of awaited send:
+            // if the event loop is briefly slow (full event_tx buffer, blocked
+            // WebSocket subscriber, etc.) we MUST NOT stall the rmcp transport
+            // reader inside a notification callback — that would deadlock the
+            // same connection the in-flight tools/call response is trying to
+            // come back on.
             if let Some((text, thread_id)) = extract_codex_event_delta(&notification) {
-                let _ = tx.send(Notify::ProgressText { text, thread_id }).await;
+                send_notify_nonblocking(&tx, Notify::ProgressText { text, thread_id });
             } else if let Some((text, thread_id)) = extract_codex_event_reasoning(&notification) {
-                let _ = tx.send(Notify::Reasoning { text, thread_id }).await;
+                send_notify_nonblocking(&tx, Notify::Reasoning { text, thread_id });
             } else if let Some(err) = extract_codex_event_error(&notification) {
-                let _ = tx.send(Notify::Error(err)).await;
+                send_notify_nonblocking(&tx, Notify::Error(err));
             }
         }
     }
@@ -234,7 +257,6 @@ fn extract_codex_event_error(notification: &CustomNotification) -> Option<String
 pub struct CodexProcess {
     cmd_tx: mpsc::Sender<Cmd>,
     pub event_rx: mpsc::Receiver<AcpEvent>,
-    _service_drop_guard: Arc<()>,
 }
 
 impl CodexProcess {
@@ -250,7 +272,12 @@ impl CodexProcess {
         let transport = TokioChildProcess::new(cmd)
             .map_err(|e| format!("spawn codex: {e}"))?;
 
-        let (notify_tx, notify_rx) = mpsc::channel::<Notify>(64);
+        // 1024 buffer: Codex emits one notification per delta token; long
+        // answers (1000+ chunks) plus reasoning summaries can burst quickly.
+        // The handler uses try_send so a full channel won't block rmcp's
+        // transport reader, but a generous buffer means we almost never
+        // drop chunks under normal load.
+        let (notify_tx, notify_rx) = mpsc::channel::<Notify>(1024);
         let handler = Handler { notify_tx };
 
         let service: RunningService<RoleClient, Handler> = handler
@@ -269,8 +296,6 @@ impl CodexProcess {
             .await;
 
         let work_dir_owned = work_dir.to_string();
-        let drop_guard = Arc::new(());
-        let drop_guard_for_loop = drop_guard.clone();
         let event_tx_for_panic = event_tx.clone();
         tokio::spawn(async move {
             let result = futures::FutureExt::catch_unwind(
@@ -281,7 +306,6 @@ impl CodexProcess {
                     event_tx,
                     work_dir_owned,
                     reasoning_effort,
-                    drop_guard_for_loop,
                 )),
             )
             .await;
@@ -297,11 +321,7 @@ impl CodexProcess {
             }
         });
 
-        Ok(Self {
-            cmd_tx,
-            event_rx,
-            _service_drop_guard: drop_guard,
-        })
+        Ok(Self { cmd_tx, event_rx })
     }
 
     pub async fn send_prompt(&mut self, text: &str) -> Result<(), std::io::Error> {
@@ -320,10 +340,13 @@ impl CodexProcess {
 
 impl Drop for CodexProcess {
     fn drop(&mut self) {
-        let tx = self.cmd_tx.clone();
-        tokio::spawn(async move {
-            let _ = tx.send(Cmd::Stop).await;
-        });
+        // Best-effort signal so the loop wakes up promptly. We DON'T spawn
+        // a tokio task here: during runtime shutdown the spawned task may
+        // never run, leaving a cloned cmd_tx pinned inside the unfinished
+        // future and the loop blocked on cmd_rx.recv() forever. try_send
+        // is non-blocking; the subsequent drop of self.cmd_tx closes the
+        // channel, which the loop's `None => break` arm handles.
+        let _ = self.cmd_tx.try_send(Cmd::Stop);
     }
 }
 
@@ -334,7 +357,6 @@ async fn run_event_loop(
     event_tx: mpsc::Sender<AcpEvent>,
     work_dir: String,
     reasoning_effort: Option<String>,
-    _drop_guard: Arc<()>,
 ) {
     use rmcp::model::CallToolRequestParams;
     use serde_json::json;
@@ -404,19 +426,34 @@ async fn run_event_loop(
                                 cmd = cmd_rx.recv() => {
                                     match cmd {
                                         Some(Cmd::Cancel) => {
-                                            tracing::info!(
+                                            tracing::debug!(
                                                 "codex: cancelling in-flight call_tool"
                                             );
                                             drop(call_fut);
                                             let _ = event_tx
                                                 .send(AcpEvent::Error {
-                                                    message: "已取消".to_string(),
+                                                    message: "Codex turn cancelled".to_string(),
                                                 })
                                                 .await;
+                                            // Without a thread_id, the next prompt would
+                                            // silently start a fresh thread — surface so
+                                            // the operator can see the lost-context case.
+                                            if thread_id.is_none() {
+                                                tracing::warn!(
+                                                    "codex: cancelled before thread_id arrived; \
+                                                     next prompt will open a new thread"
+                                                );
+                                            }
                                             break Err("cancelled by user".to_string());
                                         }
                                         Some(Cmd::Stop) | None => {
+                                            // H2 fix: emit Exit so listeners see a clean
+                                            // termination event instead of inferring it
+                                            // from broadcast channel close.
                                             drop(call_fut);
+                                            let _ = event_tx
+                                                .send(AcpEvent::Exit { code: 0 })
+                                                .await;
                                             return;
                                         }
                                         Some(Cmd::Prompt(_)) => {
@@ -488,13 +525,32 @@ async fn run_event_loop(
                                 if let Some(t) = tid.clone() {
                                     thread_id = Some(t);
                                 }
-                                let _ = event_tx
-                                    .send(AcpEvent::Result {
-                                        text: content.unwrap_or_default(),
-                                        session_id: tid.unwrap_or_default(),
-                                        cost_usd: None,
-                                    })
-                                    .await;
+                                // M2 fix: parse_codex_tool_result returns
+                                // (None, None) on unexpected response shape.
+                                // Emitting an empty Result hides the failure;
+                                // surface it as Error instead so the chat
+                                // bubble shows red-bordered diagnostic text.
+                                if tid.is_none() && content.is_none() {
+                                    tracing::warn!(
+                                        "codex: tool response had neither \
+                                         threadId nor content"
+                                    );
+                                    let _ = event_tx
+                                        .send(AcpEvent::Error {
+                                            message: "Codex returned an empty result \
+                                                      (unexpected response shape)"
+                                                .to_string(),
+                                        })
+                                        .await;
+                                } else {
+                                    let _ = event_tx
+                                        .send(AcpEvent::Result {
+                                            text: content.unwrap_or_default(),
+                                            session_id: tid.unwrap_or_default(),
+                                            cost_usd: None,
+                                        })
+                                        .await;
+                                }
                             }
                             Ok(Err(e)) => {
                                 let msg = format!("{e}");
@@ -508,13 +564,21 @@ async fn run_event_loop(
                                     .await;
                             }
                             Err(_cancel_msg) => {
-                                // Cancel path: the AcpEvent::Error{"已取消"} was
+                                // Cancel path: the AcpEvent::Error was
                                 // already sent above. thread_id is intentionally
                                 // preserved so the next prompt can codex-reply.
                             }
                         }
                     }
-                    Some(Cmd::Cancel) | Some(Cmd::Stop) | None => {
+                    // H4 fix: split idle Cancel from Stop. An idle Cancel
+                    // (no in-flight turn) shouldn't tear down the session —
+                    // user almost certainly meant "abort whatever's pending,
+                    // I want to type something else." Only Stop / channel
+                    // close should end the loop.
+                    Some(Cmd::Cancel) => {
+                        tracing::debug!("codex: idle cancel — no in-flight turn, ignoring");
+                    }
+                    Some(Cmd::Stop) | None => {
                         break;
                     }
                 }

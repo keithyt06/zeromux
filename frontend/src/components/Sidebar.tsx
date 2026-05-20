@@ -23,6 +23,19 @@ interface Props {
 
 type NewSessionStep = 'closed' | 'pick-type' | 'pick-terminal-mode' | 'pick-dir' | 'pick-tmux'
 
+/** Per-agent-type icon used in session list rows. Kept in one place so the
+ *  sidebar's two render sites (active row, condensed row) stay in sync as
+ *  agent types are added. */
+function SessionTypeIcon({ type, size = 14, className }: { type: SessionType; size?: number; className?: string }) {
+  switch (type) {
+    case 'claude': return <Bot size={size} className={className} />
+    case 'kiro':   return <Sparkles size={size} className={className} />
+    case 'codex':  return <Cpu size={size} className={className} />
+    case 'tmux':
+    default:       return <Terminal size={size} className={className} />
+  }
+}
+
 export default function Sidebar({ sessions, activeId, onSelect, onCreate, onDelete, onLogout, theme, onToggleTheme, user, open, onToggle, mobile }: Props) {
   const [step, setStep] = useState<NewSessionStep>('closed')
   const [pendingType, setPendingType] = useState<SessionType | null>(null)
@@ -133,7 +146,7 @@ export default function Sidebar({ sessions, activeId, onSelect, onCreate, onDele
             }`}
             title={s.name}
           >
-            {s.type === 'claude' ? <Bot size={14} /> : s.type === 'kiro' ? <Sparkles size={14} /> : s.type === 'codex' ? <Cpu size={14} /> : <Terminal size={14} />}
+            <SessionTypeIcon type={s.type} size={14} />
           </button>
         ))}
         <div className="mt-auto flex flex-col items-center gap-1">
@@ -233,7 +246,7 @@ export default function Sidebar({ sessions, activeId, onSelect, onCreate, onDele
             }`}
           >
             <StatusDot status={s.status} />
-            {s.type === 'claude' ? <Bot size={13} className="shrink-0" /> : s.type === 'kiro' ? <Sparkles size={13} className="shrink-0" /> : s.type === 'codex' ? <Cpu size={13} className="shrink-0" /> : <Terminal size={13} className="shrink-0" />}
+            <SessionTypeIcon type={s.type} size={13} className="shrink-0" />
             <div className="flex-1 min-w-0">
               <div className="truncate">{s.name}</div>
               {s.description && (

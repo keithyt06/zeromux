@@ -139,7 +139,7 @@ impl KiroProcess {
 
         let _ = event_tx
             .send(AcpEvent::System {
-                subtype: "init".to_string(),
+                subtype: std::borrow::Cow::Borrowed("init"),
                 session_id: Some(session_id.clone()),
             })
             .await;
@@ -360,7 +360,7 @@ fn parse_session_update(
             if let Some(text) = text {
                 pending_text.push_str(text);
                 vec![AcpEvent::ContentBlock {
-                    block_type: "text".to_string(),
+                    block_type: std::borrow::Cow::Borrowed("text"),
                     text: Some(text.to_string()),
                     name: None,
                     input: None,
@@ -381,7 +381,7 @@ fn parse_session_update(
                 .and_then(|t| t.as_str());
             if let Some(text) = text {
                 vec![AcpEvent::ContentBlock {
-                    block_type: "thinking".to_string(),
+                    block_type: std::borrow::Cow::Borrowed("thinking"),
                     text: Some(text.to_string()),
                     name: None,
                     input: None,
@@ -398,7 +398,7 @@ fn parse_session_update(
                 .unwrap_or("tool")
                 .to_string();
             vec![AcpEvent::ContentBlock {
-                block_type: "tool_use".to_string(),
+                block_type: std::borrow::Cow::Borrowed("tool_use"),
                 text: None,
                 name: Some(title),
                 input: None,

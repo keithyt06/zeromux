@@ -1,5 +1,3 @@
-#![allow(dead_code)]
-
 use crate::acp::process::AcpEvent;
 use rmcp::ErrorData as McpError;
 use rmcp::model::{
@@ -290,7 +288,7 @@ impl CodexProcess {
 
         let _ = event_tx
             .send(AcpEvent::System {
-                subtype: "init".to_string(),
+                subtype: std::borrow::Cow::Borrowed("init"),
                 session_id: None,
             })
             .await;
@@ -482,7 +480,7 @@ async fn run_event_loop(
                                             }
                                             let _ = event_tx
                                                 .send(AcpEvent::ContentBlock {
-                                                    block_type: "text".to_string(),
+                                                    block_type: std::borrow::Cow::Borrowed("text"),
                                                     text: Some(text),
                                                     name: None,
                                                     input: None,
@@ -498,7 +496,7 @@ async fn run_event_loop(
                                             }
                                             let _ = event_tx
                                                 .send(AcpEvent::ContentBlock {
-                                                    block_type: "thinking".to_string(),
+                                                    block_type: std::borrow::Cow::Borrowed("thinking"),
                                                     text: Some(text),
                                                     name: None,
                                                     input: None,

@@ -9,16 +9,23 @@ use tokio::sync::mpsc;
 /// These are translated from the NDJSON lines that `claude -p --output-format stream-json`
 /// writes to stdout. The translation flattens the nested assistant message structure
 /// into individual typed events for easy rendering in the browser.
+/// Borrowed-or-owned string for AcpEvent tag fields. The vast majority of
+/// emit sites use static literals ("text", "thinking", "tool_use", "init",
+/// etc.); using `Cow<'static, str>` lets those paths skip a heap allocation
+/// per event. Only Claude's stream-json `assistant` translation, which reads
+/// arbitrary block types out of upstream JSON, needs the owned variant.
+pub type StaticOrOwnedStr = std::borrow::Cow<'static, str>;
+
 #[derive(Debug, Clone, Serialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum AcpEvent {
     System {
-        subtype: String,
+        subtype: StaticOrOwnedStr,
         #[serde(skip_serializing_if = "Option::is_none")]
         session_id: Option<String>,
     },
     ContentBlock {
-        block_type: String,
+        block_type: StaticOrOwnedStr,
         #[serde(skip_serializing_if = "Option::is_none")]
         text: Option<String>,
         #[serde(skip_serializing_if = "Option::is_none")]
@@ -152,7 +159,7 @@ fn translate_event(val: &serde_json::Value) -> Vec<AcpEvent> {
                 return vec![];
             }
             vec![AcpEvent::System {
-                subtype: subtype.to_string(),
+                subtype: StaticOrOwnedStr::Owned(subtype.to_string()),
                 session_id: val.get("session_id").and_then(|v| v.as_str()).map(String::from),
             }]
         }
@@ -169,11 +176,17 @@ fn translate_event(val: &serde_json::Value) -> Vec<AcpEvent> {
             blocks
                 .iter()
                 .map(|b| {
-                    let block_type = b
-                        .get("type")
-                        .and_then(|v| v.as_str())
-                        .unwrap_or("text")
-                        .to_string();
+                    // block_type comes from upstream JSON, so it must be Owned.
+                    // Pin the common literals to Borrowed for zero allocation
+                    // when Claude uses the standard set; fall back to Owned
+                    // for unrecognized types so we still pass them through.
+                    let raw = b.get("type").and_then(|v| v.as_str()).unwrap_or("text");
+                    let block_type: StaticOrOwnedStr = match raw {
+                        "text" => StaticOrOwnedStr::Borrowed("text"),
+                        "thinking" => StaticOrOwnedStr::Borrowed("thinking"),
+                        "tool_use" => StaticOrOwnedStr::Borrowed("tool_use"),
+                        other => StaticOrOwnedStr::Owned(other.to_string()),
+                    };
                     // Claude stream-json sends extended-thinking blocks with
                     // `{"type":"thinking","thinking":"..."}` (the prose lives in
                     // a `thinking` field, not `text`). Read the right field so

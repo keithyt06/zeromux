@@ -674,6 +674,9 @@ fn spawn_kiro_fanout(
                             process.kill().await;
                         }
                         None => break,
+                        // PtyData / PtyResize aren't meaningful for an MCP
+                        // agent session — they only apply to PTY/tmux. Drop
+                        // silently rather than mis-route into send_prompt.
                         _ => {}
                     }
                 }
@@ -715,6 +718,8 @@ fn spawn_codex_fanout(
                             process.kill().await;
                         }
                         None => break,
+                        // See note in spawn_kiro_fanout: PTY-style inputs
+                        // are silently dropped for MCP sessions.
                         _ => {}
                     }
                 }

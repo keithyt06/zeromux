@@ -163,14 +163,31 @@ impl CodexProcess {
 
         let work_dir_owned = work_dir.to_string();
         let drop_guard = Arc::new(());
-        tokio::spawn(run_event_loop(
-            service,
-            cmd_rx,
-            notify_rx,
-            event_tx,
-            work_dir_owned,
-            drop_guard.clone(),
-        ));
+        let drop_guard_for_loop = drop_guard.clone();
+        let event_tx_for_panic = event_tx.clone();
+        tokio::spawn(async move {
+            let result = futures::FutureExt::catch_unwind(
+                std::panic::AssertUnwindSafe(run_event_loop(
+                    service,
+                    cmd_rx,
+                    notify_rx,
+                    event_tx,
+                    work_dir_owned,
+                    drop_guard_for_loop,
+                )),
+            )
+            .await;
+            if result.is_err() {
+                let _ = event_tx_for_panic
+                    .send(AcpEvent::Error {
+                        message: "Codex event loop panicked".to_string(),
+                    })
+                    .await;
+                let _ = event_tx_for_panic
+                    .send(AcpEvent::Exit { code: -1 })
+                    .await;
+            }
+        });
 
         Ok(Self {
             cmd_tx,

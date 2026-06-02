@@ -390,7 +390,7 @@ function BlockView({ block, isComplete }: { block: ContentBlock; isComplete: boo
             {createElement(iconFor(block.name), { size: 12 })}
             <span>{block.name || 'tool'}</span>
             {block.summary && (
-              <span className="text-[var(--text-secondary)] font-normal truncate">· {block.summary}</span>
+              <span className="text-[var(--text-secondary)] font-normal truncate min-w-0 flex-1">· {block.summary}</span>
             )}
           </div>
           {hasRawInput && (

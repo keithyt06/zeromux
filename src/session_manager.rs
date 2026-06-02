@@ -1,9 +1,10 @@
 use std::collections::{HashMap, VecDeque};
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, Weak};
 use tokio::sync::{broadcast, mpsc};
 
 use crate::events::{CreateEventReq, EventStore};
+use crate::session_store::{PersistedSession, SessionStore};
 
 /// Max scrollback buffer size in bytes (2MB of encoded data)
 const SCROLLBACK_MAX_BYTES: usize = 2 * 1024 * 1024;
@@ -167,6 +168,10 @@ pub struct SessionManager {
     /// Shared event store — agent fan-out tasks auto-log a `task_done` event
     /// here when their process emits an `AcpEvent::Result`.
     events: Arc<EventStore>,
+    /// Persistent session metadata store (SQLite). Always open.
+    store: Arc<SessionStore>,
+    /// Self-reference so fan-out tasks can call back without an Arc cycle.
+    self_weak: Mutex<Weak<SessionManager>>,
 }
 
 #[derive(serde::Serialize)]
@@ -268,10 +273,36 @@ fn resolve_work_dir(work_dir: &str, session_id: &str) -> (PathBuf, Option<PathBu
 }
 
 impl SessionManager {
-    pub fn new(events: Arc<EventStore>) -> Self {
-        Self {
+    pub fn new(events: Arc<EventStore>, store: Arc<SessionStore>) -> Arc<Self> {
+        let mgr = Arc::new(Self {
             sessions: Mutex::new(HashMap::new()),
             events,
+            store,
+            self_weak: Mutex::new(Weak::new()),
+        });
+        *mgr.self_weak.lock().unwrap() = Arc::downgrade(&mgr);
+        mgr
+    }
+
+    fn weak(&self) -> Weak<SessionManager> {
+        self.self_weak.lock().unwrap().clone()
+    }
+
+    /// Persist a session's metadata to the store (insert or update).
+    fn persist_meta(&self, s: &Session) {
+        let pj = PersistedSession {
+            id: s.id.clone(),
+            name: s.name.clone(),
+            session_type: s.session_type,
+            work_dir: s.work_dir.clone(),
+            owner_id: s.owner_id.clone(),
+            description: s.description.clone(),
+            resume_token: s.resume_token.clone(),
+            worktree_path: s.worktree_path.as_ref().map(|p| p.to_string_lossy().to_string()),
+            created_ms: s.created_ms,
+        };
+        if let Err(e) = self.store.upsert(&pj) {
+            tracing::warn!("persist session {} failed: {}", s.id, e);
         }
     }
 
@@ -311,6 +342,8 @@ impl SessionManager {
         let pid = pty.pid();
         let event_tx_clone = event_tx.clone();
         let sid = id.clone();
+        let mgr_weak = self.weak();
+        let sid_for_exit = id.clone();
 
         // Spawn fan-out task: owns the PtyHandle, reads output, handles input
         tokio::spawn(async move {
@@ -344,6 +377,14 @@ impl SessionManager {
                     }
                 }
             }
+            // Fan-out exiting: keep session metadata, clear running state so it
+            // can be respawned from its resume_token (Task 5+).
+            if let Some(mgr) = mgr_weak.upgrade() {
+                if let Some(s) = mgr.sessions.lock().unwrap().get_mut(&sid_for_exit) {
+                    s.running = None;
+                    s.status = SessionMeta::Idle;
+                }
+            }
         });
 
         let session = Session {
@@ -356,7 +397,7 @@ impl SessionManager {
             owner_id: owner_id.to_string(),
             description: String::new(),
             status: SessionMeta::Running,
-            resume_token: None,
+            resume_token: tmux_target.map(|t| ResumeToken::Tmux(t.to_string())),
             worktree_path: None,
             created_ms: now_millis(),
             spawning: false,
@@ -369,6 +410,7 @@ impl SessionManager {
             scrollback_bytes: 0,
         };
 
+        self.persist_meta(&session);
         self.sessions.lock().unwrap().insert(id.clone(), session);
         Ok(id)
     }
@@ -410,6 +452,7 @@ impl SessionManager {
             self.events.clone(),
             "claude-code",
             effective_dir.to_string_lossy().to_string(),
+            self.weak(),
         );
 
         let session = Session {
@@ -435,6 +478,7 @@ impl SessionManager {
             scrollback_bytes: 0,
         };
 
+        self.persist_meta(&session);
         self.sessions.lock().unwrap().insert(id.clone(), session);
         Ok(id)
     }
@@ -476,6 +520,7 @@ impl SessionManager {
             self.events.clone(),
             "kiro",
             effective_dir.to_string_lossy().to_string(),
+            self.weak(),
         );
 
         let session = Session {
@@ -501,6 +546,7 @@ impl SessionManager {
             scrollback_bytes: 0,
         };
 
+        self.persist_meta(&session);
         self.sessions.lock().unwrap().insert(id.clone(), session);
         Ok(id)
     }
@@ -553,6 +599,7 @@ impl SessionManager {
             self.events.clone(),
             "codex",
             effective_dir.to_string_lossy().to_string(),
+            self.weak(),
         );
 
         let session = Session {
@@ -578,6 +625,7 @@ impl SessionManager {
             scrollback_bytes: 0,
         };
 
+        self.persist_meta(&session);
         self.sessions.lock().unwrap().insert(id.clone(), session);
         Ok(id)
     }
@@ -619,6 +667,7 @@ impl SessionManager {
     pub fn remove_session(&self, id: &str) -> bool {
         let removed = self.sessions.lock().unwrap().remove(id);
         if let Some(session) = removed {
+            let _ = self.store.delete(id);
             // Dropping session closes event_tx + input_tx → fan-out task exits
             if let Some(wt_path) = &session.worktree_path {
                 if let Some(worktrees_dir) = wt_path.parent() {
@@ -664,16 +713,93 @@ impl SessionManager {
         description: Option<String>,
         status: Option<SessionMeta>,
     ) -> bool {
-        if let Some(session) = self.sessions.lock().unwrap().get_mut(id) {
-            if let Some(d) = description {
-                session.description = d;
+        // Apply in-memory under the lock, capturing the new description (if any)
+        // so we can persist it AFTER releasing the sessions lock.
+        let persist_desc = {
+            let mut map = self.sessions.lock().unwrap();
+            match map.get_mut(id) {
+                Some(session) => {
+                    let mut persist = None;
+                    if let Some(d) = description {
+                        session.description = d.clone();
+                        persist = Some(d);
+                    }
+                    if let Some(s) = status {
+                        session.status = s;
+                    }
+                    Some(persist)
+                }
+                None => None,
             }
-            if let Some(s) = status {
-                session.status = s;
+        };
+        match persist_desc {
+            Some(persist) => {
+                if let Some(d) = persist {
+                    let _ = self.store.update_description(id, &d);
+                }
+                true
             }
-            true
-        } else {
-            false
+            None => false,
+        }
+    }
+
+    /// Set a session's resume token, persisting only if it actually changed.
+    /// Used by fan-out tasks (Task 6/7) to record cross-process resume context.
+    pub fn set_resume_token(&self, id: &str, token: ResumeToken) {
+        let should_write = {
+            let mut map = self.sessions.lock().unwrap();
+            match map.get_mut(id) {
+                Some(s) if s.resume_token.as_ref() != Some(&token) => {
+                    s.resume_token = Some(token.clone());
+                    true
+                }
+                _ => false,
+            }
+        };
+        if should_write {
+            let _ = self.store.update_resume_token(id, Some(&token));
+        }
+    }
+
+    /// Load persisted session metadata from the store into memory on startup.
+    /// Sessions are restored with `running: None` (no live process) — they can
+    /// be respawned from their resume_token (Task 5+). Existing in-memory
+    /// sessions are never clobbered.
+    pub fn load_persisted(&self) {
+        let rows = match self.store.load_all() {
+            Ok(r) => r,
+            Err(e) => {
+                tracing::warn!("load_all failed: {}", e);
+                return;
+            }
+        };
+        let mut map = self.sessions.lock().unwrap();
+        for p in rows {
+            if map.contains_key(&p.id) {
+                continue;
+            }
+            let id = p.id.clone();
+            map.insert(
+                id,
+                Session {
+                    id: p.id,
+                    name: p.name,
+                    session_type: p.session_type,
+                    cols: 80,
+                    rows: 24,
+                    work_dir: p.work_dir,
+                    owner_id: p.owner_id,
+                    description: p.description,
+                    status: SessionMeta::Idle,
+                    resume_token: p.resume_token,
+                    worktree_path: p.worktree_path.map(std::path::PathBuf::from),
+                    created_ms: p.created_ms,
+                    spawning: false,
+                    running: None,
+                    scrollback: VecDeque::new(),
+                    scrollback_bytes: 0,
+                },
+            );
         }
     }
 
@@ -754,6 +880,18 @@ fn log_result_event(
     }
 }
 
+/// On fan-out exit, clear the session's running state (keep metadata) so it can
+/// be respawned from its resume_token (Task 5+). No-op if the manager or session
+/// is already gone (e.g. the session was removed, which is why the fan-out ended).
+fn mark_fanout_ended(mgr: &Weak<SessionManager>, sid: &str) {
+    if let Some(mgr) = mgr.upgrade() {
+        if let Some(s) = mgr.sessions.lock().unwrap().get_mut(sid) {
+            s.running = None;
+            s.status = SessionMeta::Idle;
+        }
+    }
+}
+
 fn spawn_acp_fanout(
     sid: String,
     mut process: AcpProcess,
@@ -762,6 +900,7 @@ fn spawn_acp_fanout(
     events: Arc<EventStore>,
     agent_label: &'static str,
     work_dir: String,
+    mgr: Weak<SessionManager>,
 ) {
     tokio::spawn(async move {
         loop {
@@ -795,6 +934,7 @@ fn spawn_acp_fanout(
                 }
             }
         }
+        mark_fanout_ended(&mgr, &sid);
         tracing::info!("ACP fan-out task ended for session {}", sid);
     });
 }
@@ -807,6 +947,7 @@ fn spawn_kiro_fanout(
     events: Arc<EventStore>,
     agent_label: &'static str,
     work_dir: String,
+    mgr: Weak<SessionManager>,
 ) {
     tokio::spawn(async move {
         loop {
@@ -843,6 +984,7 @@ fn spawn_kiro_fanout(
                 }
             }
         }
+        mark_fanout_ended(&mgr, &sid);
         tracing::info!("Kiro fan-out task ended for session {}", sid);
     });
 }
@@ -855,6 +997,7 @@ fn spawn_codex_fanout(
     events: Arc<EventStore>,
     agent_label: &'static str,
     work_dir: String,
+    mgr: Weak<SessionManager>,
 ) {
     tokio::spawn(async move {
         loop {
@@ -890,6 +1033,7 @@ fn spawn_codex_fanout(
                 }
             }
         }
+        mark_fanout_ended(&mgr, &sid);
         tracing::info!("Codex fan-out task ended for session {}", sid);
     });
 }

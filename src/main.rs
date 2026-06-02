@@ -100,7 +100,7 @@ struct Args {
 }
 
 pub struct AppState {
-    pub sessions: session_manager::SessionManager,
+    pub sessions: Arc<session_manager::SessionManager>,
     pub password_hash: Option<String>,
     pub shell: String,
     pub claude_path: String,
@@ -212,6 +212,11 @@ async fn main() {
             .expect("Failed to initialize event store"),
     );
 
+    let session_store = Arc::new(
+        session_store::SessionStore::open(std::path::Path::new(&data_dir_str))
+            .expect("Failed to initialize session store"),
+    );
+
     if oauth_configured {
         println!("GitHub OAuth enabled");
     } else {
@@ -219,7 +224,7 @@ async fn main() {
     }
 
     let state = Arc::new(AppState {
-        sessions: session_manager::SessionManager::new(event_store.clone()),
+        sessions: session_manager::SessionManager::new(event_store.clone(), session_store.clone()),
         password_hash,
         shell: args.shell,
         claude_path: args.claude_path,
@@ -239,6 +244,9 @@ async fn main() {
         allowed_users,
         external_url,
     });
+
+    // Restore persisted session metadata (running=None until respawned).
+    state.sessions.load_persisted();
 
     let app = web::build_router(state.clone());
 

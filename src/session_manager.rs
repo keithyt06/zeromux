@@ -117,6 +117,25 @@ pub enum SessionInput {
     Cancel,
 }
 
+/// 一个会话的运行态：仅当进程存活时存在。fan-out 任务独占其中的进程句柄
+/// （通过 channel）。Drop 此结构 → channel 关闭 → fan-out 退出 → 进程死。
+struct RunningProcess {
+    /// Broadcast channel: fan-out task writes, all WS clients subscribe
+    event_tx: broadcast::Sender<String>,
+    /// Input channel: any WS client writes, fan-out task forwards to process
+    input_tx: mpsc::Sender<SessionInput>,
+    /// PTY child PID kept for /proc lookup (PTY sessions only)
+    pty_pid: Option<u32>,
+}
+
+fn now_millis() -> i64 {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0)
+}
+
 pub struct Session {
     pub id: String,
     pub name: String,
@@ -127,14 +146,17 @@ pub struct Session {
     pub owner_id: String,
     pub description: String,
     pub status: SessionMeta,
-    /// Broadcast channel: fan-out task writes, all WS clients subscribe
-    event_tx: broadcast::Sender<String>,
-    /// Input channel: any WS client writes, fan-out task forwards to process
-    input_tx: mpsc::Sender<SessionInput>,
+    #[allow(dead_code)]
+    resume_token: Option<ResumeToken>,
     /// Git worktree path for ACP sessions (cleaned up on delete)
     worktree_path: Option<PathBuf>,
-    /// PTY child PID kept for /proc lookup (PTY sessions only)
-    pty_pid: Option<u32>,
+    #[allow(dead_code)]
+    created_ms: i64,
+    /// 并发重生互斥（仅锁内访问，Task 5 使用）。
+    #[allow(dead_code)]
+    spawning: bool,
+    /// 运行态；None = 未运行（可按 resume_token 重生）。
+    running: Option<RunningProcess>,
     /// Output history for replay on reconnect (base64 for PTY, JSON for ACP/Kiro)
     scrollback: VecDeque<String>,
     scrollback_bytes: usize,
@@ -334,10 +356,15 @@ impl SessionManager {
             owner_id: owner_id.to_string(),
             description: String::new(),
             status: SessionMeta::Running,
-            event_tx,
-            input_tx,
+            resume_token: None,
             worktree_path: None,
-            pty_pid: pid,
+            created_ms: now_millis(),
+            spawning: false,
+            running: Some(RunningProcess {
+                event_tx,
+                input_tx,
+                pty_pid: pid,
+            }),
             scrollback: VecDeque::new(),
             scrollback_bytes: 0,
         };
@@ -395,10 +422,15 @@ impl SessionManager {
             owner_id: owner_id.to_string(),
             description: String::new(),
             status: SessionMeta::Running,
-            event_tx,
-            input_tx,
+            resume_token: None,
             worktree_path,
-            pty_pid: None,
+            created_ms: now_millis(),
+            spawning: false,
+            running: Some(RunningProcess {
+                event_tx,
+                input_tx,
+                pty_pid: None,
+            }),
             scrollback: VecDeque::new(),
             scrollback_bytes: 0,
         };
@@ -456,10 +488,15 @@ impl SessionManager {
             owner_id: owner_id.to_string(),
             description: String::new(),
             status: SessionMeta::Running,
-            event_tx,
-            input_tx,
+            resume_token: None,
             worktree_path,
-            pty_pid: None,
+            created_ms: now_millis(),
+            spawning: false,
+            running: Some(RunningProcess {
+                event_tx,
+                input_tx,
+                pty_pid: None,
+            }),
             scrollback: VecDeque::new(),
             scrollback_bytes: 0,
         };
@@ -528,10 +565,15 @@ impl SessionManager {
             owner_id: owner_id.to_string(),
             description: String::new(),
             status: SessionMeta::Running,
-            event_tx,
-            input_tx,
+            resume_token: None,
             worktree_path,
-            pty_pid: None,
+            created_ms: now_millis(),
+            spawning: false,
+            running: Some(RunningProcess {
+                event_tx,
+                input_tx,
+                pty_pid: None,
+            }),
             scrollback: VecDeque::new(),
             scrollback_bytes: 0,
         };
@@ -599,7 +641,8 @@ impl SessionManager {
             .lock()
             .unwrap()
             .get(id)
-            .map(|s| s.event_tx.subscribe())
+            .and_then(|s| s.running.as_ref())
+            .map(|rp| rp.event_tx.subscribe())
     }
 
     /// Get the input sender for a session. Returns None if session not found.
@@ -608,7 +651,8 @@ impl SessionManager {
             .lock()
             .unwrap()
             .get(id)
-            .map(|s| s.input_tx.clone())
+            .and_then(|s| s.running.as_ref())
+            .map(|rp| rp.input_tx.clone())
     }
 
     // (PTY write/resize now handled via input_tx → fan-out task)
@@ -669,7 +713,12 @@ impl SessionManager {
 
     /// Get PTY child PID for a session
     pub fn pty_pid(&self, id: &str) -> Option<u32> {
-        self.sessions.lock().unwrap().get(id).and_then(|s| s.pty_pid)
+        self.sessions
+            .lock()
+            .unwrap()
+            .get(id)
+            .and_then(|s| s.running.as_ref())
+            .and_then(|rp| rp.pty_pid)
     }
 }
 

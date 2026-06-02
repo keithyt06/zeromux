@@ -122,7 +122,11 @@ export default function AcpChatView({ sessionId, active, agentType = 'claude' }:
   const handleEvent = useCallback((evt: ServerEvent) => {
     switch (evt.type) {
       case 'system': {
-        const label = evt.subtype || 'system'
+        const labelMap: Record<string, string> = {
+          init: 'session ready',
+          resume_failed: '⚠ 上下文恢复失败，已重置为新会话',
+        }
+        const label = labelMap[evt.subtype || ''] || evt.subtype || 'system'
         const sid = evt.session_id ? ` ${evt.session_id.substring(0, 8)}...` : ''
         pushMessage({ id: newId(), kind: 'system', text: `${label}${sid}` })
         break

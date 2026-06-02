@@ -588,14 +588,14 @@ impl SessionManager {
     }
 
     /// Spawn a Kiro process for `id` at `work_dir`, start its fan-out, return the
-    /// live handle. `_resume` unused in Task 5 (Task 7 wires `session/load`).
+    /// live handle. `resume: Some(sid)` issues `session/load` to restore context.
     async fn spawn_kiro(
         &self,
         id: &str,
         work_dir: &str,
-        _resume: Option<&str>,
+        resume: Option<&str>,
     ) -> Result<RunningProcess, String> {
-        let process = KiroProcess::spawn(&self.kiro_path, work_dir)
+        let process = KiroProcess::spawn(&self.kiro_path, work_dir, resume)
             .await
             .map_err(|e| format!("Failed to spawn Kiro: {}", e))?;
 
@@ -799,7 +799,15 @@ impl SessionManager {
             armed: true,
         };
 
-        // 阶段 2：锁外 await spawn（Task 6：按 backend 传入 stored ResumeToken）。
+        // 阶段 2：锁外 await spawn（Task 6/7：按 backend 传入 stored ResumeToken）。
+        // Did we attempt a resume for THIS backend? (token present + matching kind)
+        let attempted_resume = matches!(
+            (stype, &token),
+            (SessionType::Claude, Some(ResumeToken::Claude(_)))
+                | (SessionType::Kiro, Some(ResumeToken::Kiro(_)))
+                | (SessionType::Codex, Some(ResumeToken::Codex(_)))
+                | (SessionType::Tmux, Some(ResumeToken::Tmux(_)))
+        );
         let result = match stype {
             SessionType::Claude => {
                 let r = match &token {
@@ -808,7 +816,13 @@ impl SessionManager {
                 };
                 self.spawn_claude(id, &work_dir, r).await
             }
-            SessionType::Kiro => self.spawn_kiro(id, &work_dir, None).await,
+            SessionType::Kiro => {
+                let r = match &token {
+                    Some(ResumeToken::Kiro(s)) => Some(s.as_str()),
+                    _ => None,
+                };
+                self.spawn_kiro(id, &work_dir, r).await
+            }
             SessionType::Codex => {
                 let r = match &token {
                     Some(ResumeToken::Codex(t)) => Some(t.clone()),
@@ -816,7 +830,54 @@ impl SessionManager {
                 };
                 self.spawn_codex(id, &work_dir, r).await
             }
-            SessionType::Tmux => self.spawn_tmux(id, &work_dir, cols, rows, None),
+            SessionType::Tmux => {
+                let t = match &token {
+                    Some(ResumeToken::Tmux(s)) => Some(s.as_str()),
+                    _ => None,
+                };
+                self.spawn_tmux(id, &work_dir, cols, rows, t)
+            }
+        };
+
+        // resume_failed safety net: if a resume was ATTEMPTED and it FAILED, retry
+        // once with NO token (fresh session). On success, clear the stale token and
+        // emit a `resume_failed` system event so the user knows context was reset.
+        // NB: still outside the sessions lock here — the event_tx.send below must
+        // NOT be moved into phase 3 (would broadcast while holding the lock).
+        let mut fell_back = false;
+        let result = match result {
+            Ok(rp) => Ok(rp),
+            Err(e) if attempted_resume => {
+                tracing::warn!(
+                    "resume failed for {} ({}), falling back to fresh session",
+                    id,
+                    e
+                );
+                let fresh = match stype {
+                    SessionType::Claude => self.spawn_claude(id, &work_dir, None).await,
+                    SessionType::Kiro => self.spawn_kiro(id, &work_dir, None).await,
+                    SessionType::Codex => self.spawn_codex(id, &work_dir, None).await,
+                    SessionType::Tmux => self.spawn_tmux(id, &work_dir, cols, rows, None),
+                };
+                match fresh {
+                    Ok(rp) => {
+                        fell_back = true;
+                        // Clear stale token in SQLite; the in-memory token is cleared
+                        // in phase 3 below (and fan-outs will re-backfill a new one).
+                        let _ = self.store.update_resume_token(id, None);
+                        let _ = rp.event_tx.send(
+                            serde_json::json!({
+                                "type": "system",
+                                "subtype": "resume_failed"
+                            })
+                            .to_string(),
+                        );
+                        Ok(rp)
+                    }
+                    Err(e2) => Err(e2),
+                }
+            }
+            Err(e) => Err(e),
         };
 
         // 阶段 3：锁内装回 + 清 spawning。
@@ -826,6 +887,11 @@ impl SessionManager {
                 s.spawning = false;
                 match result {
                     Ok(rp) => {
+                        if fell_back {
+                            // Drop the stale resume token in memory too; the fan-out
+                            // re-backfills a fresh one on the new session's events.
+                            s.resume_token = None;
+                        }
                         s.running = Some(rp);
                         s.status = SessionMeta::Running;
                         Ok(())
@@ -1115,6 +1181,15 @@ fn claude_session_id(evt: &AcpEvent) -> Option<String> {
     }
 }
 
+/// Extract Kiro's sessionId from an id-bearing event, for resume backfill.
+/// Kiro emits `System { subtype:"init", session_id: Some(sid) }` at spawn.
+fn kiro_session_id(evt: &AcpEvent) -> Option<String> {
+    match evt {
+        AcpEvent::System { session_id: Some(s), .. } => Some(s.clone()),
+        _ => None,
+    }
+}
+
 /// Extract Codex's threadId from an id-bearing event, for resume backfill.
 fn codex_thread_id(evt: &AcpEvent) -> Option<String> {
     match evt {
@@ -1191,12 +1266,22 @@ fn spawn_kiro_fanout(
     mgr: Weak<SessionManager>,
 ) {
     tokio::spawn(async move {
+        let mut token_saved = false;
         loop {
             tokio::select! {
                 event = process.event_rx.recv() => {
                     match event {
                         Some(evt) => {
                             log_result_event(&events, agent_label, &sid, &work_dir, &evt);
+                            // Backfill Kiro resume token (sessionId) on first id-bearing event.
+                            if !token_saved {
+                                if let Some(sid_val) = kiro_session_id(&evt) {
+                                    if let Some(m) = mgr.upgrade() {
+                                        m.set_resume_token(&sid, ResumeToken::Kiro(sid_val));
+                                    }
+                                    token_saved = true;
+                                }
+                            }
                             let json = match serde_json::to_string(&evt) {
                                 Ok(j) => j,
                                 Err(_) => continue,

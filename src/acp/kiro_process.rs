@@ -83,11 +83,17 @@ impl KiroProcess {
     /// The Agent Client Protocol uses JSON-RPC 2.0 over stdio. Initialization is:
     ///   1. Client sends `initialize` with capabilities
     ///   2. Server responds with capabilities
-    ///   3. Client sends `session/new` with cwd
+    ///   3. Client sends `session/new` (fresh) or `session/load` (resume) with cwd
     ///   4. Server responds with sessionId
+    ///
+    /// `resume: Some(sid)` issues `session/load` to restore prior context. If the
+    /// old process is still alive Kiro rejects with `-32603 "Session is active in
+    /// another process"`, which surfaces as `Err` from `drain_until_response` →
+    /// the caller falls back to a fresh session (never retried here).
     pub async fn spawn(
         kiro_path: &str,
         work_dir: &str,
+        resume: Option<&str>,
     ) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
         let mut child = tokio::process::Command::new(kiro_path)
             .args(["acp", "--trust-all-tools"])
@@ -115,23 +121,35 @@ impl KiroProcess {
 
         drain_until_response(&mut lines).await?;
 
-        // ── Handshake step 2: session/new ──
+        // ── Handshake step 2: session/new (fresh) or session/load (resume) ──
         let cwd = if work_dir == "." {
             std::env::current_dir()?.to_string_lossy().to_string()
         } else {
             work_dir.to_string()
         };
 
-        write_rpc(&mut stdin, 1, "session/new", serde_json::json!({
-            "cwd": cwd,
-            "mcpServers": []
-        }))
-        .await?;
+        let (method, params, sid_known): (&str, serde_json::Value, Option<String>) = match resume {
+            Some(sid) => (
+                "session/load",
+                serde_json::json!({ "sessionId": sid, "cwd": cwd, "mcpServers": [] }),
+                Some(sid.to_string()),
+            ),
+            None => (
+                "session/new",
+                serde_json::json!({ "cwd": cwd, "mcpServers": [] }),
+                None,
+            ),
+        };
+
+        write_rpc(&mut stdin, 1, method, params).await?;
 
         let resp = drain_until_response(&mut lines).await?;
-        let session_id = resp
-            .and_then(|r| r.get("sessionId").and_then(|v| v.as_str().map(String::from)))
-            .unwrap_or_else(|| "unknown".to_string());
+        let session_id = match sid_known {
+            Some(s) => s, // session/load: reuse the id we loaded
+            None => resp
+                .and_then(|r| r.get("sessionId").and_then(|v| v.as_str().map(String::from)))
+                .unwrap_or_else(|| "unknown".to_string()),
+        };
 
         // ── Wire up channels and spawn event loop ──
         let (event_tx, event_rx) = mpsc::channel::<AcpEvent>(256);

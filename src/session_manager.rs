@@ -296,6 +296,27 @@ enum SpawnDecision {
     Spawn(SpawnPlan),
 }
 
+/// Resets `spawning=false` if dropped before being disarmed — covers the case
+/// where the `ensure_running` future is cancelled (WS dropped) mid-spawn, which
+/// would otherwise leave the session permanently stuck in `spawning=true`.
+struct SpawningGuard {
+    mgr: Weak<SessionManager>,
+    id: String,
+    armed: bool,
+}
+
+impl Drop for SpawningGuard {
+    fn drop(&mut self) {
+        if self.armed {
+            if let Some(mgr) = self.mgr.upgrade() {
+                if let Some(s) = mgr.sessions.lock().unwrap().get_mut(&self.id) {
+                    s.spawning = false;
+                }
+            }
+        }
+    }
+}
+
 /// Pure phase-1 decision for `ensure_running`. Mutates only `spawning` (sets it
 /// true on the `Spawn` path so a concurrent caller sees `Wait`). Kept free of
 /// any spawning/IO so it is unit-testable without real CLI processes.
@@ -768,6 +789,15 @@ impl SessionManager {
             return Err("timed out waiting for concurrent spawn".into());
         };
 
+        // We claimed `spawning=true` in phase 1. Arm a drop-guard so that if this
+        // future is cancelled mid-spawn (WS dropped before phase 3), the flag is
+        // reset rather than stuck true forever. Phase 3 disarms it on completion.
+        let mut guard = SpawningGuard {
+            mgr: self.weak(),
+            id: id.to_string(),
+            armed: true,
+        };
+
         // 阶段 2：锁外 await spawn（Task 5：忽略 token，全新）。
         let result = match stype {
             SessionType::Claude => self.spawn_claude(id, &work_dir, None).await,
@@ -778,7 +808,7 @@ impl SessionManager {
 
         // 阶段 3：锁内装回 + 清 spawning。
         let mut map = self.sessions.lock().unwrap();
-        match map.get_mut(id) {
+        let outcome = match map.get_mut(id) {
             Some(s) => {
                 s.spawning = false;
                 match result {
@@ -791,7 +821,14 @@ impl SessionManager {
                 }
             }
             None => Err("session removed during spawn".into()),
-        }
+        };
+        // Phase 3 reached: we cleared spawning ourselves (under the lock we hold),
+        // so disarm the guard to avoid a redundant re-lock on its Drop. Release
+        // the sessions lock BEFORE the guard drops at fn end so SpawningGuard's
+        // Drop never re-locks while we hold it (std::Mutex would deadlock).
+        drop(map);
+        guard.armed = false;
+        outcome
     }
 
     /// List sessions, optionally filtered by owner. Pass None for all (admin).
@@ -1290,5 +1327,67 @@ mod decide_spawn_tests {
         assert!(matches!(decide_spawn(&mut s), SpawnDecision::AlreadyRunning));
         // Must not flip spawning when nothing needs spawning.
         assert!(!s.spawning);
+    }
+
+    /// Build a real SessionManager backed by tempdir stores (no CLI processes).
+    fn test_manager() -> (Arc<SessionManager>, tempfile::TempDir) {
+        let dir = tempfile::tempdir().unwrap();
+        let events = Arc::new(crate::events::EventStore::open(dir.path()).unwrap());
+        let store = Arc::new(crate::session_store::SessionStore::open(dir.path()).unwrap());
+        let mgr = SessionManager::new(
+            events,
+            store,
+            "claude".into(),
+            "kiro".into(),
+            "codex".into(),
+            "off".into(),
+            "bash".into(),
+        );
+        (mgr, dir)
+    }
+
+    #[test]
+    fn armed_guard_resets_spawning_on_drop() {
+        let (mgr, _dir) = test_manager();
+        // Insert a session already mid-spawn (spawning=true), as phase 1 leaves it.
+        let mut s = test_session();
+        s.spawning = true;
+        mgr.sessions.lock().unwrap().insert(s.id.clone(), s);
+
+        // Simulate the ensure_running future being cancelled mid-spawn: the guard
+        // is created armed and then dropped without phase 3 disarming it.
+        {
+            let _guard = SpawningGuard {
+                mgr: mgr.weak(),
+                id: "sid".into(),
+                armed: true,
+            };
+        } // _guard drops here → resets spawning
+
+        let map = mgr.sessions.lock().unwrap();
+        assert!(!map.get("sid").unwrap().spawning, "armed guard must reset spawning on drop");
+    }
+
+    #[test]
+    fn disarmed_guard_leaves_spawning_untouched() {
+        let (mgr, _dir) = test_manager();
+        let mut s = test_session();
+        s.spawning = true;
+        mgr.sessions.lock().unwrap().insert(s.id.clone(), s);
+
+        // Normal success path: phase 3 already cleared spawning + disarmed guard.
+        {
+            let mut guard = SpawningGuard {
+                mgr: mgr.weak(),
+                id: "sid".into(),
+                armed: true,
+            };
+            guard.armed = false; // disarm as phase 3 does
+        }
+
+        // Guard drop was a no-op; spawning stays whatever phase 3 set it to (here
+        // we left it true to prove the guard didn't touch it).
+        let map = mgr.sessions.lock().unwrap();
+        assert!(map.get("sid").unwrap().spawning, "disarmed guard must not touch spawning");
     }
 }

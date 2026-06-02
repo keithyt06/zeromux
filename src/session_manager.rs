@@ -840,10 +840,11 @@ impl SessionManager {
         };
 
         // resume_failed safety net: if a resume was ATTEMPTED and it FAILED, retry
-        // once with NO token (fresh session). On success, clear the stale token and
-        // emit a `resume_failed` system event so the user knows context was reset.
-        // NB: still outside the sessions lock here — the event_tx.send below must
-        // NOT be moved into phase 3 (would broadcast while holding the lock).
+        // once with NO token (fresh session). On success, mark `fell_back` so we (a)
+        // clear the stale token and (b) surface a `resume_failed` system event to the
+        // user. Both are deferred to AFTER phase 3 releases the sessions lock — the
+        // scrollback push (the channel that actually reaches the client) and the
+        // SQLite clear both re-acquire/own locks and must not nest under it.
         let mut fell_back = false;
         let result = match result {
             Ok(rp) => Ok(rp),
@@ -862,9 +863,11 @@ impl SessionManager {
                 match fresh {
                     Ok(rp) => {
                         fell_back = true;
-                        // Clear stale token in SQLite; the in-memory token is cleared
-                        // in phase 3 below (and fan-outs will re-backfill a new one).
-                        let _ = self.store.update_resume_token(id, None);
+                        // Broadcast for any already-attached client (multi-tab). This
+                        // is best-effort: the connecting WS subscribes only AFTER
+                        // ensure_running returns, so it has zero subscribers in the
+                        // common case — the scrollback push after phase 3 is what
+                        // actually delivers resume_failed via replay.
                         let _ = rp.event_tx.send(
                             serde_json::json!({
                                 "type": "system",
@@ -888,8 +891,9 @@ impl SessionManager {
                 match result {
                     Ok(rp) => {
                         if fell_back {
-                            // Drop the stale resume token in memory too; the fan-out
-                            // re-backfills a fresh one on the new session's events.
+                            // Drop the stale resume token in memory before `running`
+                            // is observable. The fresh fan-out re-backfills a new
+                            // token on the new session's first id-bearing event.
                             s.resume_token = None;
                         }
                         s.running = Some(rp);
@@ -907,6 +911,28 @@ impl SessionManager {
         // Drop never re-locks while we hold it (std::Mutex would deadlock).
         drop(map);
         guard.armed = false;
+
+        // Post-phase-3 fallback bookkeeping — NO sessions lock held here, so it is
+        // safe to call push_scrollback / store (which lock internally).
+        if fell_back && outcome.is_ok() {
+            // Deliver resume_failed through scrollback: the connecting WS replays
+            // scrollback right after ensure_running returns (ws_handler ~line 79),
+            // so this is the path that actually reaches the client (the earlier
+            // broadcast had no subscribers yet).
+            let evt_json = serde_json::json!({
+                "type": "system",
+                "subtype": "resume_failed"
+            })
+            .to_string();
+            self.push_scrollback(id, evt_json);
+            // Clear the stale token in SQLite. Done after phase 3 (not at fallback
+            // time) to keep the SQLite + memory clears adjacent. Residual race: a
+            // fast fresh fan-out may have already backfilled a NEW token into both
+            // memory and SQLite before this line; this clear then wipes SQLite while
+            // memory keeps the new token. Self-heals on next restart (SQLite is
+            // authoritative) and is harmless in-session (the live process is fresh).
+            let _ = self.store.update_resume_token(id, None);
+        }
         outcome
     }
 

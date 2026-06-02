@@ -1,15 +1,17 @@
 import { useState, useEffect, useCallback } from 'react'
 import type { SessionInfo, SessionMetaStatus, NoteEntry } from '../lib/api'
 import { updateSession, listNotes, createNote, deleteNote } from '../lib/api'
-import { ChevronDown, ChevronRight, FileText, StickyNote, GitBranch, X } from 'lucide-react'
+import { ChevronDown, ChevronRight, FileText, StickyNote, GitBranch, X, Activity } from 'lucide-react'
 
 interface Props {
   session: SessionInfo
   onUpdate: (updated: Partial<SessionInfo>) => void
   onToggleFiles: () => void
   onToggleGit: () => void
+  onToggleEvents: () => void
   showFiles: boolean
   showGit: boolean
+  showEvents: boolean
   onOpenSidebar?: () => void
 }
 
@@ -25,7 +27,7 @@ export function StatusDot({ status }: { status: SessionMetaStatus }) {
   return <span className={`inline-block w-2 h-2 rounded-full ${opt?.color || 'bg-gray-400'} shrink-0`} />
 }
 
-export default function SessionInfoBar({ session, onUpdate, onToggleFiles, onToggleGit, showFiles, showGit, onOpenSidebar }: Props) {
+export default function SessionInfoBar({ session, onUpdate, onToggleFiles, onToggleGit, onToggleEvents, showFiles, showGit, showEvents, onOpenSidebar }: Props) {
   const [expanded, setExpanded] = useState(false)
   const [desc, setDesc] = useState(session.description)
   const [notes, setNotes] = useState<NoteEntry[]>([])
@@ -148,6 +150,17 @@ export default function SessionInfoBar({ session, onUpdate, onToggleFiles, onTog
             title="Git history"
           >
             <GitBranch size={14} />
+          </button>
+          <button
+            onClick={onToggleEvents}
+            className={`p-1 rounded transition-colors ${
+              showEvents
+                ? 'text-[var(--accent-blue)] bg-[var(--bg-primary)]'
+                : 'text-[var(--text-secondary)] hover:text-[var(--text-primary)]'
+            }`}
+            title="Agent activity"
+          >
+            <Activity size={14} />
           </button>
         </div>
       </div>

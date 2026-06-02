@@ -4,6 +4,7 @@ mod auth;
 mod aws_sigv4;
 mod db;
 mod event_stream;
+mod events;
 mod logger;
 mod notes;
 mod oauth;
@@ -112,6 +113,7 @@ pub struct AppState {
     pub logger: Option<logger::Logger>,
     pub db: Option<db::Database>,
     pub notes: notes::NotesStore,
+    pub events: Arc<events::EventStore>,
     pub github_client_id: Option<String>,
     pub github_client_secret: Option<String>,
     pub jwt_secret: String,
@@ -205,6 +207,11 @@ async fn main() {
     let notes_store = notes::NotesStore::open(std::path::Path::new(&data_dir_str))
         .expect("Failed to initialize notes store");
 
+    let event_store = Arc::new(
+        events::EventStore::open(std::path::Path::new(&data_dir_str))
+            .expect("Failed to initialize event store"),
+    );
+
     if oauth_configured {
         println!("GitHub OAuth enabled");
     } else {
@@ -212,7 +219,7 @@ async fn main() {
     }
 
     let state = Arc::new(AppState {
-        sessions: session_manager::SessionManager::new(),
+        sessions: session_manager::SessionManager::new(event_store.clone()),
         password_hash,
         shell: args.shell,
         claude_path: args.claude_path,
@@ -225,6 +232,7 @@ async fn main() {
         logger,
         db: database,
         notes: notes_store,
+        events: event_store,
         github_client_id: args.github_client_id,
         github_client_secret: args.github_client_secret,
         jwt_secret,

@@ -38,6 +38,8 @@ pub fn build_router(state: Arc<AppState>) -> Router {
         .route("/api/sessions/{id}/notes", get(list_notes))
         .route("/api/sessions/{id}/notes", post(create_note))
         .route("/api/sessions/{id}/notes/{note_id}", delete(delete_note))
+        .route("/api/events", get(list_events))
+        .route("/api/events/{id}", delete(delete_event))
         .route("/api/directories", get(list_directories))
         .route("/api/tmux/sessions", get(list_tmux_sessions))
         .route("/api/admin/users", get(crate::admin::list_users))
@@ -72,6 +74,10 @@ pub fn build_router(state: Arc<AppState>) -> Router {
         .route("/auth/login", post(legacy_login))
         .route("/auth/mode", get(auth_mode));
 
+    // Events POST — uses token query param auth (like WebSocket) for hook access
+    let events_ingest = Router::new()
+        .route("/api/events", post(create_event));
+
     let ws = Router::new()
         .route(
             "/ws/term/{session_id}",
@@ -89,6 +95,7 @@ pub fn build_router(state: Arc<AppState>) -> Router {
     Router::new()
         .merge(api)
         .merge(me_api)
+        .merge(events_ingest)
         .merge(auth_routes)
         .merge(ws)
         .route("/assets/{*path}", get(serve_asset))
@@ -1101,4 +1108,70 @@ async fn git_show(
         "diff": diff,
         "files": files,
     })))
+}
+
+// ── Agent Events ──
+
+/// POST /api/events — create event (token auth via query param, for hooks)
+async fn create_event(
+    State(state): State<Arc<AppState>>,
+    Query(query): Query<crate::auth::TokenQuery>,
+    Json(req): Json<crate::events::CreateEventReq>,
+) -> Result<(StatusCode, Json<serde_json::Value>), (StatusCode, String)> {
+    // Authenticate via token query param (same scheme as WebSocket upgrades).
+    let authed = query
+        .token
+        .as_ref()
+        .and_then(|t| crate::auth::verify_ws_token(&state, t))
+        .is_some();
+
+    if !authed {
+        return Err((StatusCode::UNAUTHORIZED, "Unauthorized".to_string()));
+    }
+
+    let event = state
+        .events
+        .create(req)
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
+
+    Ok((
+        StatusCode::CREATED,
+        Json(serde_json::json!({
+            "id": event.id,
+            "timestamp": event.timestamp,
+        })),
+    ))
+}
+
+/// GET /api/events — list events (requires auth middleware)
+async fn list_events(
+    State(state): State<Arc<AppState>>,
+    Query(query): Query<crate::events::EventsQuery>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    let events = state
+        .events
+        .list(&query)
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
+
+    Ok(Json(serde_json::json!({
+        "total": events.len(),
+        "events": events,
+    })))
+}
+
+/// DELETE /api/events/{id} — delete single event
+async fn delete_event(
+    State(state): State<Arc<AppState>>,
+    axum::extract::Path(id): axum::extract::Path<String>,
+) -> Result<StatusCode, (StatusCode, String)> {
+    let deleted = state
+        .events
+        .delete_one(&id)
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
+
+    if deleted {
+        Ok(StatusCode::NO_CONTENT)
+    } else {
+        Err((StatusCode::NOT_FOUND, "Event not found".to_string()))
+    }
 }

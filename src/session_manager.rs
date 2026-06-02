@@ -1,7 +1,9 @@
 use std::collections::{HashMap, VecDeque};
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use tokio::sync::{broadcast, mpsc};
+
+use crate::events::{CreateEventReq, EventStore};
 
 /// Max scrollback buffer size in bytes (2MB of encoded data)
 const SCROLLBACK_MAX_BYTES: usize = 2 * 1024 * 1024;
@@ -140,6 +142,9 @@ pub struct Session {
 
 pub struct SessionManager {
     sessions: Mutex<HashMap<String, Session>>,
+    /// Shared event store — agent fan-out tasks auto-log a `task_done` event
+    /// here when their process emits an `AcpEvent::Result`.
+    events: Arc<EventStore>,
 }
 
 #[derive(serde::Serialize)]
@@ -241,9 +246,10 @@ fn resolve_work_dir(work_dir: &str, session_id: &str) -> (PathBuf, Option<PathBu
 }
 
 impl SessionManager {
-    pub fn new() -> Self {
+    pub fn new(events: Arc<EventStore>) -> Self {
         Self {
             sessions: Mutex::new(HashMap::new()),
+            events,
         }
     }
 
@@ -369,7 +375,15 @@ impl SessionManager {
         let sid = id.clone();
 
         // Spawn fan-out task for ACP process
-        spawn_acp_fanout(sid, process, event_tx_clone, input_rx);
+        spawn_acp_fanout(
+            sid,
+            process,
+            event_tx_clone,
+            input_rx,
+            self.events.clone(),
+            "claude-code",
+            effective_dir.to_string_lossy().to_string(),
+        );
 
         let session = Session {
             id: id.clone(),
@@ -422,7 +436,15 @@ impl SessionManager {
         let sid = id.clone();
 
         // Spawn fan-out task for Kiro process
-        spawn_kiro_fanout(sid, process, event_tx_clone, input_rx);
+        spawn_kiro_fanout(
+            sid,
+            process,
+            event_tx_clone,
+            input_rx,
+            self.events.clone(),
+            "kiro",
+            effective_dir.to_string_lossy().to_string(),
+        );
 
         let session = Session {
             id: id.clone(),
@@ -486,7 +508,15 @@ impl SessionManager {
         let sid = id.clone();
 
         // Spawn fan-out task for Codex process
-        spawn_codex_fanout(sid, process, event_tx_clone, input_rx);
+        spawn_codex_fanout(
+            sid,
+            process,
+            event_tx_clone,
+            input_rx,
+            self.events.clone(),
+            "codex",
+            effective_dir.to_string_lossy().to_string(),
+        );
 
         let session = Session {
             id: id.clone(),
@@ -645,11 +675,44 @@ impl SessionManager {
 
 // ── Fan-out tasks for ACP/Kiro processes ──
 
+/// Auto-log a `task_done` agent event when a process reports a turn result.
+///
+/// Called from every agent fan-out task on each emitted `AcpEvent`. Only the
+/// `Result` variant produces an event — all three agents (Claude/Kiro/Codex)
+/// emit `AcpEvent::Result` at end-of-turn, so this is the single common hook
+/// for the activity dashboard. PTY sessions never reach here.
+fn log_result_event(
+    events: &EventStore,
+    agent_label: &'static str,
+    session_id: &str,
+    work_dir: &str,
+    evt: &crate::acp::process::AcpEvent,
+) {
+    use crate::acp::process::AcpEvent;
+    if let AcpEvent::Result { text, cost_usd, .. } = evt {
+        let metadata = cost_usd.map(|c| serde_json::json!({ "cost_usd": c }));
+        let req = CreateEventReq {
+            agent: agent_label.to_string(),
+            event: "task_done".to_string(),
+            summary: Some(crate::events::summarize(text, 200)),
+            session_id: Some(session_id.to_string()),
+            work_dir: Some(work_dir.to_string()),
+            metadata,
+        };
+        if let Err(e) = events.create(req) {
+            tracing::warn!("Failed to auto-log task_done for session {}: {}", session_id, e);
+        }
+    }
+}
+
 fn spawn_acp_fanout(
     sid: String,
     mut process: AcpProcess,
     event_tx: broadcast::Sender<String>,
     mut input_rx: mpsc::Receiver<SessionInput>,
+    events: Arc<EventStore>,
+    agent_label: &'static str,
+    work_dir: String,
 ) {
     tokio::spawn(async move {
         loop {
@@ -657,6 +720,7 @@ fn spawn_acp_fanout(
                 event = process.event_rx.recv() => {
                     match event {
                         Some(evt) => {
+                            log_result_event(&events, agent_label, &sid, &work_dir, &evt);
                             let json = match serde_json::to_string(&evt) {
                                 Ok(j) => j,
                                 Err(_) => continue,
@@ -691,6 +755,9 @@ fn spawn_kiro_fanout(
     mut process: KiroProcess,
     event_tx: broadcast::Sender<String>,
     mut input_rx: mpsc::Receiver<SessionInput>,
+    events: Arc<EventStore>,
+    agent_label: &'static str,
+    work_dir: String,
 ) {
     tokio::spawn(async move {
         loop {
@@ -698,6 +765,7 @@ fn spawn_kiro_fanout(
                 event = process.event_rx.recv() => {
                     match event {
                         Some(evt) => {
+                            log_result_event(&events, agent_label, &sid, &work_dir, &evt);
                             let json = match serde_json::to_string(&evt) {
                                 Ok(j) => j,
                                 Err(_) => continue,
@@ -735,6 +803,9 @@ fn spawn_codex_fanout(
     mut process: crate::acp::codex_process::CodexProcess,
     event_tx: broadcast::Sender<String>,
     mut input_rx: mpsc::Receiver<SessionInput>,
+    events: Arc<EventStore>,
+    agent_label: &'static str,
+    work_dir: String,
 ) {
     tokio::spawn(async move {
         loop {
@@ -742,6 +813,7 @@ fn spawn_codex_fanout(
                 event = process.event_rx.recv() => {
                     match event {
                         Some(evt) => {
+                            log_result_event(&events, agent_label, &sid, &work_dir, &evt);
                             let json = match serde_json::to_string(&evt) {
                                 Ok(j) => j,
                                 Err(_) => continue,

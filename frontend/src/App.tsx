@@ -10,9 +10,10 @@ import WaitingPage from './components/WaitingPage'
 import SessionInfoBar from './components/SessionInfoBar'
 import MarkdownViewer from './components/MarkdownViewer'
 import GitViewer from './components/GitViewer'
+import AgentDashboard from './components/AgentDashboard'
 
 type AuthState = 'loading' | 'unauthenticated' | 'pending' | 'active'
-type OverlayView = 'none' | 'files' | 'git'
+type OverlayView = 'none' | 'files' | 'git' | 'events'
 
 export default function App() {
   const [authState, setAuthState] = useState<AuthState>('loading')
@@ -103,7 +104,7 @@ export default function App() {
     setSessions(prev => prev.map(s => s.id === id ? { ...s, ...updated } : s))
   }, [])
 
-  const toggleOverlay = useCallback((id: string, view: 'files' | 'git') => {
+  const toggleOverlay = useCallback((id: string, view: 'files' | 'git' | 'events') => {
     setOverlay(prev => ({
       ...prev,
       [id]: prev[id] === view ? 'none' : view,
@@ -149,8 +150,10 @@ export default function App() {
             onUpdate={(updated) => handleSessionUpdate(activeSession.id, updated)}
             onToggleFiles={() => toggleOverlay(activeSession.id, 'files')}
             onToggleGit={() => toggleOverlay(activeSession.id, 'git')}
+            onToggleEvents={() => toggleOverlay(activeSession.id, 'events')}
             showFiles={(overlay[activeSession.id] || 'none') === 'files'}
             showGit={(overlay[activeSession.id] || 'none') === 'git'}
+            showEvents={(overlay[activeSession.id] || 'none') === 'events'}
             onOpenSidebar={isMobile && !sidebarOpen ? () => setSidebarOpen(true) : undefined}
           />
         )}
@@ -183,6 +186,7 @@ export default function App() {
                 </div>
                 {view === 'files' && <MarkdownViewer sessionId={s.id} sessionType={s.type} />}
                 {view === 'git' && <GitViewer sessionId={s.id} />}
+                {view === 'events' && <AgentDashboard sessionId={s.id} />}
               </div>
             )
           })}

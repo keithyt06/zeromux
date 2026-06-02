@@ -113,6 +113,12 @@ mod tests {
     }
 
     #[test]
+    fn glob_truncates_pattern() {
+        let input = json!({ "pattern": "**/*.rs" });
+        assert_eq!(format_tool_use("Glob", Some(&input)), Some("**/*.rs".to_string()));
+    }
+
+    #[test]
     fn unknown_tool_returns_none() {
         let input = json!({ "anything": "value" });
         assert_eq!(format_tool_use("mcp__github__create_issue", Some(&input)), None);

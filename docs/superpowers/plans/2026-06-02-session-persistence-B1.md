@@ -905,7 +905,7 @@ async fn concurrent_ensure_running_spawns_once() {
 
 - [ ] **Step 5: 编译 + 测试**
 
-Run: `cargo build 2>&1 | tail -20` → 通过（无 `todo!`）。
+Run: `cargo build 2>&1 | tail -20` → 通过（spawn_running 已完整实现，无未完成桩）。
 Run: `cargo test 2>&1 | tail -15` → 全绿。
 
 - [ ] **Step 6: Commit**
@@ -1086,5 +1086,5 @@ git commit -m "feat(session): Kiro session/load + tmux attach resume + resume_fa
 
 - **Spec 覆盖**：任务 0（spike）→ 第 0 节；Task 1（ResumeToken）→ 第 1 节类型；Task 2（SessionStore）→ 第 2 节持久化；Task 3（解耦模型）→ 第 1 节；Task 4（持久接线+懒装载+fan-out 退出）→ 第 2/3 节；Task 5（ensure_running 并发）→ 第 3 节；Task 6（Claude/Codex resume）+ Task 7（Kiro/tmux + 降级）→ 第 4 节。红线（tmux 存活、worktree 留 Session、std Mutex 不跨 await、Weak 防环、失败降级）分散落实并在对应任务标注。
 - **类型一致**：`ResumeToken`（4 变体）/`PersistedSession`/`RunningProcess`/`SessionStore` 方法名在 Task 1-4 定义、Task 5-7 调用一致；`spawn_<kind>`/`spawn_by_type`/`spawn_running`/`ensure_running` 命名贯穿一致。
-- **无占位符**：Task 5 Step 2 的 `todo!` 在 Step 3 给出真实实现并明确「不要留 todo!」；Spike 结论节是 Task 0 的产出物（设计如此），非代码占位。
+- **无占位符**：Task 5 Step 2 给出 spawn_running 的完整 match 实现（无桩）；Spike 结论节是 Task 0 的产出物（设计如此），非代码占位。
 - **风险标注**：Task 3、Task 5 标为中高风险（核心重组 + 并发）；spike 结论 gate 了 Task 6/7 的 resume 分支。

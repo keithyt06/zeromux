@@ -169,12 +169,14 @@ git add docs/superpowers/plans/2026-06-02-session-persistence-B1.md
 git commit -m "docs(plan): record B-1 resume feasibility spike results" -m "Co-Authored-By: Claude Opus 4.8 (1M context) <noreply@anthropic.com>"
 ```
 
-## Spike 结论
+## Spike 结论（2026-06-02 实测）
 
-> （Task 0 Step 5 填写。格式：）
-> - **Claude**：RESUME_WORKS = ?（True → 用 `--resume`；False → 降级全新 session）
-> - **Kiro**：session/load = ?（result/error），RESUME_WORKS = ?
-> - **Codex**：跨进程 threadId = ?（验证/待运行时验证/降级）
+- **Claude**：✅ **RESUME_WORKS = True**。`claude -p --output-format stream-json --resume <session_id>` 在 fresh 进程中正确回灌上下文（记 42 → 杀进程 → 新进程 --resume → 答 42）。captured session_id 来自事件流的 `session_id` 字段。→ Task 6 按 `--resume` 实现。
+- **Kiro**：✅ **RESUME_WORKS = True**，**但有进程独占锁约束**。`session/load {sessionId, cwd, mcpServers}` 在 fresh 进程中回灌上下文成功。**关键陷阱**：若旧进程未完全退出，`session/load` 报 `-32603 "Session is active in another process (PID …)"`。spike 用 SIGTERM 立即 load 会失败；改为 `kill + wait + sleep 5s` 后成功。
+  - **→ Task 7 实现约束**：resume Kiro 前必须确保旧 RunningProcess 已 drop 且其子进程已退出。zeromux 的 Drop 模型（休眠 = `running=None` → channel 关闭 → fan-out 退出 → `KiroProcess` Drop → `child.start_kill()`）满足这点，但 `ensure_running` 重生 Kiro 时若刚 drop 过，需容忍 `session/load` 的瞬时锁冲突——**实现里 session/load 失败一律走 resume_failed 降级（全新 session），不重试不卡死**。Kiro 的 `~/.kiro/sessions/` 持久化会话历史，session/load 读它。
+- **Codex**：⏳ **待运行时验证**。codex 二进制在 `/usr/bin/codex`（非 `~/.local/bin`）。`codex-reply` 跨进程行为未做独立 spike（MCP 驱动，spike 成本高）。→ Task 6 按「有 threadId 则 codex-reply、失败则 resume_failed 降级」编码，运行时验证。
+
+**总结论**：三后端均按「能 resume 则 resume，任何失败一律 resume_failed 降级为全新 session」实现，绝不卡死。Kiro 尤其依赖降级安全网。
 
 ---
 

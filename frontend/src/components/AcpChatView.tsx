@@ -1,6 +1,6 @@
-import { useState, useEffect, useRef, useCallback, memo, type KeyboardEvent } from 'react'
+import { useState, useEffect, useRef, useCallback, memo, createElement, type KeyboardEvent } from 'react'
 import { wsUrl } from '../lib/api'
-import { Send, ChevronDown, Wrench, Brain, AlertCircle } from 'lucide-react'
+import { Send, ChevronDown, Wrench, Brain, AlertCircle, FileText, Terminal, Search, Bot, type LucideIcon } from 'lucide-react'
 import MarkdownContent from './markdown/MarkdownContent'
 import { MicButton } from './MicButton'
 import { useTranscribe } from '../lib/transcribe'
@@ -30,6 +30,7 @@ interface ContentBlock {
   text?: string
   name?: string
   input?: any
+  summary?: string
 }
 
 // ── Server events ──
@@ -46,6 +47,7 @@ interface ServerEvent {
   message?: string
   code?: number
   streaming?: boolean
+  summary?: string
 }
 
 interface Props {
@@ -148,6 +150,7 @@ export default function AcpChatView({ sessionId, active, agentType = 'claude' }:
               text: evt.text,
               name: evt.name,
               input: evt.input,
+              summary: evt.summary,
             })
           }
           // Mirror onto the ref so subsequent events still see the latest blocks.
@@ -342,6 +345,16 @@ const MessageBubble = memo(
   (prev, next) => prev.msg === next.msg && prev.agentName === next.agentName
 )
 
+// 工具名 → lucide 图标。未知/MCP 工具回落 Wrench。
+const TOOL_ICONS: Record<string, LucideIcon> = {
+  Read: FileText, Edit: FileText, Write: FileText,
+  Bash: Terminal,
+  Grep: Search, Glob: Search,
+  Agent: Bot, Task: Bot,
+}
+const iconFor = (name?: string): LucideIcon =>
+  (name && TOOL_ICONS[name]) || Wrench
+
 function BlockView({ block, isComplete }: { block: ContentBlock; isComplete: boolean }) {
   switch (block.type) {
     case 'text':
@@ -370,16 +383,23 @@ function BlockView({ block, isComplete }: { block: ContentBlock; isComplete: boo
       const truncated = inputStr && inputStr.length > 2000
         ? inputStr.substring(0, 2000) + '\n...(truncated)'
         : inputStr
+      const hasRawInput = !!truncated && truncated !== '{}' && truncated !== 'null'
       return (
         <div className="border-l-2 border-[var(--accent-yellow)] pl-2.5 py-1 text-xs">
           <div className="flex items-center gap-1 text-[var(--accent-yellow)] font-medium">
-            <Wrench size={12} />
+            {createElement(iconFor(block.name), { size: 12 })}
             <span>{block.name || 'tool'}</span>
+            {block.summary && (
+              <span className="text-[var(--text-secondary)] font-normal truncate">· {block.summary}</span>
+            )}
           </div>
-          {truncated && truncated !== '{}' && truncated !== 'null' && (
-            <pre className="mt-1 text-[11px] text-[var(--text-secondary)] whitespace-pre-wrap break-words bg-[var(--bg-secondary)] rounded p-2 border border-[var(--border)] overflow-x-auto">
-              {truncated}
-            </pre>
+          {hasRawInput && (
+            <details className="mt-1">
+              <summary className="cursor-pointer text-[10px] text-[var(--text-muted)] select-none">input</summary>
+              <pre className="mt-1 text-[11px] text-[var(--text-secondary)] whitespace-pre-wrap break-words bg-[var(--bg-secondary)] rounded p-2 border border-[var(--border)] overflow-x-auto">
+                {truncated}
+              </pre>
+            </details>
           )}
         </div>
       )

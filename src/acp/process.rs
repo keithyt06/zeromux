@@ -19,11 +19,17 @@ pub type StaticOrOwnedStr = std::borrow::Cow<'static, str>;
 #[derive(Debug, Clone, Serialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum AcpEvent {
+    /// 会话/进程生命周期信号（init、session_id 等）。前端渲染为一行
+    /// 灰色 system 文本，不进入助手消息气泡。
     System {
         subtype: StaticOrOwnedStr,
         #[serde(skip_serializing_if = "Option::is_none")]
         session_id: Option<String>,
     },
+    /// 助手输出的一个内容块。`block_type` 决定渲染方式：
+    /// - "text"：正文 markdown；`streaming:true` 的连续块前端合并为一段。
+    /// - "thinking"：推理痕迹，渲染为可折叠区；流式块合并，turn 结束折叠。
+    /// - "tool_use"：工具调用，显示 `name · summary` + 图标，原始 `input` 折叠。
     ContentBlock {
         block_type: StaticOrOwnedStr,
         #[serde(skip_serializing_if = "Option::is_none")]
@@ -40,15 +46,22 @@ pub enum AcpEvent {
         #[serde(skip_serializing_if = "Option::is_none")]
         summary: Option<String>,
     },
+    /// turn 结束信号。`text` **始终携带完整最终文本**；但前端仅在本轮未通过
+    /// 任何 `ContentBlock{block_type:"text"}` 流式呈现过正文时，才将其渲染为
+    /// 最终文本块（见 AcpChatView result 门控）。这避免流式后重复渲染，同时
+    /// 让 Codex 非流式（Bedrock thinking 一次性返回）的正文仍能显示。
+    /// `text` 始终完整也保证 session_manager::log_result_event 的活动摘要可用。
     Result {
         text: String,
         session_id: String,
         #[serde(skip_serializing_if = "Option::is_none")]
         cost_usd: Option<f64>,
     },
+    /// 错误信息，渲染为红框气泡，并标记当前助手消息为完成。
     Error {
         message: String,
     },
+    /// 进程退出，渲染为 system 文本并结束 busy 状态。
     Exit {
         code: i32,
     },

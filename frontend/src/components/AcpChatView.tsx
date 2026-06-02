@@ -171,16 +171,13 @@ export default function AcpChatView({ sessionId, active, agentType = 'claude' }:
           const finalText = (evt.text || '').trim()
           setMessages(prev => prev.map(m => {
             if (!(m.kind === 'assistant' && m.id === activeId)) return m
-            // Codex with Bedrock thinking returns the answer in a single
-            // batch instead of agent_message_content_delta chunks. In that
-            // case `m.blocks` has no `text`-type entries (only thinking,
-            // maybe tool_use). Promote the result's text into a final
-            // text block so the answer actually renders.
-            //
-            // We MUST NOT inject when streaming text already arrived, even
-            // if the strings differ slightly (Codex re-formats whitespace
-            // server-side). Bit-equality comparison was a duplicate-render
-            // hazard. Use "any text block already exists" as the gate.
+            // 协议契约（见后端 AcpEvent::Result doc）：result.text 始终是
+            // 完整最终文本，但本轮若已通过流式 text ContentBlock 呈现过正文，
+            // 就不能再注入 result.text（否则重复渲染）。判据：blocks 里是否已
+            // 存在非空 text block。
+            // - Codex/Kiro 流式：已有 text block → 不注入。
+            // - Codex 非流式（Bedrock thinking 一次性返回）：无 text block → 注入。
+            // - Claude：assistant text block 已渲染 → 不注入。
             const hasStreamedText = m.blocks.some(
               b => b.type === 'text' && (b.text || '').length > 0,
             )

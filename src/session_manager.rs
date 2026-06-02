@@ -147,11 +147,9 @@ pub struct Session {
     pub owner_id: String,
     pub description: String,
     pub status: SessionMeta,
-    #[allow(dead_code)]
     resume_token: Option<ResumeToken>,
     /// Git worktree path for ACP sessions (cleaned up on delete)
     worktree_path: Option<PathBuf>,
-    #[allow(dead_code)]
     created_ms: i64,
     /// 并发重生互斥（仅锁内访问，Task 5 使用）。
     #[allow(dead_code)]
@@ -379,12 +377,7 @@ impl SessionManager {
             }
             // Fan-out exiting: keep session metadata, clear running state so it
             // can be respawned from its resume_token (Task 5+).
-            if let Some(mgr) = mgr_weak.upgrade() {
-                if let Some(s) = mgr.sessions.lock().unwrap().get_mut(&sid_for_exit) {
-                    s.running = None;
-                    s.status = SessionMeta::Idle;
-                }
-            }
+            mark_fanout_ended(&mgr_weak, &sid_for_exit);
         });
 
         let session = Session {

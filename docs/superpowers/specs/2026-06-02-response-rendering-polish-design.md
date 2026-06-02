@@ -14,7 +14,7 @@
 
 1. **工具调用单行摘要**（后端统一生成）
 2. **thinking 折叠 + 流式合并**（前端）
-3. **result 流式/非流式契约**（后端为主）
+3. **result 重复渲染契约**（协议文档化 + 现有前端门控）
 4. **渲染语义单一文档真相源**（enum doc 注释 + 前端 default 兜底）
 
 ## 设计原则（遵循仓库 CLAUDE.md 的 Karpathy 规则）
@@ -37,7 +37,7 @@
 pub fn format_tool_use(name: &str, input: Option<&serde_json::Value>) -> String
 ```
 
-只产出**纯文字**，不带 emoji——图标交由前端现有 lucide 体系（`Wrench` 等）按 `name` 选择，与 zeromux UI 语言一致。
+只产出**纯文字**，不带 emoji——图标交由前端 lucide 体系按 `name` 选择（见改动点 2），与 zeromux UI 语言一致。
 
 | 工具 | 读取字段 | 摘要输出 |
 |---|---|---|
@@ -76,60 +76,46 @@ ContentBlock {
 
 ---
 
-## 改动点 2：thinking 折叠 + 流式合并（前端）
+## 改动点 2：thinking 折叠 + 流式合并 + 工具图标（前端）
 
 后端无改动——三后端已发 `ContentBlock { block_type: "thinking", streaming }`。
 
-`frontend/src/components/AcpChatView.tsx` 两处：
+`frontend/src/components/AcpChatView.tsx` 三处：
 
-1. **流式合并**：`handleEvent` 的 `content_block` case 现仅对 `block_type === 'text'` 做"追加到末尾同类型 block"（约 `:141`）。扩展条件，让 `'thinking'` 也走同一合并路径——连续 streaming thinking chunk 追加进同一 thinking block，避免 Codex/Kiro 逐字 reasoning 炸出几百个 `<details>`。
+1. **thinking 流式合并**：`handleEvent` 的 `content_block` case 现仅对 `block_type === 'text'` 做"追加到末尾同类型 block"（约 `:141`）。扩展条件，让 `'thinking'` 也走同一合并路径——连续 streaming thinking chunk 追加进同一 thinking block，避免 Codex/Kiro 逐字 reasoning 炸出几百个 `<details>`。
+   - **说明**：Claude 的 thinking 是整块 assistant block（不带 `streaming` 标记），每条 message 一个 thinking block，本就不触发合并；此改动只对 Codex/Kiro 的逐字 reasoning 生效。
 
 2. **结束自动折叠**：`BlockView` 的 thinking case（约 `:354`）已是 `<details>`。改为 `<details open={!isComplete}>`——turn 进行中展开（看实时思考），turn 完成自动收起，主视图回归干练。
 
+3. **工具图标 per-tool 映射**：`BlockView` 的 tool_use case 现固定用 `Wrench`（`:377`）。加一张 `name → lucide 图标` 的小映射表，未知工具回落 `Wrench`：
+
+   | 工具 | lucide 图标 |
+   |---|---|
+   | Read / Edit / Write | `FileText` |
+   | Bash | `Terminal` |
+   | Grep / Glob | `Search` |
+   | Agent / Task | `Bot` |
+   | 其余（含 MCP） | `Wrench`（兜底） |
+
+   映射表定义为模块级常量（`Record<string, LucideIcon>`），渲染时 `iconFor(block.name)`。配合改动点 1 的文字摘要，达到 naozhi emoji 区分的效果但保持 lucide 体系一致。
+
 ---
 
-## 改动点 3：result 流式/非流式契约
+## 改动点 3：result 重复渲染契约（协议文档化）
 
-**原则**：result 事件**始终携带完整 text**，但新增 `streamed: bool` 显式告知前端"正文是否已通过流式 ContentBlock 发过"。前端据此决定是否注入最终文本块，不再用启发式猜测。
+**背景（review 修订）**：早先方案打算给 `AcpEvent::Result` 加 `streamed: bool` 标志告知前端"正文是否已流式发过"。Review 发现这是过度设计：
 
-### `AcpEvent::Result` 新增字段
+- 前端现有的 `hasStreamedText` 门控（`AcpChatView.tsx:176-187`，是之前修重复渲染 bug 留下的）**已经正确覆盖所有情况**，判据是"blocks 里是否已有非空 text block"——流式文本已到则不注入、Codex Bedrock 无 delta 则注入、Claude 仅 result 有文本则注入，全部正确。
+- `streamed` 标志语义等价于 `hasStreamedText`，却引入两个新问题：① **Claude 无法准确设标志**——`translate_event` 逐行无状态，无法跨行知道"本轮发过 text block 没"；固定 `streamed: true` 会在"正文只在 result"的边缘情况下让前端漏渲染、丢答案。② 平添协议字段 + 跨后端状态追踪，违反仓库"simplicity first"。
+- 逐一比对所有边缘（流式截断、result 重格式化、Bedrock 一次性返回），`streamed` 标志相比现有门控**无任何一处更优**。
 
-```rust
-Result {
-    text: String,
-    session_id: String,
-    cost_usd: Option<f64>,
-    /// true = 正文已通过流式 ContentBlock 逐块发出（前端应忽略 text，
-    /// 只取 cost/收尾）；false = 正文仅在此 Result 中（非流式一次性返回，
-    /// 前端需把 text 渲染为最终文本块）。
-    streamed: bool,
-}
-```
+**结论**：不加标志，不改协议结构。改为：
 
-### 各后端如何设置 `streamed`
+1. **现有门控保留为唯一权威判据**。`AcpEvent::Result` 结构不变（`text` 始终是完整最终文本）。`log_result_event`（`session_manager.rs:648`）**零改动**，dashboard `task_done` 摘要照常工作。
+2. **协议文档化**：在 `AcpEvent::Result` 的 doc 注释里写清契约——"`text` 始终携带完整最终文本；前端仅在本轮未通过 ContentBlock 流式呈现过正文时，才将其渲染为最终文本块（见 `AcpChatView` result 门控）"。把这条隐式约定升级为成文契约（呼应改动点 4）。
+3. **前端注释更新**：`AcpChatView.tsx` result case 的门控逻辑不变，仅更新注释，明确它是依据上述协议契约的权威判据，而非"启发式猜测"。
 
-- **Codex** `codex_process.rs`：event loop 加局部标志 `streamed_text: bool`。进入 `Cmd::Prompt` 时复位为 `false`；每次发 `Notify::ProgressText`（即 `agent_message_content_delta`）时置 `true`。构造 `Result` 时 `streamed: streamed_text`。
-  - 流式模型 → `true`（delta 已发过文本）。
-  - Bedrock thinking 一次性返回 → `false`（无 delta，正文只在 tool 结果里）。
-  - **注意**：`Notify::Reasoning`（thinking）**不**置 `streamed_text`——reasoning 不是正文，置 true 会误判。
-- **Kiro** `kiro_process.rs`：每个 `agent_message_chunk` 已发 streaming ContentBlock 并累积进 `pending_text`。turn 结束构造 `Result` 时 `streamed: !pending_text.is_empty()`。`pending_text` 仍照常填入 `Result.text`（供日志），但前端会因 `streamed=true` 忽略它。
-- **Claude** `process.rs`：assistant text block 已渲染正文，`result` 事件的 text 与之重复。固定 `streamed: true`（assistant 文本已发）。
-
-### 为什么"保留 text + 标志位"而非"置空 text"
-
-- `log_result_event`（`session_manager.rs:648`）用 `Result.text` 生成 dashboard `task_done` 摘要。置空会让摘要变空；要既 log 完整文本又发空给前端，得在 fan-out 里 clone-and-mutate `AcpEvent`，破坏"翻译一次"的干净模型。
-- 保留 text 后 `log_result_event` **零改动**，语义从前端"猜"变成后端"显式告知"。代价仅 scrollback 多存一份已流式文本（每 turn 几百字～数 KB，可接受）。
-
-### 前端简化（`AcpChatView.tsx` result case，约 `:163`）
-
-```
-注入条件：finalText 非空 && !evt.streamed && blocks 里无 text block
-```
-保留"blocks 里无 text block"作纯防御兜底；主判据改为后端的 `streamed` 标志。更新注释说明契约。
-
-### 测试
-
-Codex 的 `streamed_text` 标志复位/置位时机加单测：流式 delta → `streamed=true`；只有 reasoning 无 delta → `streamed=false`；新 Prompt 复位。
+本改动点因此**不碰任何后端逻辑**，归入改动点 4 的"渲染语义文档化"，无独立代码改动与新增测试。
 
 ---
 
@@ -137,7 +123,7 @@ Codex 的 `streamed_text` 标志复位/置位时机加单测：流式 delta → 
 
 不引入新机制。做两件事：
 
-1. 在 `src/acp/process.rs` 的 `AcpEvent` enum 上，为每个变体补 doc 注释，写清**前端渲染语义**（是否渲染气泡、text 字段何时有效、streaming/streamed 含义）。enum 定义成为唯一权威说明。
+1. 在 `src/acp/process.rs` 的 `AcpEvent` enum 上，为每个变体补 doc 注释，写清**前端渲染语义**（是否渲染气泡、`text` 字段何时有效、`streaming` 含义、`Result.text` 的重复渲染契约见改动点 3）。enum 定义成为唯一权威说明。
 2. 前端 `BlockView` 保留 `default: return null`、`handleEvent` 保留对未知 `type` 的忽略——后端新增 block_type/event 时优雅降级，无需同步改动即不崩。
 
 附带 UX 改进：工具摘要显示后，原始 JSON input **不删除**，收进默认折叠的 `<details>`（复用现有 `<pre>`，默认 collapsed）。默认视图干练，debug 时可展开看完整参数——比 naozhi 直接丢弃 input 更适合开发者场景。
@@ -150,12 +136,12 @@ Codex 的 `streamed_text` 标志复位/置位时机加单测：流式 delta → 
 agent CLI/进程
   → *_process.rs 归一化为 AcpEvent
       · tool_use ContentBlock 经 format::format_tool_use 填 summary
-      · Result 带 streamed 标志（text 始终完整）
-  → fan-out task：log_result_event（用完整 text）→ 序列化 → broadcast
+      · Result.text 始终完整（结构不变）
+  → fan-out task：log_result_event（用完整 text，零改动）→ 序列化 → broadcast
   → /ws/acp/{id} → 前端 AcpChatView
-      · tool_use：显示 summary + lucide 图标，原始 input 折叠
+      · tool_use：显示 summary + per-tool lucide 图标，原始 input 折叠
       · thinking：流式合并进单块，isComplete 后自动折叠
-      · result：streamed=true 忽略 text，false 注入最终文本块
+      · result：现有 hasStreamedText 门控——blocks 无 text block 时才注入 text
 ```
 
 ## 影响面 / 风险
@@ -163,16 +149,16 @@ agent CLI/进程
 | 改动 | 文件 | 风险 |
 |---|---|---|
 | `format.rs` 新模块 + 纯函数 | 新增 `src/acp/format.rs`，`src/acp/mod.rs` 注册 | 低（纯函数 + 单测） |
-| `ContentBlock.summary` 字段 | `process.rs` + 三后端填充 | 低（新增 optional 字段，序列化跳过 None） |
-| thinking 合并/折叠 | `AcpChatView.tsx` | 低（纯前端） |
-| `Result.streamed` 字段 + 各后端逻辑 | `process.rs` / `codex_process.rs` / `kiro_process.rs` + 前端 result case | **中**（Codex 标志时机；有单测兜底） |
+| `ContentBlock.summary` 字段 | `process.rs` + Claude/Kiro 填充（Codex 无 tool_use ContentBlock） | 低（新增 optional 字段，序列化跳过 None） |
+| thinking 合并/折叠 + 工具图标映射 | `AcpChatView.tsx` | 低（纯前端） |
+| result 契约文档化（无逻辑改动） | `process.rs` enum 注释 + `AcpChatView.tsx` 注释 | 低（仅注释，逻辑不变） |
 | enum doc + 折叠 input | `process.rs` 注释 + `AcpChatView.tsx` | 低 |
 
-不碰：`session_manager.rs` fan-out 结构、Drop 清理、`SessionInput` 路由、scrollback 机制、auth、worktree。
+不碰：`session_manager.rs` fan-out 结构与 `log_result_event`、Drop 清理、`SessionInput` 路由、scrollback 机制、auth、worktree、`AcpEvent::Result` 结构。
 
 ## 验证标准
 
-- `cargo test` 通过（含新 `format.rs` 单测、Codex `streamed` 单测）。
+- `cargo test` 通过（含新 `format.rs` 单测）。
 - `cargo build` 通过；`cd frontend && npm run build && npm run lint` 通过。
-- 手动：Claude/Kiro 会话发一条触发工具调用的 prompt，工具行显示一行摘要（非原始 JSON），原始 input 可展开；thinking 流式时展开、结束折叠；最终回复不重复渲染。
-- Codex 非流式（若可复现 Bedrock thinking）：最终文本正常渲染一次。
+- 手动：Claude/Kiro 会话发一条触发工具调用的 prompt，工具行显示一行摘要（非原始 JSON）+ per-tool 图标，原始 input 可展开；thinking 流式时展开、结束折叠；最终回复不重复渲染。
+- Codex 非流式（若可复现 Bedrock thinking）：最终文本经现有 `hasStreamedText` 门控正常渲染一次。

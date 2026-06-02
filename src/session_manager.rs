@@ -39,7 +39,7 @@ impl std::fmt::Display for SessionMeta {
     }
 }
 
-#[derive(Clone, Copy, PartialEq, serde::Serialize, serde::Deserialize)]
+#[derive(Clone, Copy, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum SessionType {
     Tmux,
@@ -55,6 +55,18 @@ impl std::fmt::Display for SessionType {
             SessionType::Claude => write!(f, "claude"),
             SessionType::Kiro => write!(f, "kiro"),
             SessionType::Codex => write!(f, "codex"),
+        }
+    }
+}
+
+impl SessionType {
+    /// 从持久化字符串还原；未知值回落 Tmux（最保守，PTY 无 resume 副作用）。
+    pub fn from_str_lenient(s: &str) -> Self {
+        match s {
+            "claude" => SessionType::Claude,
+            "kiro" => SessionType::Kiro,
+            "codex" => SessionType::Codex,
+            _ => SessionType::Tmux,
         }
     }
 }

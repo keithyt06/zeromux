@@ -59,6 +59,38 @@ impl std::fmt::Display for SessionType {
     }
 }
 
+/// 跨进程恢复会话上下文的令牌，按后端区分。持久化为 (kind, value) 两列。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ResumeToken {
+    Claude(String), // --resume <session_id>
+    Kiro(String),   // session/load <sessionId>
+    Codex(String),  // codex-reply threadId
+    Tmux(String),   // tmux attach -t <target>
+}
+
+impl ResumeToken {
+    /// 拆成持久化用的 (kind, value)。
+    pub fn to_kind_value(&self) -> (&'static str, String) {
+        match self {
+            ResumeToken::Claude(v) => ("claude", v.clone()),
+            ResumeToken::Kiro(v) => ("kiro", v.clone()),
+            ResumeToken::Codex(v) => ("codex", v.clone()),
+            ResumeToken::Tmux(v) => ("tmux", v.clone()),
+        }
+    }
+
+    /// 从持久化的 (kind, value) 还原。未知 kind 返回 None。
+    pub fn from_kind_value(kind: &str, value: &str) -> Option<Self> {
+        match kind {
+            "claude" => Some(ResumeToken::Claude(value.to_string())),
+            "kiro" => Some(ResumeToken::Kiro(value.to_string())),
+            "codex" => Some(ResumeToken::Codex(value.to_string())),
+            "tmux" => Some(ResumeToken::Tmux(value.to_string())),
+            _ => None,
+        }
+    }
+}
+
 /// Input commands from WS clients to the session process
 pub enum SessionInput {
     /// PTY: raw bytes (base64-decoded by WS handler)
@@ -727,4 +759,30 @@ fn spawn_codex_fanout(
         }
         tracing::info!("Codex fan-out task ended for session {}", sid);
     });
+}
+
+#[cfg(test)]
+mod resume_token_tests {
+    use super::ResumeToken;
+
+    #[test]
+    fn roundtrip_all_variants() {
+        let cases = [
+            (ResumeToken::Claude("sid-1".into()), ("claude", "sid-1")),
+            (ResumeToken::Kiro("k-2".into()), ("kiro", "k-2")),
+            (ResumeToken::Codex("t-3".into()), ("codex", "t-3")),
+            (ResumeToken::Tmux("work".into()), ("tmux", "work")),
+        ];
+        for (token, (kind, val)) in cases {
+            let (k, v) = token.to_kind_value();
+            assert_eq!((k, v.as_str()), (kind, val));
+            let back = ResumeToken::from_kind_value(kind, val).unwrap();
+            assert_eq!(back, token);
+        }
+    }
+
+    #[test]
+    fn from_unknown_kind_is_none() {
+        assert!(ResumeToken::from_kind_value("bogus", "x").is_none());
+    }
 }

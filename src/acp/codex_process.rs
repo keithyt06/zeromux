@@ -262,6 +262,7 @@ impl CodexProcess {
         codex_path: &str,
         work_dir: &str,
         reasoning_effort: Option<String>,
+        resume_thread: Option<String>,
     ) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
         let mut cmd = Command::new(codex_path);
         cmd.arg("mcp-server");
@@ -304,6 +305,7 @@ impl CodexProcess {
                     event_tx,
                     work_dir_owned,
                     reasoning_effort,
+                    resume_thread,
                 )),
             )
             .await;
@@ -355,11 +357,12 @@ async fn run_event_loop(
     event_tx: mpsc::Sender<AcpEvent>,
     work_dir: String,
     reasoning_effort: Option<String>,
+    resume_thread: Option<String>,
 ) {
     use rmcp::model::CallToolRequestParams;
     use serde_json::json;
 
-    let mut thread_id: Option<String> = None;
+    let mut thread_id: Option<String> = resume_thread;
 
     loop {
         tokio::select! {

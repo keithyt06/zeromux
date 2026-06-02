@@ -13,7 +13,7 @@ const SCROLLBACK_MAX_BYTES: usize = 2 * 1024 * 1024;
 const BROADCAST_CAPACITY: usize = 512;
 
 use crate::acp::kiro_process::KiroProcess;
-use crate::acp::process::AcpProcess;
+use crate::acp::process::{AcpEvent, AcpProcess};
 use crate::pty_bridge::PtyHandle;
 
 #[derive(Clone, Copy, PartialEq, serde::Serialize, serde::Deserialize)]
@@ -513,9 +513,9 @@ impl SessionManager {
         &self,
         id: &str,
         work_dir: &str,
-        _resume: Option<&str>,
+        resume: Option<&str>,
     ) -> Result<RunningProcess, String> {
-        let process = AcpProcess::spawn(&self.claude_path, work_dir)
+        let process = AcpProcess::spawn(&self.claude_path, work_dir, resume)
             .await
             .map_err(|e| format!("Failed to spawn Claude: {}", e))?;
 
@@ -674,7 +674,7 @@ impl SessionManager {
         &self,
         id: &str,
         work_dir: &str,
-        _resume: Option<String>,
+        resume: Option<String>,
     ) -> Result<RunningProcess, String> {
         let reasoning = if self.codex_reasoning.is_empty() || self.codex_reasoning == "off" {
             None
@@ -686,6 +686,7 @@ impl SessionManager {
             &self.codex_path,
             work_dir,
             reasoning,
+            resume,
         )
         .await
         .map_err(|e| format!("Failed to spawn Codex: {}", e))?;
@@ -774,7 +775,7 @@ impl SessionManager {
         };
 
         // 别人在 spawn：锁外轮询等待 running 出现（最多 ~30s）。
-        let Some(SpawnPlan { stype, resume_token: _token, work_dir, cols, rows }) = plan else {
+        let Some(SpawnPlan { stype, resume_token: token, work_dir, cols, rows }) = plan else {
             for _ in 0..300 {
                 tokio::time::sleep(std::time::Duration::from_millis(100)).await;
                 let map = self.sessions.lock().unwrap();
@@ -798,11 +799,23 @@ impl SessionManager {
             armed: true,
         };
 
-        // 阶段 2：锁外 await spawn（Task 5：忽略 token，全新）。
+        // 阶段 2：锁外 await spawn（Task 6：按 backend 传入 stored ResumeToken）。
         let result = match stype {
-            SessionType::Claude => self.spawn_claude(id, &work_dir, None).await,
+            SessionType::Claude => {
+                let r = match &token {
+                    Some(ResumeToken::Claude(s)) => Some(s.as_str()),
+                    _ => None,
+                };
+                self.spawn_claude(id, &work_dir, r).await
+            }
             SessionType::Kiro => self.spawn_kiro(id, &work_dir, None).await,
-            SessionType::Codex => self.spawn_codex(id, &work_dir, None).await,
+            SessionType::Codex => {
+                let r = match &token {
+                    Some(ResumeToken::Codex(t)) => Some(t.clone()),
+                    _ => None,
+                };
+                self.spawn_codex(id, &work_dir, r).await
+            }
             SessionType::Tmux => self.spawn_tmux(id, &work_dir, cols, rows, None),
         };
 
@@ -1093,6 +1106,23 @@ fn mark_fanout_ended(mgr: &Weak<SessionManager>, sid: &str) {
     }
 }
 
+/// Extract Claude's backend session_id from an id-bearing event, for resume backfill.
+fn claude_session_id(evt: &AcpEvent) -> Option<String> {
+    match evt {
+        AcpEvent::System { session_id: Some(s), .. } => Some(s.clone()),
+        AcpEvent::Result { session_id, .. } if !session_id.is_empty() => Some(session_id.clone()),
+        _ => None,
+    }
+}
+
+/// Extract Codex's threadId from an id-bearing event, for resume backfill.
+fn codex_thread_id(evt: &AcpEvent) -> Option<String> {
+    match evt {
+        AcpEvent::Result { session_id, .. } if !session_id.is_empty() => Some(session_id.clone()),
+        _ => None,
+    }
+}
+
 fn spawn_acp_fanout(
     sid: String,
     mut process: AcpProcess,
@@ -1104,12 +1134,22 @@ fn spawn_acp_fanout(
     mgr: Weak<SessionManager>,
 ) {
     tokio::spawn(async move {
+        let mut token_saved = false;
         loop {
             tokio::select! {
                 event = process.event_rx.recv() => {
                     match event {
                         Some(evt) => {
                             log_result_event(&events, agent_label, &sid, &work_dir, &evt);
+                            // Backfill Claude resume token on first id-bearing event.
+                            if !token_saved {
+                                if let Some(sid_val) = claude_session_id(&evt) {
+                                    if let Some(m) = mgr.upgrade() {
+                                        m.set_resume_token(&sid, ResumeToken::Claude(sid_val));
+                                    }
+                                    token_saved = true;
+                                }
+                            }
                             let json = match serde_json::to_string(&evt) {
                                 Ok(j) => j,
                                 Err(_) => continue,
@@ -1201,12 +1241,22 @@ fn spawn_codex_fanout(
     mgr: Weak<SessionManager>,
 ) {
     tokio::spawn(async move {
+        let mut token_saved = false;
         loop {
             tokio::select! {
                 event = process.event_rx.recv() => {
                     match event {
                         Some(evt) => {
                             log_result_event(&events, agent_label, &sid, &work_dir, &evt);
+                            // Backfill Codex resume token (threadId) on first id-bearing event.
+                            if !token_saved {
+                                if let Some(tid) = codex_thread_id(&evt) {
+                                    if let Some(m) = mgr.upgrade() {
+                                        m.set_resume_token(&sid, ResumeToken::Codex(tid));
+                                    }
+                                    token_saved = true;
+                                }
+                            }
                             let json = match serde_json::to_string(&evt) {
                                 Ok(j) => j,
                                 Err(_) => continue,

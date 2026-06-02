@@ -84,15 +84,21 @@ impl AcpProcess {
     pub async fn spawn(
         claude_path: &str,
         work_dir: &str,
+        resume: Option<&str>,
     ) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
+        let mut args: Vec<String> = vec![
+            "-p".into(),
+            "--output-format".into(), "stream-json".into(),
+            "--input-format".into(), "stream-json".into(),
+            "--verbose".into(),
+            "--dangerously-skip-permissions".into(),
+        ];
+        if let Some(sid) = resume {
+            args.push("--resume".into());
+            args.push(sid.to_string());
+        }
         let mut child = tokio::process::Command::new(claude_path)
-            .args([
-                "-p",
-                "--output-format", "stream-json",
-                "--input-format", "stream-json",
-                "--verbose",
-                "--dangerously-skip-permissions",
-            ])
+            .args(&args)
             .current_dir(work_dir)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())

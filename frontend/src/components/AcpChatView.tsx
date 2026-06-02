@@ -140,8 +140,9 @@ export default function AcpChatView({ sessionId, active, agentType = 'claude' }:
         setMessages(prev => prev.map(m => {
           if (m.kind !== 'assistant' || m.id !== activeId) return m   // reference stable, memo skips
           const blocks = [...m.blocks]
-          if (evt.streaming && evt.block_type === 'text' && blocks.length > 0
-              && blocks[blocks.length - 1].type === 'text') {
+          const mergeable = evt.block_type === 'text' || evt.block_type === 'thinking'
+          if (evt.streaming && mergeable && blocks.length > 0
+              && blocks[blocks.length - 1].type === evt.block_type) {
             const last = blocks[blocks.length - 1]
             blocks[blocks.length - 1] = { ...last, text: (last.text || '') + delta }
           } else {
@@ -366,7 +367,7 @@ function BlockView({ block, isComplete }: { block: ContentBlock; isComplete: boo
 
     case 'thinking':
       return (
-        <details className="border-l-2 border-[var(--accent-purple-dim)] pl-2.5 text-xs text-[var(--accent-purple-text)]">
+        <details open={!isComplete} className="border-l-2 border-[var(--accent-purple-dim)] pl-2.5 text-xs text-[var(--accent-purple-text)]">
           <summary className="cursor-pointer text-[var(--accent-purple-dim)] font-medium flex items-center gap-1 select-none">
             <Brain size={12} />
             <span>thinking...</span>

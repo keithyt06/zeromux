@@ -34,6 +34,11 @@ pub enum AcpEvent {
         input: Option<serde_json::Value>,
         #[serde(skip_serializing_if = "Option::is_none")]
         streaming: Option<bool>,
+        /// 仅 tool_use 类型填充：`format::format_tool_use` 生成的一行细节
+        /// 摘要（如 `src/main.rs`、`git status`）。前端显示为 `name · summary`。
+        /// text/thinking block 及无可提取细节的工具为 None。
+        #[serde(skip_serializing_if = "Option::is_none")]
+        summary: Option<String>,
     },
     Result {
         text: String,
@@ -201,12 +206,21 @@ fn translate_event(val: &serde_json::Value) -> Vec<AcpEvent> {
                     } else {
                         b.get("text").and_then(|v| v.as_str()).map(String::from)
                     };
+                    let summary = if block_type == "tool_use" {
+                        crate::acp::format::format_tool_use(
+                            b.get("name").and_then(|v| v.as_str()).unwrap_or(""),
+                            b.get("input"),
+                        )
+                    } else {
+                        None
+                    };
                     AcpEvent::ContentBlock {
                         block_type,
                         text,
                         name: b.get("name").and_then(|v| v.as_str()).map(String::from),
                         input: b.get("input").cloned(),
                         streaming: None,
+                        summary,
                     }
                 })
                 .collect()

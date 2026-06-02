@@ -485,6 +485,7 @@ async fn run_event_loop(
                                                     name: None,
                                                     input: None,
                                                     streaming: Some(true),
+                                                    summary: None,
                                                 })
                                                 .await;
                                         }
@@ -501,6 +502,7 @@ async fn run_event_loop(
                                                     name: None,
                                                     input: None,
                                                     streaming: Some(true),
+                                                    summary: None,
                                                 })
                                                 .await;
                                         }

@@ -365,6 +365,7 @@ fn parse_session_update(
                     name: None,
                     input: None,
                     streaming: Some(true),
+                    summary: None,
                 }]
             } else {
                 vec![]
@@ -386,6 +387,7 @@ fn parse_session_update(
                     name: None,
                     input: None,
                     streaming: Some(true),
+                    summary: None,
                 }]
             } else {
                 vec![]
@@ -403,6 +405,7 @@ fn parse_session_update(
                 name: Some(title),
                 input: None,
                 streaming: None,
+                summary: None,
             }]
         }
         "tool_call_update" => vec![],

@@ -224,7 +224,15 @@ async fn main() {
     }
 
     let state = Arc::new(AppState {
-        sessions: session_manager::SessionManager::new(event_store.clone(), session_store.clone()),
+        sessions: session_manager::SessionManager::new(
+            event_store.clone(),
+            session_store.clone(),
+            args.claude_path.clone(),
+            args.kiro_path.clone(),
+            args.codex_path.clone(),
+            args.codex_reasoning.clone(),
+            args.shell.clone(),
+        ),
         password_hash,
         shell: args.shell,
         claude_path: args.claude_path,

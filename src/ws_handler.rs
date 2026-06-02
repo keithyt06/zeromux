@@ -49,6 +49,11 @@ pub async fn ws_terminal(
 }
 
 async fn handle_ws(socket: WebSocket, session_id: String, state: Arc<AppState>) {
+    // Respawn the session if it's not running (e.g. after a server restart).
+    if let Err(e) = state.sessions.ensure_running(&session_id).await {
+        tracing::error!("ensure_running failed for {}: {}", session_id, e);
+        return;
+    }
     // Subscribe to broadcast (multi-client safe)
     let mut event_rx = match state.sessions.subscribe(&session_id) {
         Some(rx) => rx,

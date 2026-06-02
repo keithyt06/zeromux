@@ -151,8 +151,7 @@ pub struct Session {
     /// Git worktree path for ACP sessions (cleaned up on delete)
     worktree_path: Option<PathBuf>,
     created_ms: i64,
-    /// 并发重生互斥（仅锁内访问，Task 5 使用）。
-    #[allow(dead_code)]
+    /// 并发重生互斥（仅锁内访问）。
     spawning: bool,
     /// 运行态；None = 未运行（可按 resume_token 重生）。
     running: Option<RunningProcess>,
@@ -170,6 +169,15 @@ pub struct SessionManager {
     store: Arc<SessionStore>,
     /// Self-reference so fan-out tasks can call back without an Arc cycle.
     self_weak: Mutex<Weak<SessionManager>>,
+    /// Spawn config captured at construction so `ensure_running` can respawn a
+    /// session without re-receiving CLI paths (it only has the session id +
+    /// stored metadata). `create_*` still take the path as a param and forward
+    /// it to the `spawn_<kind>` helper.
+    claude_path: String,
+    kiro_path: String,
+    codex_path: String,
+    codex_reasoning: String,
+    shell: String,
 }
 
 #[derive(serde::Serialize)]
@@ -270,13 +278,64 @@ fn resolve_work_dir(work_dir: &str, session_id: &str) -> (PathBuf, Option<PathBu
     }
 }
 
+/// What `ensure_running` should do for one session, decided under the lock.
+struct SpawnPlan {
+    stype: SessionType,
+    resume_token: Option<ResumeToken>,
+    work_dir: String,
+    cols: u16,
+    rows: u16,
+}
+
+enum SpawnDecision {
+    /// Live process already present — nothing to do.
+    AlreadyRunning,
+    /// Another caller holds `spawning` — poll until it finishes.
+    Wait,
+    /// This caller claimed `spawning` (now set true) — spawn per the plan.
+    Spawn(SpawnPlan),
+}
+
+/// Pure phase-1 decision for `ensure_running`. Mutates only `spawning` (sets it
+/// true on the `Spawn` path so a concurrent caller sees `Wait`). Kept free of
+/// any spawning/IO so it is unit-testable without real CLI processes.
+fn decide_spawn(s: &mut Session) -> SpawnDecision {
+    if s.running.is_some() {
+        SpawnDecision::AlreadyRunning
+    } else if s.spawning {
+        SpawnDecision::Wait
+    } else {
+        s.spawning = true;
+        SpawnDecision::Spawn(SpawnPlan {
+            stype: s.session_type,
+            resume_token: s.resume_token.clone(),
+            work_dir: s.work_dir.clone(),
+            cols: s.cols,
+            rows: s.rows,
+        })
+    }
+}
+
 impl SessionManager {
-    pub fn new(events: Arc<EventStore>, store: Arc<SessionStore>) -> Arc<Self> {
+    pub fn new(
+        events: Arc<EventStore>,
+        store: Arc<SessionStore>,
+        claude_path: String,
+        kiro_path: String,
+        codex_path: String,
+        codex_reasoning: String,
+        shell: String,
+    ) -> Arc<Self> {
         let mgr = Arc::new(Self {
             sessions: Mutex::new(HashMap::new()),
             events,
             store,
             self_weak: Mutex::new(Weak::new()),
+            claude_path,
+            kiro_path,
+            codex_path,
+            codex_reasoning,
+            shell,
         });
         *mgr.self_weak.lock().unwrap() = Arc::downgrade(&mgr);
         mgr
@@ -304,44 +363,39 @@ impl SessionManager {
         }
     }
 
-    pub fn create_pty_session(
+    /// Spawn a tmux/PTY process for `id` rooted at `work_dir`, start its fan-out
+    /// task, and return the live handle. `target` Some → `tmux attach -t <target>`
+    /// (restart-survival via existing tmux server), None → plain `self.shell`.
+    /// Shared by `create_pty_session` and `ensure_running`.
+    fn spawn_tmux(
         &self,
-        name: String,
-        shell: &str,
+        id: &str,
         work_dir: &str,
         cols: u16,
         rows: u16,
-        owner_id: &str,
-        tmux_target: Option<&str>,
-    ) -> Result<String, String> {
+        target: Option<&str>,
+    ) -> Result<RunningProcess, String> {
         let cwd = if work_dir.is_empty() || work_dir == "." {
             None
         } else {
             Some(work_dir)
         };
-        let (cmd, args): (&str, Vec<&str>) = if let Some(target) = tmux_target {
+        let (cmd, args): (&str, Vec<&str>) = if let Some(target) = target {
             ("tmux", vec!["attach", "-t", target])
         } else {
-            (shell, vec![])
+            (self.shell.as_str(), vec![])
         };
         let (pty, mut output_rx) = PtyHandle::spawn(cmd, &args, &[], cols, rows, cwd)
             .map_err(|e| format!("Failed to spawn PTY: {}", e))?;
 
-        let effective_dir = if work_dir.is_empty() || work_dir == "." {
-            std::env::current_dir().unwrap_or_default().to_string_lossy().to_string()
-        } else {
-            work_dir.to_string()
-        };
-
-        let id = uuid::Uuid::new_v4().to_string();
         let (event_tx, _) = broadcast::channel(BROADCAST_CAPACITY);
         let (input_tx, mut input_rx) = mpsc::channel::<SessionInput>(64);
 
         let pid = pty.pid();
         let event_tx_clone = event_tx.clone();
-        let sid = id.clone();
+        let sid = id.to_string();
         let mgr_weak = self.weak();
-        let sid_for_exit = id.clone();
+        let sid_for_exit = id.to_string();
 
         // Spawn fan-out task: owns the PtyHandle, reads output, handles input
         tokio::spawn(async move {
@@ -380,6 +434,33 @@ impl SessionManager {
             mark_fanout_ended(&mgr_weak, &sid_for_exit);
         });
 
+        Ok(RunningProcess {
+            event_tx,
+            input_tx,
+            pty_pid: pid,
+        })
+    }
+
+    pub fn create_pty_session(
+        &self,
+        name: String,
+        _shell: &str,
+        work_dir: &str,
+        cols: u16,
+        rows: u16,
+        owner_id: &str,
+        tmux_target: Option<&str>,
+    ) -> Result<String, String> {
+        let effective_dir = if work_dir.is_empty() || work_dir == "." {
+            std::env::current_dir().unwrap_or_default().to_string_lossy().to_string()
+        } else {
+            work_dir.to_string()
+        };
+
+        let id = uuid::Uuid::new_v4().to_string();
+
+        let running = self.spawn_tmux(&id, work_dir, cols, rows, tmux_target)?;
+
         let session = Session {
             id: id.clone(),
             name,
@@ -394,11 +475,7 @@ impl SessionManager {
             worktree_path: None,
             created_ms: now_millis(),
             spawning: false,
-            running: Some(RunningProcess {
-                event_tx,
-                input_tx,
-                pty_pid: pid,
-            }),
+            running: Some(running),
             scrollback: VecDeque::new(),
             scrollback_bytes: 0,
         };
@@ -408,10 +485,44 @@ impl SessionManager {
         Ok(id)
     }
 
+    /// Spawn a Claude (ACP) process for `id` at `work_dir`, start its fan-out,
+    /// and return the live handle. `_resume` is unused in Task 5 (always fresh);
+    /// Task 6 wires `--resume`. Worktree creation/cleanup stays with the caller.
+    async fn spawn_claude(
+        &self,
+        id: &str,
+        work_dir: &str,
+        _resume: Option<&str>,
+    ) -> Result<RunningProcess, String> {
+        let process = AcpProcess::spawn(&self.claude_path, work_dir)
+            .await
+            .map_err(|e| format!("Failed to spawn Claude: {}", e))?;
+
+        let (event_tx, _) = broadcast::channel(BROADCAST_CAPACITY);
+        let (input_tx, input_rx) = mpsc::channel::<SessionInput>(64);
+
+        spawn_acp_fanout(
+            id.to_string(),
+            process,
+            event_tx.clone(),
+            input_rx,
+            self.events.clone(),
+            "claude-code",
+            work_dir.to_string(),
+            self.weak(),
+        );
+
+        Ok(RunningProcess {
+            event_tx,
+            input_tx,
+            pty_pid: None,
+        })
+    }
+
     pub async fn create_acp_session(
         &self,
         name: String,
-        claude_path: &str,
+        _claude_path: &str,
         work_dir: &str,
         cols: u16,
         rows: u16,
@@ -420,33 +531,16 @@ impl SessionManager {
         let id = uuid::Uuid::new_v4().to_string();
         let (effective_dir, worktree_path) = resolve_work_dir(work_dir, &id);
 
-        let process = AcpProcess::spawn(claude_path, effective_dir.to_str().unwrap_or("."))
+        let running = self
+            .spawn_claude(&id, &effective_dir.to_string_lossy(), None)
             .await
             .map_err(|e| {
                 if let Some(wt) = &worktree_path {
                     let base = PathBuf::from(work_dir);
                     remove_worktree(&base, wt);
                 }
-                format!("Failed to spawn Claude: {}", e)
+                e
             })?;
-
-        let (event_tx, _) = broadcast::channel(BROADCAST_CAPACITY);
-        let (input_tx, input_rx) = mpsc::channel::<SessionInput>(64);
-
-        let event_tx_clone = event_tx.clone();
-        let sid = id.clone();
-
-        // Spawn fan-out task for ACP process
-        spawn_acp_fanout(
-            sid,
-            process,
-            event_tx_clone,
-            input_rx,
-            self.events.clone(),
-            "claude-code",
-            effective_dir.to_string_lossy().to_string(),
-            self.weak(),
-        );
 
         let session = Session {
             id: id.clone(),
@@ -462,11 +556,7 @@ impl SessionManager {
             worktree_path,
             created_ms: now_millis(),
             spawning: false,
-            running: Some(RunningProcess {
-                event_tx,
-                input_tx,
-                pty_pid: None,
-            }),
+            running: Some(running),
             scrollback: VecDeque::new(),
             scrollback_bytes: 0,
         };
@@ -476,10 +566,43 @@ impl SessionManager {
         Ok(id)
     }
 
+    /// Spawn a Kiro process for `id` at `work_dir`, start its fan-out, return the
+    /// live handle. `_resume` unused in Task 5 (Task 7 wires `session/load`).
+    async fn spawn_kiro(
+        &self,
+        id: &str,
+        work_dir: &str,
+        _resume: Option<&str>,
+    ) -> Result<RunningProcess, String> {
+        let process = KiroProcess::spawn(&self.kiro_path, work_dir)
+            .await
+            .map_err(|e| format!("Failed to spawn Kiro: {}", e))?;
+
+        let (event_tx, _) = broadcast::channel(BROADCAST_CAPACITY);
+        let (input_tx, input_rx) = mpsc::channel::<SessionInput>(64);
+
+        spawn_kiro_fanout(
+            id.to_string(),
+            process,
+            event_tx.clone(),
+            input_rx,
+            self.events.clone(),
+            "kiro",
+            work_dir.to_string(),
+            self.weak(),
+        );
+
+        Ok(RunningProcess {
+            event_tx,
+            input_tx,
+            pty_pid: None,
+        })
+    }
+
     pub async fn create_kiro_session(
         &self,
         name: String,
-        kiro_path: &str,
+        _kiro_path: &str,
         work_dir: &str,
         cols: u16,
         rows: u16,
@@ -488,33 +611,16 @@ impl SessionManager {
         let id = uuid::Uuid::new_v4().to_string();
         let (effective_dir, worktree_path) = resolve_work_dir(work_dir, &id);
 
-        let process = KiroProcess::spawn(kiro_path, effective_dir.to_str().unwrap_or("."))
+        let running = self
+            .spawn_kiro(&id, &effective_dir.to_string_lossy(), None)
             .await
             .map_err(|e| {
                 if let Some(wt) = &worktree_path {
                     let base = PathBuf::from(work_dir);
                     remove_worktree(&base, wt);
                 }
-                format!("Failed to spawn Kiro: {}", e)
+                e
             })?;
-
-        let (event_tx, _) = broadcast::channel(BROADCAST_CAPACITY);
-        let (input_tx, input_rx) = mpsc::channel::<SessionInput>(64);
-
-        let event_tx_clone = event_tx.clone();
-        let sid = id.clone();
-
-        // Spawn fan-out task for Kiro process
-        spawn_kiro_fanout(
-            sid,
-            process,
-            event_tx_clone,
-            input_rx,
-            self.events.clone(),
-            "kiro",
-            effective_dir.to_string_lossy().to_string(),
-            self.weak(),
-        );
 
         let session = Session {
             id: id.clone(),
@@ -530,11 +636,7 @@ impl SessionManager {
             worktree_path,
             created_ms: now_millis(),
             spawning: false,
-            running: Some(RunningProcess {
-                event_tx,
-                input_tx,
-                pty_pid: None,
-            }),
+            running: Some(running),
             scrollback: VecDeque::new(),
             scrollback_bytes: 0,
         };
@@ -544,11 +646,55 @@ impl SessionManager {
         Ok(id)
     }
 
+    /// Spawn a Codex process for `id` at `work_dir`, start its fan-out, return
+    /// the live handle. `_resume` unused in Task 5 (Task 6 wires `codex-reply`).
+    /// Reasoning effort comes from the stored `self.codex_reasoning`.
+    async fn spawn_codex(
+        &self,
+        id: &str,
+        work_dir: &str,
+        _resume: Option<String>,
+    ) -> Result<RunningProcess, String> {
+        let reasoning = if self.codex_reasoning.is_empty() || self.codex_reasoning == "off" {
+            None
+        } else {
+            Some(self.codex_reasoning.clone())
+        };
+
+        let process = crate::acp::codex_process::CodexProcess::spawn(
+            &self.codex_path,
+            work_dir,
+            reasoning,
+        )
+        .await
+        .map_err(|e| format!("Failed to spawn Codex: {}", e))?;
+
+        let (event_tx, _) = broadcast::channel(BROADCAST_CAPACITY);
+        let (input_tx, input_rx) = mpsc::channel::<SessionInput>(64);
+
+        spawn_codex_fanout(
+            id.to_string(),
+            process,
+            event_tx.clone(),
+            input_rx,
+            self.events.clone(),
+            "codex",
+            work_dir.to_string(),
+            self.weak(),
+        );
+
+        Ok(RunningProcess {
+            event_tx,
+            input_tx,
+            pty_pid: None,
+        })
+    }
+
     pub async fn create_codex_session(
         &self,
         name: String,
-        codex_path: &str,
-        codex_reasoning: &str,
+        _codex_path: &str,
+        _codex_reasoning: &str,
         work_dir: &str,
         cols: u16,
         rows: u16,
@@ -557,43 +703,16 @@ impl SessionManager {
         let id = uuid::Uuid::new_v4().to_string();
         let (effective_dir, worktree_path) = resolve_work_dir(work_dir, &id);
 
-        let reasoning = if codex_reasoning.is_empty() || codex_reasoning == "off" {
-            None
-        } else {
-            Some(codex_reasoning.to_string())
-        };
-
-        let process = crate::acp::codex_process::CodexProcess::spawn(
-            codex_path,
-            effective_dir.to_str().unwrap_or("."),
-            reasoning,
-        )
-        .await
-        .map_err(|e| {
-            if let Some(wt) = &worktree_path {
-                let base = PathBuf::from(work_dir);
-                remove_worktree(&base, wt);
-            }
-            format!("Failed to spawn Codex: {}", e)
-        })?;
-
-        let (event_tx, _) = broadcast::channel(BROADCAST_CAPACITY);
-        let (input_tx, input_rx) = mpsc::channel::<SessionInput>(64);
-
-        let event_tx_clone = event_tx.clone();
-        let sid = id.clone();
-
-        // Spawn fan-out task for Codex process
-        spawn_codex_fanout(
-            sid,
-            process,
-            event_tx_clone,
-            input_rx,
-            self.events.clone(),
-            "codex",
-            effective_dir.to_string_lossy().to_string(),
-            self.weak(),
-        );
+        let running = self
+            .spawn_codex(&id, &effective_dir.to_string_lossy(), None)
+            .await
+            .map_err(|e| {
+                if let Some(wt) = &worktree_path {
+                    let base = PathBuf::from(work_dir);
+                    remove_worktree(&base, wt);
+                }
+                e
+            })?;
 
         let session = Session {
             id: id.clone(),
@@ -609,11 +728,7 @@ impl SessionManager {
             worktree_path,
             created_ms: now_millis(),
             spawning: false,
-            running: Some(RunningProcess {
-                event_tx,
-                input_tx,
-                pty_pid: None,
-            }),
+            running: Some(running),
             scrollback: VecDeque::new(),
             scrollback_bytes: 0,
         };
@@ -621,6 +736,62 @@ impl SessionManager {
         self.persist_meta(&session);
         self.sessions.lock().unwrap().insert(id.clone(), session);
         Ok(id)
+    }
+
+    /// 确保 session 有活进程；未运行则按 type 重生（Task 5：一律全新，无 resume）。
+    /// 并发安全：spawning 标志防止两个并发请求双 spawn 同一 session。
+    pub async fn ensure_running(&self, id: &str) -> Result<(), String> {
+        // 阶段 1：锁内决策（guard 在本块结束即释放，await 前无锁）。
+        let plan = {
+            let mut map = self.sessions.lock().unwrap();
+            let s = map.get_mut(id).ok_or_else(|| "session not found".to_string())?;
+            match decide_spawn(s) {
+                SpawnDecision::AlreadyRunning => return Ok(()),
+                SpawnDecision::Wait => None,
+                SpawnDecision::Spawn(plan) => Some(plan),
+            }
+        };
+
+        // 别人在 spawn：锁外轮询等待 running 出现（最多 ~30s）。
+        let Some(SpawnPlan { stype, resume_token: _token, work_dir, cols, rows }) = plan else {
+            for _ in 0..300 {
+                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                let map = self.sessions.lock().unwrap();
+                match map.get(id) {
+                    Some(s) if s.running.is_some() => return Ok(()),
+                    Some(s) if s.spawning => continue,
+                    Some(_) => return Err("spawn aborted".into()),
+                    None => return Err("session removed".into()),
+                }
+                // guard drops here at end of loop body, before next sleep().await
+            }
+            return Err("timed out waiting for concurrent spawn".into());
+        };
+
+        // 阶段 2：锁外 await spawn（Task 5：忽略 token，全新）。
+        let result = match stype {
+            SessionType::Claude => self.spawn_claude(id, &work_dir, None).await,
+            SessionType::Kiro => self.spawn_kiro(id, &work_dir, None).await,
+            SessionType::Codex => self.spawn_codex(id, &work_dir, None).await,
+            SessionType::Tmux => self.spawn_tmux(id, &work_dir, cols, rows, None),
+        };
+
+        // 阶段 3：锁内装回 + 清 spawning。
+        let mut map = self.sessions.lock().unwrap();
+        match map.get_mut(id) {
+            Some(s) => {
+                s.spawning = false;
+                match result {
+                    Ok(rp) => {
+                        s.running = Some(rp);
+                        s.status = SessionMeta::Running;
+                        Ok(())
+                    }
+                    Err(e) => Err(e),
+                }
+            }
+            None => Err("session removed during spawn".into()),
+        }
     }
 
     /// List sessions, optionally filtered by owner. Pass None for all (admin).
@@ -1054,5 +1225,70 @@ mod resume_token_tests {
     #[test]
     fn from_unknown_kind_is_none() {
         assert!(ResumeToken::from_kind_value("bogus", "x").is_none());
+    }
+}
+
+#[cfg(test)]
+mod decide_spawn_tests {
+    use super::*;
+
+    /// Build a minimal not-running session for decision-logic tests. No process
+    /// is spawned, so this is safe without any CLI binaries present.
+    fn test_session() -> Session {
+        Session {
+            id: "sid".into(),
+            name: "n".into(),
+            session_type: SessionType::Tmux,
+            cols: 80,
+            rows: 24,
+            work_dir: "/tmp".into(),
+            owner_id: "o".into(),
+            description: String::new(),
+            status: SessionMeta::Idle,
+            resume_token: None,
+            worktree_path: None,
+            created_ms: 0,
+            spawning: false,
+            running: None,
+            scrollback: VecDeque::new(),
+            scrollback_bytes: 0,
+        }
+    }
+
+    #[test]
+    fn fresh_session_claims_spawning() {
+        let mut s = test_session();
+        match decide_spawn(&mut s) {
+            SpawnDecision::Spawn(plan) => {
+                assert_eq!(plan.stype, SessionType::Tmux);
+                assert_eq!(plan.work_dir, "/tmp");
+            }
+            _ => panic!("expected Spawn"),
+        }
+        // The decision must have claimed the spawning flag so a concurrent
+        // caller observes Wait rather than double-spawning.
+        assert!(s.spawning, "spawning flag must be set after claiming");
+    }
+
+    #[test]
+    fn concurrent_caller_waits() {
+        let mut s = test_session();
+        // First caller claims spawning.
+        assert!(matches!(decide_spawn(&mut s), SpawnDecision::Spawn(_)));
+        // Second caller, seeing spawning=true and still not running, must Wait.
+        assert!(matches!(decide_spawn(&mut s), SpawnDecision::Wait));
+        // Flag stays set (only phase 3 clears it).
+        assert!(s.spawning);
+    }
+
+    #[test]
+    fn already_running_is_noop() {
+        let mut s = test_session();
+        let (event_tx, _) = broadcast::channel(BROADCAST_CAPACITY);
+        let (input_tx, _input_rx) = mpsc::channel::<SessionInput>(64);
+        s.running = Some(RunningProcess { event_tx, input_tx, pty_pid: None });
+        assert!(matches!(decide_spawn(&mut s), SpawnDecision::AlreadyRunning));
+        // Must not flip spawning when nothing needs spawning.
+        assert!(!s.spawning);
     }
 }

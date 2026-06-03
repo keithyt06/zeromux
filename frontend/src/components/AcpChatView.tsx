@@ -60,6 +60,8 @@ export default function AcpChatView({ sessionId, active, agentType = 'claude' }:
   const [messages, setMessages] = useState<ChatMessage[]>([])
   const [input, setInput] = useState('')
   const [busy, setBusy] = useState(false)
+  const [turnStartedMs, setTurnStartedMs] = useState<number | null>(null)
+  const [nowMs, setNowMs] = useState(() => Date.now())
   const wsRef = useRef<WebSocket | null>(null)
   const scrollRef = useRef<HTMLDivElement>(null)
   const inputRef = useRef<HTMLTextAreaElement>(null)
@@ -112,6 +114,7 @@ export default function AcpChatView({ sessionId, active, agentType = 'claude' }:
       }
       currentAssistant.current = null
       setBusy(false)
+      setTurnStartedMs(null)
     }
     ws.onerror = () => { ws.close() }
 
@@ -164,6 +167,9 @@ export default function AcpChatView({ sessionId, active, agentType = 'claude' }:
           return next
         }))
         setBusy(true)
+        // Stamp turn start if not already running (e.g. a turn observed from
+        // another tab via replay, where this client didn't call sendPrompt).
+        setTurnStartedMs(prev => prev ?? Date.now())
         scrollBottom()
         break
       }
@@ -193,6 +199,7 @@ export default function AcpChatView({ sessionId, active, agentType = 'claude' }:
         }
         currentAssistant.current = null
         setBusy(false)
+        setTurnStartedMs(null)
         break
       }
 
@@ -206,6 +213,7 @@ export default function AcpChatView({ sessionId, active, agentType = 'claude' }:
         pushMessage({ id: newId(), kind: 'error', text: evt.message || 'Unknown error' })
         currentAssistant.current = null
         setBusy(false)
+        setTurnStartedMs(null)
         break
       }
 
@@ -219,6 +227,7 @@ export default function AcpChatView({ sessionId, active, agentType = 'claude' }:
         pushMessage({ id: newId(), kind: 'system', text: `Process exited (code: ${evt.code || 0})` })
         currentAssistant.current = null
         setBusy(false)
+        setTurnStartedMs(null)
         break
       }
 
@@ -231,6 +240,7 @@ export default function AcpChatView({ sessionId, active, agentType = 'claude' }:
         }
         currentAssistant.current = null
         setBusy(false)
+        setTurnStartedMs(null)
         break
       }
     }
@@ -240,9 +250,13 @@ export default function AcpChatView({ sessionId, active, agentType = 'claude' }:
     const text = input.trim()
     if (!text || !wsRef.current || wsRef.current.readyState !== WebSocket.OPEN) return
     pushMessage({ id: newId(), kind: 'user', text })
+    // Backend fan-out auto-interrupts any in-flight turn before resending, so
+    // the frontend only needs to send the prompt. Reset the stuck timer to the
+    // new turn's start.
     wsRef.current.send(JSON.stringify({ type: 'prompt', text }))
     setInput('')
     setBusy(true)
+    setTurnStartedMs(Date.now())
   }, [input, pushMessage])
 
   const handleKeyDown = (e: KeyboardEvent) => {
@@ -255,6 +269,24 @@ export default function AcpChatView({ sessionId, active, agentType = 'claude' }:
   useEffect(() => {
     if (active) inputRef.current?.focus()
   }, [active])
+
+  // Stuck-turn timer: tick a 1s clock while busy so the elapsed display
+  // updates. turnStartedMs is stamped in the event handlers (turn start) and
+  // cleared at turn end — set-state lives in handlers, not in this effect.
+  useEffect(() => {
+    if (!busy) return
+    const t = setInterval(() => setNowMs(Date.now()), 1000)
+    return () => clearInterval(t)
+  }, [busy])
+
+  const elapsed = turnStartedMs ? Math.floor((nowMs - turnStartedMs) / 1000) : 0
+  const stuck = elapsed > 180
+
+  const interrupt = useCallback(() => {
+    if (wsRef.current?.readyState === WebSocket.OPEN) {
+      wsRef.current.send(JSON.stringify({ type: 'interrupt' }))
+    }
+  }, [])
 
   return (
     <div className="flex flex-col h-full">
@@ -270,6 +302,23 @@ export default function AcpChatView({ sessionId, active, agentType = 'claude' }:
             {transcribe.error
               ? <span className="text-[var(--accent-red)]">⚠ {transcribe.error}</span>
               : transcribe.partial}
+          </div>
+        )}
+        {busy && (
+          <div className="flex items-center gap-2 px-2 pb-1 text-xs">
+            {stuck ? (
+              <>
+                <span className="text-[var(--accent-red)]">已运行 {elapsed}s，可能卡住</span>
+                <button
+                  onClick={interrupt}
+                  className="px-2 py-0.5 text-[10px] font-semibold text-[var(--accent-red)] border border-[var(--accent-red)] rounded hover:bg-[var(--accent-red)] hover:text-white transition-colors"
+                >
+                  中断
+                </button>
+              </>
+            ) : (
+              <span className="text-[var(--text-muted)] italic">已运行 {elapsed}s…</span>
+            )}
           </div>
         )}
         <div className="flex gap-2">
@@ -292,7 +341,7 @@ export default function AcpChatView({ sessionId, active, agentType = 'claude' }:
           />
           <button
             onClick={sendPrompt}
-            disabled={busy || !input.trim()}
+            disabled={!input.trim()}
             className="self-end p-2 bg-[var(--accent-green)] hover:bg-[var(--accent-green-hover)] disabled:bg-[var(--btn-disabled-bg)] disabled:text-[var(--btn-disabled-text)] text-white rounded-lg transition-colors"
             title="Send"
           >

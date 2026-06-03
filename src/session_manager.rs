@@ -375,6 +375,29 @@ fn apply_turn(session: &mut Session, state: TurnState, seq: u64) {
     }
 }
 
+/// 应用 meta 改动到内存 Session，返回需落盘的 (name, description)。纯函数，便于单测。
+fn apply_meta(
+    session: &mut Session,
+    name: Option<String>,
+    description: Option<String>,
+    status: Option<SessionMeta>,
+) -> (Option<String>, Option<String>) {
+    let mut pn = None;
+    let mut pd = None;
+    if let Some(n) = name {
+        session.name = n.clone();
+        pn = Some(n);
+    }
+    if let Some(d) = description {
+        session.description = d.clone();
+        pd = Some(d);
+    }
+    if let Some(s) = status {
+        session.status = s;
+    }
+    (pn, pd)
+}
+
 fn session_info_of(s: &Session) -> SessionInfo {
     SessionInfo {
         id: s.id.clone(),
@@ -1098,28 +1121,29 @@ impl SessionManager {
         description: Option<String>,
         status: Option<SessionMeta>,
     ) -> bool {
-        // Apply in-memory under the lock, capturing the new description (if any)
-        // so we can persist it AFTER releasing the sessions lock.
-        let persist_desc = {
+        self.update_session_meta_named(id, None, description, status)
+    }
+
+    pub fn update_session_meta_named(
+        &self,
+        id: &str,
+        name: Option<String>,
+        description: Option<String>,
+        status: Option<SessionMeta>,
+    ) -> bool {
+        // Apply in-memory under the lock, capturing what to persist (name/desc)
+        // so we can write to the store AFTER releasing the sessions lock.
+        let persist = {
             let mut map = self.sessions.lock().unwrap();
-            match map.get_mut(id) {
-                Some(session) => {
-                    let mut persist = None;
-                    if let Some(d) = description {
-                        session.description = d.clone();
-                        persist = Some(d);
-                    }
-                    if let Some(s) = status {
-                        session.status = s;
-                    }
-                    Some(persist)
-                }
-                None => None,
-            }
+            map.get_mut(id)
+                .map(|s| apply_meta(s, name, description, status))
         };
-        match persist_desc {
-            Some(persist) => {
-                if let Some(d) = persist {
+        match persist {
+            Some((pn, pd)) => {
+                if let Some(n) = pn {
+                    let _ = self.store.update_name(id, &n);
+                }
+                if let Some(d) = pd {
                     let _ = self.store.update_description(id, &d);
                 }
                 true
@@ -1814,5 +1838,14 @@ mod turn_state_tests {
         let info = session_info_of(&s);
         assert_eq!(info.running, false);
         assert_eq!(info.turn_state, None);
+    }
+
+    #[test]
+    fn apply_meta_changes_name_and_reports_persist() {
+        let mut s = running_session("s");
+        let (pn, pd) = apply_meta(&mut s, Some("renamed".into()), None, None);
+        assert_eq!(s.name, "renamed");
+        assert_eq!(pn.as_deref(), Some("renamed"));
+        assert_eq!(pd, None);
     }
 }

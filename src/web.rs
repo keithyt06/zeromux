@@ -463,6 +463,7 @@ async fn session_logs(
 
 #[derive(serde::Deserialize)]
 struct UpdateSessionReq {
+    name: Option<String>,
     description: Option<String>,
     status: Option<crate::session_manager::SessionMeta>,
 }
@@ -476,7 +477,13 @@ async fn update_session(
     if !user.is_admin() && !state.sessions.is_owner(&id, &user.id) {
         return StatusCode::FORBIDDEN;
     }
-    if state.sessions.update_session_meta(&id, req.description, req.status) {
+    if req.name.as_deref() == Some("") {
+        return StatusCode::BAD_REQUEST;
+    }
+    if state
+        .sessions
+        .update_session_meta_named(&id, req.name, req.description, req.status)
+    {
         StatusCode::OK
     } else {
         StatusCode::NOT_FOUND

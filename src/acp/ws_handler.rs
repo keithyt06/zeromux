@@ -24,6 +24,8 @@ enum ClientMsg {
     Prompt { text: String },
     #[serde(rename = "cancel")]
     Cancel,
+    #[serde(rename = "interrupt")]
+    Interrupt,
 }
 
 pub async fn ws_acp(
@@ -135,6 +137,9 @@ async fn handle_acp_ws(socket: WebSocket, session_id: String, state: Arc<AppStat
                                 }
                                 ClientMsg::Cancel => {
                                     let _ = input_tx.send(SessionInput::Cancel).await;
+                                }
+                                ClientMsg::Interrupt => {
+                                    let _ = input_tx.send(SessionInput::Interrupt).await;
                                 }
                             }
                         }

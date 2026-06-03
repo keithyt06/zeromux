@@ -66,6 +66,7 @@ fn classify(val: &serde_json::Value) -> RpcFrame {
 
 enum Cmd {
     Prompt(String),
+    Cancel,
     Stop,
 }
 
@@ -172,6 +173,12 @@ impl KiroProcess {
             .send(Cmd::Prompt(text.to_string()))
             .await
             .map_err(|_| std::io::Error::new(std::io::ErrorKind::BrokenPipe, "kiro process exited"))
+    }
+
+    pub async fn interrupt(&mut self) -> Result<(), std::io::Error> {
+        self.cmd_tx.send(Cmd::Cancel).await.map_err(|_| {
+            std::io::Error::new(std::io::ErrorKind::BrokenPipe, "kiro event loop exited")
+        })
     }
 
     pub async fn kill(&mut self) {
@@ -302,6 +309,19 @@ async fn run_event_loop(
                             }
                         });
                         rpc_id += 1;
+                        let mut buf = serde_json::to_string(&req).unwrap();
+                        buf.push('\n');
+                        if stdin.write_all(buf.as_bytes()).await.is_err() { return; }
+                        let _ = stdin.flush().await;
+                    }
+                    Some(Cmd::Cancel) => {
+                        // ACP session/cancel is a notification (no id). Verified:
+                        // aborts the in-flight session/prompt turn, process lives.
+                        let req = serde_json::json!({
+                            "jsonrpc": "2.0",
+                            "method": "session/cancel",
+                            "params": { "sessionId": session_id }
+                        });
                         let mut buf = serde_json::to_string(&req).unwrap();
                         buf.push('\n');
                         if stdin.write_all(buf.as_bytes()).await.is_err() { return; }

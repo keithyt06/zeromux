@@ -333,8 +333,17 @@ impl CodexProcess {
             })
     }
 
+    pub async fn interrupt(&mut self) -> Result<(), std::io::Error> {
+        // Turn-level cancel: drop in-flight call_fut, keep thread_id (verified).
+        self.cmd_tx.send(Cmd::Cancel).await.map_err(|_| {
+            std::io::Error::new(std::io::ErrorKind::BrokenPipe, "codex event loop exited")
+        })
+    }
+
     pub async fn kill(&mut self) {
-        let _ = self.cmd_tx.send(Cmd::Cancel).await;
+        // Process teardown: Stop ends the loop (was Cmd::Cancel — turn-level —
+        // which only worked because Drop later closed cmd_tx).
+        let _ = self.cmd_tx.send(Cmd::Stop).await;
     }
 }
 

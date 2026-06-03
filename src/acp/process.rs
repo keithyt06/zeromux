@@ -1,8 +1,14 @@
 use serde::Serialize;
 use std::process::Stdio;
+use std::sync::atomic::{AtomicU64, Ordering};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{Child, ChildStdin};
 use tokio::sync::mpsc;
+
+static INT_SEQ: AtomicU64 = AtomicU64::new(0);
+fn now_seq() -> u64 {
+    INT_SEQ.fetch_add(1, Ordering::Relaxed)
+}
 
 /// Browser-facing events emitted by the Claude CLI stream-json protocol.
 ///
@@ -146,6 +152,20 @@ impl AcpProcess {
                 "role": "user",
                 "content": [{"type": "text", "text": text}]
             }
+        });
+        let mut line = serde_json::to_string(&msg).unwrap();
+        line.push('\n');
+        self.stdin.write_all(line.as_bytes()).await?;
+        self.stdin.flush().await
+    }
+
+    /// Turn-level interrupt: tell Claude to abort the current turn but keep the
+    /// process alive (verified: stdin control_request {subtype:"interrupt"}).
+    pub async fn interrupt(&mut self) -> Result<(), std::io::Error> {
+        let msg = serde_json::json!({
+            "type": "control_request",
+            "request_id": format!("zmx-int-{}", now_seq()),
+            "request": { "subtype": "interrupt" }
         });
         let mut line = serde_json::to_string(&msg).unwrap();
         line.push('\n');

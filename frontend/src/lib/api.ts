@@ -11,6 +11,11 @@ export interface SessionInfo {
   work_dir: string
   description: string
   status: SessionMetaStatus
+  running: boolean
+  turn_state: 'idle' | 'running' | null
+  turn_started_ms: number | null
+  last_activity_ms: number
+  turns_completed: number
 }
 
 export interface NoteEntry {
@@ -197,6 +202,7 @@ export async function removeUser(id: string): Promise<void> {
 
 // Session metadata
 export async function updateSession(id: string, data: {
+  name?: string
   description?: string
   status?: SessionMetaStatus
 }): Promise<void> {
@@ -205,6 +211,10 @@ export async function updateSession(id: string, data: {
     body: JSON.stringify(data),
   })
   if (!res.ok) throw new Error('Failed to update session')
+}
+
+export async function renameSession(id: string, name: string): Promise<void> {
+  return updateSession(id, { name })
 }
 
 // Notes API

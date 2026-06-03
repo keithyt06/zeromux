@@ -54,6 +54,19 @@ export default function App() {
     }
   }, [])
 
+  // 3s polling: refresh session list so turn-state / activity fields stay live.
+  // Replaces the whole list each tick; activeId is independent state so it's
+  // unaffected. Transient failures are ignored (don't bounce to login).
+  useEffect(() => {
+    if (authState !== 'active') return
+    const tick = setInterval(async () => {
+      try {
+        setSessions(await listSessions())
+      } catch { /* ignore transient */ }
+    }, 3000)
+    return () => clearInterval(tick)
+  }, [authState])
+
   const handleLegacyLogin = useCallback(async (password: string, remember?: boolean) => {
     const userInfo = await legacyLogin(password, remember)
     setUser(userInfo)

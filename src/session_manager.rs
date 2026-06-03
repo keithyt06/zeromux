@@ -1343,6 +1343,7 @@ fn spawn_acp_fanout(
         let mut token_saved = false;
         let mut turn_seq: u64 = 0;
         let mut local_running = false;
+        let mut boundary_count: u64 = 0;
         loop {
             tokio::select! {
                 event = process.event_rx.recv() => {
@@ -1368,9 +1369,22 @@ fn spawn_acp_fanout(
                             };
                             let _ = event_tx.send(json);
                             if is_boundary {
-                                local_running = false;
+                                // Each started turn emits exactly one boundary
+                                // (Result/Error/Exit), in FIFO order, so the
+                                // Nth boundary belongs to turn N. A boundary
+                                // only settles the session to Idle once we've
+                                // seen as many boundaries as turns started;
+                                // earlier boundaries belong to turns that were
+                                // already superseded by an interrupt-resend and
+                                // must NOT idle the live turn. We still pass the
+                                // boundary's own seq so apply_turn's seq guard
+                                // is exercised consistently.
+                                boundary_count += 1;
+                                if boundary_count >= turn_seq {
+                                    local_running = false;
+                                }
                                 if let Some(m) = mgr.upgrade() {
-                                    m.mark_turn(&sid, TurnState::Idle, turn_seq);
+                                    m.mark_turn(&sid, TurnState::Idle, boundary_count);
                                 }
                             }
                         }
@@ -1430,6 +1444,7 @@ fn spawn_kiro_fanout(
         let mut token_saved = false;
         let mut turn_seq: u64 = 0;
         let mut local_running = false;
+        let mut boundary_count: u64 = 0;
         loop {
             tokio::select! {
                 event = process.event_rx.recv() => {
@@ -1455,9 +1470,22 @@ fn spawn_kiro_fanout(
                             };
                             let _ = event_tx.send(json);
                             if is_boundary {
-                                local_running = false;
+                                // Each started turn emits exactly one boundary
+                                // (Result/Error/Exit), in FIFO order, so the
+                                // Nth boundary belongs to turn N. A boundary
+                                // only settles the session to Idle once we've
+                                // seen as many boundaries as turns started;
+                                // earlier boundaries belong to turns that were
+                                // already superseded by an interrupt-resend and
+                                // must NOT idle the live turn. We still pass the
+                                // boundary's own seq so apply_turn's seq guard
+                                // is exercised consistently.
+                                boundary_count += 1;
+                                if boundary_count >= turn_seq {
+                                    local_running = false;
+                                }
                                 if let Some(m) = mgr.upgrade() {
-                                    m.mark_turn(&sid, TurnState::Idle, turn_seq);
+                                    m.mark_turn(&sid, TurnState::Idle, boundary_count);
                                 }
                             }
                         }
@@ -1519,6 +1547,7 @@ fn spawn_codex_fanout(
         let mut token_saved = false;
         let mut turn_seq: u64 = 0;
         let mut local_running = false;
+        let mut boundary_count: u64 = 0;
         loop {
             tokio::select! {
                 event = process.event_rx.recv() => {
@@ -1544,9 +1573,22 @@ fn spawn_codex_fanout(
                             };
                             let _ = event_tx.send(json);
                             if is_boundary {
-                                local_running = false;
+                                // Each started turn emits exactly one boundary
+                                // (Result/Error/Exit), in FIFO order, so the
+                                // Nth boundary belongs to turn N. A boundary
+                                // only settles the session to Idle once we've
+                                // seen as many boundaries as turns started;
+                                // earlier boundaries belong to turns that were
+                                // already superseded by an interrupt-resend and
+                                // must NOT idle the live turn. We still pass the
+                                // boundary's own seq so apply_turn's seq guard
+                                // is exercised consistently.
+                                boundary_count += 1;
+                                if boundary_count >= turn_seq {
+                                    local_running = false;
+                                }
                                 if let Some(m) = mgr.upgrade() {
-                                    m.mark_turn(&sid, TurnState::Idle, turn_seq);
+                                    m.mark_turn(&sid, TurnState::Idle, boundary_count);
                                 }
                             }
                         }
@@ -1838,6 +1880,25 @@ mod turn_state_tests {
         let info = session_info_of(&s);
         assert_eq!(info.running, false);
         assert_eq!(info.turn_state, None);
+    }
+
+    #[test]
+    fn interrupt_resend_stale_boundary_does_not_idle_new_turn() {
+        // Reproduces the interrupt-and-resend interleaving the fan-out drives:
+        // turn 1 running, a mid-turn Prompt interrupts+bumps to turn 2, then
+        // turn 1's stale boundary arrives. The fan-out reports boundaries by
+        // their FIFO ordinal (boundary_count), so the stale boundary carries
+        // seq=1 while the live turn is seq=2 — apply_turn's guard must drop it,
+        // leaving the new turn Running and NOT counting the aborted turn.
+        let mut s = running_session("s");
+        apply_turn(&mut s, TurnState::Running, 1); // turn 1 starts
+        apply_turn(&mut s, TurnState::Running, 2); // resend → turn 2
+        apply_turn(&mut s, TurnState::Idle, 1); // stale boundary #1 (turn 1)
+        assert_eq!(s.running.as_ref().unwrap().turn_state, TurnState::Running);
+        assert_eq!(s.turns_completed, 0);
+        apply_turn(&mut s, TurnState::Idle, 2); // real boundary #2 (turn 2)
+        assert_eq!(s.running.as_ref().unwrap().turn_state, TurnState::Idle);
+        assert_eq!(s.turns_completed, 1);
     }
 
     #[test]

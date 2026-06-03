@@ -143,32 +143,58 @@ export default function TerminalView({ sessionId, active, theme }: Props) {
     if (!termRef.current) return
     if (wsRef.current) return
 
-    const ws = new WebSocket(wsUrl(`/ws/term/${sessionId}`))
-    wsRef.current = ws
+    let disposed = false
+    let retryTimer: ReturnType<typeof setTimeout> | undefined
+    let attempt = 0
 
-    ws.onopen = () => {
-      const fit = fitRef.current
-      if (fit) {
-        const dims = fit.proposeDimensions()
-        if (dims) {
-          ws.send(JSON.stringify({ type: 'resize', cols: dims.cols, rows: dims.rows }))
+    const connect = () => {
+      if (disposed) return
+      const ws = new WebSocket(wsUrl(`/ws/term/${sessionId}`))
+      wsRef.current = ws
+
+      ws.onopen = () => {
+        attempt = 0
+        // The server replays full scrollback on (re)connect; reset the terminal
+        // first so a reconnect doesn't double-paint the buffer.
+        termRef.current?.reset()
+        const fit = fitRef.current
+        if (fit) {
+          const dims = fit.proposeDimensions()
+          if (dims) {
+            ws.send(JSON.stringify({ type: 'resize', cols: dims.cols, rows: dims.rows }))
+          }
         }
       }
-    }
 
-    ws.onmessage = (evt) => {
-      try {
-        const msg = JSON.parse(evt.data)
-        if (msg.type === 'output') {
-          termRef.current?.write(b64decode(msg.data))
+      ws.onmessage = (evt) => {
+        try {
+          const msg = JSON.parse(evt.data)
+          if (msg.type === 'output') {
+            termRef.current?.write(b64decode(msg.data))
+          }
+        } catch { /* ignore */ }
+      }
+
+      ws.onclose = () => {
+        wsRef.current = null
+        // Auto-reconnect through idle-timeout proxy drops / transient closes so
+        // the terminal never freezes silently. Exponential backoff, capped at 10s.
+        if (!disposed) {
+          const delay = Math.min(1000 * 2 ** attempt, 10000)
+          attempt += 1
+          retryTimer = setTimeout(connect, delay)
         }
-      } catch { /* ignore */ }
+      }
+      ws.onerror = () => { ws.close() }
     }
 
-    ws.onclose = () => { wsRef.current = null }
-    ws.onerror = () => { ws.close() }
+    connect()
 
-    return () => { ws.close() }
+    return () => {
+      disposed = true
+      if (retryTimer) clearTimeout(retryTimer)
+      wsRef.current?.close()
+    }
   }, [sessionId])
 
   const handleResize = useCallback(() => {

@@ -94,31 +94,62 @@ export default function AcpChatView({ sessionId, active, agentType = 'claude' }:
   }, [scrollBottom])
 
   useEffect(() => {
-    const ws = new WebSocket(wsUrl(`/ws/acp/${sessionId}`))
-    wsRef.current = ws
+    let disposed = false
+    let retryTimer: ReturnType<typeof setTimeout> | undefined
+    let attempt = 0
 
-    ws.onmessage = (evt) => {
-      try {
-        const msg: ServerEvent = JSON.parse(evt.data)
-        handleEvent(msg)
-      } catch { /* ignore */ }
-    }
+    const connect = () => {
+      if (disposed) return
+      const ws = new WebSocket(wsUrl(`/ws/acp/${sessionId}`))
+      wsRef.current = ws
 
-    ws.onclose = () => {
-      wsRef.current = null
-      const activeId = currentAssistant.current?.id
-      if (activeId) {
-        setMessages(prev => prev.map(m =>
-          m.kind === 'assistant' && m.id === activeId ? { ...m, complete: true } : m
-        ))
+      ws.onopen = () => {
+        attempt = 0
+        // The server replays full scrollback on (re)connect, so start clean to
+        // avoid duplicating already-rendered messages. Matches page-reload behavior.
+        setMessages([])
+        currentAssistant.current = null
+        setBusy(false)
+        setTurnStartedMs(null)
       }
-      currentAssistant.current = null
-      setBusy(false)
-      setTurnStartedMs(null)
-    }
-    ws.onerror = () => { ws.close() }
 
-    return () => { ws.close() }
+      ws.onmessage = (evt) => {
+        try {
+          const msg: ServerEvent = JSON.parse(evt.data)
+          handleEvent(msg)
+        } catch { /* ignore */ }
+      }
+
+      ws.onclose = () => {
+        wsRef.current = null
+        const activeId = currentAssistant.current?.id
+        if (activeId) {
+          setMessages(prev => prev.map(m =>
+            m.kind === 'assistant' && m.id === activeId ? { ...m, complete: true } : m
+          ))
+        }
+        currentAssistant.current = null
+        setBusy(false)
+        setTurnStartedMs(null)
+        // Auto-reconnect: an idle-timeout proxy or transient drop must not leave
+        // the session permanently unable to send. Reconnect re-runs ensure_running
+        // server-side and replays scrollback. Exponential backoff, capped at 10s.
+        if (!disposed) {
+          const delay = Math.min(1000 * 2 ** attempt, 10000)
+          attempt += 1
+          retryTimer = setTimeout(connect, delay)
+        }
+      }
+      ws.onerror = () => { ws.close() }
+    }
+
+    connect()
+
+    return () => {
+      disposed = true
+      if (retryTimer) clearTimeout(retryTimer)
+      wsRef.current?.close()
+    }
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [sessionId])
 

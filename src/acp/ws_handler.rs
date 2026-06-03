@@ -97,9 +97,20 @@ async fn handle_acp_ws(socket: WebSocket, session_id: String, state: Arc<AppStat
 
     let logger = state.logger.clone();
 
+    // Periodic ping keeps the connection alive through idle-timeout proxies
+    // (e.g. nginx proxy_read_timeout, Cloudflare ~100s) that would otherwise
+    // drop a quiet WebSocket and leave the client unable to send.
+    let mut keepalive = tokio::time::interval(std::time::Duration::from_secs(30));
+    keepalive.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+
     // Subscribe loop: receive broadcast events + forward client input
     loop {
         tokio::select! {
+            _ = keepalive.tick() => {
+                if ws_sink.send(Message::Ping(Default::default())).await.is_err() {
+                    break;
+                }
+            }
             result = event_rx.recv() => {
                 match result {
                     Ok(json) => {

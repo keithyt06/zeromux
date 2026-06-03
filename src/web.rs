@@ -306,6 +306,23 @@ async fn create_session(
     let type_label = req.session_type.to_string();
     let work_dir = req.work_dir.unwrap_or_else(|| state.work_dir.clone());
 
+    // Security: a client-supplied work_dir must resolve to a path under HOME,
+    // mirroring the file-browser's resolve_base_dir. Without this an authenticated
+    // user could spawn a shell/agent (and write a git worktree) anywhere on the
+    // host the server process can reach (e.g. /etc, another user's home).
+    {
+        let canonical = std::path::Path::new(&work_dir)
+            .canonicalize()
+            .map_err(|e| (StatusCode::BAD_REQUEST, format!("Invalid work_dir: {}", e)))?;
+        let home = std::env::var("HOME").unwrap_or_else(|_| "/home/ubuntu".to_string());
+        let home_path = std::path::Path::new(&home)
+            .canonicalize()
+            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("Home dir error: {}", e)))?;
+        if !canonical.starts_with(&home_path) {
+            return Err((StatusCode::FORBIDDEN, "work_dir must be under home directory".to_string()));
+        }
+    }
+
     let name = req.name.or_else(|| req.tmux_target.clone()).unwrap_or_else(|| {
         // Use directory basename as part of session name
         let dir_name = std::path::Path::new(&work_dir)
@@ -468,6 +485,15 @@ struct UpdateSessionReq {
     status: Option<crate::session_manager::SessionMeta>,
 }
 
+/// Strip control characters (newlines, terminal escapes, etc.) and cap the
+/// length of a user-supplied metadata string (char-boundary-safe).
+fn sanitize_meta(s: &str, max_chars: usize) -> String {
+    s.chars()
+        .filter(|c| !c.is_control())
+        .take(max_chars)
+        .collect()
+}
+
 async fn update_session(
     State(state): State<Arc<AppState>>,
     user: axum::Extension<CurrentUser>,
@@ -480,9 +506,14 @@ async fn update_session(
     if req.name.as_deref() == Some("") {
         return StatusCode::BAD_REQUEST;
     }
+    // Sanitize free-form fields: strip control chars (incl. newlines, which break
+    // the sidebar layout) and cap length, so a renamed session can't bloat every
+    // 3s poll payload or smuggle terminal escapes into the UI.
+    let name = req.name.map(|n| sanitize_meta(&n, 200));
+    let description = req.description.map(|d| sanitize_meta(&d, 1000));
     if state
         .sessions
-        .update_session_meta_named(&id, req.name, req.description, req.status)
+        .update_session_meta_named(&id, name, description, req.status)
     {
         StatusCode::OK
     } else {
@@ -1126,19 +1157,17 @@ async fn create_event(
     Json(req): Json<crate::events::CreateEventReq>,
 ) -> Result<(StatusCode, Json<serde_json::Value>), (StatusCode, String)> {
     // Authenticate via token query param (same scheme as WebSocket upgrades).
-    let authed = query
+    // The resolved user owns the event — owner_id is stamped from the token,
+    // never trusted from the request body.
+    let user = query
         .token
         .as_ref()
         .and_then(|t| crate::auth::verify_ws_token(&state, t))
-        .is_some();
-
-    if !authed {
-        return Err((StatusCode::UNAUTHORIZED, "Unauthorized".to_string()));
-    }
+        .ok_or((StatusCode::UNAUTHORIZED, "Unauthorized".to_string()))?;
 
     let event = state
         .events
-        .create(req)
+        .create(req, &user.id)
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
 
     Ok((
@@ -1150,14 +1179,17 @@ async fn create_event(
     ))
 }
 
-/// GET /api/events — list events (requires auth middleware)
+/// GET /api/events — list events (requires auth middleware). Non-admins see
+/// only their own events; admins see all.
 async fn list_events(
     State(state): State<Arc<AppState>>,
+    user: axum::Extension<CurrentUser>,
     Query(query): Query<crate::events::EventsQuery>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    let owner_filter = if user.is_admin() { None } else { Some(user.id.as_str()) };
     let events = state
         .events
-        .list(&query)
+        .list(&query, owner_filter)
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
 
     Ok(Json(serde_json::json!({
@@ -1166,14 +1198,17 @@ async fn list_events(
     })))
 }
 
-/// DELETE /api/events/{id} — delete single event
+/// DELETE /api/events/{id} — delete single event. Non-admins can only delete
+/// their own events.
 async fn delete_event(
     State(state): State<Arc<AppState>>,
+    user: axum::Extension<CurrentUser>,
     axum::extract::Path(id): axum::extract::Path<String>,
 ) -> Result<StatusCode, (StatusCode, String)> {
+    let owner_filter = if user.is_admin() { None } else { Some(user.id.as_str()) };
     let deleted = state
         .events
-        .delete_one(&id)
+        .delete_one(&id, owner_filter)
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
 
     if deleted {

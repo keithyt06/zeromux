@@ -32,16 +32,23 @@ pub async fn ws_terminal(
     Query(query): Query<WsQuery>,
     State(state): State<Arc<AppState>>,
 ) -> Response {
-    let authed = query
-        .token
-        .as_ref()
-        .and_then(|t| auth::verify_ws_token(&state, t))
-        .is_some();
+    let user = match query.token.as_ref().and_then(|t| auth::verify_ws_token(&state, t)) {
+        Some(u) => u,
+        None => {
+            return Response::builder()
+                .status(401)
+                .body(axum::body::Body::from("Unauthorized"))
+                .unwrap();
+        }
+    };
 
-    if !authed {
+    // Authorization: only the session owner (or an admin) may attach. Without
+    // this any authenticated user could read/drive — and now respawn — another
+    // user's session by guessing its id.
+    if !user.is_admin() && !state.sessions.is_owner(&session_id, &user.id) {
         return Response::builder()
-            .status(401)
-            .body(axum::body::Body::from("Unauthorized"))
+            .status(403)
+            .body(axum::body::Body::from("Forbidden"))
             .unwrap();
     }
 

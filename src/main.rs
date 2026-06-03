@@ -256,6 +256,24 @@ async fn main() {
     // Restore persisted session metadata (running=None until respawned).
     state.sessions.load_persisted();
 
+    // Periodically prune the agent-events table (one row per turn, otherwise
+    // unbounded). Prune once at startup, then daily. 30-day retention.
+    {
+        let events = state.events.clone();
+        tokio::spawn(async move {
+            const RETENTION_DAYS: u64 = 30;
+            let mut tick = tokio::time::interval(std::time::Duration::from_secs(24 * 3600));
+            loop {
+                tick.tick().await;
+                match events.prune_older_than_days(RETENTION_DAYS) {
+                    Ok(n) if n > 0 => tracing::info!("pruned {} agent events older than {} days", n, RETENTION_DAYS),
+                    Ok(_) => {}
+                    Err(e) => tracing::warn!("event prune failed: {}", e),
+                }
+            }
+        });
+    }
+
     let app = web::build_router(state.clone());
 
     let addr = format!("{}:{}", args.host, args.port);

@@ -298,6 +298,7 @@ struct SpawnPlan {
     stype: SessionType,
     resume_token: Option<ResumeToken>,
     work_dir: String,
+    owner_id: String,
     cols: u16,
     rows: u16,
 }
@@ -346,6 +347,7 @@ fn decide_spawn(s: &mut Session) -> SpawnDecision {
             stype: s.session_type,
             resume_token: s.resume_token.clone(),
             work_dir: s.work_dir.clone(),
+            owner_id: s.owner_id.clone(),
             cols: s.cols,
             rows: s.rows,
         })
@@ -600,6 +602,7 @@ impl SessionManager {
         &self,
         id: &str,
         work_dir: &str,
+        owner_id: &str,
         resume: Option<&str>,
     ) -> Result<RunningProcess, String> {
         let process = AcpProcess::spawn(&self.claude_path, work_dir, resume)
@@ -617,6 +620,7 @@ impl SessionManager {
             self.events.clone(),
             "claude-code",
             work_dir.to_string(),
+            owner_id.to_string(),
             self.weak(),
         );
 
@@ -643,7 +647,7 @@ impl SessionManager {
         let (effective_dir, worktree_path) = resolve_work_dir(work_dir, &id);
 
         let running = self
-            .spawn_claude(&id, &effective_dir.to_string_lossy(), None)
+            .spawn_claude(&id, &effective_dir.to_string_lossy(), owner_id, None)
             .await
             .map_err(|e| {
                 if let Some(wt) = &worktree_path {
@@ -685,6 +689,7 @@ impl SessionManager {
         &self,
         id: &str,
         work_dir: &str,
+        owner_id: &str,
         resume: Option<&str>,
     ) -> Result<RunningProcess, String> {
         let process = KiroProcess::spawn(&self.kiro_path, work_dir, resume)
@@ -702,6 +707,7 @@ impl SessionManager {
             self.events.clone(),
             "kiro",
             work_dir.to_string(),
+            owner_id.to_string(),
             self.weak(),
         );
 
@@ -728,7 +734,7 @@ impl SessionManager {
         let (effective_dir, worktree_path) = resolve_work_dir(work_dir, &id);
 
         let running = self
-            .spawn_kiro(&id, &effective_dir.to_string_lossy(), None)
+            .spawn_kiro(&id, &effective_dir.to_string_lossy(), owner_id, None)
             .await
             .map_err(|e| {
                 if let Some(wt) = &worktree_path {
@@ -771,6 +777,7 @@ impl SessionManager {
         &self,
         id: &str,
         work_dir: &str,
+        owner_id: &str,
         resume: Option<String>,
     ) -> Result<RunningProcess, String> {
         let reasoning = if self.codex_reasoning.is_empty() || self.codex_reasoning == "off" {
@@ -799,6 +806,7 @@ impl SessionManager {
             self.events.clone(),
             "codex",
             work_dir.to_string(),
+            owner_id.to_string(),
             self.weak(),
         );
 
@@ -826,7 +834,7 @@ impl SessionManager {
         let (effective_dir, worktree_path) = resolve_work_dir(work_dir, &id);
 
         let running = self
-            .spawn_codex(&id, &effective_dir.to_string_lossy(), None)
+            .spawn_codex(&id, &effective_dir.to_string_lossy(), owner_id, None)
             .await
             .map_err(|e| {
                 if let Some(wt) = &worktree_path {
@@ -877,7 +885,7 @@ impl SessionManager {
         };
 
         // 别人在 spawn：锁外轮询等待 running 出现（最多 ~30s）。
-        let Some(SpawnPlan { stype, resume_token: token, work_dir, cols, rows }) = plan else {
+        let Some(SpawnPlan { stype, resume_token: token, work_dir, owner_id, cols, rows }) = plan else {
             for _ in 0..300 {
                 tokio::time::sleep(std::time::Duration::from_millis(100)).await;
                 let map = self.sessions.lock().unwrap();
@@ -916,21 +924,21 @@ impl SessionManager {
                     Some(ResumeToken::Claude(s)) => Some(s.as_str()),
                     _ => None,
                 };
-                self.spawn_claude(id, &work_dir, r).await
+                self.spawn_claude(id, &work_dir, &owner_id, r).await
             }
             SessionType::Kiro => {
                 let r = match &token {
                     Some(ResumeToken::Kiro(s)) => Some(s.as_str()),
                     _ => None,
                 };
-                self.spawn_kiro(id, &work_dir, r).await
+                self.spawn_kiro(id, &work_dir, &owner_id, r).await
             }
             SessionType::Codex => {
                 let r = match &token {
                     Some(ResumeToken::Codex(t)) => Some(t.clone()),
                     _ => None,
                 };
-                self.spawn_codex(id, &work_dir, r).await
+                self.spawn_codex(id, &work_dir, &owner_id, r).await
             }
             SessionType::Tmux => {
                 let t = match &token {
@@ -957,9 +965,9 @@ impl SessionManager {
                     e
                 );
                 let fresh = match stype {
-                    SessionType::Claude => self.spawn_claude(id, &work_dir, None).await,
-                    SessionType::Kiro => self.spawn_kiro(id, &work_dir, None).await,
-                    SessionType::Codex => self.spawn_codex(id, &work_dir, None).await,
+                    SessionType::Claude => self.spawn_claude(id, &work_dir, &owner_id, None).await,
+                    SessionType::Kiro => self.spawn_kiro(id, &work_dir, &owner_id, None).await,
+                    SessionType::Codex => self.spawn_codex(id, &work_dir, &owner_id, None).await,
                     SessionType::Tmux => self.spawn_tmux(id, &work_dir, cols, rows, None),
                 };
                 match fresh {
@@ -1272,6 +1280,7 @@ fn log_result_event(
     agent_label: &'static str,
     session_id: &str,
     work_dir: &str,
+    owner_id: &str,
     evt: &crate::acp::process::AcpEvent,
 ) {
     use crate::acp::process::AcpEvent;
@@ -1285,7 +1294,7 @@ fn log_result_event(
             work_dir: Some(work_dir.to_string()),
             metadata,
         };
-        if let Err(e) = events.create(req) {
+        if let Err(e) = events.create(req, owner_id) {
             tracing::warn!("Failed to auto-log task_done for session {}: {}", session_id, e);
         }
     }
@@ -1337,6 +1346,7 @@ fn spawn_acp_fanout(
     events: Arc<EventStore>,
     agent_label: &'static str,
     work_dir: String,
+    owner_id: String,
     mgr: Weak<SessionManager>,
 ) {
     tokio::spawn(async move {
@@ -1349,7 +1359,7 @@ fn spawn_acp_fanout(
                 event = process.event_rx.recv() => {
                     match event {
                         Some(evt) => {
-                            log_result_event(&events, agent_label, &sid, &work_dir, &evt);
+                            log_result_event(&events, agent_label, &sid, &work_dir, &owner_id, &evt);
                             // Backfill Claude resume token on first id-bearing event.
                             if !token_saved {
                                 if let Some(sid_val) = claude_session_id(&evt) {
@@ -1438,6 +1448,7 @@ fn spawn_kiro_fanout(
     events: Arc<EventStore>,
     agent_label: &'static str,
     work_dir: String,
+    owner_id: String,
     mgr: Weak<SessionManager>,
 ) {
     tokio::spawn(async move {
@@ -1450,7 +1461,7 @@ fn spawn_kiro_fanout(
                 event = process.event_rx.recv() => {
                     match event {
                         Some(evt) => {
-                            log_result_event(&events, agent_label, &sid, &work_dir, &evt);
+                            log_result_event(&events, agent_label, &sid, &work_dir, &owner_id, &evt);
                             // Backfill Kiro resume token (sessionId) on first id-bearing event.
                             if !token_saved {
                                 if let Some(sid_val) = kiro_session_id(&evt) {
@@ -1541,6 +1552,7 @@ fn spawn_codex_fanout(
     events: Arc<EventStore>,
     agent_label: &'static str,
     work_dir: String,
+    owner_id: String,
     mgr: Weak<SessionManager>,
 ) {
     tokio::spawn(async move {
@@ -1553,7 +1565,7 @@ fn spawn_codex_fanout(
                 event = process.event_rx.recv() => {
                     match event {
                         Some(evt) => {
-                            log_result_event(&events, agent_label, &sid, &work_dir, &evt);
+                            log_result_event(&events, agent_label, &sid, &work_dir, &owner_id, &evt);
                             // Backfill Codex resume token (threadId) on first id-bearing event.
                             if !token_saved {
                                 if let Some(tid) = codex_thread_id(&evt) {

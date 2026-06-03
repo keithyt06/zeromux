@@ -116,6 +116,8 @@ pub enum SessionInput {
     Prompt(String),
     /// ACP/Kiro: cancel/kill
     Cancel,
+    /// ACP/Kiro: turn-level interrupt (abort current turn, keep process alive)
+    Interrupt,
 }
 
 #[derive(Clone, Copy, PartialEq, Debug)]
@@ -1315,6 +1317,8 @@ fn spawn_acp_fanout(
 ) {
     tokio::spawn(async move {
         let mut token_saved = false;
+        let mut turn_seq: u64 = 0;
+        let mut local_running = false;
         loop {
             tokio::select! {
                 event = process.event_rx.recv() => {
@@ -1330,11 +1334,21 @@ fn spawn_acp_fanout(
                                     token_saved = true;
                                 }
                             }
+                            let is_boundary = matches!(
+                                evt,
+                                AcpEvent::Result { .. } | AcpEvent::Error { .. } | AcpEvent::Exit { .. }
+                            );
                             let json = match serde_json::to_string(&evt) {
                                 Ok(j) => j,
                                 Err(_) => continue,
                             };
                             let _ = event_tx.send(json);
+                            if is_boundary {
+                                local_running = false;
+                                if let Some(m) = mgr.upgrade() {
+                                    m.mark_turn(&sid, TurnState::Idle, turn_seq);
+                                }
+                            }
                         }
                         None => break,
                     }
@@ -1342,8 +1356,26 @@ fn spawn_acp_fanout(
                 input = input_rx.recv() => {
                     match input {
                         Some(SessionInput::Prompt(text)) => {
+                            if local_running {
+                                if let Err(e) = process.interrupt().await {
+                                    tracing::warn!("interrupt before resend failed for {}: {}", sid, e);
+                                }
+                            }
+                            turn_seq += 1;
+                            local_running = true;
+                            if let Some(m) = mgr.upgrade() {
+                                m.mark_turn(&sid, TurnState::Running, turn_seq);
+                            }
                             if let Err(e) = process.send_prompt(&text).await {
                                 tracing::warn!("ACP send_prompt failed for {}: {}", sid, e);
+                            }
+                        }
+                        Some(SessionInput::Interrupt) => {
+                            if local_running {
+                                if let Err(e) = process.interrupt().await {
+                                    tracing::warn!("interrupt failed for {}: {}", sid, e);
+                                }
+                                // 旧 turn 的 Result/Error 会照常到达并经 mark_turn(Idle,seq) 翻 Idle
                             }
                         }
                         Some(SessionInput::Cancel) => {
@@ -1372,6 +1404,8 @@ fn spawn_kiro_fanout(
 ) {
     tokio::spawn(async move {
         let mut token_saved = false;
+        let mut turn_seq: u64 = 0;
+        let mut local_running = false;
         loop {
             tokio::select! {
                 event = process.event_rx.recv() => {
@@ -1387,11 +1421,21 @@ fn spawn_kiro_fanout(
                                     token_saved = true;
                                 }
                             }
+                            let is_boundary = matches!(
+                                evt,
+                                AcpEvent::Result { .. } | AcpEvent::Error { .. } | AcpEvent::Exit { .. }
+                            );
                             let json = match serde_json::to_string(&evt) {
                                 Ok(j) => j,
                                 Err(_) => continue,
                             };
                             let _ = event_tx.send(json);
+                            if is_boundary {
+                                local_running = false;
+                                if let Some(m) = mgr.upgrade() {
+                                    m.mark_turn(&sid, TurnState::Idle, turn_seq);
+                                }
+                            }
                         }
                         None => break,
                     }
@@ -1399,8 +1443,25 @@ fn spawn_kiro_fanout(
                 input = input_rx.recv() => {
                     match input {
                         Some(SessionInput::Prompt(text)) => {
+                            if local_running {
+                                if let Err(e) = process.interrupt().await {
+                                    tracing::warn!("interrupt before resend failed for {}: {}", sid, e);
+                                }
+                            }
+                            turn_seq += 1;
+                            local_running = true;
+                            if let Some(m) = mgr.upgrade() {
+                                m.mark_turn(&sid, TurnState::Running, turn_seq);
+                            }
                             if let Err(e) = process.send_prompt(&text).await {
                                 tracing::warn!("Kiro send_prompt failed for {}: {}", sid, e);
+                            }
+                        }
+                        Some(SessionInput::Interrupt) => {
+                            if local_running {
+                                if let Err(e) = process.interrupt().await {
+                                    tracing::warn!("interrupt failed for {}: {}", sid, e);
+                                }
                             }
                         }
                         Some(SessionInput::Cancel) => {
@@ -1432,6 +1493,8 @@ fn spawn_codex_fanout(
 ) {
     tokio::spawn(async move {
         let mut token_saved = false;
+        let mut turn_seq: u64 = 0;
+        let mut local_running = false;
         loop {
             tokio::select! {
                 event = process.event_rx.recv() => {
@@ -1447,11 +1510,21 @@ fn spawn_codex_fanout(
                                     token_saved = true;
                                 }
                             }
+                            let is_boundary = matches!(
+                                evt,
+                                AcpEvent::Result { .. } | AcpEvent::Error { .. } | AcpEvent::Exit { .. }
+                            );
                             let json = match serde_json::to_string(&evt) {
                                 Ok(j) => j,
                                 Err(_) => continue,
                             };
                             let _ = event_tx.send(json);
+                            if is_boundary {
+                                local_running = false;
+                                if let Some(m) = mgr.upgrade() {
+                                    m.mark_turn(&sid, TurnState::Idle, turn_seq);
+                                }
+                            }
                         }
                         None => break,
                     }
@@ -1459,8 +1532,25 @@ fn spawn_codex_fanout(
                 input = input_rx.recv() => {
                     match input {
                         Some(SessionInput::Prompt(text)) => {
+                            if local_running {
+                                if let Err(e) = process.interrupt().await {
+                                    tracing::warn!("interrupt before resend failed for {}: {}", sid, e);
+                                }
+                            }
+                            turn_seq += 1;
+                            local_running = true;
+                            if let Some(m) = mgr.upgrade() {
+                                m.mark_turn(&sid, TurnState::Running, turn_seq);
+                            }
                             if let Err(e) = process.send_prompt(&text).await {
                                 tracing::warn!("Codex send_prompt failed for {}: {}", sid, e);
+                            }
+                        }
+                        Some(SessionInput::Interrupt) => {
+                            if local_running {
+                                if let Err(e) = process.interrupt().await {
+                                    tracing::warn!("interrupt failed for {}: {}", sid, e);
+                                }
                             }
                         }
                         Some(SessionInput::Cancel) => {

@@ -118,6 +118,9 @@ pub enum SessionInput {
     Cancel,
 }
 
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub enum TurnState { Idle, Running }
+
 /// 一个会话的运行态：仅当进程存活时存在。fan-out 任务独占其中的进程句柄
 /// （通过 channel）。Drop 此结构 → channel 关闭 → fan-out 退出 → 进程死。
 struct RunningProcess {
@@ -127,6 +130,9 @@ struct RunningProcess {
     input_tx: mpsc::Sender<SessionInput>,
     /// PTY child PID kept for /proc lookup (PTY sessions only)
     pty_pid: Option<u32>,
+    turn_state: TurnState,
+    turn_started_ms: Option<i64>,
+    turn_seq: u64,
 }
 
 fn now_millis() -> i64 {
@@ -153,6 +159,8 @@ pub struct Session {
     created_ms: i64,
     /// 并发重生互斥（仅锁内访问）。
     spawning: bool,
+    last_activity_ms: i64,
+    turns_completed: u32,
     /// 运行态；None = 未运行（可按 resume_token 重生）。
     running: Option<RunningProcess>,
     /// Output history for replay on reconnect (base64 for PTY, JSON for ACP/Kiro)
@@ -337,6 +345,29 @@ fn decide_spawn(s: &mut Session) -> SpawnDecision {
     }
 }
 
+/// turn 边界状态变更（纯函数，便于单测）。Running 置 started_ms 并采纳新 seq；
+/// Idle 仅当 seq 与当前一致才生效（忽略被中断旧 turn 的迟到事件）并 +1 完成计数。
+fn apply_turn(session: &mut Session, state: TurnState, seq: u64) {
+    let now = now_millis();
+    session.last_activity_ms = now;
+    if let Some(rp) = session.running.as_mut() {
+        match state {
+            TurnState::Running => {
+                rp.turn_state = TurnState::Running;
+                rp.turn_started_ms = Some(now);
+                rp.turn_seq = seq;
+            }
+            TurnState::Idle => {
+                if rp.turn_seq == seq {
+                    rp.turn_state = TurnState::Idle;
+                    rp.turn_started_ms = None;
+                    session.turns_completed = session.turns_completed.wrapping_add(1);
+                }
+            }
+        }
+    }
+}
+
 impl SessionManager {
     pub fn new(
         events: Arc<EventStore>,
@@ -459,6 +490,9 @@ impl SessionManager {
             event_tx,
             input_tx,
             pty_pid: pid,
+            turn_state: TurnState::Idle,
+            turn_started_ms: None,
+            turn_seq: 0,
         })
     }
 
@@ -496,6 +530,8 @@ impl SessionManager {
             worktree_path: None,
             created_ms: now_millis(),
             spawning: false,
+            last_activity_ms: now_millis(),
+            turns_completed: 0,
             running: Some(running),
             scrollback: VecDeque::new(),
             scrollback_bytes: 0,
@@ -537,6 +573,9 @@ impl SessionManager {
             event_tx,
             input_tx,
             pty_pid: None,
+            turn_state: TurnState::Idle,
+            turn_started_ms: None,
+            turn_seq: 0,
         })
     }
 
@@ -577,6 +616,8 @@ impl SessionManager {
             worktree_path,
             created_ms: now_millis(),
             spawning: false,
+            last_activity_ms: now_millis(),
+            turns_completed: 0,
             running: Some(running),
             scrollback: VecDeque::new(),
             scrollback_bytes: 0,
@@ -617,6 +658,9 @@ impl SessionManager {
             event_tx,
             input_tx,
             pty_pid: None,
+            turn_state: TurnState::Idle,
+            turn_started_ms: None,
+            turn_seq: 0,
         })
     }
 
@@ -657,6 +701,8 @@ impl SessionManager {
             worktree_path,
             created_ms: now_millis(),
             spawning: false,
+            last_activity_ms: now_millis(),
+            turns_completed: 0,
             running: Some(running),
             scrollback: VecDeque::new(),
             scrollback_bytes: 0,
@@ -709,6 +755,9 @@ impl SessionManager {
             event_tx,
             input_tx,
             pty_pid: None,
+            turn_state: TurnState::Idle,
+            turn_started_ms: None,
+            turn_seq: 0,
         })
     }
 
@@ -750,6 +799,8 @@ impl SessionManager {
             worktree_path,
             created_ms: now_millis(),
             spawning: false,
+            last_activity_ms: now_millis(),
+            turns_completed: 0,
             running: Some(running),
             scrollback: VecDeque::new(),
             scrollback_bytes: 0,
@@ -1012,6 +1063,15 @@ impl SessionManager {
 
     // (PTY write/resize now handled via input_tx → fan-out task)
 
+    /// fan-out turn-boundary callback; locks sessions and applies the state change.
+    #[allow(dead_code)]
+    fn mark_turn(&self, sid: &str, state: TurnState, seq: u64) {
+        let mut map = self.sessions.lock().unwrap();
+        if let Some(s) = map.get_mut(sid) {
+            apply_turn(s, state, seq);
+        }
+    }
+
     /// Update session metadata (description, status)
     pub fn update_session_meta(
         &self,
@@ -1101,6 +1161,8 @@ impl SessionManager {
                     worktree_path: p.worktree_path.map(std::path::PathBuf::from),
                     created_ms: p.created_ms,
                     spawning: false,
+                    last_activity_ms: now_millis(),
+                    turns_completed: 0,
                     running: None,
                     scrollback: VecDeque::new(),
                     scrollback_bytes: 0,
@@ -1447,6 +1509,8 @@ mod decide_spawn_tests {
             worktree_path: None,
             created_ms: 0,
             spawning: false,
+            last_activity_ms: 0,
+            turns_completed: 0,
             running: None,
             scrollback: VecDeque::new(),
             scrollback_bytes: 0,
@@ -1484,7 +1548,14 @@ mod decide_spawn_tests {
         let mut s = test_session();
         let (event_tx, _) = broadcast::channel(BROADCAST_CAPACITY);
         let (input_tx, _input_rx) = mpsc::channel::<SessionInput>(64);
-        s.running = Some(RunningProcess { event_tx, input_tx, pty_pid: None });
+        s.running = Some(RunningProcess {
+            event_tx,
+            input_tx,
+            pty_pid: None,
+            turn_state: TurnState::Idle,
+            turn_started_ms: None,
+            turn_seq: 0,
+        });
         assert!(matches!(decide_spawn(&mut s), SpawnDecision::AlreadyRunning));
         // Must not flip spawning when nothing needs spawning.
         assert!(!s.spawning);
@@ -1550,5 +1621,72 @@ mod decide_spawn_tests {
         // we left it true to prove the guard didn't touch it).
         let map = mgr.sessions.lock().unwrap();
         assert!(map.get("sid").unwrap().spawning, "disarmed guard must not touch spawning");
+    }
+}
+
+#[cfg(test)]
+mod turn_state_tests {
+    use super::*;
+
+    fn running_session(id: &str) -> Session {
+        let (event_tx, _) = broadcast::channel(BROADCAST_CAPACITY);
+        let (input_tx, _rx) = mpsc::channel(8);
+        Session {
+            id: id.into(), name: "t".into(),
+            session_type: SessionType::Claude,
+            cols: 80, rows: 24, work_dir: "/tmp".into(),
+            owner_id: "u".into(), description: String::new(),
+            status: SessionMeta::Running,
+            resume_token: None, worktree_path: None, created_ms: 0,
+            spawning: false,
+            last_activity_ms: 0,
+            turns_completed: 0,
+            running: Some(RunningProcess {
+                event_tx, input_tx, pty_pid: None,
+                turn_state: TurnState::Idle,
+                turn_started_ms: None,
+                turn_seq: 0,
+            }),
+            scrollback: VecDeque::new(), scrollback_bytes: 0,
+        }
+    }
+
+    #[test]
+    fn apply_running_sets_started_and_seq() {
+        let mut s = running_session("s");
+        apply_turn(&mut s, TurnState::Running, 1);
+        let rp = s.running.as_ref().unwrap();
+        assert_eq!(rp.turn_state, TurnState::Running);
+        assert!(rp.turn_started_ms.is_some());
+        assert_eq!(rp.turn_seq, 1);
+    }
+
+    #[test]
+    fn apply_idle_matching_seq_clears_and_counts() {
+        let mut s = running_session("s");
+        apply_turn(&mut s, TurnState::Running, 1);
+        apply_turn(&mut s, TurnState::Idle, 1);
+        assert_eq!(s.turns_completed, 1);
+        assert_eq!(s.running.as_ref().unwrap().turn_state, TurnState::Idle);
+        assert!(s.running.as_ref().unwrap().turn_started_ms.is_none());
+    }
+
+    #[test]
+    fn apply_idle_stale_seq_ignored() {
+        let mut s = running_session("s");
+        apply_turn(&mut s, TurnState::Running, 2);
+        apply_turn(&mut s, TurnState::Idle, 1);
+        assert_eq!(s.turns_completed, 0);
+        assert_eq!(s.running.as_ref().unwrap().turn_state, TurnState::Running);
+    }
+
+    #[test]
+    fn apply_on_hibernated_is_noop() {
+        let mut s = running_session("s");
+        s.running = None;
+        s.last_activity_ms = -1; // sentinel
+        apply_turn(&mut s, TurnState::Running, 1);
+        assert!(s.running.is_none());
+        assert!(s.last_activity_ms > 0, "last_activity_ms must update even when hibernated");
     }
 }

@@ -4,7 +4,6 @@ import { listDirectories, listTmuxSessions } from '../lib/api'
 import type { Theme } from '../lib/theme'
 import { Terminal, Bot, Plus, X, PanelLeftClose, PanelLeft, Sun, Moon, Sparkles, Folder, FolderGit2, ChevronLeft, Home, LogOut, Users, MonitorUp, Link, Cpu } from 'lucide-react'
 import AdminPanel from './AdminPanel'
-import { StatusDot } from './SessionInfoBar'
 
 interface Props {
   sessions: SessionInfo[]
@@ -12,6 +11,8 @@ interface Props {
   onSelect: (id: string) => void
   onCreate: (type: SessionType, workDir?: string, tmuxTarget?: string) => void
   onDelete: (id: string) => void
+  onRename: (id: string, name: string) => void
+  hasUnread: (s: SessionInfo) => boolean
   onLogout: () => void
   theme: Theme
   onToggleTheme: () => void
@@ -19,6 +20,26 @@ interface Props {
   open: boolean
   onToggle: () => void
   mobile: boolean
+}
+
+/** Relative "last activity" label. <60s 刚刚, <60m Xm, <24h Xh, else Xd. */
+function relativeTime(ms: number): string {
+  if (!ms) return ''
+  const diff = Date.now() - ms
+  if (diff < 60_000) return '刚刚'
+  if (diff < 3_600_000) return `${Math.floor(diff / 60_000)}m`
+  if (diff < 86_400_000) return `${Math.floor(diff / 3_600_000)}h`
+  return `${Math.floor(diff / 86_400_000)}d`
+}
+
+/** Turn-state dot: hollow=hibernated, green=running, gray=idle. */
+function TurnDot({ s }: { s: SessionInfo }) {
+  const cls = !s.running
+    ? 'border border-[var(--text-secondary)]'
+    : s.turn_state === 'running'
+      ? 'bg-green-400'
+      : 'bg-[var(--text-secondary)]'
+  return <span className={`w-2 h-2 rounded-full shrink-0 ${cls}`} />
 }
 
 type NewSessionStep = 'closed' | 'pick-type' | 'pick-terminal-mode' | 'pick-dir' | 'pick-tmux'
@@ -36,10 +57,16 @@ function SessionTypeIcon({ type, size = 14, className }: { type: SessionType; si
   }
 }
 
-export default function Sidebar({ sessions, activeId, onSelect, onCreate, onDelete, onLogout, theme, onToggleTheme, user, open, onToggle, mobile }: Props) {
+export default function Sidebar({ sessions, activeId, onSelect, onCreate, onDelete, onRename, hasUnread, onLogout, theme, onToggleTheme, user, open, onToggle, mobile }: Props) {
   const [step, setStep] = useState<NewSessionStep>('closed')
   const [pendingType, setPendingType] = useState<SessionType | null>(null)
   const [showAdmin, setShowAdmin] = useState(false)
+  const [editingId, setEditingId] = useState<string | null>(null)
+
+  const commitRename = (id: string, name: string) => {
+    setEditingId(null)
+    onRename(id, name)
+  }
   const isAdmin = user?.role === 'admin'
 
   // Directory browser state
@@ -245,10 +272,34 @@ export default function Sidebar({ sessions, activeId, onSelect, onCreate, onDele
                 : 'text-[var(--text-secondary)] hover:bg-[var(--bg-tertiary)] hover:text-[var(--text-primary)]'
             }`}
           >
-            <StatusDot status={s.status} />
+            <TurnDot s={s} />
             <SessionTypeIcon type={s.type} size={13} className="shrink-0" />
             <div className="flex-1 min-w-0">
-              <div className="truncate">{s.name}</div>
+              <div className="flex items-center gap-1.5">
+                {editingId === s.id ? (
+                  <input
+                    autoFocus
+                    defaultValue={s.name}
+                    onClick={e => e.stopPropagation()}
+                    onBlur={e => commitRename(s.id, e.target.value)}
+                    onKeyDown={e => {
+                      if (e.key === 'Enter') commitRename(s.id, (e.target as HTMLInputElement).value)
+                      else if (e.key === 'Escape') setEditingId(null)
+                    }}
+                    className="flex-1 min-w-0 bg-[var(--bg-primary)] border border-[var(--accent-blue)] rounded px-1 py-0 text-xs text-[var(--text-primary)] outline-none"
+                  />
+                ) : (
+                  <span
+                    className="truncate"
+                    onDoubleClick={e => { e.stopPropagation(); setEditingId(s.id) }}
+                    title="Double-click to rename"
+                  >
+                    {s.name}
+                  </span>
+                )}
+                {hasUnread(s) && <span className="w-2 h-2 rounded-full bg-red-500 shrink-0" title="New activity" />}
+                <span className="ml-auto text-[10px] text-[var(--text-muted)] shrink-0">{relativeTime(s.last_activity_ms)}</span>
+              </div>
               {s.description && (
                 <div className="truncate text-[10px] text-[var(--text-muted)] -mt-0.5">{s.description}</div>
               )}

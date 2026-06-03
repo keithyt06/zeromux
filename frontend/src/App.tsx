@@ -1,6 +1,6 @@
-import { useState, useEffect, useCallback, useMemo } from 'react'
+import { useState, useEffect, useCallback, useMemo, useRef } from 'react'
 import type { SessionInfo, SessionType, UserInfo } from './lib/api'
-import { listSessions, createSession, deleteSession, checkAuth, legacyLogin, clearAuth } from './lib/api'
+import { listSessions, createSession, deleteSession, checkAuth, legacyLogin, clearAuth, renameSession } from './lib/api'
 import { useTheme } from './lib/theme'
 import Sidebar from './components/Sidebar'
 import TerminalView from './components/TerminalView'
@@ -21,6 +21,9 @@ export default function App() {
   const [sessions, setSessions] = useState<SessionInfo[]>([])
   const [activeId, setActiveId] = useState<string | null>(null)
   const [overlay, setOverlay] = useState<Record<string, OverlayView>>({})
+  // session id → turns_completed already seen (red-dot read baseline)
+  const [readCounts, setReadCounts] = useState<Record<string, number>>({})
+  const baselineInit = useRef(false)
   const themeCtx = useTheme()
   const isMobile = useMemo(() => window.innerWidth < 768, [])
   const [sidebarOpen, setSidebarOpen] = useState(!isMobile)
@@ -66,6 +69,35 @@ export default function App() {
     }, 3000)
     return () => clearInterval(tick)
   }, [authState])
+
+  // First time we have a session list, treat all existing completions as read
+  // so pre-existing history doesn't light up every row's red dot.
+  useEffect(() => {
+    if (baselineInit.current || sessions.length === 0) return
+    baselineInit.current = true
+    setReadCounts(Object.fromEntries(sessions.map(s => [s.id, s.turns_completed])))
+  }, [sessions])
+
+  // Switching to a session marks its completions read (clears its red dot).
+  useEffect(() => {
+    if (!activeId) return
+    const s = sessions.find(x => x.id === activeId)
+    if (s) setReadCounts(prev => ({ ...prev, [activeId]: s.turns_completed }))
+  }, [activeId, sessions])
+
+  const hasUnread = useCallback((s: SessionInfo) =>
+    s.id !== activeId && s.turns_completed > (readCounts[s.id] ?? 0),
+  [activeId, readCounts])
+
+  const handleRename = useCallback(async (id: string, name: string) => {
+    const trimmed = name.trim()
+    const cur = sessions.find(s => s.id === id)
+    if (!trimmed || !cur || trimmed === cur.name) return
+    try {
+      await renameSession(id, trimmed)
+      setSessions(prev => prev.map(s => s.id === id ? { ...s, name: trimmed } : s))
+    } catch { /* keep old name on failure */ }
+  }, [sessions])
 
   const handleLegacyLogin = useCallback(async (password: string, remember?: boolean) => {
     const userInfo = await legacyLogin(password, remember)
@@ -146,6 +178,8 @@ export default function App() {
         onSelect={setActiveId}
         onCreate={handleCreate}
         onDelete={handleDelete}
+        onRename={handleRename}
+        hasUnread={hasUnread}
         onLogout={handleLogout}
         theme={themeCtx.theme}
         onToggleTheme={themeCtx.toggle}

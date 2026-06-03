@@ -49,6 +49,21 @@ enum Notify {
     /// so without a dedicated path they would be silently dropped and the
     /// user would see "no reply" forever.
     Error(String),
+    /// Codex is about to run a tool — a shell command (`exec_command_begin`)
+    /// or a file edit (`patch_apply_begin`). Rendered as a `tool_use` block so
+    /// the user can see what the agent is actually doing, not just its prose.
+    ToolUse {
+        /// "shell" or "apply_patch"
+        name: String,
+        /// One-line summary (the command, or the edited file list).
+        summary: String,
+    },
+    /// A tool finished (`exec_command_end` / `patch_apply_end`). Rendered as a
+    /// `tool_result` block carrying output / exit code / success.
+    ToolResult {
+        name: String,
+        text: String,
+    },
 }
 
 #[derive(Clone)]
@@ -111,6 +126,14 @@ impl ClientHandler for Handler {
                 send_notify_nonblocking(&tx, Notify::Reasoning { text, thread_id });
             } else if let Some(err) = extract_codex_event_error(&notification) {
                 send_notify_nonblocking(&tx, Notify::Error(err));
+            } else if let Some(cmd) = extract_codex_exec_begin(&notification) {
+                send_notify_nonblocking(&tx, Notify::ToolUse { name: "shell".into(), summary: cmd });
+            } else if let Some(out) = extract_codex_exec_end(&notification) {
+                send_notify_nonblocking(&tx, Notify::ToolResult { name: "shell".into(), text: out });
+            } else if let Some(files) = extract_codex_patch_begin(&notification) {
+                send_notify_nonblocking(&tx, Notify::ToolUse { name: "apply_patch".into(), summary: files });
+            } else if let Some(detail) = extract_codex_patch_end(&notification) {
+                send_notify_nonblocking(&tx, Notify::ToolResult { name: "apply_patch".into(), text: detail });
             }
         }
     }
@@ -250,6 +273,103 @@ fn extract_codex_event_error(notification: &CustomNotification) -> Option<String
         return None;
     }
     Some(text.to_string())
+}
+
+/// Extract a shell-command-start event (`exec_command_begin`). Codex sends the
+/// argv as `msg.command: Vec<String>`. Returns the joined command line for a
+/// `tool_use` bubble so the user sees what the agent is about to run.
+fn extract_codex_exec_begin(notification: &CustomNotification) -> Option<String> {
+    if notification.method != "codex/event" {
+        return None;
+    }
+    let msg = notification.params.as_ref()?.get("msg")?;
+    if msg.get("type").and_then(|v| v.as_str())? != "exec_command_begin" {
+        return None;
+    }
+    let cmd = msg
+        .get("command")?
+        .as_array()?
+        .iter()
+        .filter_map(|v| v.as_str())
+        .collect::<Vec<_>>()
+        .join(" ");
+    if cmd.is_empty() {
+        return None;
+    }
+    Some(cmd)
+}
+
+/// Extract a shell-command-end event (`exec_command_end`). Renders the
+/// aggregated output and exit code into a `tool_result` bubble.
+fn extract_codex_exec_end(notification: &CustomNotification) -> Option<String> {
+    if notification.method != "codex/event" {
+        return None;
+    }
+    let msg = notification.params.as_ref()?.get("msg")?;
+    if msg.get("type").and_then(|v| v.as_str())? != "exec_command_end" {
+        return None;
+    }
+    let exit_code = msg.get("exit_code").and_then(|v| v.as_i64()).unwrap_or(-1);
+    // Prefer the combined stream; fall back to stdout/stderr if absent.
+    let output = msg
+        .get("aggregated_output")
+        .and_then(|v| v.as_str())
+        .map(String::from)
+        .or_else(|| {
+            let out = msg.get("stdout").and_then(|v| v.as_str()).unwrap_or("");
+            let err = msg.get("stderr").and_then(|v| v.as_str()).unwrap_or("");
+            let combined = format!("{out}{err}");
+            if combined.is_empty() { None } else { Some(combined) }
+        })
+        .unwrap_or_default();
+    Some(format!("{}\n[exit: {}]", output.trim_end(), exit_code))
+}
+
+/// Extract a file-edit-start event (`patch_apply_begin`). We run Codex with
+/// `approval-policy:"never"`, so edits auto-apply and we get begin/end events
+/// rather than an approval request. `msg.changes` is a map of path → change;
+/// we surface the touched file list in a `tool_use` bubble.
+fn extract_codex_patch_begin(notification: &CustomNotification) -> Option<String> {
+    if notification.method != "codex/event" {
+        return None;
+    }
+    let msg = notification.params.as_ref()?.get("msg")?;
+    if msg.get("type").and_then(|v| v.as_str())? != "patch_apply_begin" {
+        return None;
+    }
+    let files = msg
+        .get("changes")?
+        .as_object()?
+        .keys()
+        .cloned()
+        .collect::<Vec<_>>()
+        .join(", ");
+    if files.is_empty() {
+        return None;
+    }
+    Some(files)
+}
+
+/// Extract a file-edit-end event (`patch_apply_end`). Surfaces success +
+/// stdout/stderr in a `tool_result` bubble.
+fn extract_codex_patch_end(notification: &CustomNotification) -> Option<String> {
+    if notification.method != "codex/event" {
+        return None;
+    }
+    let msg = notification.params.as_ref()?.get("msg")?;
+    if msg.get("type").and_then(|v| v.as_str())? != "patch_apply_end" {
+        return None;
+    }
+    let success = msg.get("success").and_then(|v| v.as_bool()).unwrap_or(false);
+    let out = msg.get("stdout").and_then(|v| v.as_str()).unwrap_or("");
+    let err = msg.get("stderr").and_then(|v| v.as_str()).unwrap_or("");
+    let detail = format!("{out}{err}");
+    let status = if success { "✓ applied" } else { "✗ failed" };
+    if detail.trim().is_empty() {
+        Some(status.to_string())
+    } else {
+        Some(format!("{}\n{}", status, detail.trim_end()))
+    }
 }
 
 pub struct CodexProcess {
@@ -525,6 +645,30 @@ async fn run_event_loop(
                                                 })
                                                 .await;
                                         }
+                                        Notify::ToolUse { name, summary } => {
+                                            let _ = event_tx
+                                                .send(AcpEvent::ContentBlock {
+                                                    block_type: std::borrow::Cow::Borrowed("tool_use"),
+                                                    text: None,
+                                                    name: Some(name),
+                                                    input: None,
+                                                    streaming: Some(false),
+                                                    summary: Some(summary),
+                                                })
+                                                .await;
+                                        }
+                                        Notify::ToolResult { name, text } => {
+                                            let _ = event_tx
+                                                .send(AcpEvent::ContentBlock {
+                                                    block_type: std::borrow::Cow::Borrowed("tool_result"),
+                                                    text: Some(text),
+                                                    name: Some(name),
+                                                    input: None,
+                                                    streaming: Some(false),
+                                                    summary: None,
+                                                })
+                                                .await;
+                                        }
                                     }
                                 }
                                 r = &mut call_fut => break Ok(r),
@@ -605,7 +749,10 @@ async fn run_event_loop(
             // session_configured rejection before any prompt) and must surface.
             Some(notify) = notify_rx.recv() => {
                 match notify {
-                    Notify::ProgressText { .. } | Notify::Reasoning { .. } => {
+                    Notify::ProgressText { .. }
+                    | Notify::Reasoning { .. }
+                    | Notify::ToolUse { .. }
+                    | Notify::ToolResult { .. } => {
                         tracing::debug!("codex: stream chunk between turns (dropped): {:?}", notify);
                     }
                     Notify::Error(message) => {
@@ -898,5 +1045,91 @@ mod tests {
         let v = codex_config_overrides(Some("medium"));
         assert_eq!(v["model_reasoning_effort"], "medium");
         assert_eq!(v["model_reasoning_summary"], "auto");
+    }
+
+    // ---- tool-visibility extractors (exec / patch) ----
+
+    #[test]
+    fn extract_exec_begin_joins_argv() {
+        let n = codex_event(json!({
+            "type": "exec_command_begin",
+            "call_id": "c1",
+            "command": ["ls", "-la", "/home/ubuntu"],
+        }));
+        assert_eq!(extract_codex_exec_begin(&n).as_deref(), Some("ls -la /home/ubuntu"));
+    }
+
+    #[test]
+    fn extract_exec_begin_ignores_other_types() {
+        let n = codex_event(json!({ "type": "exec_command_end", "command": ["ls"] }));
+        assert!(extract_codex_exec_begin(&n).is_none());
+    }
+
+    #[test]
+    fn extract_exec_end_uses_aggregated_output_and_exit() {
+        let n = codex_event(json!({
+            "type": "exec_command_end",
+            "call_id": "c1",
+            "aggregated_output": "file1\nfile2\n",
+            "exit_code": 0,
+        }));
+        assert_eq!(extract_codex_exec_end(&n).as_deref(), Some("file1\nfile2\n[exit: 0]"));
+    }
+
+    #[test]
+    fn extract_exec_end_falls_back_to_stdout_stderr() {
+        let n = codex_event(json!({
+            "type": "exec_command_end",
+            "stdout": "out",
+            "stderr": "err",
+            "exit_code": 2,
+        }));
+        assert_eq!(extract_codex_exec_end(&n).as_deref(), Some("outerr\n[exit: 2]"));
+    }
+
+    #[test]
+    fn extract_patch_begin_lists_files() {
+        let n = codex_event(json!({
+            "type": "patch_apply_begin",
+            "call_id": "p1",
+            "auto_approved": true,
+            "changes": { "src/main.rs": { "kind": "modify" } },
+        }));
+        assert_eq!(extract_codex_patch_begin(&n).as_deref(), Some("src/main.rs"));
+    }
+
+    #[test]
+    fn extract_patch_end_reports_success() {
+        let n = codex_event(json!({
+            "type": "patch_apply_end",
+            "call_id": "p1",
+            "success": true,
+            "stdout": "",
+            "stderr": "",
+        }));
+        assert_eq!(extract_codex_patch_end(&n).as_deref(), Some("✓ applied"));
+    }
+
+    #[test]
+    fn extract_patch_end_reports_failure_with_detail() {
+        let n = codex_event(json!({
+            "type": "patch_apply_end",
+            "success": false,
+            "stdout": "",
+            "stderr": "patch does not apply",
+        }));
+        assert_eq!(
+            extract_codex_patch_end(&n).as_deref(),
+            Some("✗ failed\npatch does not apply"),
+        );
+    }
+
+    #[test]
+    fn tool_extractors_ignore_non_codex_method() {
+        let n = CustomNotification::new(
+            "other/method",
+            Some(json!({ "msg": { "type": "exec_command_begin", "command": ["ls"] } })),
+        );
+        assert!(extract_codex_exec_begin(&n).is_none());
     }
 }

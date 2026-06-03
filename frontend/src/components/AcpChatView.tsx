@@ -26,7 +26,7 @@ const newId = () =>
     : Math.random().toString(36).slice(2) + Date.now().toString(36)
 
 interface ContentBlock {
-  type: 'text' | 'thinking' | 'tool_use'
+  type: 'text' | 'thinking' | 'tool_use' | 'tool_result'
   text?: string
   name?: string
   input?: any
@@ -482,6 +482,24 @@ function BlockView({ block, isComplete }: { block: ContentBlock; isComplete: boo
                 {truncated}
               </pre>
             </details>
+          )}
+        </div>
+      )
+    }
+
+    case 'tool_result': {
+      const out = block.text || ''
+      return (
+        <div className="border-l-2 border-[var(--accent-green,#3fb950)] pl-2.5 py-1 text-xs">
+          <div className="flex items-center gap-1 text-[var(--accent-green,#3fb950)] font-medium">
+            {createElement(iconFor(block.name), { size: 12 })}
+            <span>{block.name || 'tool'}</span>
+            <span className="text-[var(--text-secondary)] font-normal">· result</span>
+          </div>
+          {out && (
+            <pre className="mt-1 text-[11px] text-[var(--text-secondary)] whitespace-pre-wrap break-words bg-[var(--bg-secondary)] rounded p-2 border border-[var(--border)] overflow-x-auto max-h-60 overflow-y-auto">
+              {out.length > 4000 ? out.substring(0, 4000) + '\n...(truncated)' : out}
+            </pre>
           )}
         </div>
       )

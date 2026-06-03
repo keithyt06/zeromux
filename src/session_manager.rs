@@ -199,6 +199,11 @@ pub struct SessionInfo {
     pub work_dir: String,
     pub description: String,
     pub status: SessionMeta,
+    pub running: bool,
+    pub turn_state: Option<&'static str>,
+    pub turn_started_ms: Option<i64>,
+    pub last_activity_ms: i64,
+    pub turns_completed: u32,
 }
 
 // ── Git worktree helpers ──
@@ -365,6 +370,27 @@ fn apply_turn(session: &mut Session, state: TurnState, seq: u64) {
                 }
             }
         }
+    }
+}
+
+fn session_info_of(s: &Session) -> SessionInfo {
+    SessionInfo {
+        id: s.id.clone(),
+        name: s.name.clone(),
+        session_type: s.session_type,
+        cols: s.cols,
+        rows: s.rows,
+        work_dir: s.work_dir.clone(),
+        description: s.description.clone(),
+        status: s.status,
+        running: s.running.is_some(),
+        turn_state: s.running.as_ref().map(|rp| match rp.turn_state {
+            TurnState::Idle => "idle",
+            TurnState::Running => "running",
+        }),
+        turn_started_ms: s.running.as_ref().and_then(|rp| rp.turn_started_ms),
+        last_activity_ms: s.last_activity_ms,
+        turns_completed: s.turns_completed,
     }
 }
 
@@ -998,16 +1024,7 @@ impl SessionManager {
                     .map(|uid| s.owner_id == uid)
                     .unwrap_or(true)
             })
-            .map(|s| SessionInfo {
-                id: s.id.clone(),
-                name: s.name.clone(),
-                session_type: s.session_type,
-                cols: s.cols,
-                rows: s.rows,
-                work_dir: s.work_dir.clone(),
-                description: s.description.clone(),
-                status: s.status,
-            })
+            .map(session_info_of)
             .collect()
     }
 
@@ -1688,5 +1705,24 @@ mod turn_state_tests {
         apply_turn(&mut s, TurnState::Running, 1);
         assert!(s.running.is_none());
         assert!(s.last_activity_ms > 0, "last_activity_ms must update even when hibernated");
+    }
+
+    #[test]
+    fn session_info_reports_turn_fields() {
+        let mut s = running_session("s");
+        apply_turn(&mut s, TurnState::Running, 1);
+        let info = session_info_of(&s);
+        assert_eq!(info.running, true);
+        assert_eq!(info.turn_state, Some("running"));
+        assert!(info.turn_started_ms.is_some());
+    }
+
+    #[test]
+    fn hibernated_session_turn_state_none() {
+        let mut s = running_session("h");
+        s.running = None;
+        let info = session_info_of(&s);
+        assert_eq!(info.running, false);
+        assert_eq!(info.turn_state, None);
     }
 }

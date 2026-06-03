@@ -1,6 +1,6 @@
 # Group B-2 会话主动管理 Implementation Plan
 
-> **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
+> **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [x]`) syntax for tracking.
 
 **Goal:** 在 B-1 持久可恢复会话之上叠加主动生命周期管理：会话运行态可见、turn 完成红点、卡死计时、中断重发、侧栏 rename。
 
@@ -37,7 +37,7 @@
 
 **关键模式约束**：现有测试（`decide_spawn_tests`）从不构造 `SessionManager`（其 `new()` 是 async 且需 EventStore/SessionStore/CLI 配置）。它们测**作用于 `&mut Session` 的纯函数**（如 `decide_spawn`）。本任务遵循同一模式：把 turn 状态变更逻辑抽成纯函数 `apply_turn(session: &mut Session, state: TurnState, seq: u64)`，`mark_turn` 方法只负责「持锁 + 调 `apply_turn`」。测试只测 `apply_turn`，复用 `decide_spawn_tests` 已有的 `test_session()` helper 风格。
 
-- [ ] **Step 1: 写失败测试**（追加到 `session_manager.rs` 末尾，新建 mod）
+- [x] **Step 1: 写失败测试**（追加到 `session_manager.rs` 末尾，新建 mod）
 
 ```rust
 #[cfg(test)]
@@ -109,12 +109,12 @@ mod turn_state_tests {
 }
 ```
 
-- [ ] **Step 2: 运行测试确认失败**
+- [x] **Step 2: 运行测试确认失败**
 
 Run: `cargo test turn_state_tests 2>&1 | tail -20`
 Expected: 编译失败（`TurnState`、新字段、`mark_turn` 不存在）
 
-- [ ] **Step 3: 加 `TurnState` 枚举 + 字段**
+- [x] **Step 3: 加 `TurnState` 枚举 + 字段**
 
 在 `RunningProcess`（~123）：
 
@@ -139,7 +139,7 @@ struct RunningProcess {
     turns_completed: u32,
 ```
 
-- [ ] **Step 4: 4 个 RunningProcess 构造点补字段**
+- [x] **Step 4: 4 个 RunningProcess 构造点补字段**
 
 在 `spawn_tmux`/`spawn_claude`(spawn_acp)/`spawn_kiro`/`spawn_codex` 各自的 `Ok(RunningProcess { event_tx, input_tx, pty_pid })`（grep `Ok(RunningProcess`）改为：
 
@@ -156,7 +156,7 @@ struct RunningProcess {
 
 并在所有 `Session { ... }` 字面量构造点（`create_*` + `load_persisted`）补 `last_activity_ms: now_millis(), turns_completed: 0,`（load_persisted 用 `created_ms` 或 `now_millis()` 均可——休眠 session 无 turn 历史，用 `now_millis()`）。grep `Session {` 找全部构造点（应为 4 个 create + 1 个 load）。
 
-- [ ] **Step 5: 加纯函数 `apply_turn` + 方法 `mark_turn`**
+- [x] **Step 5: 加纯函数 `apply_turn` + 方法 `mark_turn`**
 
 纯函数（模块级，放 `decide_spawn` 附近，便于单测）：
 
@@ -198,12 +198,12 @@ fn apply_turn(session: &mut Session, state: TurnState, seq: u64) {
 
 > `turn_seq` 由 `apply_turn(Running)` 采纳 fan-out 传入的 seq（fan-out 自增后传入，见 Task 4），无需 fan-out 再单独写回 `rp.turn_seq`。
 
-- [ ] **Step 6: 运行测试确认通过**
+- [x] **Step 6: 运行测试确认通过**
 
 Run: `cargo test turn_state_tests 2>&1 | tail -20`
 Expected: 4 passed
 
-- [ ] **Step 7: Commit**
+- [x] **Step 7: Commit**
 
 ```bash
 git add src/session_manager.rs
@@ -219,7 +219,7 @@ git commit -m "feat(b2): TurnState + per-process turn fields + mark_turn"
 
 **模式约束**：同 Task 1，不构造 `SessionManager`。把 `Session → SessionInfo` 的映射抽成纯函数 `session_info_of(&Session) -> SessionInfo`，`list_sessions` 的 map 闭包改调它，测试只测纯函数。
 
-- [ ] **Step 1: 写失败测试**（turn_state_tests mod 内追加）
+- [x] **Step 1: 写失败测试**（turn_state_tests mod 内追加）
 
 ```rust
     #[test]
@@ -242,12 +242,12 @@ git commit -m "feat(b2): TurnState + per-process turn fields + mark_turn"
     }
 ```
 
-- [ ] **Step 2: 运行确认失败**
+- [x] **Step 2: 运行确认失败**
 
 Run: `cargo test turn_state_tests 2>&1 | tail`
 Expected: 编译失败（`session_info_of` 不存在 / SessionInfo 无新字段）
 
-- [ ] **Step 3: 扩展 `SessionInfo`**（~183）
+- [x] **Step 3: 扩展 `SessionInfo`**（~183）
 
 ```rust
 #[derive(serde::Serialize)]
@@ -269,7 +269,7 @@ pub struct SessionInfo {
 }
 ```
 
-- [ ] **Step 4: 加纯函数 `session_info_of` + `list_sessions` 改调它**
+- [x] **Step 4: 加纯函数 `session_info_of` + `list_sessions` 改调它**
 
 纯函数（模块级，`apply_turn` 附近）：
 
@@ -298,12 +298,12 @@ fn session_info_of(s: &Session) -> SessionInfo {
 
 `list_sessions`（~940）的 `.map(|s| SessionInfo { ... })` 整体替换为 `.map(session_info_of)`（注意 filter 后是 `&Session`，签名匹配）。
 
-- [ ] **Step 5: 运行确认通过**
+- [x] **Step 5: 运行确认通过**
 
 Run: `cargo test turn_state_tests 2>&1 | tail -20`
 Expected: 6 passed（Task1 的 4 个 + Task2 的 2 个）
 
-- [ ] **Step 6: Commit**
+- [x] **Step 6: Commit**
 
 ```bash
 git add src/session_manager.rs
@@ -319,7 +319,7 @@ git commit -m "feat(b2): expose turn state + activity in SessionInfo/list_sessio
 
 实测线路（spec §6.2）：Claude=stdin control_request；Kiro=session/cancel 通知；Codex=Cmd::Cancel。
 
-- [ ] **Step 1: Claude `AcpProcess::interrupt()`**（`process.rs`，紧接 `send_prompt` 后）
+- [x] **Step 1: Claude `AcpProcess::interrupt()`**（`process.rs`，紧接 `send_prompt` 后）
 
 ```rust
     /// Turn-level interrupt: tell Claude to abort the current turn but keep the
@@ -346,7 +346,7 @@ static INT_SEQ: AtomicU64 = AtomicU64::new(0);
 fn now_seq() -> u64 { INT_SEQ.fetch_add(1, Ordering::Relaxed) }
 ```
 
-- [ ] **Step 2: Kiro `Cmd::Cancel` + `interrupt()`**（`kiro_process.rs`）
+- [x] **Step 2: Kiro `Cmd::Cancel` + `interrupt()`**（`kiro_process.rs`）
 
 枚举（~67）加变体：
 
@@ -388,7 +388,7 @@ enum Cmd {
 
 `kill()` 不变（仍 `Cmd::Stop` + `child.kill()`）。
 
-- [ ] **Step 3: Codex `interrupt()` + `kill()` 改 Stop**（`codex_process.rs` ~327-338）
+- [x] **Step 3: Codex `interrupt()` + `kill()` 改 Stop**（`codex_process.rs` ~327-338）
 
 ```rust
     pub async fn interrupt(&mut self) -> Result<(), std::io::Error> {
@@ -407,12 +407,12 @@ enum Cmd {
 
 > 检查：codex 的 idle-cancel 分支（H4 fix，~581）`Some(Cmd::Cancel) => { ...ignoring }` 仍正确（idle 时 interrupt 无在途 turn，忽略即可）。`Drop`（~349）try_send `Cmd::Stop` 不变。
 
-- [ ] **Step 4: 编译**
+- [x] **Step 4: 编译**
 
 Run: `cargo build 2>&1 | tail -20`
 Expected: 编译通过（这 3 个方法暂未被调用，会有 dead_code 警告——Task 4 接线后消除；本步只验证签名/类型正确）
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add src/acp/process.rs src/acp/kiro_process.rs src/acp/codex_process.rs
@@ -426,7 +426,7 @@ git commit -m "feat(b2): per-backend interrupt() turn-cancel primitives (spike-v
 **Files:**
 - Modify: `src/session_manager.rs`（`SessionInput` ~110、3 个 agent fan-out ~1227/1284/1344）
 
-- [ ] **Step 1: 加 `SessionInput::Interrupt`**（~118）
+- [x] **Step 1: 加 `SessionInput::Interrupt`**（~118）
 
 ```rust
 pub enum SessionInput {
@@ -438,7 +438,7 @@ pub enum SessionInput {
 }
 ```
 
-- [ ] **Step 2: 改三个 agent fan-out 的 Prompt/事件分支**
+- [x] **Step 2: 改三个 agent fan-out 的 Prompt/事件分支**
 
 对 `spawn_acp_fanout` / `spawn_kiro_fanout` / `spawn_codex_fanout` 三者做**相同结构**的改动。每个 fan-out 的 `tokio::spawn(async move { ... })` 顶部、`loop` 之前加本地状态：
 
@@ -496,12 +496,12 @@ Prompt 分支改为中断重发：
 
 > **注意 Codex 的 `interrupt()`/`send_prompt()` 返回 `Result`**，Claude/Kiro 同。三端 `interrupt()` 签名一致（`async fn interrupt(&mut self) -> Result<(), io::Error>`），上面代码三端通用。Cancel 分支保持原样（`process.kill().await`）。
 
-- [ ] **Step 3: 编译 + 既有测试**
+- [x] **Step 3: 编译 + 既有测试**
 
 Run: `cargo test 2>&1 | tail -25`
 Expected: 全部通过（含 Task1/2 的 5 个），无 dead_code 警告（interrupt 已被调用）
 
-- [ ] **Step 4: Commit**
+- [x] **Step 4: Commit**
 
 ```bash
 git add src/session_manager.rs
@@ -515,7 +515,7 @@ git commit -m "feat(b2): interrupt-resend in agent fan-outs + turn boundary repo
 **Files:**
 - Modify: `src/acp/ws_handler.rs`（`ClientMsg` ~20、消息映射 ~129）
 
-- [ ] **Step 1: 加 `ClientMsg::Interrupt`**（~20）
+- [x] **Step 1: 加 `ClientMsg::Interrupt`**（~20）
 
 ```rust
 #[derive(serde::Deserialize)]
@@ -530,7 +530,7 @@ enum ClientMsg {
 }
 ```
 
-- [ ] **Step 2: 映射到 SessionInput**（~136，Cancel 分支后）
+- [x] **Step 2: 映射到 SessionInput**（~136，Cancel 分支后）
 
 ```rust
                                 ClientMsg::Interrupt => {
@@ -538,12 +538,12 @@ enum ClientMsg {
                                 }
 ```
 
-- [ ] **Step 3: 编译**
+- [x] **Step 3: 编译**
 
 Run: `cargo build 2>&1 | tail -10`
 Expected: 通过
 
-- [ ] **Step 4: Commit**
+- [x] **Step 4: Commit**
 
 ```bash
 git add src/acp/ws_handler.rs
@@ -559,7 +559,7 @@ git commit -m "feat(b2): wire ClientMsg::Interrupt → SessionInput::Interrupt"
 
 **模式约束**：`update_session_meta_named` 是触碰 store 的方法，难做纯函数单测。把**内存改动 + 决定落盘什么**抽成纯函数 `apply_meta(session, name, description, status) -> (Option<String>, Option<String>)`（返回要落盘的 name/desc），方法负责持锁调它 + 锁外落盘。测试只测 `apply_meta`。
 
-- [ ] **Step 1: 写失败测试**（turn_state_tests mod）
+- [x] **Step 1: 写失败测试**（turn_state_tests mod）
 
 ```rust
     #[test]
@@ -572,12 +572,12 @@ git commit -m "feat(b2): wire ClientMsg::Interrupt → SessionInput::Interrupt"
     }
 ```
 
-- [ ] **Step 2: 确认失败**
+- [x] **Step 2: 确认失败**
 
 Run: `cargo test turn_state_tests::apply_meta 2>&1 | tail`
 Expected: `apply_meta` 不存在，编译失败
 
-- [ ] **Step 3: 实现**（`session_manager.rs`）
+- [x] **Step 3: 实现**（`session_manager.rs`）
 
 决策：不改 `update_session_meta` 现有签名（避免大面积改调用点），**新增** `update_session_meta_named`，旧 `update_session_meta` 转调它（name=None）。内存逻辑抽到纯函数 `apply_meta`。
 
@@ -636,7 +636,7 @@ fn apply_meta(
 
 > 这同时清理 B-1 遗留的 `SessionStore::update_name` dead code。
 
-- [ ] **Step 4: web.rs `UpdateSessionReq` 加 name**（~465）
+- [x] **Step 4: web.rs `UpdateSessionReq` 加 name**（~465）
 
 ```rust
 #[derive(serde::Deserialize)]
@@ -659,12 +659,12 @@ handler 改调用：
 
 > 空 name 校验：在 handler 里若 `req.name.as_deref() == Some("")` 返回 `StatusCode::BAD_REQUEST`。
 
-- [ ] **Step 5: 运行测试 + 编译**
+- [x] **Step 5: 运行测试 + 编译**
 
 Run: `cargo test turn_state_tests 2>&1 | tail; cargo build 2>&1 | tail -5`
 Expected: 全通过
 
-- [ ] **Step 6: Commit**
+- [x] **Step 6: Commit**
 
 ```bash
 git add src/session_manager.rs src/web.rs
@@ -678,7 +678,7 @@ git commit -m "feat(b2): session rename via PATCH name; retires update_name dead
 **Files:**
 - Modify: `frontend/src/lib/api.ts`、`frontend/src/App.tsx`
 
-- [ ] **Step 1: api.ts — 扩展 SessionInfo 类型 + renameSession**
+- [x] **Step 1: api.ts — 扩展 SessionInfo 类型 + renameSession**
 
 在 `SessionInfo`（或对应 interface）加：
 
@@ -705,7 +705,7 @@ export async function renameSession(id: string, name: string): Promise<void> {
 
 > 校验现有 api.ts 是否已有 PATCH session 的 helper（updateSession?）；若有则复用/扩展，不新建。
 
-- [ ] **Step 2: App.tsx — 3s 轮询合并状态**
+- [x] **Step 2: App.tsx — 3s 轮询合并状态**
 
 在持有 session list 的组件加：
 
@@ -723,16 +723,16 @@ useEffect(() => {
 
 > 若现有已有轮询/刷新机制，复用之并确保新字段被纳入 state，不重复建 interval。
 
-- [ ] **Step 3: api.ts — WS interrupt 消息**
+- [x] **Step 3: api.ts — WS interrupt 消息**
 
 WS 发送处（现有 sendPrompt/cancel 旁）加 interrupt sender，或在 AcpChatView 直接 `ws.send(JSON.stringify({ type: 'interrupt' }))`（Task 8 用）。本步只确保协议字符串 `{ type: 'interrupt' }` 与后端 `#[serde(rename="interrupt")]` 对齐。
 
-- [ ] **Step 4: 构建验证**
+- [x] **Step 4: 构建验证**
 
 Run: `cd frontend && npm run build 2>&1 | tail -15`
 Expected: tsc + vite 通过
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add frontend/src/lib/api.ts frontend/src/App.tsx
@@ -746,7 +746,7 @@ git commit -m "feat(b2): frontend session-state types + 3s polling + rename api"
 **Files:**
 - Modify: `frontend/src/components/AcpChatView.tsx`
 
-- [ ] **Step 1: 解禁 busy 时发送**（~295）
+- [x] **Step 1: 解禁 busy 时发送**（~295）
 
 ```tsx
             disabled={!input.trim()}
@@ -754,7 +754,7 @@ git commit -m "feat(b2): frontend session-state types + 3s polling + rename api"
 
 并改 `sendPrompt`：发送前若 `busy`，先发 interrupt（中断重发由后端处理，但前端也可仅发 prompt——后端 fan-out 已自动中断在途 turn）。**简洁做法：前端只发 prompt，中断重发完全由后端 fan-out 处理**（Task 4 已实现 Prompt 分支自动 interrupt）。因此本步仅解禁按钮，`sendPrompt` 逻辑不变。
 
-- [ ] **Step 2: 卡死计时提示**
+- [x] **Step 2: 卡死计时提示**
 
 加本地 1s 计时器，当当前会话 `turn_state==='running'` 显示已运行时长。从 props/state 拿当前 session 的 `turn_started_ms`：
 
@@ -784,12 +784,12 @@ onClick={() => ws.send(JSON.stringify({ type: 'interrupt' }))}
 
 > 复用现有 ws 引用；若现有有 cancel 按钮，stuck 取消按钮发 `interrupt`（保会话），不发 `cancel`（杀进程）。
 
-- [ ] **Step 3: 构建验证**
+- [x] **Step 3: 构建验证**
 
 Run: `cd frontend && npm run build 2>&1 | tail -15`
 Expected: 通过
 
-- [ ] **Step 4: Commit**
+- [x] **Step 4: Commit**
 
 ```bash
 git add frontend/src/components/AcpChatView.tsx
@@ -803,7 +803,7 @@ git commit -m "feat(b2): unlock busy-send + stuck-turn timer + interrupt button"
 **Files:**
 - Modify: `frontend/src/App.tsx`（侧栏 session 列表渲染）
 
-- [ ] **Step 1: 完成红点状态（计数器版）**
+- [x] **Step 1: 完成红点状态（计数器版）**
 
 维护「已读基线」map：
 
@@ -825,7 +825,7 @@ useEffect(() => {
 
 > 首次见到某 session（基线缺失）以其当前 `turns_completed` 为基线？否——新完成应亮红点。基线缺省 0，但**初次加载已有历史的 session 不应全亮**：在首次拉到 list 时，对所有非激活 session 用其当前 `turns_completed` 初始化 readCounts（视作「加载前的都已读」）。实现者加一个 `initializedRef` 守卫，仅首帧做基线初始化。
 
-- [ ] **Step 2: 侧栏每项渲染状态点 + 红点 + 最后活动 + rename**
+- [x] **Step 2: 侧栏每项渲染状态点 + 红点 + 最后活动 + rename**
 
 每个 session 列表项：
 
@@ -868,12 +868,12 @@ const commitRename = async (id: string, name: string) => {
 }
 ```
 
-- [ ] **Step 3: 构建 + lint**
+- [x] **Step 3: 构建 + lint**
 
 Run: `cd frontend && npm run build 2>&1 | tail -15 && npm run lint 2>&1 | tail -15`
 Expected: 均通过（注意 lucide 图标若用，按既往用 `createElement` 避免 react-hooks/static-components）
 
-- [ ] **Step 4: Commit**
+- [x] **Step 4: Commit**
 
 ```bash
 git add frontend/src/App.tsx
@@ -884,11 +884,11 @@ git commit -m "feat(b2): sidebar status dots + completion red-dot + inline renam
 
 ## Final Verification（全部任务后）
 
-- [ ] **后端全测**：`cargo test 2>&1 | tail -25`（B-1 的 57 + B-2 新增全过）
-- [ ] **前端全测**：`cd frontend && npm run build && npm run lint && npm test 2>&1 | tail`
-- [ ] **部署**（按 [[zeromux-deploy]]）：`sudo systemctl stop zeromux` → `cargo build --release` → `cp target/release/zeromux /usr/local/bin/zeromux` → `sudo systemctl start zeromux`
-- [ ] **手动验证**（spec §9.手动验证 四项）：中断重发三端各一次、完成红点、卡死计时+取消、rename 重启存活
-- [ ] **通知用户**
+- [x] **后端全测**：`cargo test 2>&1 | tail -25`（B-1 的 57 + B-2 新增全过）
+- [x] **前端全测**：`cd frontend && npm run build && npm run lint && npm test 2>&1 | tail`
+- [x] **部署**（按 [[zeromux-deploy]]）：`sudo systemctl stop zeromux` → `cargo build --release` → `cp target/release/zeromux /usr/local/bin/zeromux` → `sudo systemctl start zeromux`
+- [x] **手动验证**（spec §9.手动验证 四项）：中断重发三端各一次、完成红点、卡死计时+取消、rename 重启存活
+- [x] **通知用户**
 
 ---
 

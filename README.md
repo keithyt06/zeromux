@@ -2,21 +2,29 @@
 
 A single-binary, web-based terminal multiplexer and AI agent orchestration platform built with Rust.
 
-ZeroMux lets you manage multiple terminal sessions, Claude Code agents, and Kiro CLI agents from a browser — with built-in file browsing, git visualization, session notes, and multi-client support.
+ZeroMux lets you manage multiple terminal sessions and **three AI coding agents — Claude Code, Kiro CLI, and OpenAI Codex** — from a browser, with built-in file browsing, git visualization, session notes, voice input, an activity dashboard, and multi-client support. Sessions survive server restarts and reconnect automatically.
+
+> 中文文档见 [README_ZH.md](README_ZH.md)。
 
 ## Features
 
 - **Web Terminal** — Full xterm.js terminal with PTY backend, WebGL rendering, 2MB scrollback persistence across reconnects
-- **AI Agent Sessions** — Run Claude Code (stream-json ACP) and Kiro CLI (JSON-RPC 2.0) side by side
+- **Three AI Agent Backends** — Run **Claude Code** (stream-json ACP), **Kiro CLI** (JSON-RPC 2.0), and **OpenAI Codex** (`codex mcp-server` via the MCP/rmcp client) side by side, each normalized to a common event stream
+- **Agent Tool Visibility** — Streaming text, reasoning/thinking blocks, and tool calls (shell commands, file edits) render inline in the chat — you see what the agent actually did, not just its prose
+- **Session Persistence & Recovery** — Session metadata is persisted to SQLite; after a server restart (or an idle hibernation) sessions are lazily respawned on reconnect, resuming agent context where the backend supports it (Claude `--resume`, Kiro `session/load`, Codex `codex-reply`, tmux re-attach)
+- **Active Session Management** — Per-session turn state (Idle/Running) with live status dots, a completion red-dot for finished turns in background sessions, an **Interrupt** button to cancel an in-flight turn, send-while-busy (auto-interrupt + resend), a stuck-turn timer, and inline session rename
+- **Activity Dashboard** — A cross-session feed of agent `task_done` events (per-user scoped) with summaries, working directory, and cost
 - **Voice Input** — Push-to-talk microphone next to the chat input streams audio to AWS Transcribe Streaming for real-time Chinese transcription; results populate the textarea, never auto-send
-- **Multi-Client WebSocket** — Broadcast architecture allows multiple browser tabs/devices to view the same session simultaneously
+- **Resilient WebSockets** — Server-side keepalive ping + frontend auto-reconnect with backoff, so idle-timeout proxies (nginx, Cloudflare) can't silently freeze a session
+- **Multi-Client WebSocket** — Broadcast architecture allows multiple browser tabs/devices to view and drive the same session simultaneously
 - **Session Notes** — Per-working-directory note timeline with markdown files as source of truth and SQLite index, stored centrally in `~/.zeromux/notes/`
 - **Git Viewer** — Branch/merge graph visualization with commit diffs, file stats, and ref badges (HEAD, branches, tags)
 - **File Browser** — Browse, edit, create, rename, upload, and delete files in session working directories
-- **Session Metadata** — Description, status (Running/Done/Blocked/Idle) per session with color-coded indicators
+- **Markdown Rendering** — KaTeX math, mermaid diagrams, syntax highlighting, and pipe tables in agent output, with content-hash caching to avoid re-render churn
 - **Git Worktrees** — Auto-creates isolated git worktrees for each AI agent session
 - **Mobile Responsive** — Collapsible overlay sidebar, auto-close on selection, hamburger menu for small screens
 - **Authentication** — GitHub OAuth with admin approval flow, or simple password mode
+- **Per-User Authorization** — Sessions and agent events are owner-scoped; only the owner (or an admin) can attach to, drive, or read a session and its events
 - **Single Binary** — Frontend embedded via `rust-embed`, no external file dependencies
 - **Docker Ready** — Multi-stage Dockerfile included
 
@@ -27,8 +35,11 @@ ZeroMux lets you manage multiple terminal sessions, Claude Code agents, and Kiro
 - Rust 1.70+
 - Node.js 20+
 - git, tmux (for terminal sessions)
+- Optional, per agent you want to use: `claude`, `kiro-cli`, `codex` on PATH (or pass explicit paths)
 
 ### Build & Run
+
+The frontend **must** be built before the Rust binary — `rust-embed` reads `frontend/dist/` at compile time.
 
 ```bash
 # Build frontend
@@ -44,7 +55,7 @@ cargo build --release
 ./target/release/zeromux --port 8080 --password "my-secret"
 ```
 
-Or use the helper script:
+Or use the helper script (rebuilds if the binary is missing, manages a PID file + `zeromux.log`):
 
 ```bash
 ./start.sh --port 8080 --password "my-secret"
@@ -57,7 +68,7 @@ docker build -t zeromux .
 docker run -p 8080:8080 zeromux --password "my-secret"
 ```
 
-Mount a volume for persistent notes storage:
+Mount a volume for persistent notes / session / events storage:
 
 ```bash
 docker run -p 8080:8080 -v zeromux-data:/root/.zeromux zeromux --password "my-secret"
@@ -75,11 +86,15 @@ All options can be set via CLI flags or environment variables.
 | `--shell` | — | `bash` | Shell for terminal sessions |
 | `--claude-path` | — | `claude` | Path to Claude CLI binary |
 | `--kiro-path` | — | `kiro-cli` | Path to Kiro CLI binary |
-| `--work-dir` | — | `.` | Default working directory |
+| `--codex-path` | — | `codex` | Path to Codex CLI binary (run as `codex mcp-server`) |
+| `--codex-reasoning` | — | `off` | Codex reasoning effort: `off` \| `low` \| `medium` \| `high` (see note below) |
+| `--work-dir` | — | `.` | Default working directory (sessions are restricted to paths under `$HOME`) |
 | `--cols` | — | `120` | Default terminal columns |
 | `--rows` | — | `36` | Default terminal rows |
 | `--log-dir` | — | — | Enable session I/O logging |
 | `--data-dir` | — | `~/.zeromux` | Database and notes directory |
+
+> **`--codex-reasoning`** injects `model_reasoning_effort` into each Codex `tools/call`. It only has an effect if the underlying model/provider (e.g. LiteLLM → Bedrock Claude) supports and propagates the `thinking` parameter; otherwise it is a no-op.
 
 ### GitHub OAuth
 
@@ -101,7 +116,7 @@ For multi-user setups with GitHub authentication:
   --allowed-users "alice,bob"
 ```
 
-The first user to log in is automatically promoted to admin.
+The first user to log in is automatically promoted to admin. In OAuth mode, sessions and events are scoped per user; admins can see all.
 
 ### AWS Credentials (optional, required for voice input)
 
@@ -121,8 +136,8 @@ Voice input is the only feature that uses AWS — without credentials, the rest 
 ┌──────────────────────────────────────────────────┐
 │                    Browser                        │
 │  ┌──────────┐ ┌──────────┐ ┌───────────────────┐ │
-│  │ Terminal  │ │  Claude   │ │ Git / Files /     │ │
-│  │ (xterm)  │ │  Chat     │ │ Notes Viewer      │ │
+│  │ Terminal │ │  Agent   │ │ Git / Files /     │ │
+│  │ (xterm)  │ │  Chat    │ │ Notes / Dashboard │ │
 │  └────┬─────┘ └────┬─────┘ └──────┬────────────┘ │
 │       │WS          │WS            │HTTP           │
 └───────┼────────────┼──────────────┼───────────────┘
@@ -133,26 +148,29 @@ Voice input is the only feature that uses AWS — without credentials, the rest 
 │  ┌──────────┐  ┌────────────────┐  ┌───────────┐  │
 │  │  Axum    │  │  Session       │  │   Auth    │  │
 │  │  Router  │  │  Manager       │  │ (JWT/     │  │
-│  │          │  │                │  │  OAuth)   │  │
+│  │          │  │  + Store       │  │  OAuth)   │  │
 │  └────┬─────┘  └───────┬────────┘  └───────────┘  │
 │       │                │                           │
 │  ┌────┴─────┐  ┌───────┴────────┐  ┌───────────┐  │
 │  │ Fan-out  │  │  broadcast::   │  │  SQLite   │  │
-│  │ Tasks    │  │  Sender<T>     │  │ + Notes   │  │
-│  │ (PTY/    │  │  (per session) │  │  Store    │  │
-│  │  ACP)    │  │                │  │           │  │
+│  │ Tasks    │  │  Sender<T>     │  │ Sessions/ │  │
+│  │ (PTY /   │  │  (per session) │  │ Events /  │  │
+│  │  ACP ×3) │  │                │  │ Notes     │  │
 │  └──────────┘  └────────────────┘  └───────────┘  │
 └────────────────────────────────────────────────────┘
 ```
 
 **Key design decisions:**
 
-- **Broadcast fan-out** — Each session spawns a dedicated fan-out task that owns the PTY/ACP process and broadcasts events via `tokio::sync::broadcast`. Multiple WebSocket clients subscribe independently — no exclusive ownership, no session hanging on disconnect.
-- **Server-side scrollback** (2MB per session) replayed on reconnect — survives browser refresh and device switching
-- **Unified input channel** — All WebSocket clients send input through a shared `mpsc` channel (`SessionInput` enum: `PtyData`, `PtyResize`, `Prompt`, `Cancel`)
-- **CSS visibility toggle** for view switching — terminal state preserved when switching to file/git views
-- **Git worktree isolation** — each AI agent session gets its own worktree, preventing conflicts
-- **Notes as files** — Notes stored as markdown files with YAML frontmatter in `~/.zeromux/notes/{dir_hash}/`, with SQLite as a query index
+- **Broadcast fan-out** — Each session spawns a dedicated fan-out task that *exclusively owns* the PTY/agent process and broadcasts events via `tokio::sync::broadcast`. Multiple WebSocket clients subscribe independently — no exclusive ownership, no session hanging on disconnect. Cleanup is by `Drop`: removing a session ends its fan-out task, which drops the process.
+- **Three agent wire protocols, one event model** — Claude (NDJSON stream-json), Kiro (JSON-RPC 2.0), and Codex (MCP notifications over rmcp) all normalize to a common `AcpEvent` enum the frontend renders.
+- **Persistence & lazy respawn** — Session metadata lives in SQLite; on (re)connect a non-running session is respawned concurrency-safely and, where possible, resumed from a stored token.
+- **Server-side scrollback** (2MB per session) replayed on reconnect — survives browser refresh and device switching.
+- **WebSocket resilience** — periodic server ping + frontend auto-reconnect keep idle sessions alive behind timeout proxies.
+- **Unified input channel** — All WebSocket clients send input through a shared `mpsc` channel (`SessionInput` enum: `PtyData`, `PtyResize`, `Prompt`, `Cancel`, `Interrupt`).
+- **CSS visibility toggle** for view switching — terminal/chat state preserved when switching to file/git/dashboard views.
+- **Git worktree isolation** — each AI agent session gets its own worktree, preventing conflicts.
+- **Notes as files** — Notes stored as markdown files with YAML frontmatter in `~/.zeromux/notes/{dir_hash}/`, with SQLite as a query index.
 
 ## Session Types
 
@@ -161,6 +179,7 @@ Voice input is the only feature that uses AWS — without credentials, the rest 
 | `tmux` | portable-pty | Raw PTY over WebSocket | Shell, tmux, vim, etc. |
 | `claude` | Claude CLI | Stream-JSON ACP | Claude Code agent |
 | `kiro` | Kiro CLI | JSON-RPC 2.0 | Kiro AI agent |
+| `codex` | Codex CLI | MCP (`codex mcp-server` via rmcp) | OpenAI Codex agent |
 
 ## API
 
@@ -168,11 +187,19 @@ Voice input is the only feature that uses AWS — without credentials, the rest 
 
 | Method | Path | Description |
 |--------|------|-------------|
-| GET | `/api/sessions` | List sessions |
-| POST | `/api/sessions` | Create session |
-| PATCH | `/api/sessions/{id}` | Update description / status |
-| DELETE | `/api/sessions/{id}` | Delete session |
+| GET | `/api/sessions` | List sessions (with turn state + activity) |
+| POST | `/api/sessions` | Create session (`work_dir` restricted to `$HOME`) |
+| PATCH | `/api/sessions/{id}` | Update name / description / status (owner only) |
+| DELETE | `/api/sessions/{id}` | Delete session (owner only) |
 | GET | `/api/sessions/{id}/status` | Git branch, dirty count |
+
+### Agent Events (activity dashboard)
+
+| Method | Path | Description |
+|--------|------|-------------|
+| GET | `/api/events` | List agent events (own events; admins see all) |
+| POST | `/api/events?token=...` | Ingest an event (token auth, for hooks; owner stamped server-side) |
+| DELETE | `/api/events/{id}` | Delete an event (own events; admins any) |
 
 ### Notes
 
@@ -206,15 +233,16 @@ Notes are scoped by working directory — sessions sharing the same work_dir sha
 | Path | Protocol | Description |
 |------|----------|-------------|
 | `/ws/term/{id}` | Binary (base64) | Terminal I/O (multi-client) |
-| `/ws/acp/{id}` | JSON | ACP agent stream (multi-client) |
+| `/ws/acp/{id}` | JSON | Agent stream — Claude/Kiro/Codex (multi-client) |
+| `/ws/transcribe` | Binary | Mic audio → AWS Transcribe Streaming |
 
-Multiple clients can connect to the same session WebSocket simultaneously. Each receives the full broadcast stream independently.
+WebSocket auth is via a `?token=` query param. Only the session owner (or an admin) may attach. ACP client messages: `{"type":"prompt","text":...}`, `{"type":"interrupt"}`, `{"type":"cancel"}`. Multiple clients can connect to the same session simultaneously, each receiving the full broadcast stream.
 
 ## Tech Stack
 
-**Backend:** Rust, Axum 0.8, Tokio, portable-pty, rusqlite, jsonwebtoken, rust-embed
+**Backend:** Rust, Axum 0.8, Tokio, portable-pty, rmcp (MCP client), rusqlite, jsonwebtoken, rust-embed
 
-**Frontend:** React 19, TypeScript, Tailwind CSS 4, xterm.js 6, react-markdown, Vite 8, lucide-react
+**Frontend:** React 19, TypeScript, Tailwind CSS 4, xterm.js, react-markdown + KaTeX + mermaid, Vite, lucide-react
 
 ## License
 

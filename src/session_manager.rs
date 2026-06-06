@@ -191,6 +191,9 @@ pub struct SessionManager {
     codex_path: String,
     codex_reasoning: String,
     shell: String,
+    /// Scheduled-tasks store, set at startup after construction. Fan-out tasks
+    /// use it to finalize scheduled runs. None when no scheduler is wired.
+    scheduled: Mutex<Option<Arc<crate::scheduled_tasks::ScheduledStore>>>,
 }
 
 #[derive(serde::Serialize)]
@@ -446,6 +449,7 @@ impl SessionManager {
             codex_path,
             codex_reasoning,
             shell,
+            scheduled: Mutex::new(None),
         });
         *mgr.self_weak.lock().unwrap() = Arc::downgrade(&mgr);
         mgr
@@ -453,6 +457,22 @@ impl SessionManager {
 
     fn weak(&self) -> Weak<SessionManager> {
         self.self_weak.lock().unwrap().clone()
+    }
+
+    /// Wire the scheduled-tasks store (called once at startup).
+    pub fn set_scheduled_store(&self, store: Arc<crate::scheduled_tasks::ScheduledStore>) {
+        *self.scheduled.lock().unwrap() = Some(store);
+    }
+
+    /// Finalize a scheduled run exactly once (called by the agent fan-out on the
+    /// terminal event for that run). No-op if no scheduled store is wired.
+    pub fn finalize_run(&self, run_id: &str, state: &str, verdict: Option<&str>, failure_kind: Option<&str>) {
+        let store = { self.scheduled.lock().unwrap().clone() };
+        if let Some(store) = store {
+            if let Err(e) = store.set_run_state(run_id, state, None, verdict, failure_kind, Some(now_millis())) {
+                tracing::warn!("finalize_run {} failed: {}", run_id, e);
+            }
+        }
     }
 
     /// Persist a session's metadata to the store (insert or update).
@@ -1365,6 +1385,7 @@ fn spawn_acp_fanout(
         let mut turn_seq: u64 = 0;
         let mut local_running = false;
         let mut boundary_count: u64 = 0;
+        let mut active_run_id: Option<String> = None;
         loop {
             tokio::select! {
                 event = process.event_rx.recv() => {
@@ -1407,6 +1428,22 @@ fn spawn_acp_fanout(
                                 if let Some(m) = mgr.upgrade() {
                                     m.mark_turn(&sid, TurnState::Idle, boundary_count);
                                 }
+                                // Finalize a scheduled run exactly once, keyed
+                                // on active_run_id, mapped by terminal event type.
+                                if let Some(rid) = active_run_id.take() {
+                                    if let Some(m) = mgr.upgrade() {
+                                        match &evt {
+                                            AcpEvent::Result { text, .. } => {
+                                                let verdict = crate::scheduled_tasks::extract_verdict(text);
+                                                m.finalize_run(&rid, "succeeded", verdict.as_deref(),
+                                                    if verdict.is_some() { None } else { Some("no_verdict") });
+                                            }
+                                            AcpEvent::Error { .. } => m.finalize_run(&rid, "failed", None, Some("cli_error")),
+                                            AcpEvent::Exit { .. } => m.finalize_run(&rid, "failed", None, Some("cli_exited")),
+                                            _ => { active_run_id = Some(rid); } // not terminal, keep waiting
+                                        }
+                                    }
+                                }
                             }
                         }
                         None => break,
@@ -1415,7 +1452,7 @@ fn spawn_acp_fanout(
                 input = input_rx.recv() => {
                     match input {
                         Some(SessionInput::Prompt { text, run_id }) => {
-                            let _ = run_id.as_ref(); // used by Task 7
+                            active_run_id = run_id.clone();
                             if local_running {
                                 if let Err(e) = process.interrupt().await {
                                     tracing::warn!("interrupt before resend failed for {}: {}", sid, e);

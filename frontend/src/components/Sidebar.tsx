@@ -1,9 +1,11 @@
-import { useState, useCallback } from 'react'
+import { useState, useEffect, useCallback } from 'react'
 import type { SessionInfo, SessionType, DirEntry, UserInfo, TmuxSession } from '../lib/api'
-import { listDirectories, listTmuxSessions } from '../lib/api'
+import { listDirectories, listTmuxSessions, getSchedulerHealth } from '../lib/api'
 import type { Theme } from '../lib/theme'
-import { Terminal, Bot, Plus, X, PanelLeftClose, PanelLeft, Sun, Moon, Sparkles, Folder, FolderGit2, ChevronLeft, Home, LogOut, Users, MonitorUp, Link, Cpu } from 'lucide-react'
+import { Terminal, Plus, X, PanelLeftClose, PanelLeft, Sun, Moon, Folder, FolderGit2, ChevronLeft, Home, LogOut, Users, MonitorUp, Link, Clock } from 'lucide-react'
 import AdminPanel from './AdminPanel'
+import ScheduledTasksPanel from './ScheduledTasksPanel'
+import { ClaudeCodeIcon, KiroIcon, CodexIcon } from './BrandIcons'
 
 interface Props {
   sessions: SessionInfo[]
@@ -49,9 +51,9 @@ type NewSessionStep = 'closed' | 'pick-type' | 'pick-terminal-mode' | 'pick-dir'
  *  agent types are added. */
 function SessionTypeIcon({ type, size = 14, className }: { type: SessionType; size?: number; className?: string }) {
   switch (type) {
-    case 'claude': return <Bot size={size} className={className} />
-    case 'kiro':   return <Sparkles size={size} className={className} />
-    case 'codex':  return <Cpu size={size} className={className} />
+    case 'claude': return <ClaudeCodeIcon size={size} className={className} />
+    case 'kiro':   return <KiroIcon size={size} className={className} />
+    case 'codex':  return <CodexIcon size={size} className={className} />
     case 'tmux':
     default:       return <Terminal size={size} className={className} />
   }
@@ -61,6 +63,8 @@ export default function Sidebar({ sessions, activeId, onSelect, onCreate, onDele
   const [step, setStep] = useState<NewSessionStep>('closed')
   const [pendingType, setPendingType] = useState<SessionType | null>(null)
   const [showAdmin, setShowAdmin] = useState(false)
+  const [showScheduled, setShowScheduled] = useState(false)
+  const [schedulerHealthy, setSchedulerHealthy] = useState(true)
   const [editingId, setEditingId] = useState<string | null>(null)
 
   const commitRename = (id: string, name: string) => {
@@ -68,6 +72,20 @@ export default function Sidebar({ sessions, activeId, onSelect, onCreate, onDele
     onRename(id, name)
   }
   const isAdmin = user?.role === 'admin'
+
+  // Poll scheduler health (once on mount, then every 60s)
+  useEffect(() => {
+    let cancelled = false
+    const check = async () => {
+      try {
+        const h = await getSchedulerHealth()
+        if (!cancelled) setSchedulerHealthy(h.healthy)
+      } catch { /* ignore */ }
+    }
+    check()
+    const id = setInterval(check, 60_000)
+    return () => { cancelled = true; clearInterval(id) }
+  }, [])
 
   // Directory browser state
   const [currentPath, setCurrentPath] = useState('')
@@ -166,7 +184,7 @@ export default function Sidebar({ sessions, activeId, onSelect, onCreate, onDele
           <button
             key={s.id}
             onClick={() => handleSelect(s.id)}
-            className={`p-1.5 rounded transition-colors ${
+            className={`relative p-1.5 rounded transition-colors ${
               s.id === activeId
                 ? 'bg-[var(--bg-primary)] text-[var(--accent-blue)]'
                 : 'text-[var(--text-secondary)] hover:text-[var(--text-primary)] hover:bg-[var(--bg-tertiary)]'
@@ -174,6 +192,9 @@ export default function Sidebar({ sessions, activeId, onSelect, onCreate, onDele
             title={s.name}
           >
             <SessionTypeIcon type={s.type} size={14} />
+            {s.source_task_id && (
+              <Clock size={8} className="absolute bottom-0 right-0 text-[var(--text-muted)]" />
+            )}
           </button>
         ))}
         <div className="mt-auto flex flex-col items-center gap-1">
@@ -224,6 +245,16 @@ export default function Sidebar({ sessions, activeId, onSelect, onCreate, onDele
           </span>
         </div>
         <div className="flex items-center gap-0.5">
+          <button
+            onClick={() => setShowScheduled(true)}
+            className="relative p-1 text-[var(--text-secondary)] hover:text-[var(--accent-blue)] rounded transition-colors"
+            title={schedulerHealthy ? '定时任务' : '调度器异常'}
+          >
+            <Clock size={14} />
+            {!schedulerHealthy && (
+              <span className="absolute top-0.5 right-0.5 w-1.5 h-1.5 rounded-full bg-red-500" title="调度器异常" />
+            )}
+          </button>
           {isAdmin && (
             <button
               onClick={() => setShowAdmin(true)}
@@ -260,6 +291,9 @@ export default function Sidebar({ sessions, activeId, onSelect, onCreate, onDele
       {/* Admin Panel overlay */}
       {showAdmin && <AdminPanel onClose={() => setShowAdmin(false)} />}
 
+      {/* Scheduled Tasks overlay */}
+      {showScheduled && <ScheduledTasksPanel onClose={() => setShowScheduled(false)} />}
+
       {/* Sessions */}
       <div className="flex-1 overflow-y-auto py-1">
         {sessions.map(s => (
@@ -273,7 +307,12 @@ export default function Sidebar({ sessions, activeId, onSelect, onCreate, onDele
             }`}
           >
             <TurnDot s={s} />
-            <SessionTypeIcon type={s.type} size={13} className="shrink-0" />
+            <span className="relative shrink-0 flex items-center" title={s.source_task_id ? '定时任务' : undefined}>
+              <SessionTypeIcon type={s.type} size={13} />
+              {s.source_task_id && (
+                <Clock size={9} className="absolute -bottom-1 -right-1 text-[var(--text-muted)]" />
+              )}
+            </span>
             <div className="flex-1 min-w-0">
               <div className="flex items-center gap-1.5">
                 {editingId === s.id ? (
@@ -346,7 +385,7 @@ export default function Sidebar({ sessions, activeId, onSelect, onCreate, onDele
                     onClick={() => selectType('claude')}
                     className="flex items-center gap-2.5 w-full px-3 py-2 text-xs text-[var(--text-primary)] hover:bg-[var(--bg-hover)] transition-colors"
                   >
-                    <Bot size={14} className="text-[var(--accent-purple)] shrink-0" />
+                    <ClaudeCodeIcon size={14} className="shrink-0" />
                     <div className="text-left">
                       <div className="font-medium">Claude Code</div>
                       <div className="text-[10px] text-[var(--text-secondary)]">AI coding agent</div>
@@ -356,7 +395,7 @@ export default function Sidebar({ sessions, activeId, onSelect, onCreate, onDele
                     onClick={() => selectType('kiro')}
                     className="flex items-center gap-2.5 w-full px-3 py-2 text-xs text-[var(--text-primary)] hover:bg-[var(--bg-hover)] transition-colors"
                   >
-                    <Sparkles size={14} className="text-[var(--accent-yellow)] shrink-0" />
+                    <KiroIcon size={14} className="shrink-0" />
                     <div className="text-left">
                       <div className="font-medium">Kiro</div>
                       <div className="text-[10px] text-[var(--text-secondary)]">AI coding agent (ACP)</div>
@@ -366,7 +405,7 @@ export default function Sidebar({ sessions, activeId, onSelect, onCreate, onDele
                     onClick={() => selectType('codex')}
                     className="flex items-center gap-2.5 w-full px-3 py-2 text-xs text-[var(--text-primary)] hover:bg-[var(--bg-hover)] transition-colors"
                   >
-                    <Cpu size={14} className="text-[var(--accent-blue)] shrink-0" />
+                    <CodexIcon size={14} className="text-[var(--text-primary)] shrink-0" />
                     <div className="text-left">
                       <div className="font-medium">Codex</div>
                       <div className="text-[10px] text-[var(--text-secondary)]">AI coding agent (MCP)</div>

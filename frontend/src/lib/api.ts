@@ -16,6 +16,7 @@ export interface SessionInfo {
   turn_started_ms: number | null
   last_activity_ms: number
   turns_completed: number
+  source_task_id?: string | null
 }
 
 export interface NoteEntry {
@@ -386,6 +387,89 @@ export async function listEvents(params?: { session_id?: string; agent?: string;
 export async function deleteEvent(id: string): Promise<void> {
   const res = await api(`/api/events/${id}`, { method: 'DELETE' })
   if (!res.ok) throw new Error(await res.text())
+}
+
+// Scheduled tasks
+export type ScheduleInput =
+  | { kind: 'daily'; hour: number; minute: number }
+  | { kind: 'weekly'; weekdays: number[]; hour: number; minute: number }
+  | { kind: 'cron'; expr: string }
+
+export interface ScheduledTask {
+  id: string
+  owner_id: string
+  name: string
+  trigger_type: string
+  trigger_spec: string
+  tz: string
+  agent_type: string
+  work_dir: string
+  prompt: string
+  enabled: boolean
+  retention_n: number
+  created_ms: number
+}
+
+export interface TaskRun {
+  id: string
+  task_id: string
+  scheduled_for_ms: number
+  state: 'claimed' | 'running' | 'succeeded' | 'failed' | 'skipped' | 'aborted'
+  session_id: string | null
+  verdict: string | null
+  failure_kind: string | null
+  started_ms: number | null
+  ended_ms: number | null
+}
+
+export interface ScheduledTaskReq {
+  name: string
+  schedule: ScheduleInput
+  work_dir: string
+  prompt: string
+  enabled?: boolean
+  retention_n?: number
+}
+
+export async function listScheduledTasks(): Promise<ScheduledTask[]> {
+  const res = await api('/api/scheduled-tasks')
+  if (!res.ok) throw new Error(await res.text())
+  return (await res.json()).tasks
+}
+
+export async function createScheduledTask(body: ScheduledTaskReq): Promise<ScheduledTask> {
+  const res = await api('/api/scheduled-tasks', { method: 'POST', body: JSON.stringify(body) })
+  if (!res.ok) throw new Error(await res.text())
+  return res.json()
+}
+
+export async function updateScheduledTask(id: string, body: ScheduledTaskReq): Promise<ScheduledTask> {
+  const res = await api(`/api/scheduled-tasks/${id}`, { method: 'PUT', body: JSON.stringify(body) })
+  if (!res.ok) throw new Error(await res.text())
+  return res.json()
+}
+
+export async function deleteScheduledTask(id: string): Promise<void> {
+  const res = await api(`/api/scheduled-tasks/${id}`, { method: 'DELETE' })
+  if (!res.ok) throw new Error(await res.text())
+}
+
+export async function runScheduledTaskNow(id: string): Promise<{ skipped?: boolean; reason?: string; session_id?: string; run_id?: string }> {
+  const res = await api(`/api/scheduled-tasks/${id}/run`, { method: 'POST' })
+  if (!res.ok) throw new Error(await res.text())
+  return res.json()
+}
+
+export async function listTaskRuns(id: string): Promise<TaskRun[]> {
+  const res = await api(`/api/scheduled-tasks/${id}/runs`)
+  if (!res.ok) throw new Error(await res.text())
+  return (await res.json()).runs
+}
+
+export async function getSchedulerHealth(): Promise<{ heartbeat_ms: number; healthy: boolean }> {
+  const res = await api('/api/scheduler/health')
+  if (!res.ok) throw new Error(await res.text())
+  return res.json()
 }
 
 export function wsUrl(path: string): string {

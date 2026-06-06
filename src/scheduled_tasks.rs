@@ -71,6 +71,28 @@ pub fn is_safe_to_reclaim(
     path_under_worktree_root && !process_alive && !has_uncommitted
 }
 
+#[derive(serde::Deserialize, serde::Serialize)]
+#[serde(tag = "kind", rename_all = "lowercase")]
+pub enum ScheduleInput {
+    Daily { hour: u32, minute: u32 },
+    Weekly { weekdays: Vec<u32>, hour: u32, minute: u32 }, // 0=Sun..6=Sat
+    Cron { expr: String },
+}
+
+/// Build a 6-field cron string (sec min hour dom mon dow), evaluated by the
+/// scheduler in Asia/Shanghai. No UTC offset baked in. Weekly weekdays use the
+/// cron crate convention (0/7=Sun, 1=Mon..6=Sat).
+pub fn schedule_to_cron(s: &ScheduleInput) -> String {
+    match s {
+        ScheduleInput::Daily { hour, minute } => format!("0 {} {} * * *", minute, hour),
+        ScheduleInput::Weekly { weekdays, hour, minute } => {
+            let dows = weekdays.iter().map(|d| d.to_string()).collect::<Vec<_>>().join(",");
+            format!("0 {} {} * * {}", minute, hour, if dows.is_empty() { "*".to_string() } else { dows })
+        }
+        ScheduleInput::Cron { expr } => expr.clone(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -147,6 +169,14 @@ mod tests {
         assert!(should_skip_overlap(&["claimed"]));
         assert!(!should_skip_overlap(&["succeeded", "failed"]));
         assert!(!should_skip_overlap(&[]));
+    }
+    #[test]
+    fn daily_to_cron() {
+        assert_eq!(schedule_to_cron(&ScheduleInput::Daily { hour: 9, minute: 0 }), "0 0 9 * * *");
+    }
+    #[test]
+    fn weekly_to_cron() {
+        assert_eq!(schedule_to_cron(&ScheduleInput::Weekly { weekdays: vec![1,2,3,4,5], hour: 9, minute: 0 }), "0 0 9 * * 1,2,3,4,5");
     }
     #[test]
     fn reclaim_gates() {

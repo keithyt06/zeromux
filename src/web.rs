@@ -40,6 +40,11 @@ pub fn build_router(state: Arc<AppState>) -> Router {
         .route("/api/sessions/{id}/notes/{note_id}", delete(delete_note))
         .route("/api/events", get(list_events))
         .route("/api/events/{id}", delete(delete_event))
+        .route("/api/scheduled-tasks", get(list_scheduled).post(create_scheduled))
+        .route("/api/scheduled-tasks/{id}", put(update_scheduled).delete(delete_scheduled))
+        .route("/api/scheduled-tasks/{id}/run", post(run_scheduled_now))
+        .route("/api/scheduled-tasks/{id}/runs", get(list_scheduled_runs))
+        .route("/api/scheduler/health", get(scheduler_health))
         .route("/api/directories", get(list_directories))
         .route("/api/tmux/sessions", get(list_tmux_sessions))
         .route("/api/admin/users", get(crate::admin::list_users))
@@ -1216,4 +1221,214 @@ async fn delete_event(
     } else {
         Err((StatusCode::NOT_FOUND, "Event not found".to_string()))
     }
+}
+
+// ---- Scheduled tasks (owner-scoped: each user manages only their own) ----
+
+#[derive(serde::Deserialize)]
+struct ScheduledTaskReq {
+    name: String,
+    schedule: crate::scheduled_tasks::ScheduleInput,
+    work_dir: String,
+    prompt: String,
+    #[serde(default = "default_true")]
+    enabled: bool,
+    #[serde(default = "default_retention")]
+    retention_n: i64,
+}
+fn default_true() -> bool {
+    true
+}
+fn default_retention() -> i64 {
+    20
+}
+
+/// GET /api/scheduled-tasks — list the caller's own task configs.
+async fn list_scheduled(
+    State(state): State<Arc<AppState>>,
+    user: axum::Extension<CurrentUser>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    let tasks = state
+        .scheduled_tasks
+        .list_for_owner(&user.id)
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
+    Ok(Json(serde_json::json!({ "tasks": tasks })))
+}
+
+/// POST /api/scheduled-tasks — create a task config. The schedule is converted
+/// to a cron string and validated before persisting.
+async fn create_scheduled(
+    State(state): State<Arc<AppState>>,
+    user: axum::Extension<CurrentUser>,
+    Json(req): Json<ScheduledTaskReq>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    let cron = crate::scheduled_tasks::schedule_to_cron(&req.schedule);
+    <cron::Schedule as std::str::FromStr>::from_str(&cron)
+        .map_err(|e| (StatusCode::BAD_REQUEST, format!("invalid schedule: {e}")))?;
+    let config = crate::scheduled_tasks::TaskConfig {
+        id: uuid::Uuid::new_v4().to_string(),
+        owner_id: user.id.clone(),
+        name: req.name,
+        trigger_type: "cron".into(),
+        trigger_spec: cron,
+        tz: "Asia/Shanghai".into(),
+        agent_type: "claude".into(),
+        work_dir: req.work_dir,
+        prompt: req.prompt,
+        enabled: req.enabled,
+        retention_n: req.retention_n,
+        created_ms: chrono::Utc::now().timestamp_millis(),
+    };
+    state
+        .scheduled_tasks
+        .upsert_config(&config)
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
+    Ok(Json(serde_json::to_value(config).unwrap()))
+}
+
+/// PUT /api/scheduled-tasks/{id} — update an existing config (owner only).
+async fn update_scheduled(
+    State(state): State<Arc<AppState>>,
+    user: axum::Extension<CurrentUser>,
+    axum::extract::Path(id): axum::extract::Path<String>,
+    Json(req): Json<ScheduledTaskReq>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    let existing = state
+        .scheduled_tasks
+        .get_config(&id)
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?
+        .ok_or((StatusCode::NOT_FOUND, "Task not found".to_string()))?;
+    if existing.owner_id != user.id {
+        return Err((StatusCode::FORBIDDEN, "Forbidden".to_string()));
+    }
+    let cron = crate::scheduled_tasks::schedule_to_cron(&req.schedule);
+    <cron::Schedule as std::str::FromStr>::from_str(&cron)
+        .map_err(|e| (StatusCode::BAD_REQUEST, format!("invalid schedule: {e}")))?;
+    let config = crate::scheduled_tasks::TaskConfig {
+        id: existing.id,
+        owner_id: existing.owner_id,
+        name: req.name,
+        trigger_type: "cron".into(),
+        trigger_spec: cron,
+        tz: "Asia/Shanghai".into(),
+        agent_type: "claude".into(),
+        work_dir: req.work_dir,
+        prompt: req.prompt,
+        enabled: req.enabled,
+        retention_n: req.retention_n,
+        created_ms: existing.created_ms,
+    };
+    state
+        .scheduled_tasks
+        .upsert_config(&config)
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
+    Ok(Json(serde_json::to_value(config).unwrap()))
+}
+
+/// DELETE /api/scheduled-tasks/{id} — delete a config (owner only).
+async fn delete_scheduled(
+    State(state): State<Arc<AppState>>,
+    user: axum::Extension<CurrentUser>,
+    axum::extract::Path(id): axum::extract::Path<String>,
+) -> Result<StatusCode, (StatusCode, String)> {
+    let existing = state
+        .scheduled_tasks
+        .get_config(&id)
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?
+        .ok_or((StatusCode::NOT_FOUND, "Task not found".to_string()))?;
+    if existing.owner_id != user.id {
+        return Err((StatusCode::FORBIDDEN, "Forbidden".to_string()));
+    }
+    state
+        .scheduled_tasks
+        .delete_config(&id)
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+/// POST /api/scheduled-tasks/{id}/run — run the task now (owner only). Skips if
+/// the task already has an active run (overlap guard, mirroring the scheduler).
+async fn run_scheduled_now(
+    State(state): State<Arc<AppState>>,
+    user: axum::Extension<CurrentUser>,
+    axum::extract::Path(id): axum::extract::Path<String>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    let cfg = state
+        .scheduled_tasks
+        .get_config(&id)
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?
+        .ok_or((StatusCode::NOT_FOUND, "Task not found".to_string()))?;
+    if cfg.owner_id != user.id {
+        return Err((StatusCode::FORBIDDEN, "Forbidden".to_string()));
+    }
+    let active = state
+        .scheduled_tasks
+        .active_states_for_task(&id)
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
+    let active_refs: Vec<&str> = active.iter().map(|s| s.as_str()).collect();
+    if crate::scheduled_tasks::should_skip_overlap(&active_refs) {
+        return Ok(Json(serde_json::json!({ "skipped": true, "reason": "overlap" })));
+    }
+    let now = chrono::Utc::now().timestamp_millis();
+    let run = crate::scheduled_tasks::TaskRun {
+        id: uuid::Uuid::new_v4().to_string(),
+        task_id: id.clone(),
+        scheduled_for_ms: now,
+        state: "claimed".into(),
+        session_id: None,
+        verdict: None,
+        failure_kind: None,
+        started_ms: Some(now),
+        ended_ms: None,
+    };
+    state
+        .scheduled_tasks
+        .claim_run(&run)
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
+    let sid = state
+        .sessions
+        .trigger_run(
+            &run.id,
+            format!("{} · 手动", cfg.name),
+            &cfg.work_dir,
+            &user.id,
+            &id,
+            cfg.prompt.clone(),
+        )
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
+    Ok(Json(serde_json::json!({ "session_id": sid, "run_id": run.id })))
+}
+
+/// GET /api/scheduled-tasks/{id}/runs — recent run history (owner only).
+async fn list_scheduled_runs(
+    State(state): State<Arc<AppState>>,
+    user: axum::Extension<CurrentUser>,
+    axum::extract::Path(id): axum::extract::Path<String>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    let cfg = state
+        .scheduled_tasks
+        .get_config(&id)
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?
+        .ok_or((StatusCode::NOT_FOUND, "Task not found".to_string()))?;
+    if cfg.owner_id != user.id {
+        return Err((StatusCode::FORBIDDEN, "Forbidden".to_string()));
+    }
+    let runs = state
+        .scheduled_tasks
+        .runs_for_task(&id, 50)
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
+    Ok(Json(serde_json::json!({ "runs": runs })))
+}
+
+/// GET /api/scheduler/health — scheduler heartbeat freshness.
+async fn scheduler_health(
+    State(state): State<Arc<AppState>>,
+    _user: axum::Extension<CurrentUser>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    use std::sync::atomic::Ordering;
+    let hb = state.sched_heartbeat.load(Ordering::Relaxed);
+    let now = chrono::Utc::now().timestamp_millis();
+    let healthy = hb != 0 && now - hb < 180_000;
+    Ok(Json(serde_json::json!({ "heartbeat_ms": hb, "healthy": healthy })))
 }

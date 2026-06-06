@@ -4,21 +4,21 @@
 /* ── Theme variables ── */
 
 :root {
-  --bg-primary:   #0d1117;
-  --bg-secondary: #161b22;
-  --bg-tertiary:  #1c2128;
-  --bg-hover:     #263040;
-  --border:       #30363d;
+  --bg-primary:   #11161d;
+  --bg-secondary: #161c25;
+  --bg-tertiary:  #1f2630;
+  --bg-hover:     #243040;
+  --border:       #2a323d;
   --border-light: #21262d;
-  --text-primary: #c9d1d9;
+  --text-primary: #cdd6e0;
   --text-bright:  #e6edf3;
-  --text-secondary: #8b949e;
+  --text-secondary: #9aa5b1;
   --text-muted:   #484f58;
   --accent-blue:  #58a6ff;
   --accent-blue-hover: #79c0ff;
   --accent-green: #238636;
   --accent-green-hover: #2ea043;
-  --accent-green-text: #3fb950;
+  --accent-green-text: #56d364;
   --accent-purple: #a371f7;
   --accent-purple-dim: #8b5cf6;
   --accent-purple-bg: #1c1c2e;
@@ -28,6 +28,7 @@
   --btn-disabled-bg: #21262d;
   --btn-disabled-text: #484f58;
   --code-bg:      #1c2128;
+  --accent-brand: #f7b500;
 }
 
 :root.light {
@@ -55,6 +56,7 @@
   --btn-disabled-bg: #eaeef2;
   --btn-disabled-text: #8c959f;
   --code-bg:      #f6f8fa;
+  --accent-brand: #d39e00;
 }
 
 /* ── xterm ── */

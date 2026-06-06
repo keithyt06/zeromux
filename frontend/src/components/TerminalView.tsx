@@ -10,6 +10,8 @@ import { GitBranch, Folder, Circle } from 'lucide-react'
 import MobileKeyBar from './MobileKeyBar'
 import { arrowSequence, rowHeight, linesFromDrag, type ArrowKey } from '../lib/terminalInput'
 
+const FONT_SIZE = 14
+
 const THEMES = {
   dark: {
     background: '#0d1117',
@@ -115,7 +117,7 @@ export default function TerminalView({ sessionId, active, theme }: Props) {
 
     const term = new Terminal({
       cursorBlink: true,
-      fontSize: 14,
+      fontSize: FONT_SIZE,
       fontFamily: "'JetBrains Mono', 'Fira Code', 'Cascadia Code', Menlo, monospace",
       theme: THEMES[theme],
       allowProposedApi: true,
@@ -167,7 +169,7 @@ export default function TerminalView({ sessionId, active, theme }: Props) {
       }
       if (!t) return
       e.preventDefault()  // 全程阻止，防止浏览器抢手势 / 橡皮筋
-      const rh = rowHeight(term.element?.clientHeight ?? 0, term.rows, 14)
+      const rh = rowHeight(term.element?.clientHeight ?? 0, term.rows, FONT_SIZE)
       const lines = linesFromDrag(startY, t.clientY, rh)
       if (lines !== 0) {
         term.scrollLines(lines)
@@ -175,12 +177,18 @@ export default function TerminalView({ sessionId, active, theme }: Props) {
       }
     }
 
+    const onTouchEnd = () => { touchId = null }
+
     container?.addEventListener('touchstart', onTouchStart, { passive: true })
     container?.addEventListener('touchmove', onTouchMove, { passive: false })
+    container?.addEventListener('touchend', onTouchEnd, { passive: true })
+    container?.addEventListener('touchcancel', onTouchEnd, { passive: true })
 
     return () => {
       container?.removeEventListener('touchstart', onTouchStart)
       container?.removeEventListener('touchmove', onTouchMove)
+      container?.removeEventListener('touchend', onTouchEnd)
+      container?.removeEventListener('touchcancel', onTouchEnd)
       wsRef.current?.close()
       term.dispose()
     }

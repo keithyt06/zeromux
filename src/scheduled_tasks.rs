@@ -1,6 +1,9 @@
 use chrono::{DateTime, Utc};
 use chrono_tz::Asia::Shanghai;
+use rusqlite::{params, Connection};
+use std::path::Path;
 use std::str::FromStr;
+use std::sync::Mutex;
 
 /// Return scheduled fire points in the half-open interval (last_seen, now],
 /// evaluated in Asia/Shanghai, oldest -> newest. The scheduler caller uses
@@ -151,5 +154,214 @@ mod tests {
         assert!(!is_safe_to_reclaim(false, false, false)); // outside worktree root
         assert!(!is_safe_to_reclaim(true, true, false));   // process alive
         assert!(!is_safe_to_reclaim(true, false, true));   // uncommitted changes
+    }
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct TaskConfig {
+    pub id: String,
+    pub owner_id: String,
+    pub name: String,
+    pub trigger_type: String, // "cron"
+    pub trigger_spec: String, // cron string
+    pub tz: String,           // "Asia/Shanghai"
+    pub agent_type: String,   // "claude"
+    pub work_dir: String,
+    pub prompt: String,
+    pub enabled: bool,
+    pub retention_n: i64,
+    pub created_ms: i64,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct TaskRun {
+    pub id: String,
+    pub task_id: String,
+    pub scheduled_for_ms: i64,
+    pub state: String, // claimed|running|succeeded|failed|skipped|aborted
+    pub session_id: Option<String>,
+    pub verdict: Option<String>,
+    pub failure_kind: Option<String>,
+    pub started_ms: Option<i64>,
+    pub ended_ms: Option<i64>,
+}
+
+pub struct ScheduledStore {
+    conn: Mutex<Connection>,
+}
+
+impl ScheduledStore {
+    pub fn open(data_dir: &Path) -> Result<Self, String> {
+        std::fs::create_dir_all(data_dir).map_err(|e| e.to_string())?;
+        let conn = Connection::open(data_dir.join("scheduled.db")).map_err(|e| e.to_string())?;
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS agent_runs_config (
+                id TEXT PRIMARY KEY, owner_id TEXT NOT NULL, name TEXT NOT NULL,
+                trigger_type TEXT NOT NULL, trigger_spec TEXT NOT NULL, tz TEXT NOT NULL,
+                agent_type TEXT NOT NULL, work_dir TEXT NOT NULL, prompt TEXT NOT NULL,
+                enabled INTEGER NOT NULL DEFAULT 1, retention_n INTEGER NOT NULL DEFAULT 20,
+                created_ms INTEGER NOT NULL);
+            CREATE TABLE IF NOT EXISTS agent_task_runs (
+                id TEXT PRIMARY KEY, task_id TEXT NOT NULL, scheduled_for_ms INTEGER NOT NULL,
+                state TEXT NOT NULL, session_id TEXT, verdict TEXT, failure_kind TEXT,
+                started_ms INTEGER, ended_ms INTEGER,
+                UNIQUE(task_id, scheduled_for_ms));
+            CREATE INDEX IF NOT EXISTS idx_runs_task_state ON agent_task_runs(task_id, state);",
+        ).map_err(|e| e.to_string())?;
+        Ok(Self { conn: Mutex::new(conn) })
+    }
+
+    pub fn upsert_config(&self, c: &TaskConfig) -> Result<(), String> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "INSERT INTO agent_runs_config
+             (id,owner_id,name,trigger_type,trigger_spec,tz,agent_type,work_dir,prompt,enabled,retention_n,created_ms)
+             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12)
+             ON CONFLICT(id) DO UPDATE SET name=?3,trigger_spec=?5,work_dir=?8,prompt=?9,enabled=?10,retention_n=?11",
+            params![c.id,c.owner_id,c.name,c.trigger_type,c.trigger_spec,c.tz,c.agent_type,
+                    c.work_dir,c.prompt,c.enabled as i64,c.retention_n,c.created_ms],
+        ).map_err(|e| e.to_string())?;
+        Ok(())
+    }
+
+    pub fn list_enabled(&self) -> Result<Vec<TaskConfig>, String> {
+        self.query_configs("WHERE enabled=1", params![])
+    }
+    pub fn list_for_owner(&self, owner: &str) -> Result<Vec<TaskConfig>, String> {
+        self.query_configs("WHERE owner_id=?1", params![owner])
+    }
+    fn query_configs(&self, where_clause: &str, p: impl rusqlite::Params) -> Result<Vec<TaskConfig>, String> {
+        let conn = self.conn.lock().unwrap();
+        let sql = format!("SELECT id,owner_id,name,trigger_type,trigger_spec,tz,agent_type,work_dir,prompt,enabled,retention_n,created_ms FROM agent_runs_config {}", where_clause);
+        let mut stmt = conn.prepare(&sql).map_err(|e| e.to_string())?;
+        let rows = stmt.query_map(p, |r| Ok(TaskConfig {
+            id: r.get(0)?, owner_id: r.get(1)?, name: r.get(2)?, trigger_type: r.get(3)?,
+            trigger_spec: r.get(4)?, tz: r.get(5)?, agent_type: r.get(6)?, work_dir: r.get(7)?,
+            prompt: r.get(8)?, enabled: r.get::<_, i64>(9)? != 0, retention_n: r.get(10)?, created_ms: r.get(11)?,
+        })).map_err(|e| e.to_string())?;
+        rows.collect::<Result<_,_>>().map_err(|e| e.to_string())
+    }
+
+    pub fn get_config(&self, id: &str) -> Result<Option<TaskConfig>, String> {
+        Ok(self.query_configs("WHERE id=?1", params![id])?.into_iter().next())
+    }
+    pub fn delete_config(&self, id: &str) -> Result<(), String> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute("DELETE FROM agent_runs_config WHERE id=?1", params![id]).map_err(|e| e.to_string())?;
+        Ok(())
+    }
+
+    /// Atomic claim: INSERT OR IGNORE. Returns true iff this caller inserted
+    /// (won the scheduled_for slot). Side effects (session spawn) happen only
+    /// after a successful claim.
+    pub fn claim_run(&self, run: &TaskRun) -> Result<bool, String> {
+        let conn = self.conn.lock().unwrap();
+        let n = conn.execute(
+            "INSERT OR IGNORE INTO agent_task_runs
+             (id,task_id,scheduled_for_ms,state,started_ms) VALUES (?1,?2,?3,'claimed',?4)",
+            params![run.id, run.task_id, run.scheduled_for_ms, run.started_ms],
+        ).map_err(|e| e.to_string())?;
+        Ok(n == 1)
+    }
+
+    pub fn set_run_state(&self, run_id: &str, state: &str, session_id: Option<&str>,
+                         verdict: Option<&str>, failure_kind: Option<&str>, ended_ms: Option<i64>) -> Result<(), String> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "UPDATE agent_task_runs SET state=?2, session_id=COALESCE(?3,session_id),
+             verdict=COALESCE(?4,verdict), failure_kind=COALESCE(?5,failure_kind),
+             ended_ms=COALESCE(?6,ended_ms) WHERE id=?1",
+            params![run_id, state, session_id, verdict, failure_kind, ended_ms],
+        ).map_err(|e| e.to_string())?;
+        Ok(())
+    }
+
+    pub fn active_states_for_task(&self, task_id: &str) -> Result<Vec<String>, String> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare("SELECT state FROM agent_task_runs WHERE task_id=?1 AND state IN ('claimed','running')").map_err(|e| e.to_string())?;
+        let rows = stmt.query_map(params![task_id], |r| r.get::<_,String>(0)).map_err(|e| e.to_string())?;
+        rows.collect::<Result<_,_>>().map_err(|e| e.to_string())
+    }
+
+    /// Startup + watchdog: mark claimed/running as aborted. cutoff_ms=None at
+    /// startup (all orphans); Some(cutoff) for the timeout watchdog (only runs
+    /// whose started_ms is older than cutoff).
+    pub fn reconcile_orphans(&self, cutoff_ms: Option<i64>) -> Result<usize, String> {
+        let conn = self.conn.lock().unwrap();
+        let n = match cutoff_ms {
+            None => conn.execute("UPDATE agent_task_runs SET state='aborted' WHERE state IN ('claimed','running')", params![]),
+            Some(c) => conn.execute("UPDATE agent_task_runs SET state='aborted' WHERE state IN ('claimed','running') AND started_ms < ?1", params![c]),
+        }.map_err(|e| e.to_string())?;
+        Ok(n)
+    }
+
+    pub fn runs_for_task(&self, task_id: &str, limit: i64) -> Result<Vec<TaskRun>, String> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare("SELECT id,task_id,scheduled_for_ms,state,session_id,verdict,failure_kind,started_ms,ended_ms FROM agent_task_runs WHERE task_id=?1 ORDER BY scheduled_for_ms DESC LIMIT ?2").map_err(|e| e.to_string())?;
+        let rows = stmt.query_map(params![task_id, limit], |r| Ok(TaskRun {
+            id: r.get(0)?, task_id: r.get(1)?, scheduled_for_ms: r.get(2)?, state: r.get(3)?,
+            session_id: r.get(4)?, verdict: r.get(5)?, failure_kind: r.get(6)?, started_ms: r.get(7)?, ended_ms: r.get(8)?,
+        })).map_err(|e| e.to_string())?;
+        rows.collect::<Result<_,_>>().map_err(|e| e.to_string())
+    }
+}
+
+#[cfg(test)]
+mod store_tests {
+    use super::*;
+    // Return the TempDir guard alongside the store: if we dropped it here the
+    // temp directory would be removed before the test writes, and SQLite would
+    // fail with "attempt to write a readonly database".
+    fn store() -> (ScheduledStore, tempfile::TempDir) {
+        let dir = tempfile::tempdir().unwrap();
+        let s = ScheduledStore::open(dir.path()).unwrap();
+        (s, dir)
+    }
+
+    #[test]
+    fn claim_is_unique_per_scheduled_for() {
+        let (s, _dir) = store();
+        let run = TaskRun { id: "r1".into(), task_id: "t1".into(), scheduled_for_ms: 1000,
+            state: "claimed".into(), session_id: None, verdict: None, failure_kind: None, started_ms: Some(1), ended_ms: None };
+        assert!(s.claim_run(&run).unwrap(), "first claim wins");
+        let dup = TaskRun { id: "r2".into(), ..run.clone() };
+        assert!(!s.claim_run(&dup).unwrap(), "same scheduled_for second claim ignored");
+    }
+
+    #[test]
+    fn reconcile_marks_orphans_aborted() {
+        let (s, _dir) = store();
+        s.claim_run(&TaskRun { id:"r1".into(),task_id:"t1".into(),scheduled_for_ms:1,state:"claimed".into(),session_id:None,verdict:None,failure_kind:None,started_ms:Some(1),ended_ms:None }).unwrap();
+        assert_eq!(s.reconcile_orphans(None).unwrap(), 1);
+        assert!(s.active_states_for_task("t1").unwrap().is_empty());
+    }
+
+    #[test]
+    fn config_roundtrip_and_owner_filter() {
+        let (s, _dir) = store();
+        let c = TaskConfig { id:"t1".into(), owner_id:"alice".into(), name:"daily".into(),
+            trigger_type:"cron".into(), trigger_spec:"0 0 9 * * *".into(), tz:"Asia/Shanghai".into(),
+            agent_type:"claude".into(), work_dir:"/tmp".into(), prompt:"review".into(),
+            enabled:true, retention_n:20, created_ms:123 };
+        s.upsert_config(&c).unwrap();
+        assert_eq!(s.list_for_owner("alice").unwrap().len(), 1);
+        assert_eq!(s.list_for_owner("bob").unwrap().len(), 0);
+        assert_eq!(s.list_enabled().unwrap().len(), 1);
+        assert_eq!(s.get_config("t1").unwrap().unwrap().name, "daily");
+    }
+
+    #[test]
+    fn run_state_transition_and_history() {
+        let (s, _dir) = store();
+        let run = TaskRun { id:"r1".into(),task_id:"t1".into(),scheduled_for_ms:1,state:"claimed".into(),session_id:None,verdict:None,failure_kind:None,started_ms:Some(1),ended_ms:None };
+        s.claim_run(&run).unwrap();
+        s.set_run_state("r1","running",Some("sess1"),None,None,None).unwrap();
+        s.set_run_state("r1","succeeded",None,Some("2 issues"),None,Some(99)).unwrap();
+        let runs = s.runs_for_task("t1", 10).unwrap();
+        assert_eq!(runs.len(), 1);
+        assert_eq!(runs[0].state, "succeeded");
+        assert_eq!(runs[0].session_id.as_deref(), Some("sess1"));
+        assert_eq!(runs[0].verdict.as_deref(), Some("2 issues"));
+        assert!(s.active_states_for_task("t1").unwrap().is_empty(), "succeeded is not active");
     }
 }

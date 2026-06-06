@@ -66,3 +66,11 @@
 .xterm-container .xterm {
   height: 100%;
 }
+/* 移动端：完全接管触摸手势，禁止浏览器原生滚动与 overscroll 橡皮筋。
+   实际触点可能落在 screen 画布或 viewport 上，三处都要声明。 */
+.xterm-container,
+.xterm-container .xterm-screen,
+.xterm-container .xterm-viewport {
+  touch-action: none;
+  overscroll-behavior: contain;
+}

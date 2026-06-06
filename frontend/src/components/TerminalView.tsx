@@ -7,6 +7,10 @@ import type { SessionStatus } from '../lib/api'
 import type { Theme } from '../lib/theme'
 import { b64encode, b64decode } from '../lib/base64'
 import { GitBranch, Folder, Circle } from 'lucide-react'
+import MobileKeyBar from './MobileKeyBar'
+import { arrowSequence, rowHeight, linesFromDrag, type ArrowKey } from '../lib/terminalInput'
+
+const FONT_SIZE = 14
 
 const THEMES = {
   dark: {
@@ -68,6 +72,13 @@ export default function TerminalView({ sessionId, active, theme }: Props) {
   const wsRef = useRef<WebSocket | null>(null)
   const initRef = useRef(false)
   const [status, setStatus] = useState<SessionStatus | null>(null)
+  // 触摸设备检测：any-pointer:coarse 或 maxTouchPoints>0，少漏触屏笔记本/iPad。
+  // 触摸能力在页面生命周期内不变，用惰性初始化在挂载时算一次即可（避免 effect 内 setState）。
+  const [isTouch] = useState(
+    () =>
+      (typeof matchMedia !== 'undefined' && matchMedia('(any-pointer: coarse)').matches) ||
+      (typeof navigator !== 'undefined' && navigator.maxTouchPoints > 0)
+  )
 
   // Fetch status
   useEffect(() => {
@@ -82,6 +93,23 @@ export default function TerminalView({ sessionId, active, theme }: Props) {
     return () => { cancelled = true; clearInterval(interval) }
   }, [sessionId])
 
+  // 所有 client→PTY 输入走这一条；term.onData 与 MobileKeyBar 共用。
+  const sendInput = useCallback((data: string) => {
+    const ws = wsRef.current
+    if (ws?.readyState === WebSocket.OPEN) {
+      ws.send(JSON.stringify({ type: 'input', data: b64encode(new TextEncoder().encode(data)) }))
+    }
+  }, [])
+
+  // 虚拟方向键：先回到底部（否则用户在 scrollback 里点键看不到反馈），
+  // 再按当前光标键模式（DECCKM）生成序列发送。
+  const handleArrowKey = useCallback((key: ArrowKey) => {
+    const term = termRef.current
+    if (!term) return
+    term.scrollToBottom()
+    sendInput(arrowSequence(key, term.modes.applicationCursorKeysMode))
+  }, [sendInput])
+
   // Initialize terminal once
   useEffect(() => {
     if (initRef.current || !containerRef.current) return
@@ -89,7 +117,7 @@ export default function TerminalView({ sessionId, active, theme }: Props) {
 
     const term = new Terminal({
       cursorBlink: true,
-      fontSize: 14,
+      fontSize: FONT_SIZE,
       fontFamily: "'JetBrains Mono', 'Fira Code', 'Cascadia Code', Menlo, monospace",
       theme: THEMES[theme],
       allowProposedApi: true,
@@ -110,10 +138,7 @@ export default function TerminalView({ sessionId, active, theme }: Props) {
     fitRef.current = fit
 
     term.onData(data => {
-      const ws = wsRef.current
-      if (ws?.readyState === WebSocket.OPEN) {
-        ws.send(JSON.stringify({ type: 'input', data: b64encode(new TextEncoder().encode(data)) }))
-      }
+      sendInput(data)
     })
 
     term.onBinary(data => {
@@ -125,7 +150,45 @@ export default function TerminalView({ sessionId, active, theme }: Props) {
       }
     })
 
+    // 移动端触摸滚动：完全接管手势（CSS 已禁原生滚动），位移换算成 scrollLines。
+    const container = containerRef.current
+    let startY = 0
+    let touchId: number | null = null
+
+    const onTouchStart = (e: TouchEvent) => {
+      // 仅单指进入滚动逻辑；多指（pinch）忽略。
+      if (e.touches.length !== 1) { touchId = null; return }
+      startY = e.touches[0].clientY
+      touchId = e.touches[0].identifier
+    }
+    const onTouchMove = (e: TouchEvent) => {
+      if (touchId === null) return
+      let t: Touch | undefined
+      for (let i = 0; i < e.touches.length; i++) {
+        if (e.touches[i].identifier === touchId) { t = e.touches[i]; break }
+      }
+      if (!t) return
+      e.preventDefault()  // 全程阻止，防止浏览器抢手势 / 橡皮筋
+      const rh = rowHeight(term.element?.clientHeight ?? 0, term.rows, FONT_SIZE)
+      const lines = linesFromDrag(startY, t.clientY, rh)
+      if (lines !== 0) {
+        term.scrollLines(lines)
+        startY = t.clientY
+      }
+    }
+
+    const onTouchEnd = () => { touchId = null }
+
+    container?.addEventListener('touchstart', onTouchStart, { passive: true })
+    container?.addEventListener('touchmove', onTouchMove, { passive: false })
+    container?.addEventListener('touchend', onTouchEnd, { passive: true })
+    container?.addEventListener('touchcancel', onTouchEnd, { passive: true })
+
     return () => {
+      container?.removeEventListener('touchstart', onTouchStart)
+      container?.removeEventListener('touchmove', onTouchMove)
+      container?.removeEventListener('touchend', onTouchEnd)
+      container?.removeEventListener('touchcancel', onTouchEnd)
       wsRef.current?.close()
       term.dispose()
     }
@@ -223,9 +286,17 @@ export default function TerminalView({ sessionId, active, theme }: Props) {
     return () => window.removeEventListener('resize', handleResize)
   }, [handleResize])
 
+  // 键条占用约 40px 高度，改变终端可用区；渲染后重新 fit，避免底部行被遮 / canvas 尺寸过期。
+  useEffect(() => {
+    if (!isTouch) return
+    const t = setTimeout(handleResize, 50)
+    return () => clearTimeout(t)
+  }, [isTouch, handleResize])
+
   return (
     <div className="flex flex-col h-full">
       <div ref={containerRef} className="xterm-container w-full flex-1 min-h-0" />
+      {isTouch && <MobileKeyBar onKey={handleArrowKey} />}
       <div className="flex items-center gap-3 px-4 py-3 border-t border-[var(--border)] bg-[var(--bg-secondary)] min-h-[40px]">
         {status ? (
           <>

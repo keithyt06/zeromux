@@ -321,7 +321,7 @@ export default function AcpChatView({ sessionId, active, agentType = 'claude' }:
 
   return (
     <div className="flex flex-col h-full">
-      <div ref={scrollRef} className="flex-1 overflow-y-auto px-4 py-3 space-y-3">
+      <div ref={scrollRef} className="flex-1 overflow-y-auto px-5 py-4 space-y-4">
         {messages.map(msg => (
           <MessageBubble key={msg.id} msg={msg} agentName={agentType === 'kiro' ? 'Kiro' : agentType === 'codex' ? 'Codex' : 'Claude'} />
         ))}

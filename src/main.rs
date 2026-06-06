@@ -9,6 +9,7 @@ mod logger;
 mod notes;
 mod oauth;
 mod pty_bridge;
+mod scheduled_tasks;
 mod session_manager;
 mod session_store;
 mod transcribe;
@@ -114,6 +115,8 @@ pub struct AppState {
     pub db: Option<db::Database>,
     pub notes: notes::NotesStore,
     pub events: Arc<events::EventStore>,
+    pub scheduled_tasks: Arc<scheduled_tasks::ScheduledStore>,
+    pub sched_heartbeat: Arc<std::sync::atomic::AtomicI64>,
     pub github_client_id: Option<String>,
     pub github_client_secret: Option<String>,
     pub jwt_secret: String,
@@ -217,6 +220,11 @@ async fn main() {
             .expect("Failed to initialize session store"),
     );
 
+    let scheduled_store = Arc::new(
+        scheduled_tasks::ScheduledStore::open(std::path::Path::new(&data_dir_str))
+            .expect("Failed to initialize scheduled store"),
+    );
+
     if oauth_configured {
         println!("GitHub OAuth enabled");
     } else {
@@ -246,6 +254,8 @@ async fn main() {
         db: database,
         notes: notes_store,
         events: event_store,
+        scheduled_tasks: scheduled_store.clone(),
+        sched_heartbeat: Arc::new(std::sync::atomic::AtomicI64::new(0)),
         github_client_id: args.github_client_id,
         github_client_secret: args.github_client_secret,
         jwt_secret,
@@ -255,6 +265,16 @@ async fn main() {
 
     // Restore persisted session metadata (running=None until respawned).
     state.sessions.load_persisted();
+
+    // Scheduled tasks: wire the store into the manager, reconcile orphans from a
+    // prior process, then start the supervised scheduler loop.
+    state.sessions.set_scheduled_store(state.scheduled_tasks.clone());
+    let _ = state.scheduled_tasks.reconcile_orphans(None);
+    scheduled_tasks::spawn_scheduler(
+        state.sessions.clone(),
+        state.scheduled_tasks.clone(),
+        state.sched_heartbeat.clone(),
+    );
 
     // Periodically prune the agent-events table (one row per turn, otherwise
     // unbounded). Prune once at startup, then daily. 30-day retention.

@@ -151,7 +151,7 @@ async fn handle_acp_ws(socket: WebSocket, session_id: String, state: Arc<AppStat
                                     if let Some(ref log) = logger {
                                         log.log_acp_input(&session_id, &text);
                                     }
-                                    let _ = input_tx.send(SessionInput::Prompt(text)).await;
+                                    let _ = input_tx.send(SessionInput::Prompt { text, run_id: None }).await;
                                 }
                                 ClientMsg::Cancel => {
                                     let _ = input_tx.send(SessionInput::Cancel).await;

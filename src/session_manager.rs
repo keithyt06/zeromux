@@ -112,8 +112,9 @@ pub enum SessionInput {
     PtyData(Vec<u8>),
     /// PTY: resize
     PtyResize(u16, u16),
-    /// ACP/Kiro: prompt text
-    Prompt(String),
+    /// ACP/Kiro: prompt text + optional scheduled-run id for exactly-once
+    /// finalization (None for manual user prompts).
+    Prompt { text: String, run_id: Option<String> },
     /// ACP/Kiro: cancel/kill
     Cancel,
     /// ACP/Kiro: turn-level interrupt (abort current turn, keep process alive)
@@ -159,6 +160,8 @@ pub struct Session {
     /// Git worktree path for ACP sessions (cleaned up on delete)
     worktree_path: Option<PathBuf>,
     created_ms: i64,
+    /// Set for sessions auto-created by a scheduled task; None for manual ones.
+    source_task_id: Option<String>,
     /// 并发重生互斥（仅锁内访问）。
     spawning: bool,
     last_activity_ms: i64,
@@ -188,6 +191,9 @@ pub struct SessionManager {
     codex_path: String,
     codex_reasoning: String,
     shell: String,
+    /// Scheduled-tasks store, set at startup after construction. Fan-out tasks
+    /// use it to finalize scheduled runs. None when no scheduler is wired.
+    scheduled: Mutex<Option<Arc<crate::scheduled_tasks::ScheduledStore>>>,
 }
 
 #[derive(serde::Serialize)]
@@ -206,6 +212,7 @@ pub struct SessionInfo {
     pub turn_started_ms: Option<i64>,
     pub last_activity_ms: i64,
     pub turns_completed: u32,
+    pub source_task_id: Option<String>,
 }
 
 // ── Git worktree helpers ──
@@ -418,6 +425,7 @@ fn session_info_of(s: &Session) -> SessionInfo {
         turn_started_ms: s.running.as_ref().and_then(|rp| rp.turn_started_ms),
         last_activity_ms: s.last_activity_ms,
         turns_completed: s.turns_completed,
+        source_task_id: s.source_task_id.clone(),
     }
 }
 
@@ -441,6 +449,7 @@ impl SessionManager {
             codex_path,
             codex_reasoning,
             shell,
+            scheduled: Mutex::new(None),
         });
         *mgr.self_weak.lock().unwrap() = Arc::downgrade(&mgr);
         mgr
@@ -448,6 +457,22 @@ impl SessionManager {
 
     fn weak(&self) -> Weak<SessionManager> {
         self.self_weak.lock().unwrap().clone()
+    }
+
+    /// Wire the scheduled-tasks store (called once at startup).
+    pub fn set_scheduled_store(&self, store: Arc<crate::scheduled_tasks::ScheduledStore>) {
+        *self.scheduled.lock().unwrap() = Some(store);
+    }
+
+    /// Finalize a scheduled run exactly once (called by the agent fan-out on the
+    /// terminal event for that run). No-op if no scheduled store is wired.
+    pub fn finalize_run(&self, run_id: &str, state: &str, verdict: Option<&str>, failure_kind: Option<&str>) {
+        let store = { self.scheduled.lock().unwrap().clone() };
+        if let Some(store) = store {
+            if let Err(e) = store.set_run_state(run_id, state, None, verdict, failure_kind, Some(now_millis())) {
+                tracing::warn!("finalize_run {} failed: {}", run_id, e);
+            }
+        }
     }
 
     /// Persist a session's metadata to the store (insert or update).
@@ -462,6 +487,7 @@ impl SessionManager {
             resume_token: s.resume_token.clone(),
             worktree_path: s.worktree_path.as_ref().map(|p| p.to_string_lossy().to_string()),
             created_ms: s.created_ms,
+            source_task_id: s.source_task_id.clone(),
         };
         if let Err(e) = self.store.upsert(&pj) {
             tracing::warn!("persist session {} failed: {}", s.id, e);
@@ -582,6 +608,7 @@ impl SessionManager {
             resume_token: tmux_target.map(|t| ResumeToken::Tmux(t.to_string())),
             worktree_path: None,
             created_ms: now_millis(),
+            source_task_id: None,
             spawning: false,
             last_activity_ms: now_millis(),
             turns_completed: 0,
@@ -643,6 +670,22 @@ impl SessionManager {
         rows: u16,
         owner_id: &str,
     ) -> Result<String, String> {
+        self.create_acp_session_tagged(name, work_dir, cols, rows, owner_id, None)
+            .await
+    }
+
+    /// Like `create_acp_session` but tags the session with an optional
+    /// `source_task_id` (set for scheduled-task runs so the fan-out can finalize
+    /// the run when the turn completes).
+    pub async fn create_acp_session_tagged(
+        &self,
+        name: String,
+        work_dir: &str,
+        cols: u16,
+        rows: u16,
+        owner_id: &str,
+        source_task_id: Option<String>,
+    ) -> Result<String, String> {
         let id = uuid::Uuid::new_v4().to_string();
         let (effective_dir, worktree_path) = resolve_work_dir(work_dir, &id);
 
@@ -670,6 +713,7 @@ impl SessionManager {
             resume_token: None,
             worktree_path,
             created_ms: now_millis(),
+            source_task_id,
             spawning: false,
             last_activity_ms: now_millis(),
             turns_completed: 0,
@@ -681,6 +725,57 @@ impl SessionManager {
         self.persist_meta(&session);
         self.sessions.lock().unwrap().insert(id.clone(), session);
         Ok(id)
+    }
+
+    /// True if a session with this id currently exists (process may be running).
+    pub fn session_exists(&self, id: &str) -> bool {
+        self.sessions.lock().unwrap().contains_key(id)
+    }
+
+    /// Create a Claude session for a scheduled run, mark the run running, and
+    /// inject the goal prompt carrying the run_id (so the fan-out finalizes it).
+    pub async fn trigger_run(
+        &self,
+        run_id: &str,
+        name: String,
+        work_dir: &str,
+        owner_id: &str,
+        task_id: &str,
+        prompt: String,
+    ) -> Result<String, String> {
+        // default terminal size for unattended sessions
+        let sid = self
+            .create_acp_session_tagged(name, work_dir, 80, 24, owner_id, Some(task_id.to_string()))
+            .await?;
+        if let Some(store) = self.scheduled.lock().unwrap().clone() {
+            let _ = store.set_run_state(run_id, "running", Some(&sid), None, None, None);
+        }
+        let goal = format!(
+            "{}\n\n完成后，最后单独输出一行：\n<<<VERDICT>>>一句话结论<<<END>>>",
+            prompt
+        );
+        if let Some(tx) = self.input_tx(&sid) {
+            if let Err(e) = tx
+                .send(SessionInput::Prompt {
+                    text: goal,
+                    run_id: Some(run_id.to_string()),
+                })
+                .await
+            {
+                if let Some(store) = self.scheduled.lock().unwrap().clone() {
+                    let _ = store.set_run_state(
+                        run_id,
+                        "failed",
+                        None,
+                        None,
+                        Some("prompt_send_failed"),
+                        Some(now_millis()),
+                    );
+                }
+                return Err(format!("send prompt failed: {}", e));
+            }
+        }
+        Ok(sid)
     }
 
     /// Spawn a Kiro process for `id` at `work_dir`, start its fan-out, return the
@@ -757,6 +852,7 @@ impl SessionManager {
             resume_token: None,
             worktree_path,
             created_ms: now_millis(),
+            source_task_id: None,
             spawning: false,
             last_activity_ms: now_millis(),
             turns_completed: 0,
@@ -857,6 +953,7 @@ impl SessionManager {
             resume_token: None,
             worktree_path,
             created_ms: now_millis(),
+            source_task_id: None,
             spawning: false,
             last_activity_ms: now_millis(),
             turns_completed: 0,
@@ -1211,6 +1308,7 @@ impl SessionManager {
                     resume_token: p.resume_token,
                     worktree_path: p.worktree_path.map(std::path::PathBuf::from),
                     created_ms: p.created_ms,
+                    source_task_id: p.source_task_id.clone(),
                     spawning: false,
                     last_activity_ms: now_millis(),
                     turns_completed: 0,
@@ -1354,6 +1452,7 @@ fn spawn_acp_fanout(
         let mut turn_seq: u64 = 0;
         let mut local_running = false;
         let mut boundary_count: u64 = 0;
+        let mut active_run_id: Option<String> = None;
         loop {
             tokio::select! {
                 event = process.event_rx.recv() => {
@@ -1396,6 +1495,22 @@ fn spawn_acp_fanout(
                                 if let Some(m) = mgr.upgrade() {
                                     m.mark_turn(&sid, TurnState::Idle, boundary_count);
                                 }
+                                // Finalize a scheduled run exactly once, keyed
+                                // on active_run_id, mapped by terminal event type.
+                                if let Some(rid) = active_run_id.take() {
+                                    if let Some(m) = mgr.upgrade() {
+                                        match &evt {
+                                            AcpEvent::Result { text, .. } => {
+                                                let verdict = crate::scheduled_tasks::extract_verdict(text);
+                                                m.finalize_run(&rid, "succeeded", verdict.as_deref(),
+                                                    if verdict.is_some() { None } else { Some("no_verdict") });
+                                            }
+                                            AcpEvent::Error { .. } => m.finalize_run(&rid, "failed", None, Some("cli_error")),
+                                            AcpEvent::Exit { .. } => m.finalize_run(&rid, "failed", None, Some("cli_exited")),
+                                            _ => { active_run_id = Some(rid); } // not terminal, keep waiting
+                                        }
+                                    }
+                                }
                             }
                         }
                         None => break,
@@ -1403,7 +1518,8 @@ fn spawn_acp_fanout(
                 }
                 input = input_rx.recv() => {
                     match input {
-                        Some(SessionInput::Prompt(text)) => {
+                        Some(SessionInput::Prompt { text, run_id }) => {
+                            active_run_id = run_id.clone();
                             if local_running {
                                 if let Err(e) = process.interrupt().await {
                                     tracing::warn!("interrupt before resend failed for {}: {}", sid, e);
@@ -1505,7 +1621,7 @@ fn spawn_kiro_fanout(
                 }
                 input = input_rx.recv() => {
                     match input {
-                        Some(SessionInput::Prompt(text)) => {
+                        Some(SessionInput::Prompt { text, run_id: _ }) => {
                             if local_running {
                                 if let Err(e) = process.interrupt().await {
                                     tracing::warn!("interrupt before resend failed for {}: {}", sid, e);
@@ -1609,7 +1725,7 @@ fn spawn_codex_fanout(
                 }
                 input = input_rx.recv() => {
                     match input {
-                        Some(SessionInput::Prompt(text)) => {
+                        Some(SessionInput::Prompt { text, run_id: _ }) => {
                             if local_running {
                                 if let Err(e) = process.interrupt().await {
                                     tracing::warn!("interrupt before resend failed for {}: {}", sid, e);
@@ -1693,6 +1809,7 @@ mod decide_spawn_tests {
             resume_token: None,
             worktree_path: None,
             created_ms: 0,
+            source_task_id: None,
             spawning: false,
             last_activity_ms: 0,
             turns_completed: 0,
@@ -1823,6 +1940,7 @@ mod turn_state_tests {
             owner_id: "u".into(), description: String::new(),
             status: SessionMeta::Running,
             resume_token: None, worktree_path: None, created_ms: 0,
+            source_task_id: None,
             spawning: false,
             last_activity_ms: 0,
             turns_completed: 0,

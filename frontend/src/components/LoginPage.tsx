@@ -1,7 +1,7 @@
 import { useState, useEffect, type FormEvent } from 'react'
-import { KeyRound } from 'lucide-react'
 import type { AuthMode } from '../lib/api'
 import { getAuthMode } from '../lib/api'
+import HaringLogo from './HaringLogo'
 
 interface Props {
   onLegacyLogin: (password: string, remember?: boolean) => Promise<void>
@@ -34,9 +34,9 @@ export default function LoginPage({ onLegacyLogin }: Props) {
   return (
     <div className="h-full bg-[var(--bg-primary)] flex items-center justify-center">
       <div className="bg-[var(--bg-secondary)] border border-[var(--border)] rounded-lg p-8 w-80 space-y-5">
-        <div className="flex items-center gap-2 text-[var(--accent-blue)]">
-          <KeyRound size={20} />
-          <h1 className="text-lg font-bold">ZeroMux</h1>
+        <div className="flex items-center gap-2.5">
+          <HaringLogo size={28} />
+          <h1 className="text-lg font-bold text-[var(--text-primary)]">ZeroMux</h1>
         </div>
 
         {error && (

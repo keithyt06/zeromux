@@ -5,7 +5,7 @@ interface HaringLogoProps {
   className?: string
 }
 
-export default function HaringLogo({ size = 24, className }: HaringLogoProps) {
+export function HaringLogo({ size = 24, className }: HaringLogoProps) {
   return (
     <svg width={size} height={size} viewBox="0 0 120 120" className={className} xmlns="http://www.w3.org/2000/svg">
       <title>ZeroMux</title>

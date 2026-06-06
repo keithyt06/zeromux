@@ -1,7 +1,7 @@
 import { useState, useEffect, type FormEvent } from 'react'
 import type { AuthMode } from '../lib/api'
 import { getAuthMode } from '../lib/api'
-import HaringLogo from './HaringLogo'
+import { HaringLogo } from './HaringLogo'
 
 interface Props {
   onLegacyLogin: (password: string, remember?: boolean) => Promise<void>

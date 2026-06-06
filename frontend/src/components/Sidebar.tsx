@@ -186,7 +186,7 @@ export default function Sidebar({ sessions, activeId, onSelect, onCreate, onDele
             onClick={() => handleSelect(s.id)}
             className={`relative p-1.5 rounded transition-colors ${
               s.id === activeId
-                ? 'bg-[var(--bg-primary)] text-[var(--accent-blue)]'
+                ? 'bg-[var(--bg-tertiary)] text-[var(--text-bright)] shadow-[inset_2px_0_0_var(--accent-brand)]'
                 : 'text-[var(--text-secondary)] hover:text-[var(--text-primary)] hover:bg-[var(--bg-tertiary)]'
             }`}
             title={s.name}
@@ -302,7 +302,7 @@ export default function Sidebar({ sessions, activeId, onSelect, onCreate, onDele
             onClick={() => handleSelect(s.id)}
             className={`group flex items-center gap-2 px-3 py-1.5 mx-1 rounded cursor-pointer text-xs transition-colors ${
               s.id === activeId
-                ? 'bg-[var(--bg-primary)] text-[var(--accent-blue)]'
+                ? 'bg-[var(--bg-tertiary)] text-[var(--text-bright)] shadow-[inset_2px_0_0_var(--accent-brand)]'
                 : 'text-[var(--text-secondary)] hover:bg-[var(--bg-tertiary)] hover:text-[var(--text-primary)]'
             }`}
           >

@@ -9,6 +9,7 @@ mod logger;
 mod notes;
 mod oauth;
 mod pty_bridge;
+mod scheduled_tasks;
 mod session_manager;
 mod session_store;
 mod transcribe;

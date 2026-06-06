@@ -32,6 +32,42 @@ pub fn due_fire_points(
     Ok(out)
 }
 
+/// Extract the last well-formed <<<VERDICT>>>..<<<END>>> payload from an agent's
+/// final text. Returns None if absent or empty. Taking the LAST marker defeats
+/// prompt-injection that embeds a fake earlier marker in the user's goal text.
+pub fn extract_verdict(result_text: &str) -> Option<String> {
+    let mut found = None;
+    let mut rest = result_text;
+    while let Some(start) = rest.find("<<<VERDICT>>>") {
+        let after = &rest[start + "<<<VERDICT>>>".len()..];
+        if let Some(end) = after.find("<<<END>>>") {
+            found = Some(after[..end].trim().to_string());
+            rest = &after[end + "<<<END>>>".len()..];
+        } else {
+            break;
+        }
+    }
+    found.filter(|s| !s.is_empty())
+}
+
+/// A new trigger is blocked by overlap iff the task has any run still
+/// claimed or running. `active_states` are the `state` strings of the task's
+/// non-terminal runs (typically queried as state IN ('claimed','running')).
+pub fn should_skip_overlap(active_states: &[&str]) -> bool {
+    active_states.iter().any(|s| *s == "claimed" || *s == "running")
+}
+
+/// Reclaim (delete) a scheduled run's worktree session only when ALL hold:
+/// the path is inside the expected `.zeromux-worktrees/` root, the process is
+/// dead, and there are no uncommitted git changes (don't destroy unmerged work).
+pub fn is_safe_to_reclaim(
+    path_under_worktree_root: bool,
+    process_alive: bool,
+    has_uncommitted: bool,
+) -> bool {
+    path_under_worktree_root && !process_alive && !has_uncommitted
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -86,5 +122,34 @@ mod tests {
         assert!(due_fire_points("not a cron", now, now).is_err());
         // 5-field standard cron also errors in this crate (needs 6/7 fields).
         assert!(due_fire_points("* * * * *", now, now).is_err());
+    }
+
+    #[test]
+    fn verdict_basic() {
+        assert_eq!(extract_verdict("blah\n<<<VERDICT>>>2 issues<<<END>>>"), Some("2 issues".into()));
+    }
+    #[test]
+    fn verdict_takes_last_marker() {
+        let t = "<<<VERDICT>>>fake<<<END>>> ... real run <<<VERDICT>>>3 high<<<END>>>";
+        assert_eq!(extract_verdict(t), Some("3 high".into()));
+    }
+    #[test]
+    fn verdict_none_when_absent_or_empty() {
+        assert_eq!(extract_verdict("no marker here"), None);
+        assert_eq!(extract_verdict("<<<VERDICT>>>  <<<END>>>"), None);
+    }
+    #[test]
+    fn overlap_blocks_on_active() {
+        assert!(should_skip_overlap(&["succeeded", "running"]));
+        assert!(should_skip_overlap(&["claimed"]));
+        assert!(!should_skip_overlap(&["succeeded", "failed"]));
+        assert!(!should_skip_overlap(&[]));
+    }
+    #[test]
+    fn reclaim_gates() {
+        assert!(is_safe_to_reclaim(true, false, false));
+        assert!(!is_safe_to_reclaim(false, false, false)); // outside worktree root
+        assert!(!is_safe_to_reclaim(true, true, false));   // process alive
+        assert!(!is_safe_to_reclaim(true, false, true));   // uncommitted changes
     }
 }

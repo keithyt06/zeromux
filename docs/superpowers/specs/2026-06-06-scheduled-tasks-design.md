@@ -291,3 +291,12 @@ Codex(第一轮) 采纳：dedup 改用 scheduled_for、`agent_task_runs` 表 + U
 - **CROSS-MODEL:** CEO×Codex 张力（verdict/worktree/状态表）+ Eng×Codex 张力（run 终结语义）均交用户裁决，全选「保留功能 + 按外部声音加固」。
 - **UNRESOLVED:** 0
 - **VERDICT:** CEO + ENG CLEARED — 架构锁定，可写实施计划。无人值守可行性（§0）为实施第一任务硬前置；按 v1 骨架 → v1.1 体验分期。
+
+## §0 Spike 结果（2026-06-06，PASSED）
+
+无人值守可行性已验证，功能成立：
+- `claude -p --output-format stream-json --input-format stream-json --verbose`，prompt 经管道喂入（非 TTY，即真实无人值守条件），跑到完成，exit 0，末尾 `result/success` 事件。
+- VERDICT 哨兵：`result` 事件文本含 `<<<VERDICT>>>ok<<<END>>>` —— 证实「读 AcpEvent::Result.text」可行，无需 scrollback/strip ANSI。
+- 管道喂入的 prompt（进程启动后立即给）被正确消费，**无早期 stdin 丢弃** → 不需要 wait_until_ready。
+- **关键**：ZeroMux 现有 `AcpProcess::spawn`（src/acp/process.rs:100）已带 `--dangerously-skip-permissions`，调度器复用此路径，**不会卡在权限提示**。
+- 注意：`-p` + `stream-json` 必须带 `--verbose`，否则报错退出。

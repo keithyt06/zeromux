@@ -112,8 +112,9 @@ pub enum SessionInput {
     PtyData(Vec<u8>),
     /// PTY: resize
     PtyResize(u16, u16),
-    /// ACP/Kiro: prompt text
-    Prompt(String),
+    /// ACP/Kiro: prompt text + optional scheduled-run id for exactly-once
+    /// finalization (None for manual user prompts).
+    Prompt { text: String, run_id: Option<String> },
     /// ACP/Kiro: cancel/kill
     Cancel,
     /// ACP/Kiro: turn-level interrupt (abort current turn, keep process alive)
@@ -1413,7 +1414,8 @@ fn spawn_acp_fanout(
                 }
                 input = input_rx.recv() => {
                     match input {
-                        Some(SessionInput::Prompt(text)) => {
+                        Some(SessionInput::Prompt { text, run_id }) => {
+                            let _ = run_id.as_ref(); // used by Task 7
                             if local_running {
                                 if let Err(e) = process.interrupt().await {
                                     tracing::warn!("interrupt before resend failed for {}: {}", sid, e);
@@ -1515,7 +1517,7 @@ fn spawn_kiro_fanout(
                 }
                 input = input_rx.recv() => {
                     match input {
-                        Some(SessionInput::Prompt(text)) => {
+                        Some(SessionInput::Prompt { text, run_id: _ }) => {
                             if local_running {
                                 if let Err(e) = process.interrupt().await {
                                     tracing::warn!("interrupt before resend failed for {}: {}", sid, e);
@@ -1619,7 +1621,7 @@ fn spawn_codex_fanout(
                 }
                 input = input_rx.recv() => {
                     match input {
-                        Some(SessionInput::Prompt(text)) => {
+                        Some(SessionInput::Prompt { text, run_id: _ }) => {
                             if local_running {
                                 if let Err(e) = process.interrupt().await {
                                     tracing::warn!("interrupt before resend failed for {}: {}", sid, e);

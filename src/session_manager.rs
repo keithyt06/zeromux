@@ -159,6 +159,8 @@ pub struct Session {
     /// Git worktree path for ACP sessions (cleaned up on delete)
     worktree_path: Option<PathBuf>,
     created_ms: i64,
+    /// Set for sessions auto-created by a scheduled task; None for manual ones.
+    source_task_id: Option<String>,
     /// 并发重生互斥（仅锁内访问）。
     spawning: bool,
     last_activity_ms: i64,
@@ -206,6 +208,7 @@ pub struct SessionInfo {
     pub turn_started_ms: Option<i64>,
     pub last_activity_ms: i64,
     pub turns_completed: u32,
+    pub source_task_id: Option<String>,
 }
 
 // ── Git worktree helpers ──
@@ -418,6 +421,7 @@ fn session_info_of(s: &Session) -> SessionInfo {
         turn_started_ms: s.running.as_ref().and_then(|rp| rp.turn_started_ms),
         last_activity_ms: s.last_activity_ms,
         turns_completed: s.turns_completed,
+        source_task_id: s.source_task_id.clone(),
     }
 }
 
@@ -462,6 +466,7 @@ impl SessionManager {
             resume_token: s.resume_token.clone(),
             worktree_path: s.worktree_path.as_ref().map(|p| p.to_string_lossy().to_string()),
             created_ms: s.created_ms,
+            source_task_id: s.source_task_id.clone(),
         };
         if let Err(e) = self.store.upsert(&pj) {
             tracing::warn!("persist session {} failed: {}", s.id, e);
@@ -582,6 +587,7 @@ impl SessionManager {
             resume_token: tmux_target.map(|t| ResumeToken::Tmux(t.to_string())),
             worktree_path: None,
             created_ms: now_millis(),
+            source_task_id: None,
             spawning: false,
             last_activity_ms: now_millis(),
             turns_completed: 0,
@@ -670,6 +676,7 @@ impl SessionManager {
             resume_token: None,
             worktree_path,
             created_ms: now_millis(),
+            source_task_id: None,
             spawning: false,
             last_activity_ms: now_millis(),
             turns_completed: 0,
@@ -757,6 +764,7 @@ impl SessionManager {
             resume_token: None,
             worktree_path,
             created_ms: now_millis(),
+            source_task_id: None,
             spawning: false,
             last_activity_ms: now_millis(),
             turns_completed: 0,
@@ -857,6 +865,7 @@ impl SessionManager {
             resume_token: None,
             worktree_path,
             created_ms: now_millis(),
+            source_task_id: None,
             spawning: false,
             last_activity_ms: now_millis(),
             turns_completed: 0,
@@ -1211,6 +1220,7 @@ impl SessionManager {
                     resume_token: p.resume_token,
                     worktree_path: p.worktree_path.map(std::path::PathBuf::from),
                     created_ms: p.created_ms,
+                    source_task_id: p.source_task_id.clone(),
                     spawning: false,
                     last_activity_ms: now_millis(),
                     turns_completed: 0,
@@ -1693,6 +1703,7 @@ mod decide_spawn_tests {
             resume_token: None,
             worktree_path: None,
             created_ms: 0,
+            source_task_id: None,
             spawning: false,
             last_activity_ms: 0,
             turns_completed: 0,
@@ -1823,6 +1834,7 @@ mod turn_state_tests {
             owner_id: "u".into(), description: String::new(),
             status: SessionMeta::Running,
             resume_token: None, worktree_path: None, created_ms: 0,
+            source_task_id: None,
             spawning: false,
             last_activity_ms: 0,
             turns_completed: 0,

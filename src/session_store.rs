@@ -20,6 +20,7 @@ pub struct PersistedSession {
     pub resume_token: Option<ResumeToken>,
     pub worktree_path: Option<String>,
     pub created_ms: i64,
+    pub source_task_id: Option<String>,
 }
 
 pub struct SessionStore {
@@ -49,6 +50,8 @@ impl SessionStore {
             [],
         )
         .map_err(|e| format!("Failed to create sessions table: {}", e))?;
+        // Best-effort migration for older DBs (ignores duplicate-column error).
+        let _ = conn.execute("ALTER TABLE sessions ADD COLUMN source_task_id TEXT", []);
         Ok(Self { conn: Mutex::new(conn) })
     }
 
@@ -59,13 +62,13 @@ impl SessionStore {
         };
         let conn = self.conn.lock().unwrap();
         conn.execute(
-            "INSERT INTO sessions (id,name,type,work_dir,owner_id,description,resume_kind,resume_value,worktree_path,created_ms)
-             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10)
+            "INSERT INTO sessions (id,name,type,work_dir,owner_id,description,resume_kind,resume_value,worktree_path,created_ms,source_task_id)
+             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11)
              ON CONFLICT(id) DO UPDATE SET
                name=?2, type=?3, work_dir=?4, owner_id=?5, description=?6,
                resume_kind=?7, resume_value=?8, worktree_path=?9",
             params![s.id, s.name, s.session_type.to_string(), s.work_dir, s.owner_id,
-                    s.description, rk, rv, s.worktree_path, s.created_ms],
+                    s.description, rk, rv, s.worktree_path, s.created_ms, s.source_task_id],
         )
         .map_err(|e| format!("upsert failed: {}", e))?;
         Ok(())
@@ -107,7 +110,7 @@ impl SessionStore {
     pub fn load_all(&self) -> Result<Vec<PersistedSession>, String> {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(
-            "SELECT id,name,type,work_dir,owner_id,description,resume_kind,resume_value,worktree_path,created_ms FROM sessions")
+            "SELECT id,name,type,work_dir,owner_id,description,resume_kind,resume_value,worktree_path,created_ms,source_task_id FROM sessions")
             .map_err(|e| format!("prepare failed: {}", e))?;
         let rows = stmt.query_map([], |row| {
             let type_str: String = row.get(2)?;
@@ -127,6 +130,7 @@ impl SessionStore {
                 resume_token,
                 worktree_path: row.get(8)?,
                 created_ms: row.get(9)?,
+                source_task_id: row.get(10)?,
             })
         }).map_err(|e| format!("query failed: {}", e))?;
         let mut out = Vec::new();
@@ -151,6 +155,7 @@ mod tests {
             id: id.into(), name: "n".into(), session_type: SessionType::Claude,
             work_dir: "/w".into(), owner_id: "u".into(), description: "d".into(),
             resume_token: token, worktree_path: Some("/wt".into()), created_ms: 1000,
+            source_task_id: None,
         }
     }
 

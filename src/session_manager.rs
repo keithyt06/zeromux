@@ -670,6 +670,22 @@ impl SessionManager {
         rows: u16,
         owner_id: &str,
     ) -> Result<String, String> {
+        self.create_acp_session_tagged(name, work_dir, cols, rows, owner_id, None)
+            .await
+    }
+
+    /// Like `create_acp_session` but tags the session with an optional
+    /// `source_task_id` (set for scheduled-task runs so the fan-out can finalize
+    /// the run when the turn completes).
+    pub async fn create_acp_session_tagged(
+        &self,
+        name: String,
+        work_dir: &str,
+        cols: u16,
+        rows: u16,
+        owner_id: &str,
+        source_task_id: Option<String>,
+    ) -> Result<String, String> {
         let id = uuid::Uuid::new_v4().to_string();
         let (effective_dir, worktree_path) = resolve_work_dir(work_dir, &id);
 
@@ -697,7 +713,7 @@ impl SessionManager {
             resume_token: None,
             worktree_path,
             created_ms: now_millis(),
-            source_task_id: None,
+            source_task_id,
             spawning: false,
             last_activity_ms: now_millis(),
             turns_completed: 0,
@@ -709,6 +725,57 @@ impl SessionManager {
         self.persist_meta(&session);
         self.sessions.lock().unwrap().insert(id.clone(), session);
         Ok(id)
+    }
+
+    /// True if a session with this id currently exists (process may be running).
+    pub fn session_exists(&self, id: &str) -> bool {
+        self.sessions.lock().unwrap().contains_key(id)
+    }
+
+    /// Create a Claude session for a scheduled run, mark the run running, and
+    /// inject the goal prompt carrying the run_id (so the fan-out finalizes it).
+    pub async fn trigger_run(
+        &self,
+        run_id: &str,
+        name: String,
+        work_dir: &str,
+        owner_id: &str,
+        task_id: &str,
+        prompt: String,
+    ) -> Result<String, String> {
+        // default terminal size for unattended sessions
+        let sid = self
+            .create_acp_session_tagged(name, work_dir, 80, 24, owner_id, Some(task_id.to_string()))
+            .await?;
+        if let Some(store) = self.scheduled.lock().unwrap().clone() {
+            let _ = store.set_run_state(run_id, "running", Some(&sid), None, None, None);
+        }
+        let goal = format!(
+            "{}\n\n完成后，最后单独输出一行：\n<<<VERDICT>>>一句话结论<<<END>>>",
+            prompt
+        );
+        if let Some(tx) = self.input_tx(&sid) {
+            if let Err(e) = tx
+                .send(SessionInput::Prompt {
+                    text: goal,
+                    run_id: Some(run_id.to_string()),
+                })
+                .await
+            {
+                if let Some(store) = self.scheduled.lock().unwrap().clone() {
+                    let _ = store.set_run_state(
+                        run_id,
+                        "failed",
+                        None,
+                        None,
+                        Some("prompt_send_failed"),
+                        Some(now_millis()),
+                    );
+                }
+                return Err(format!("send prompt failed: {}", e));
+            }
+        }
+        Ok(sid)
     }
 
     /// Spawn a Kiro process for `id` at `work_dir`, start its fan-out, return the

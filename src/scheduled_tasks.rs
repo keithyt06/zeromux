@@ -306,6 +306,77 @@ impl ScheduledStore {
     }
 }
 
+use std::sync::atomic::{AtomicI64, Ordering};
+
+/// Spawn the supervised scheduler. The outer task respawns the inner loop if it
+/// panics (so a single bad tick can't silently kill scheduling), updates a
+/// heartbeat each tick (frontend health), runs a timeout watchdog, and triggers
+/// due tasks. last_seen lives in the inner loop; on respawn it resets to now
+/// (missed fires during downtime are skipped, matching the no-backfill policy).
+pub fn spawn_scheduler(
+    mgr: std::sync::Arc<crate::session_manager::SessionManager>,
+    store: std::sync::Arc<ScheduledStore>,
+    heartbeat: std::sync::Arc<AtomicI64>,
+) {
+    tokio::spawn(async move {
+        loop {
+            let m = mgr.clone();
+            let s = store.clone();
+            let hb = heartbeat.clone();
+            let inner = tokio::spawn(async move {
+                let mut last_seen = chrono::Utc::now();
+                let mut tick = tokio::time::interval(std::time::Duration::from_secs(60));
+                loop {
+                    tick.tick().await;
+                    let now = chrono::Utc::now();
+                    hb.store(now.timestamp_millis(), Ordering::Relaxed);
+                    // runtime watchdog: abort runs running longer than 30 min
+                    let cutoff = now.timestamp_millis() - 30 * 60 * 1000;
+                    let _ = s.reconcile_orphans(Some(cutoff));
+                    let tasks = match s.list_enabled() { Ok(t) => t, Err(_) => { continue; } };
+                    for task in tasks {
+                        let fires = match due_fire_points(&task.trigger_spec, last_seen, now) {
+                            Ok(f) => f,
+                            Err(err) => { tracing::warn!("cron {} bad: {}", task.id, err); continue; }
+                        };
+                        if let Some(fire) = fires.last() {
+                            let active = s.active_states_for_task(&task.id).unwrap_or_default();
+                            let active_refs: Vec<&str> = active.iter().map(|x| x.as_str()).collect();
+                            if should_skip_overlap(&active_refs) { continue; }
+                            let run = TaskRun {
+                                id: uuid::Uuid::new_v4().to_string(),
+                                task_id: task.id.clone(),
+                                scheduled_for_ms: fire.timestamp_millis(),
+                                state: "claimed".into(), session_id: None, verdict: None,
+                                failure_kind: None, started_ms: Some(now.timestamp_millis()), ended_ms: None,
+                            };
+                            match s.claim_run(&run) {
+                                Ok(true) => {
+                                    let nm = format!("{} · {}", task.name,
+                                        fire.with_timezone(&Shanghai).format("%H:%M"));
+                                    if let Err(err) = m.trigger_run(&run.id, nm, &task.work_dir, &task.owner_id, &task.id, task.prompt.clone()).await {
+                                        let _ = s.set_run_state(&run.id, "failed", None, None, Some("spawn_failed"), Some(now.timestamp_millis()));
+                                        tracing::warn!("trigger {} failed: {}", task.id, err);
+                                    }
+                                }
+                                _ => {} // not claimed (dup) or error — skip
+                            }
+                        }
+                    }
+                    last_seen = now;
+                }
+            });
+            match inner.await {
+                Ok(_) => break, // inner returned without panic (shouldn't happen); stop supervising
+                Err(_) => {
+                    tracing::error!("scheduler loop panicked; reconciling orphans + respawning");
+                    let _ = store.reconcile_orphans(None);
+                }
+            }
+        }
+    });
+}
+
 #[cfg(test)]
 mod store_tests {
     use super::*;

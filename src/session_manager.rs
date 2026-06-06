@@ -774,6 +774,21 @@ impl SessionManager {
                 }
                 return Err(format!("send prompt failed: {}", e));
             }
+        } else {
+            // No input channel means the session never registered one (spawn raced
+            // or failed). Without this the run would sit in "running" forever and
+            // the overlap guard would wedge every future fire of the task.
+            if let Some(store) = self.scheduled.lock().unwrap().clone() {
+                let _ = store.set_run_state(
+                    run_id,
+                    "failed",
+                    None,
+                    None,
+                    Some("no_input_channel"),
+                    Some(now_millis()),
+                );
+            }
+            return Err("session has no input channel".to_string());
         }
         Ok(sid)
     }

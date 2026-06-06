@@ -4,3 +4,6 @@ zeromux.log
 zeromux.pid
 frontend/dist/
 frontend/node_modules/
+.gstack/
+.superpowers/
+.claude/

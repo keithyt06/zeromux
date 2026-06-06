@@ -1,5 +1,6 @@
 import { useState, useEffect, useCallback } from 'react'
-import { Clock, X, Play, Pencil, Trash2, Plus, History, ChevronLeft } from 'lucide-react'
+import { Clock, X, Play, Pencil, Trash2, Plus, History, ChevronLeft, Folder } from 'lucide-react'
+import DirectoryPicker from './DirectoryPicker'
 import type { ScheduledTask, TaskRun, ScheduleInput, ScheduledTaskReq } from '../lib/api'
 import {
   listScheduledTasks,
@@ -257,6 +258,7 @@ function TaskForm({ task, onCancel, onSaved }: {
   const [minute, setMinute] = useState(0)
   const [weekdays, setWeekdays] = useState<number[]>([1, 2, 3, 4, 5])
   const [cronExpr, setCronExpr] = useState(task?.trigger_spec ?? '')
+  const [pickingDir, setPickingDir] = useState(false)
   const [saving, setSaving] = useState(false)
   const [error, setError] = useState<string | null>(null)
 
@@ -365,7 +367,26 @@ function TaskForm({ task, onCancel, onSaved }: {
 
       <div>
         <label className={labelCls}>工作目录</label>
-        <input value={workDir} onChange={e => setWorkDir(e.target.value)} className={`${inputCls} font-mono`} placeholder="/home/ubuntu/project" />
+        {pickingDir ? (
+          <DirectoryPicker
+            initialPath={workDir.trim() || undefined}
+            onSelect={p => { setWorkDir(p); setPickingDir(false) }}
+            onCancel={() => setPickingDir(false)}
+          />
+        ) : (
+          <div className="flex gap-2">
+            <input value={workDir} onChange={e => setWorkDir(e.target.value)} className={`${inputCls} font-mono`} placeholder="/home/ubuntu/project" />
+            <button
+              type="button"
+              onClick={() => setPickingDir(true)}
+              className="shrink-0 flex items-center gap-1 px-2 py-1.5 text-xs text-[var(--text-secondary)] hover:text-[var(--text-primary)] bg-[var(--bg-secondary)] border border-[var(--border)] rounded hover:bg-[var(--bg-tertiary)] transition-colors"
+              title="浏览选择目录"
+            >
+              <Folder size={13} />
+              选择
+            </button>
+          </div>
+        )}
       </div>
 
       <div>

@@ -303,6 +303,25 @@ fn default_session_type() -> crate::session_manager::SessionType {
     crate::session_manager::SessionType::Tmux
 }
 
+/// Security: a client-supplied work_dir must resolve to a path under HOME.
+/// Without this an authenticated user could spawn a shell/agent (and write a
+/// git worktree) anywhere on the host the server process can reach (e.g. /etc,
+/// another user's home). Shared by interactive session creation and scheduled
+/// tasks — the directory picker is advisory only, so the server is the sole gate.
+fn validate_work_dir_under_home(work_dir: &str) -> Result<(), (StatusCode, String)> {
+    let canonical = std::path::Path::new(work_dir)
+        .canonicalize()
+        .map_err(|e| (StatusCode::BAD_REQUEST, format!("Invalid work_dir: {}", e)))?;
+    let home = std::env::var("HOME").unwrap_or_else(|_| "/home/ubuntu".to_string());
+    let home_path = std::path::Path::new(&home)
+        .canonicalize()
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("Home dir error: {}", e)))?;
+    if !canonical.starts_with(&home_path) {
+        return Err((StatusCode::FORBIDDEN, "work_dir must be under home directory".to_string()));
+    }
+    Ok(())
+}
+
 async fn create_session(
     State(state): State<Arc<AppState>>,
     user: axum::Extension<CurrentUser>,
@@ -311,22 +330,7 @@ async fn create_session(
     let type_label = req.session_type.to_string();
     let work_dir = req.work_dir.unwrap_or_else(|| state.work_dir.clone());
 
-    // Security: a client-supplied work_dir must resolve to a path under HOME,
-    // mirroring the file-browser's resolve_base_dir. Without this an authenticated
-    // user could spawn a shell/agent (and write a git worktree) anywhere on the
-    // host the server process can reach (e.g. /etc, another user's home).
-    {
-        let canonical = std::path::Path::new(&work_dir)
-            .canonicalize()
-            .map_err(|e| (StatusCode::BAD_REQUEST, format!("Invalid work_dir: {}", e)))?;
-        let home = std::env::var("HOME").unwrap_or_else(|_| "/home/ubuntu".to_string());
-        let home_path = std::path::Path::new(&home)
-            .canonicalize()
-            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("Home dir error: {}", e)))?;
-        if !canonical.starts_with(&home_path) {
-            return Err((StatusCode::FORBIDDEN, "work_dir must be under home directory".to_string()));
-        }
-    }
+    validate_work_dir_under_home(&work_dir)?;
 
     let name = req.name.or_else(|| req.tmux_target.clone()).unwrap_or_else(|| {
         // Use directory basename as part of session name
@@ -1265,6 +1269,7 @@ async fn create_scheduled(
     let cron = crate::scheduled_tasks::schedule_to_cron(&req.schedule);
     <cron::Schedule as std::str::FromStr>::from_str(&cron)
         .map_err(|e| (StatusCode::BAD_REQUEST, format!("invalid schedule: {e}")))?;
+    validate_work_dir_under_home(&req.work_dir)?;
     let config = crate::scheduled_tasks::TaskConfig {
         id: uuid::Uuid::new_v4().to_string(),
         owner_id: user.id.clone(),
@@ -1304,6 +1309,7 @@ async fn update_scheduled(
     let cron = crate::scheduled_tasks::schedule_to_cron(&req.schedule);
     <cron::Schedule as std::str::FromStr>::from_str(&cron)
         .map_err(|e| (StatusCode::BAD_REQUEST, format!("invalid schedule: {e}")))?;
+    validate_work_dir_under_home(&req.work_dir)?;
     let config = crate::scheduled_tasks::TaskConfig {
         id: existing.id,
         owner_id: existing.owner_id,
@@ -1381,11 +1387,17 @@ async fn run_scheduled_now(
         started_ms: Some(now),
         ended_ms: None,
     };
-    state
+    // Honor the atomic claim: if another caller (the scheduler, or a double-click)
+    // already took this slot, INSERT OR IGNORE matches 0 rows. Spawning anyway
+    // would create a duplicate session whose run has no DB row to update.
+    let claimed = state
         .scheduled_tasks
         .claim_run(&run)
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
-    let sid = state
+    if !claimed {
+        return Ok(Json(serde_json::json!({ "skipped": true, "reason": "already_claimed" })));
+    }
+    let sid = match state
         .sessions
         .trigger_run(
             &run.id,
@@ -1396,7 +1408,18 @@ async fn run_scheduled_now(
             cfg.prompt.clone(),
         )
         .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
+    {
+        Ok(sid) => sid,
+        Err(e) => {
+            // Mirror the scheduler path: a claimed run whose spawn fails must be
+            // finalized, or the overlap guard wedges every future fire of the task.
+            let now = chrono::Utc::now().timestamp_millis();
+            let _ = state.scheduled_tasks.set_run_state(
+                &run.id, "failed", None, None, Some("spawn_failed"), Some(now),
+            );
+            return Err((StatusCode::INTERNAL_SERVER_ERROR, e));
+        }
+    };
     Ok(Json(serde_json::json!({ "session_id": sid, "run_id": run.id })))
 }
 

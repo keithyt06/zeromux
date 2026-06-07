@@ -3,9 +3,9 @@ import { describe, it, expect, vi } from 'vitest'
 import MobileKeyBar from '../MobileKeyBar'
 
 describe('MobileKeyBar', () => {
-  it('渲染全部 5 个键', () => {
+  it('渲染方向键/Enter + 控制键', () => {
     render(<MobileKeyBar onKey={() => {}} />)
-    for (const k of ['left', 'up', 'down', 'right', 'enter']) {
+    for (const k of ['left', 'up', 'down', 'right', 'enter', 'esc', 'ctrl-c', 'y', 'n']) {
       expect(screen.getByLabelText(k)).toBeInTheDocument()
     }
   })
@@ -17,5 +17,9 @@ describe('MobileKeyBar', () => {
     expect(onKey).toHaveBeenCalledWith('up')
     fireEvent.pointerDown(screen.getByLabelText('enter'))
     expect(onKey).toHaveBeenCalledWith('enter')
+    fireEvent.pointerDown(screen.getByLabelText('esc'))
+    expect(onKey).toHaveBeenCalledWith('esc')
+    fireEvent.pointerDown(screen.getByLabelText('ctrl-c'))
+    expect(onKey).toHaveBeenCalledWith('ctrl-c')
   })
 })

@@ -43,3 +43,31 @@ export function linesFromDrag(startY: number, currentY: number, rh: number): num
   if (rh <= 0) return 0
   return Math.round((startY - currentY) / rh)
 }
+
+// 整段提交：bracketed paste（DECSET 2004）。内部 \n 原样保留，
+// 支持的 TUI（Claude Code / Codex / bash readline）把整段当粘贴内容，
+// 不会逐行提交。调用方负责非空判断。
+export function bracketedPaste(text: string): string {
+  return `\x1b[200~${text}\x1b[201~`
+}
+
+// paste 后是否发回车，取决于对端 bracketed paste 模式
+// （xterm 公开 API term.modes.bracketedPasteMode）。
+// 开（TUI 输入框）→ 发 \r 提交；关（裸 shell）→ 不发，避免多行命令被误执行。
+export function submitSequence(bracketedPasteMode: boolean): string {
+  return bracketedPasteMode ? '\r' : ''
+}
+
+// 单键 / 控制键 → 直发字节。与方向键分开：这些走 MobileKeyBar，不经 composer。
+export type ControlKey = 'esc' | 'ctrl-c' | 'y' | 'n'
+
+const CONTROL: Record<ControlKey, string> = {
+  esc: '\x1b',
+  'ctrl-c': '\x03',
+  y: 'y',
+  n: 'n',
+}
+
+export function controlSequence(key: ControlKey): string {
+  return CONTROL[key]
+}

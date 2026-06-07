@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest'
-import { arrowSequence, rowHeight, linesFromDrag } from '../terminalInput'
+import { arrowSequence, rowHeight, linesFromDrag, bracketedPaste, submitSequence, controlSequence } from '../terminalInput'
 
 describe('arrowSequence', () => {
   it('普通光标键模式用 CSI（\\x1b[）', () => {
@@ -44,5 +44,35 @@ describe('linesFromDrag', () => {
   })
   it('行高非正时返回 0（不崩）', () => {
     expect(linesFromDrag(200, 100, 0)).toBe(0)
+  })
+})
+
+describe('bracketedPaste', () => {
+  it('用 DECSET 2004 粘贴标记包裹文本', () => {
+    expect(bracketedPaste('hello')).toBe('\x1b[200~hello\x1b[201~')
+  })
+  it('保留内部换行（多行 prompt 仍是一次粘贴）', () => {
+    expect(bracketedPaste('a\nb\nc')).toBe('\x1b[200~a\nb\nc\x1b[201~')
+  })
+  it('空串也照样包裹（非空判断在调用方）', () => {
+    expect(bracketedPaste('')).toBe('\x1b[200~\x1b[201~')
+  })
+})
+
+describe('submitSequence', () => {
+  it('bracketed paste 模式开 → 回车（TUI 输入框，如 Claude Code）', () => {
+    expect(submitSequence(true)).toBe('\r')
+  })
+  it('bracketed paste 模式关 → 空串（裸 shell：多行不自动执行）', () => {
+    expect(submitSequence(false)).toBe('')
+  })
+})
+
+describe('controlSequence', () => {
+  it('esc → ESC 字节', () => { expect(controlSequence('esc')).toBe('\x1b') })
+  it('ctrl-c → ETX (0x03)', () => { expect(controlSequence('ctrl-c')).toBe('\x03') })
+  it('y / n → 字面字符', () => {
+    expect(controlSequence('y')).toBe('y')
+    expect(controlSequence('n')).toBe('n')
   })
 })

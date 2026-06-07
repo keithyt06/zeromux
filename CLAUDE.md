@@ -30,6 +30,21 @@ cargo test                                 # Rust unit tests (inline #[cfg(test)
 
 Release profile is size-optimized (`opt-level = "z"`, `lto = true`, `strip = true`) — release builds are slow; prefer `cargo build` (debug) and `cargo check` while iterating.
 
+## Deploying to the live server (zeromux.keithyu.cloud)
+
+**Always deploy with `./deploy.sh`. Never hand-run `systemctl stop` + `cp` + `systemctl start`.**
+
+The live site runs from `/usr/local/bin/zeromux` under systemd unit `zeromux.service` (port 8090). Replacing it requires stopping the service first (the running process holds the binary open, so `cp` over it fails with "Text file busy"). The manual stop→cp→start sequence has repeatedly caused outages: a deploy interrupted *between* `stop` and `start` leaves the service `inactive` and the public URL returning **502**. This has happened multiple times.
+
+`./deploy.sh` makes the swap atomic and self-verifying — it does smoke-test → backup → stop → cp → start → curl health-check, and **auto-rolls-back** to the backup if the health check fails. It never leaves the service stopped.
+
+```bash
+./deploy.sh            # reinstall the already-built target/release/zeromux, restart, verify
+./deploy.sh --build    # build frontend + cargo release first, then deploy
+```
+
+Recovery if found 502 / `inactive`: if the installed binary is already the intended one, `sudo systemctl start zeromux`; otherwise just run `./deploy.sh`. Do **not** switch the unit to `systemctl restart` (it keeps the OLD binary, since `cp` can't overwrite a running binary).
+
 ## Architecture
 
 ### Session lifecycle & the broadcast fan-out model (core abstraction)

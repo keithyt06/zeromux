@@ -280,6 +280,25 @@ fn remove_worktree(repo_dir: &Path, wt_path: &Path) {
 
 /// Resolve the effective work directory: create a worktree if inside a git repo,
 /// otherwise return the original path.
+/// Security: a work_dir must canonicalize to a path under HOME. The HTTP layer
+/// checks this at task create/update, but scheduled runs spawn long after that:
+/// pre-existing DB rows (written before the check existed) and TOCTOU symlink
+/// swaps both bypass the create-time gate. This is the last gate before a real
+/// process + git worktree land on disk, so it must re-validate the stored path.
+fn work_dir_under_home(work_dir: &str) -> Result<(), String> {
+    let canonical = Path::new(work_dir)
+        .canonicalize()
+        .map_err(|e| format!("invalid work_dir {work_dir}: {e}"))?;
+    let home = std::env::var("HOME").unwrap_or_else(|_| "/home/ubuntu".to_string());
+    let home_path = Path::new(&home)
+        .canonicalize()
+        .map_err(|e| format!("home dir error: {e}"))?;
+    if !canonical.starts_with(&home_path) {
+        return Err(format!("work_dir must be under home directory: {work_dir}"));
+    }
+    Ok(())
+}
+
 fn resolve_work_dir(work_dir: &str, session_id: &str) -> (PathBuf, Option<PathBuf>) {
     let base = if work_dir == "." {
         std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."))
@@ -743,6 +762,24 @@ impl SessionManager {
         task_id: &str,
         prompt: String,
     ) -> Result<String, String> {
+        // Last gate before a process + git worktree hit disk. The HTTP layer
+        // validated work_dir at create/update, but stored paths can be pre-check
+        // rows or symlink-swapped since (TOCTOU); re-validate here so the spawn
+        // path is the sole authority. Finalize the run on rejection, else the
+        // overlap guard wedges every future fire.
+        if let Err(e) = work_dir_under_home(work_dir) {
+            if let Some(store) = self.scheduled.lock().unwrap().clone() {
+                let _ = store.set_run_state(
+                    run_id,
+                    "failed",
+                    None,
+                    None,
+                    Some("work_dir_rejected"),
+                    Some(now_millis()),
+                );
+            }
+            return Err(e);
+        }
         // default terminal size for unattended sessions
         let sid = self
             .create_acp_session_tagged(name, work_dir, 80, 24, owner_id, Some(task_id.to_string()))
@@ -1776,6 +1813,35 @@ fn spawn_codex_fanout(
         mark_fanout_ended(&mgr, &sid);
         tracing::info!("Codex fan-out task ended for session {}", sid);
     });
+}
+
+#[cfg(test)]
+mod work_dir_confinement_tests {
+    use super::work_dir_under_home;
+
+    #[test]
+    fn home_itself_and_subdir_pass() {
+        let home = std::env::var("HOME").unwrap();
+        assert!(work_dir_under_home(&home).is_ok());
+        // A subdir guaranteed to exist and canonicalize under HOME.
+        let sub = std::path::Path::new(&home);
+        if sub.join(".").canonicalize().is_ok() {
+            assert!(work_dir_under_home(&format!("{home}/.")).is_ok());
+        }
+    }
+
+    #[test]
+    fn outside_home_is_rejected() {
+        // /etc exists and canonicalizes, but is not under HOME.
+        assert!(work_dir_under_home("/etc").is_err());
+        assert!(work_dir_under_home("/").is_err());
+    }
+
+    #[test]
+    fn nonexistent_path_is_rejected() {
+        // canonicalize() fails on a path that does not exist — must not pass.
+        assert!(work_dir_under_home("/home/ubuntu/__zeromux_does_not_exist__/x").is_err());
+    }
 }
 
 #[cfg(test)]

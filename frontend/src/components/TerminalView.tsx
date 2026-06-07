@@ -6,9 +6,10 @@ import { wsUrl, getSessionStatus } from '../lib/api'
 import type { SessionStatus } from '../lib/api'
 import type { Theme } from '../lib/theme'
 import { b64encode, b64decode } from '../lib/base64'
-import { GitBranch, Folder, Circle } from 'lucide-react'
-import MobileKeyBar from './MobileKeyBar'
-import { arrowSequence, rowHeight, linesFromDrag, type ArrowKey } from '../lib/terminalInput'
+import { GitBranch, Folder, Circle, Keyboard } from 'lucide-react'
+import MobileKeyBar, { type BarKey } from './MobileKeyBar'
+import Composer from './Composer'
+import { arrowSequence, rowHeight, linesFromDrag, bracketedPaste, submitSequence, controlSequence, type ArrowKey } from '../lib/terminalInput'
 
 const FONT_SIZE = 14
 
@@ -79,6 +80,8 @@ export default function TerminalView({ sessionId, active, theme }: Props) {
       (typeof matchMedia !== 'undefined' && matchMedia('(any-pointer: coarse)').matches) ||
       (typeof navigator !== 'undefined' && navigator.maxTouchPoints > 0)
   )
+  const [composerOpen, setComposerOpen] = useState(false)
+  const [composerText, setComposerText] = useState('')
 
   // Fetch status
   useEffect(() => {
@@ -101,13 +104,27 @@ export default function TerminalView({ sessionId, active, theme }: Props) {
     }
   }, [])
 
-  // 虚拟方向键：先回到底部（否则用户在 scrollback 里点键看不到反馈），
-  // 再按当前光标键模式（DECCKM）生成序列发送。
-  const handleArrowKey = useCallback((key: ArrowKey) => {
+  // 虚拟键：先回到底部（否则在 scrollback 里点键看不到反馈），再发对应字节。
+  // 方向键/Enter 按 DECCKM 模式；控制键直发。
+  const handleBarKey = useCallback((key: BarKey) => {
     const term = termRef.current
     if (!term) return
     term.scrollToBottom()
-    sendInput(arrowSequence(key, term.modes.applicationCursorKeysMode))
+    if (key === 'esc' || key === 'ctrl-c' || key === 'y' || key === 'n') {
+      sendInput(controlSequence(key))
+    } else {
+      sendInput(arrowSequence(key as ArrowKey, term.modes.applicationCursorKeysMode))
+    }
+  }, [sendInput])
+
+  // Composer 发送：整段走 bracketed paste，再按对端 bracketed paste 模式决定回车。
+  // 发送后滚到底，确保看到 agent 反应（用户可能正在 scrollback 里翻）。
+  const sendComposer = useCallback((text: string) => {
+    const term = termRef.current
+    if (!term) return
+    sendInput(bracketedPaste(text) + submitSequence(term.modes.bracketedPasteMode))
+    setComposerText('')
+    term.scrollToBottom()
   }, [sendInput])
 
   // Initialize terminal once
@@ -260,13 +277,19 @@ export default function TerminalView({ sessionId, active, theme }: Props) {
     }
   }, [sessionId])
 
+  const lastDims = useRef<{ cols: number; rows: number }>({ cols: 0, rows: 0 })
   const handleResize = useCallback(() => {
     const fit = fitRef.current
     const term = termRef.current
     const ws = wsRef.current
     if (!fit || !term) return
     fit.fit()
-    if (ws?.readyState === WebSocket.OPEN) {
+    // Skip redundant resize sends: Android fires window.resize on soft-keyboard
+    // open, which would otherwise spam PTY SIGWINCH and thrash the TUI even
+    // though cols/rows didn't change.
+    if (ws?.readyState === WebSocket.OPEN
+        && (term.cols !== lastDims.current.cols || term.rows !== lastDims.current.rows)) {
+      lastDims.current = { cols: term.cols, rows: term.rows }
       ws.send(JSON.stringify({ type: 'resize', cols: term.cols, rows: term.rows }))
     }
   }, [])
@@ -275,28 +298,77 @@ export default function TerminalView({ sessionId, active, theme }: Props) {
     if (active) {
       const t = setTimeout(() => {
         handleResize()
-        termRef.current?.focus()
+        // 触摸端不自动聚焦：避免一进会话就弹软键盘（正是用户烦的）。
+        // 桌面端保持聚焦，键盘直接可用。
+        if (!isTouch) termRef.current?.focus()
       }, 50)
       return () => clearTimeout(t)
     }
-  }, [active, handleResize])
+  }, [active, handleResize, isTouch])
 
   useEffect(() => {
     window.addEventListener('resize', handleResize)
     return () => window.removeEventListener('resize', handleResize)
   }, [handleResize])
 
-  // 键条占用约 40px 高度，改变终端可用区；渲染后重新 fit，避免底部行被遮 / canvas 尺寸过期。
+  // 键条 / composer 占用高度，改变终端可用区；渲染后重新 fit，
+  // 避免底部行被遮 / canvas 尺寸过期。composerOpen 切换也要重算。
   useEffect(() => {
     if (!isTouch) return
     const t = setTimeout(handleResize, 50)
     return () => clearTimeout(t)
-  }, [isTouch, handleResize])
+  }, [isTouch, composerOpen, handleResize])
+
+  // 软键盘遮挡补偿：仅触摸端 + active。用 VisualViewport 把容器底部内边距顶起
+  // 键盘高度，使 composer 和终端区不被遮。只改 CSS（paddingBottom），不动
+  // xterm 的 cols/rows（避免 PTY SIGWINCH 抖动 / TUI 重绘风暴）。
+  useEffect(() => {
+    if (!isTouch || !active) return
+    const vv = window.visualViewport
+    if (!vv) return
+    const root = containerRef.current?.parentElement
+    const apply = () => {
+      const overlap = Math.max(0, window.innerHeight - vv.height - vv.offsetTop)
+      if (root) root.style.paddingBottom = `${overlap}px`
+    }
+    apply()
+    vv.addEventListener('resize', apply)
+    vv.addEventListener('scroll', apply)
+    return () => {
+      vv.removeEventListener('resize', apply)
+      vv.removeEventListener('scroll', apply)
+      if (root) root.style.paddingBottom = ''
+    }
+  }, [isTouch, active])
 
   return (
     <div className="flex flex-col h-full">
       <div ref={containerRef} className="xterm-container w-full flex-1 min-h-0" />
-      {isTouch && <MobileKeyBar onKey={handleArrowKey} />}
+      {isTouch && composerOpen && (
+        <div className="px-2 py-1.5 border-t border-[var(--border)] bg-[var(--bg-secondary)]">
+          <Composer
+            value={composerText}
+            onChange={setComposerText}
+            onSend={sendComposer}
+            submitOnEnter={false}
+            placeholder="输入整段文字发送…（Enter 换行，点发送提交）"
+          />
+        </div>
+      )}
+      {isTouch && (
+        <div className="flex items-stretch gap-1 px-2 pt-1.5 bg-[var(--bg-secondary)]">
+          <button
+            onPointerDown={(e) => { e.preventDefault(); setComposerOpen(v => !v) }}
+            aria-label="toggle-composer"
+            style={{ touchAction: 'manipulation' }}
+            className="flex items-center justify-center gap-1 px-3 py-1 rounded-md bg-[var(--bg-primary)] border border-[var(--border)] text-xs text-[var(--text-secondary)] active:text-[var(--text-primary)]"
+          >
+            <Keyboard size={14} />
+            {composerOpen ? '收起' : '打字'}
+          </button>
+        </div>
+      )}
+      {isTouch && <MobileKeyBar onKey={handleBarKey} />}
       <div className="flex items-center gap-3 px-4 py-3 border-t border-[var(--border)] bg-[var(--bg-secondary)] min-h-[40px]">
         {status ? (
           <>

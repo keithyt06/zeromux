@@ -1,7 +1,8 @@
-import { useState, useEffect, useRef, useCallback, memo, createElement, type KeyboardEvent } from 'react'
+import { useState, useEffect, useRef, useCallback, memo, createElement } from 'react'
 import { wsUrl } from '../lib/api'
-import { Send, ChevronDown, Wrench, Brain, AlertCircle, FileText, Terminal, Search, Bot, type LucideIcon } from 'lucide-react'
+import { ChevronDown, Wrench, Brain, AlertCircle, FileText, Terminal, Search, Bot, type LucideIcon } from 'lucide-react'
 import MarkdownContent from './markdown/MarkdownContent'
+import Composer from './Composer'
 import { MicButton } from './MicButton'
 import { useTranscribe } from '../lib/transcribe'
 
@@ -56,7 +57,10 @@ interface Props {
   agentType?: 'claude' | 'kiro' | 'codex'
 }
 
-export default function AcpChatView({ sessionId, active, agentType = 'claude' }: Props) {
+// `active` is accepted (App passes it for all session views) but no longer used:
+// the Composer owns its own textarea and we intentionally don't auto-focus it,
+// so switching to a chat session doesn't pop the mobile keyboard.
+export default function AcpChatView({ sessionId, agentType = 'claude' }: Props) {
   const [messages, setMessages] = useState<ChatMessage[]>([])
   const [input, setInput] = useState('')
   const [busy, setBusy] = useState(false)
@@ -64,22 +68,11 @@ export default function AcpChatView({ sessionId, active, agentType = 'claude' }:
   const [nowMs, setNowMs] = useState(() => Date.now())
   const wsRef = useRef<WebSocket | null>(null)
   const scrollRef = useRef<HTMLDivElement>(null)
-  const inputRef = useRef<HTMLTextAreaElement>(null)
   const currentAssistant = useRef<AssistantMsg | null>(null)
-
-  const autoResize = (t: HTMLTextAreaElement) => {
-    t.style.height = 'auto'
-    t.style.height = Math.min(t.scrollHeight, 120) + 'px'
-  }
 
   const transcribe = useTranscribe({
     language: 'zh-CN',
-    onFinal: (text) => {
-      setInput(prev => prev + text)
-      requestAnimationFrame(() => {
-        if (inputRef.current) autoResize(inputRef.current)
-      })
-    },
+    onFinal: (text) => setInput(prev => prev + text),
   })
 
   const scrollBottom = useCallback(() => {
@@ -277,29 +270,16 @@ export default function AcpChatView({ sessionId, active, agentType = 'claude' }:
     }
   }, [pushMessage, scrollBottom])
 
-  const sendPrompt = useCallback(() => {
-    const text = input.trim()
-    if (!text || !wsRef.current || wsRef.current.readyState !== WebSocket.OPEN) return
+  // Composer 已 trim 且非空才回调；后端 fan-out 会在重发前自动打断在途轮次，
+  // 前端只需发 prompt。
+  const sendPrompt = useCallback((text: string) => {
+    if (!wsRef.current || wsRef.current.readyState !== WebSocket.OPEN) return
     pushMessage({ id: newId(), kind: 'user', text })
-    // Backend fan-out auto-interrupts any in-flight turn before resending, so
-    // the frontend only needs to send the prompt. Reset the stuck timer to the
-    // new turn's start.
     wsRef.current.send(JSON.stringify({ type: 'prompt', text }))
     setInput('')
     setBusy(true)
     setTurnStartedMs(Date.now())
-  }, [input, pushMessage])
-
-  const handleKeyDown = (e: KeyboardEvent) => {
-    if (e.key === 'Enter' && !e.shiftKey) {
-      e.preventDefault()
-      sendPrompt()
-    }
-  }
-
-  useEffect(() => {
-    if (active) inputRef.current?.focus()
-  }, [active])
+  }, [pushMessage])
 
   // Stuck-turn timer: tick a 1s clock while busy so the elapsed display
   // updates. turnStartedMs is stamped in the event handlers (turn start) and
@@ -352,33 +332,21 @@ export default function AcpChatView({ sessionId, active, agentType = 'claude' }:
             )}
           </div>
         )}
-        <div className="flex gap-2">
-          <textarea
-            ref={inputRef}
-            value={input}
-            onChange={e => setInput(e.target.value)}
-            onKeyDown={handleKeyDown}
-            placeholder={`Send a message to ${agentType === 'kiro' ? 'Kiro' : agentType === 'codex' ? 'Codex' : 'Claude'}...`}
-            rows={1}
-            className="flex-1 px-3 py-2 bg-[var(--bg-primary)] border border-[var(--border)] rounded-lg text-sm text-[var(--text-primary)] placeholder-[var(--text-muted)] outline-none focus:border-[var(--accent-blue)] resize-none min-h-[40px] max-h-[120px]"
-            style={{ height: 'auto', overflow: 'hidden' }}
-            onInput={e => autoResize(e.target as HTMLTextAreaElement)}
-          />
-          <MicButton
-            isRecording={transcribe.isRecording}
-            supported={transcribe.supported}
-            onPressStart={transcribe.start}
-            onPressEnd={transcribe.stop}
-          />
-          <button
-            onClick={sendPrompt}
-            disabled={!input.trim()}
-            className="self-end p-2 bg-[var(--accent-green)] hover:bg-[var(--accent-green-hover)] disabled:bg-[var(--btn-disabled-bg)] disabled:text-[var(--btn-disabled-text)] text-white rounded-lg transition-colors"
-            title="Send"
-          >
-            <Send size={16} />
-          </button>
-        </div>
+        <Composer
+          value={input}
+          onChange={setInput}
+          onSend={sendPrompt}
+          submitOnEnter={true}
+          placeholder={`Send a message to ${agentType === 'kiro' ? 'Kiro' : agentType === 'codex' ? 'Codex' : 'Claude'}...`}
+          rightSlot={
+            <MicButton
+              isRecording={transcribe.isRecording}
+              supported={transcribe.supported}
+              onPressStart={transcribe.start}
+              onPressEnd={transcribe.stop}
+            />
+          }
+        />
       </div>
     </div>
   )

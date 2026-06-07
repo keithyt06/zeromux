@@ -1,4 +1,4 @@
-import { useRef, type KeyboardEvent, type ReactNode } from 'react'
+import { useRef, useEffect, type KeyboardEvent, type ReactNode } from 'react'
 import { Send } from 'lucide-react'
 
 interface ComposerProps {
@@ -22,6 +22,12 @@ export default function Composer({
   value, onChange, onSend, submitOnEnter, placeholder, rightSlot,
 }: ComposerProps) {
   const inputRef = useRef<HTMLTextAreaElement>(null)
+
+  // Re-fit height whenever value changes from the outside (e.g. voice transcript
+  // appended, or cleared after send) — onInput only fires for user typing.
+  useEffect(() => {
+    if (inputRef.current) autoResize(inputRef.current)
+  }, [value])
 
   const send = () => {
     const text = value.trim()

@@ -285,7 +285,13 @@ fn remove_worktree(repo_dir: &Path, wt_path: &Path) {
 /// pre-existing DB rows (written before the check existed) and TOCTOU symlink
 /// swaps both bypass the create-time gate. This is the last gate before a real
 /// process + git worktree land on disk, so it must re-validate the stored path.
-fn work_dir_under_home(work_dir: &str) -> Result<(), String> {
+///
+/// Returns the *canonical* path on success. The caller MUST spawn from this
+/// returned path, not from the raw `work_dir` string: validating a canonicalized
+/// copy while spawning from the unresolved string reopens the very TOCTOU this
+/// gate closes (a symlink component swapped between canonicalize() here and the
+/// later `PathBuf::from(work_dir)` in resolve_work_dir would escape HOME).
+fn work_dir_under_home(work_dir: &str) -> Result<PathBuf, String> {
     let canonical = Path::new(work_dir)
         .canonicalize()
         .map_err(|e| format!("invalid work_dir {work_dir}: {e}"))?;
@@ -296,7 +302,7 @@ fn work_dir_under_home(work_dir: &str) -> Result<(), String> {
     if !canonical.starts_with(&home_path) {
         return Err(format!("work_dir must be under home directory: {work_dir}"));
     }
-    Ok(())
+    Ok(canonical)
 }
 
 fn resolve_work_dir(work_dir: &str, session_id: &str) -> (PathBuf, Option<PathBuf>) {
@@ -767,22 +773,36 @@ impl SessionManager {
         // rows or symlink-swapped since (TOCTOU); re-validate here so the spawn
         // path is the sole authority. Finalize the run on rejection, else the
         // overlap guard wedges every future fire.
-        if let Err(e) = work_dir_under_home(work_dir) {
-            if let Some(store) = self.scheduled.lock().unwrap().clone() {
-                let _ = store.set_run_state(
-                    run_id,
-                    "failed",
-                    None,
-                    None,
-                    Some("work_dir_rejected"),
-                    Some(now_millis()),
-                );
+        let canonical_dir = match work_dir_under_home(work_dir) {
+            Ok(p) => p,
+            Err(e) => {
+                if let Some(store) = self.scheduled.lock().unwrap().clone() {
+                    let _ = store.set_run_state(
+                        run_id,
+                        "failed",
+                        None,
+                        None,
+                        Some("work_dir_rejected"),
+                        Some(now_millis()),
+                    );
+                }
+                return Err(e);
             }
-            return Err(e);
-        }
+        };
+        // Spawn from the canonical path the gate just verified — NOT the raw
+        // `work_dir` string. Re-resolving the unvalidated string downstream would
+        // let a symlink swapped in after the check escape HOME (the TOCTOU above).
+        let canonical_str = canonical_dir.to_string_lossy();
         // default terminal size for unattended sessions
         let sid = self
-            .create_acp_session_tagged(name, work_dir, 80, 24, owner_id, Some(task_id.to_string()))
+            .create_acp_session_tagged(
+                name,
+                &canonical_str,
+                80,
+                24,
+                owner_id,
+                Some(task_id.to_string()),
+            )
             .await?;
         if let Some(store) = self.scheduled.lock().unwrap().clone() {
             let _ = store.set_run_state(run_id, "running", Some(&sid), None, None, None);
@@ -1841,6 +1861,19 @@ mod work_dir_confinement_tests {
     fn nonexistent_path_is_rejected() {
         // canonicalize() fails on a path that does not exist — must not pass.
         assert!(work_dir_under_home("/home/ubuntu/__zeromux_does_not_exist__/x").is_err());
+    }
+
+    #[test]
+    fn returns_canonical_path_not_raw_input() {
+        // The caller MUST spawn from the returned (canonical) path, not the raw
+        // string — that is what closes the TOCTOU. So a path with a symlink or
+        // a `.` component must come back fully resolved, with no `.`/symlink left.
+        let home = std::env::var("HOME").unwrap();
+        let canonical_home = std::path::Path::new(&home).canonicalize().unwrap();
+        let resolved = work_dir_under_home(&format!("{home}/.")).unwrap();
+        assert_eq!(resolved, canonical_home);
+        // No trailing `.` component survives canonicalization.
+        assert!(!resolved.to_string_lossy().ends_with("/."));
     }
 }
 

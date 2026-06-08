@@ -47,8 +47,14 @@ export function linesFromDrag(startY: number, currentY: number, rh: number): num
 // 整段提交：bracketed paste（DECSET 2004）。内部 \n 原样保留，
 // 支持的 TUI（Claude Code / Codex / bash readline）把整段当粘贴内容，
 // 不会逐行提交。调用方负责非空判断。
+//
+// 安全：必须剥掉正文里出现的结束标记 \x1b[201~，否则它会提前关闭粘贴态，
+// 其后的字节被当作真实键入——这正是 bracketed paste 要防住的注入。
+// 起始标记 \x1b[200~ 一并剥掉，避免嵌套粘贴态错乱。
 export function bracketedPaste(text: string): string {
-  return `\x1b[200~${text}\x1b[201~`
+  // eslint-disable-next-line no-control-regex
+  const safe = text.replace(/\x1b\[20[01]~/g, '')
+  return `\x1b[200~${safe}\x1b[201~`
 }
 
 // paste 后是否发回车，取决于对端 bracketed paste 模式

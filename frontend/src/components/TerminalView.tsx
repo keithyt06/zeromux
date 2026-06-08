@@ -97,11 +97,14 @@ export default function TerminalView({ sessionId, active, theme }: Props) {
   }, [sessionId])
 
   // 所有 client→PTY 输入走这一条；term.onData 与 MobileKeyBar 共用。
+  // 返回是否真正送出：重连窗口里 WS 未 OPEN 时为 false，调用方据此决定是否清空输入。
   const sendInput = useCallback((data: string) => {
     const ws = wsRef.current
     if (ws?.readyState === WebSocket.OPEN) {
       ws.send(JSON.stringify({ type: 'input', data: b64encode(new TextEncoder().encode(data)) }))
+      return true
     }
+    return false
   }, [])
 
   // 虚拟键：先回到底部（否则在 scrollback 里点键看不到反馈），再发对应字节。
@@ -122,7 +125,9 @@ export default function TerminalView({ sessionId, active, theme }: Props) {
   const sendComposer = useCallback((text: string) => {
     const term = termRef.current
     if (!term) return
-    sendInput(bracketedPaste(text) + submitSequence(term.modes.bracketedPasteMode))
+    // 只有真正送出才清空，否则重连窗口里用户辛苦打的整段会被静默丢掉。
+    const sent = sendInput(bracketedPaste(text) + submitSequence(term.modes.bracketedPasteMode))
+    if (!sent) return
     setComposerText('')
     term.scrollToBottom()
   }, [sendInput])
@@ -218,6 +223,10 @@ export default function TerminalView({ sessionId, active, theme }: Props) {
     }
   }, [theme])
 
+  // 上一次发给 PTY 的 cols/rows。handleResize 据此跳过冗余 resize；onopen
+  // 重连首发也要同步它，否则下一次「真实尺寸变回这个旧值」会被误判为冗余而漏发。
+  const lastDims = useRef<{ cols: number; rows: number }>({ cols: 0, rows: 0 })
+
   // Connect WebSocket
   useEffect(() => {
     if (!termRef.current) return
@@ -242,6 +251,7 @@ export default function TerminalView({ sessionId, active, theme }: Props) {
           const dims = fit.proposeDimensions()
           if (dims) {
             ws.send(JSON.stringify({ type: 'resize', cols: dims.cols, rows: dims.rows }))
+            lastDims.current = { cols: dims.cols, rows: dims.rows }
           }
         }
       }
@@ -277,7 +287,6 @@ export default function TerminalView({ sessionId, active, theme }: Props) {
     }
   }, [sessionId])
 
-  const lastDims = useRef<{ cols: number; rows: number }>({ cols: 0, rows: 0 })
   const handleResize = useCallback(() => {
     const fit = fitRef.current
     const term = termRef.current
@@ -326,8 +335,10 @@ export default function TerminalView({ sessionId, active, theme }: Props) {
     if (!isTouch || !active) return
     const vv = window.visualViewport
     if (!vv) return
-    const root = containerRef.current?.parentElement
+    // 每次都读实时 parentElement，不在 effect 顶部捕获一份：父节点若被重挂，
+    // 捕获的旧引用会让 padding 改在错节点上、新节点又清不掉（残留遮挡）。
     const apply = () => {
+      const root = containerRef.current?.parentElement
       const overlap = Math.max(0, window.innerHeight - vv.height - vv.offsetTop)
       if (root) root.style.paddingBottom = `${overlap}px`
     }
@@ -337,6 +348,7 @@ export default function TerminalView({ sessionId, active, theme }: Props) {
     return () => {
       vv.removeEventListener('resize', apply)
       vv.removeEventListener('scroll', apply)
+      const root = containerRef.current?.parentElement
       if (root) root.style.paddingBottom = ''
     }
   }, [isTouch, active])

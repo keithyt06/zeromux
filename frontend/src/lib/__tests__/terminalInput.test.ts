@@ -57,6 +57,17 @@ describe('bracketedPaste', () => {
   it('空串也照样包裹（非空判断在调用方）', () => {
     expect(bracketedPaste('')).toBe('\x1b[200~\x1b[201~')
   })
+  it('剥掉正文里的结束标记 \\x1b[201~，防止提前关闭粘贴态注入', () => {
+    // 攻击载荷：正文里塞 201~ 提前结束粘贴，其后 rm -rf ~ 会被当真实键入。
+    const payload = 'foo\x1b[201~\rrm -rf ~'
+    const out = bracketedPaste(payload)
+    // 内部不得再出现裸结束标记；只有最外层包裹的那一个。
+    expect(out).toBe('\x1b[200~foo\rrm -rf ~\x1b[201~')
+    expect(out.indexOf('\x1b[201~')).toBe(out.length - '\x1b[201~'.length)
+  })
+  it('剥掉正文里的起始标记 \\x1b[200~，避免嵌套粘贴态', () => {
+    expect(bracketedPaste('a\x1b[200~b')).toBe('\x1b[200~ab\x1b[201~')
+  })
 })
 
 describe('submitSequence', () => {

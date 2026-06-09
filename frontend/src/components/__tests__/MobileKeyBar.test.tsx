@@ -3,16 +3,16 @@ import { describe, it, expect, vi } from 'vitest'
 import MobileKeyBar from '../MobileKeyBar'
 
 describe('MobileKeyBar', () => {
-  it('渲染 ↑↓ + ^C + 三个 agent 启动键', () => {
+  it('渲染 ↑↓ + ^C + Enter + 三个 agent 启动键', () => {
     render(<MobileKeyBar onKey={() => {}} />)
-    for (const k of ['up', 'down', 'ctrl-c', 'claude', 'codex', 'kiro']) {
+    for (const k of ['up', 'down', 'ctrl-c', 'enter', 'claude', 'codex', 'kiro']) {
       expect(screen.getByLabelText(k)).toBeInTheDocument()
     }
   })
 
   it('不再渲染已删除的键', () => {
     render(<MobileKeyBar onKey={() => {}} />)
-    for (const k of ['esc', 'left', 'right', 'enter', 'y', 'n']) {
+    for (const k of ['esc', 'left', 'right', 'y', 'n']) {
       expect(screen.queryByLabelText(k)).toBeNull()
     }
   })
@@ -24,6 +24,8 @@ describe('MobileKeyBar', () => {
     expect(onKey).toHaveBeenCalledWith('up')
     fireEvent.pointerDown(screen.getByLabelText('ctrl-c'))
     expect(onKey).toHaveBeenCalledWith('ctrl-c')
+    fireEvent.pointerDown(screen.getByLabelText('enter'))
+    expect(onKey).toHaveBeenCalledWith('enter')
     fireEvent.pointerDown(screen.getByLabelText('claude'))
     expect(onKey).toHaveBeenCalledWith('claude')
   })

@@ -84,9 +84,11 @@ describe('controlSequence', () => {
 })
 
 describe('launchSequence', () => {
-  it('agent 别名 + 回车，直接在当前 shell 启动', () => {
+  it('claude / codex 裸命令即进交互，发命令名 + 回车', () => {
     expect(launchSequence('claude')).toBe('claude\r')
     expect(launchSequence('codex')).toBe('codex\r')
-    expect(launchSequence('kiro')).toBe('kiro\r')
+  })
+  it('kiro 真实命令是 kiro-cli，裸命令只出菜单，交互入口是 kiro-cli chat', () => {
+    expect(launchSequence('kiro')).toBe('kiro-cli chat\r')
   })
 })

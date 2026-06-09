@@ -1,12 +1,13 @@
-import { ArrowUp, ArrowDown, type LucideIcon } from 'lucide-react'
+import { ArrowUp, ArrowDown, CornerDownLeft, type LucideIcon } from 'lucide-react'
 import type { AgentKey } from '../lib/terminalInput'
 
-export type BarKey = 'up' | 'down' | 'ctrl-c' | AgentKey
+export type BarKey = 'up' | 'down' | 'enter' | 'ctrl-c' | AgentKey
 
-// 方向键用图标；^C 与 agent 启动键用文字标签。aria-label 用逻辑键名，便于测试与无障碍。
-const ARROW_KEYS: { key: 'up' | 'down'; Icon: LucideIcon }[] = [
+// 方向键/Enter 用图标；^C 与 agent 启动键用文字标签。aria-label 用逻辑键名，便于测试与无障碍。
+const ARROW_KEYS: { key: 'up' | 'down' | 'enter'; Icon: LucideIcon }[] = [
   { key: 'up', Icon: ArrowUp },
   { key: 'down', Icon: ArrowDown },
+  { key: 'enter', Icon: CornerDownLeft },
 ]
 
 const CONTROL_KEYS: { key: 'ctrl-c'; label: string }[] = [

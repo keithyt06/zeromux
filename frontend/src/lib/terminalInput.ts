@@ -75,10 +75,17 @@ export function controlSequence(key: ControlKey): string {
   return CONTROL[key]
 }
 
-// agent CLI 一键启动 → 发别名 + 回车，在当前 shell 立即运行。
-// 别名（claude/codex/kiro）已在用户 shell 配置为最高权限，不带参数。
+// agent CLI 一键启动 → 发命令 + 回车，在当前 shell 立即运行。
+// claude/codex 裸命令即进交互会话；kiro 的真实二进制是 kiro-cli，裸命令只出菜单，
+// 交互入口是 `kiro-cli chat`。命令已配置为最高权限模式，不带其它参数。
 export type AgentKey = 'claude' | 'codex' | 'kiro'
 
+const LAUNCH: Record<AgentKey, string> = {
+  claude: 'claude',
+  codex: 'codex',
+  kiro: 'kiro-cli chat',
+}
+
 export function launchSequence(agent: AgentKey): string {
-  return `${agent}\r`
+  return `${LAUNCH[agent]}\r`
 }

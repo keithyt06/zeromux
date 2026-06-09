@@ -152,9 +152,18 @@ export interface DirListing {
 
 export async function listDirectories(path?: string): Promise<DirListing> {
   const params = path ? `?path=${encodeURIComponent(path)}` : ''
-  const res = await api(`/api/directories${params}`)
-  if (!res.ok) throw new Error(await res.text())
-  return res.json()
+  // 8s timeout: on flaky mobile networks a stalled fetch would otherwise leave
+  // the picker stuck on "Loading…" forever. AbortController turns it into a
+  // catchable error so the caller can show a retry.
+  const ctrl = new AbortController()
+  const timer = setTimeout(() => ctrl.abort(), 8000)
+  try {
+    const res = await api(`/api/directories${params}`, { signal: ctrl.signal })
+    if (!res.ok) throw new Error(await res.text())
+    return res.json()
+  } finally {
+    clearTimeout(timer)
+  }
 }
 
 export async function deleteSession(id: string): Promise<void> {

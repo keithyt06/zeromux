@@ -1,4 +1,4 @@
-import { useState, useEffect, useCallback } from 'react'
+import { useState, useEffect, useCallback, useRef } from 'react'
 import type { SessionInfo, SessionType, DirEntry, UserInfo, TmuxSession } from '../lib/api'
 import { listDirectories, listTmuxSessions, getSchedulerHealth } from '../lib/api'
 import type { Theme } from '../lib/theme'
@@ -93,6 +93,10 @@ export default function Sidebar({ sessions, activeId, onSelect, onCreate, onDele
   const [homePath, setHomePath] = useState('')
   const [dirs, setDirs] = useState<DirEntry[]>([])
   const [loading, setLoading] = useState(false)
+  // 加载失败（超时/网络/权限）时记下来，连同上次的 path，供「重试」按钮用。
+  // 没有它时 fetch 卡住会永远停在 Loading…（手机弱网下的实际表现）。
+  const [dirError, setDirError] = useState<string | null>(null)
+  const lastDirPath = useRef<string | undefined>(undefined)
 
   // Tmux session list state
   const [tmuxSessions, setTmuxSessions] = useState<TmuxSession[]>([])
@@ -101,14 +105,23 @@ export default function Sidebar({ sessions, activeId, onSelect, onCreate, onDele
   const ThemeIcon = theme === 'dark' ? Sun : Moon
 
   const loadDirs = useCallback(async (path?: string) => {
+    lastDirPath.current = path
     setLoading(true)
+    setDirError(null)
     try {
       const data = await listDirectories(path)
       setCurrentPath(data.current)
       setParentPath(data.parent)
       setHomePath(data.home)
       setDirs(data.entries)
-    } catch { /* ignore */ }
+    } catch (e) {
+      // 超时（AbortError）或网络/权限错误：显式报错 + 让用户重试，
+      // 而不是静默停在 Loading…。
+      const msg = e instanceof DOMException && e.name === 'AbortError'
+        ? '加载超时，请重试'
+        : (e instanceof Error ? e.message : '加载失败')
+      setDirError(msg)
+    }
     setLoading(false)
   }, [])
 
@@ -540,6 +553,16 @@ export default function Sidebar({ sessions, activeId, onSelect, onCreate, onDele
                   <div className="max-h-48 overflow-y-auto">
                     {loading ? (
                       <div className="px-3 py-2 text-[10px] text-[var(--text-muted)]">Loading...</div>
+                    ) : dirError ? (
+                      <div className="px-3 py-2 flex items-center justify-between gap-2">
+                        <span className="text-[10px] text-[var(--accent-red)] truncate">{dirError}</span>
+                        <button
+                          onClick={() => loadDirs(lastDirPath.current)}
+                          className="shrink-0 px-2 py-0.5 text-[10px] font-semibold bg-[var(--bg-hover)] hover:bg-[var(--border)] text-[var(--text-primary)] rounded transition-colors"
+                        >
+                          重试
+                        </button>
+                      </div>
                     ) : dirs.length === 0 ? (
                       <div className="px-3 py-2 text-[10px] text-[var(--text-muted)]">No subdirectories</div>
                     ) : (

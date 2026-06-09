@@ -1587,6 +1587,10 @@ fn spawn_acp_fanout(
         let mut local_running = false;
         let mut boundary_count: u64 = 0;
         let mut active_run_id: Option<String> = None;
+        // ── auto-titler 状态(仅 acp/claude fanout 触发;见 auto_titler.rs 后端覆盖说明) ──
+        // 记录本会话首条"实质" prompt;首个 Result 到达且仍为 auto 名时,后台命名一次。
+        let mut first_substantive_prompt: Option<String> = None;
+        let mut titled = false;
         // ── collect 队列状态 ──
         // 不变量:两个 deadline 仅在 `!local_running && !pending.is_empty()` 时为 Some。
         // 入队只在 turn 进行中(Running)发生;flush 窗口只在 turn 结束(Idle)后 arm,
@@ -1662,6 +1666,27 @@ fn spawn_acp_fanout(
                                     collect_hard_deadline = Some(Box::pin(tokio::time::sleep(
                                         std::time::Duration::from_millis(COLLECT_MAX_MS))));
                                 }
+                                // auto-titler:首条实质 prompt 的首个 Result 触发一次性命名。
+                                // first_substantive_prompt 仅在普通(非 run_id)turn 记录,故调度
+                                // 运行不会触发。命中即 titled=true,无论成功与否只尝试一次;
+                                // set_auto_title 内部再查 name_is_auto 防与用户改名竞态(E12)。
+                                if !titled {
+                                    if let AcpEvent::Result { text, .. } = &evt {
+                                        if let Some(fp) = first_substantive_prompt.clone() {
+                                            titled = true;
+                                            if let Some(m) = mgr.upgrade() {
+                                                if m.session_name_is_auto(&sid) {
+                                                    if let Some((backend, path)) = m.titler_cli_for(agent_label) {
+                                                        crate::auto_titler::spawn_titler(
+                                                            sid.clone(), backend, path,
+                                                            fp, text.clone(), mgr.clone(),
+                                                        );
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
                             }
                         }
                         None => break,
@@ -1704,6 +1729,10 @@ fn spawn_acp_fanout(
                                 emit_queued(&event_tx, pending.len());
                             } else {
                                 // 真正空闲:立即发送(原行为)
+                                // auto-titler:记录首条实质 prompt(P1:跳过 hi/ls/继续 等开场)
+                                if first_substantive_prompt.is_none() && is_substantive_prompt(&text) {
+                                    first_substantive_prompt = Some(text.clone());
+                                }
                                 active_run_id = None;
                                 turn_seq += 1;
                                 local_running = true;
@@ -1806,7 +1835,6 @@ fn merge_pending(items: &[PendingPrompt]) -> String {
 /// 判定一条 prompt 是否"实质"——值得用它生成会话标题。
 /// 规则:trim 后,含空白(多词/含说明)即实质;否则要求字符数 >= 6。
 /// 挡掉 hi/ls/继续/y/q/ok 这类单 token 短命令开场(评审 P1)。
-#[allow(dead_code)] // 由 Task 6 collect 接入后消费
 fn is_substantive_prompt(text: &str) -> bool {
     let t = text.trim();
     if t.is_empty() {
@@ -1819,8 +1847,7 @@ fn is_substantive_prompt(text: &str) -> bool {
 }
 
 /// 清洗 LLM 返回的标题:取第一行、去引号/常见前缀、按字符截断 16、空→None。
-#[allow(dead_code)] // 由 Task 6 collect 接入后消费
-fn sanitize_title(raw: &str) -> Option<String> {
+pub fn sanitize_title(raw: &str) -> Option<String> {
     let first_line = raw.lines().next().unwrap_or("").trim();
     let stripped = first_line
         .strip_prefix("标题：")

@@ -4,7 +4,9 @@
 > - ✅ **Task 1–4 已合并**:`name_is_auto` 持久化、用户改名锁定、`set_auto_title`/`session_name_is_auto`/`titler_cli_for` 访问器、三个纯函数(`merge_pending`/`is_substantive_prompt`/`sanitize_title`)含单测。
 > - ✅ **Task 6/7/9/10 已实现(collect 全功能)**:三个 fanout 接入排队+防抖(500ms)+硬上限(3000ms)+第三 select 臂 flush;`run_id` prompt 绕行(C3);Interrupt 无条件清队列(E5);`queued` 事件 ephemeral(E7,ws_handler 跳过 scrollback);前端「已排队 N 条」提示。
 >   - **评审修订(E-collect-window)**:原计划在"入队时(Running 期间)"arm 防抖窗口——但 turn 通常远长于 500ms,窗口会在 turn 进行中到期、把合并 prompt flush 进一个未结束的 turn(等于乱序强打断,正是 collect 要消灭的)。已改为**仅在 turn 结束(翻 Idle)后才 arm 窗口**,不变量:两个 deadline 仅在 `!local_running && !pending.is_empty()` 时为 Some。新增 `queued_event_serializes_to_ephemeral_contract` 测试锁住跨层 JSON 契约。
-> - ⏸ **Task 5/8 已延后(auto-titler)**:`auto_titler.rs` + 三后端(Claude NDJSON / Kiro JSON-RPC / Codex MCP-notification)沙箱无工具 spawn。spec 自标 C2 高复杂度;三套 wire protocol 的 Result 提取需 live agent CLI 端到端验证,当前环境无法验证,作为独立已验证 PR 落地。titler 的纯函数/访问器(`sanitize_title`/`set_auto_title`/`session_name_is_auto`/`titler_cli_for`/`name_is_auto`)已作为地基保留。
+> - ✅ **Task 5/8 已实现(auto-titler,Claude-only)**:`auto_titler.rs` 后台任务 = 沙箱临时空目录 + Claude 专用无工具 spawn(`AcpProcess::spawn_titler`:`--allowedTools ""` + 不 `--dangerously-skip-permissions`,C1/E10)+ 15s 超时读 Result + `sanitize_title` 清洗 + 二次校验 `name_is_auto` 写回(E12 一生一次)。`process.rs` 的 NDJSON reader 抽成共享 `start_reader`(DRY)。acp/claude fanout 首条实质 prompt 的首个 Result 触发(P1:`first_substantive_prompt` + `titled` 一次性)。
+>   - **后端覆盖决策(对应 spec C2 回退)**:仅 Claude 做真正的无工具 spawn。Kiro/Codex 的现有事件循环会 auto-approve / 写死 full-access,无法在不大改的前提下安全降为无工具,故 `run_titler` 对二者按设计返回 `None`——会话保留默认名,不命名也不冒注入风险。这正是 spec 预留的"titler 一律用 claude"回退的安全化版本。
+>   - **未验证项(诚实记录)**:titler 对 live `claude` CLI 的端到端命名行为在本环境无法跑(无交互式 CLI);但失败模式安全(spawn 失败/超时/空 → 静默保留原名),且 `titler_prompt` 截断/规则、`sanitize_title` 清洗均有单测。部署后需人工冒烟:起 claude 会话→发实质 prompt→首 turn 结束观察改名一次;重启 resume 不再改名(E12)。
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 

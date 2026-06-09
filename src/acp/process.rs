@@ -2,7 +2,7 @@ use serde::Serialize;
 use std::process::Stdio;
 use std::sync::atomic::{AtomicU64, Ordering};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-use tokio::process::{Child, ChildStdin};
+use tokio::process::{Child, ChildStdin, ChildStdout};
 use tokio::sync::mpsc;
 
 static INT_SEQ: AtomicU64 = AtomicU64::new(0);
@@ -118,31 +118,45 @@ impl AcpProcess {
         let stdout = child.stdout.take().unwrap();
 
         let (tx, rx) = mpsc::channel::<AcpEvent>(256);
+        start_reader(stdout, tx);
 
-        // Read NDJSON lines from stdout in a background task.
-        // Use a large buffer because assistant responses can contain big tool_use inputs.
-        let reader = BufReader::with_capacity(256 * 1024, stdout);
-        tokio::spawn(async move {
-            let mut lines = reader.lines();
-            while let Ok(Some(line)) = lines.next_line().await {
-                if line.is_empty() {
-                    continue;
-                }
-                let val: serde_json::Value = match serde_json::from_str(&line) {
-                    Ok(v) => v,
-                    Err(e) => {
-                        tracing::debug!("stream-json: bad line: {e} — {}", &line[..line.len().min(200)]);
-                        continue;
-                    }
-                };
-                for evt in translate_event(&val) {
-                    if tx.send(evt).await.is_err() {
-                        return;
-                    }
-                }
-            }
-            let _ = tx.send(AcpEvent::Exit { code: 0 }).await;
-        });
+        Ok(Self { child, stdin, event_rx: rx })
+    }
+
+    /// Spawn `claude -p` in stream-json mode for the **auto-titler**: a
+    /// sandboxed, tool-less read of conversation text (C1/E10). Differs from
+    /// `spawn` in two security-critical ways:
+    ///   - **No `--dangerously-skip-permissions`** (so any tool use Claude
+    ///     attempts would hit a permission prompt and stall, never auto-run).
+    ///   - **`--allowedTools ""`** — empty allow-list grants zero tools, so
+    ///     even a prompt-injected conversation can't make the model act.
+    /// Runs in `sandbox_dir` (a temp empty dir), NOT the session's repo.
+    /// Keeps the stream-json input/output flags so the shared NDJSON reader
+    /// (`start_reader`) parses its output identically.
+    pub async fn spawn_titler(
+        claude_path: &str,
+        sandbox_dir: &str,
+    ) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
+        let args: Vec<String> = vec![
+            "-p".into(),
+            "--output-format".into(), "stream-json".into(),
+            "--input-format".into(), "stream-json".into(),
+            "--verbose".into(),
+            "--allowedTools".into(), "".into(),
+        ];
+        let mut child = tokio::process::Command::new(claude_path)
+            .args(&args)
+            .current_dir(sandbox_dir)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn()?;
+
+        let stdin = child.stdin.take().unwrap();
+        let stdout = child.stdout.take().unwrap();
+
+        let (tx, rx) = mpsc::channel::<AcpEvent>(256);
+        start_reader(stdout, tx);
 
         Ok(Self { child, stdin, event_rx: rx })
     }
@@ -185,6 +199,36 @@ impl Drop for AcpProcess {
     fn drop(&mut self) {
         let _ = self.child.start_kill();
     }
+}
+
+/// Spawn the background task that reads NDJSON lines from the CLI's stdout,
+/// translates each into `AcpEvent`s, and forwards them down `tx`. Shared by
+/// both `spawn` and `spawn_titler` so the stream-json parsing lives in one
+/// place. Uses a large buffer because assistant responses can carry big
+/// tool_use inputs.
+fn start_reader(stdout: ChildStdout, tx: mpsc::Sender<AcpEvent>) {
+    let reader = BufReader::with_capacity(256 * 1024, stdout);
+    tokio::spawn(async move {
+        let mut lines = reader.lines();
+        while let Ok(Some(line)) = lines.next_line().await {
+            if line.is_empty() {
+                continue;
+            }
+            let val: serde_json::Value = match serde_json::from_str(&line) {
+                Ok(v) => v,
+                Err(e) => {
+                    tracing::debug!("stream-json: bad line: {e} — {}", &line[..line.len().min(200)]);
+                    continue;
+                }
+            };
+            for evt in translate_event(&val) {
+                if tx.send(evt).await.is_err() {
+                    return;
+                }
+            }
+        }
+        let _ = tx.send(AcpEvent::Exit { code: 0 }).await;
+    });
 }
 
 // ── Stream-json event translation ──

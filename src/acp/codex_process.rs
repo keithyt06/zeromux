@@ -411,6 +411,7 @@ impl CodexProcess {
             .send(AcpEvent::System {
                 subtype: std::borrow::Cow::Borrowed("init"),
                 session_id: None,
+                count: None,
             })
             .await;
 

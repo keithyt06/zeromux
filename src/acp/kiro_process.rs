@@ -160,6 +160,7 @@ impl KiroProcess {
             .send(AcpEvent::System {
                 subtype: std::borrow::Cow::Borrowed("init"),
                 session_id: Some(session_id.clone()),
+                count: None,
             })
             .await;
 

@@ -31,6 +31,9 @@ pub enum AcpEvent {
         subtype: StaticOrOwnedStr,
         #[serde(skip_serializing_if = "Option::is_none")]
         session_id: Option<String>,
+        /// 仅 subtype=="queued" 填充：当前排队条数，供前端显示"已排队 N 条"。
+        #[serde(skip_serializing_if = "Option::is_none")]
+        count: Option<u32>,
     },
     /// 助手输出的一个内容块。`block_type` 决定渲染方式：
     /// - "text"：正文 markdown；`streaming:true` 的连续块前端合并为一段。
@@ -205,6 +208,7 @@ fn translate_event(val: &serde_json::Value) -> Vec<AcpEvent> {
             vec![AcpEvent::System {
                 subtype: StaticOrOwnedStr::Owned(subtype.to_string()),
                 session_id: val.get("session_id").and_then(|v| v.as_str()).map(String::from),
+                count: None,
             }]
         }
 

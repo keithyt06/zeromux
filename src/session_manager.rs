@@ -1587,6 +1587,15 @@ fn spawn_acp_fanout(
         let mut local_running = false;
         let mut boundary_count: u64 = 0;
         let mut active_run_id: Option<String> = None;
+        // ── collect 队列状态 ──
+        // 不变量:两个 deadline 仅在 `!local_running && !pending.is_empty()` 时为 Some。
+        // 入队只在 turn 进行中(Running)发生;flush 窗口只在 turn 结束(Idle)后 arm,
+        // 因此合并 prompt 永不在一个进行中的 turn 里发出(否则会变成 mid-turn 强打断)。
+        let mut pending: Vec<PendingPrompt> = Vec::new();
+        let mut collect_deadline: Option<std::pin::Pin<Box<tokio::time::Sleep>>> = None;
+        let mut collect_hard_deadline: Option<std::pin::Pin<Box<tokio::time::Sleep>>> = None;
+        const COLLECT_DEBOUNCE_MS: u64 = 500; // 防抖:窗口内新 prompt 重置
+        const COLLECT_MAX_MS: u64 = 3000;     // 硬上限:首条入队起最多等这么久必 flush(E3)
         loop {
             tokio::select! {
                 event = process.event_rx.recv() => {
@@ -1645,6 +1654,14 @@ fn spawn_acp_fanout(
                                         }
                                     }
                                 }
+                                // collect:turn 真正结束(已翻 Idle)且有排队的追加 →
+                                // arm 收集窗口。只在这里 arm,保证 flush 永不发生在进行中的 turn 里。
+                                if !local_running && !pending.is_empty() && collect_deadline.is_none() {
+                                    collect_deadline = Some(Box::pin(tokio::time::sleep(
+                                        std::time::Duration::from_millis(COLLECT_DEBOUNCE_MS))));
+                                    collect_hard_deadline = Some(Box::pin(tokio::time::sleep(
+                                        std::time::Duration::from_millis(COLLECT_MAX_MS))));
+                                }
                             }
                         }
                         None => break,
@@ -1653,19 +1670,49 @@ fn spawn_acp_fanout(
                 input = input_rx.recv() => {
                     match input {
                         Some(SessionInput::Prompt { text, run_id }) => {
-                            active_run_id = run_id.clone();
-                            if local_running {
-                                if let Err(e) = process.interrupt().await {
-                                    tracing::warn!("interrupt before resend failed for {}: {}", sid, e);
+                            if run_id.is_some() {
+                                // C3:调度运行 prompt 绕过 collect,自成干净 turn。先丢弃任何
+                                // 待合并队列+窗口,保证调度 turn 不被用户闲聊追加污染,且收集
+                                // 窗口不会在调度 turn 进行中 flush(verdict 不会 finalize 在混入
+                                // 对话的合并 turn 上)。
+                                pending.clear();
+                                collect_deadline = None;
+                                collect_hard_deadline = None;
+                                active_run_id = run_id.clone();
+                                if local_running {
+                                    if let Err(e) = process.interrupt().await {
+                                        tracing::warn!("interrupt before resend failed for {}: {}", sid, e);
+                                    }
                                 }
-                            }
-                            turn_seq += 1;
-                            local_running = true;
-                            if let Some(m) = mgr.upgrade() {
-                                m.mark_turn(&sid, TurnState::Running, turn_seq);
-                            }
-                            if let Err(e) = process.send_prompt(&text).await {
-                                tracing::warn!("ACP send_prompt failed for {}: {}", sid, e);
+                                turn_seq += 1;
+                                local_running = true;
+                                if let Some(m) = mgr.upgrade() {
+                                    m.mark_turn(&sid, TurnState::Running, turn_seq);
+                                }
+                                if let Err(e) = process.send_prompt(&text).await {
+                                    tracing::warn!("ACP send_prompt failed for {}: {}", sid, e);
+                                }
+                            } else if local_running {
+                                // turn 进行中:入队,不打断(collect 核心)。窗口在 turn 结束后才 arm。
+                                pending.push(PendingPrompt { text, ts_ms: now_millis() });
+                                emit_queued(&event_tx, pending.len());
+                            } else if collect_deadline.is_some() {
+                                // 收集窗口开着(已 Idle,等 flush):继续入队 + 重置防抖,硬上限保持。
+                                pending.push(PendingPrompt { text, ts_ms: now_millis() });
+                                collect_deadline = Some(Box::pin(tokio::time::sleep(
+                                    std::time::Duration::from_millis(COLLECT_DEBOUNCE_MS))));
+                                emit_queued(&event_tx, pending.len());
+                            } else {
+                                // 真正空闲:立即发送(原行为)
+                                active_run_id = None;
+                                turn_seq += 1;
+                                local_running = true;
+                                if let Some(m) = mgr.upgrade() {
+                                    m.mark_turn(&sid, TurnState::Running, turn_seq);
+                                }
+                                if let Err(e) = process.send_prompt(&text).await {
+                                    tracing::warn!("ACP send_prompt failed for {}: {}", sid, e);
+                                }
                             }
                         }
                         Some(SessionInput::Interrupt) => {
@@ -1675,12 +1722,43 @@ fn spawn_acp_fanout(
                                 }
                                 // 旧 turn 的 Result/Error 会照常到达并经 mark_turn(Idle,seq) 翻 Idle
                             }
+                            // E5:无条件清队列 + 取消窗口。用户中断意图含"别发那批排队的了",
+                            // 即使 turn 已结束、窗口正等 flush(local_running==false)也要清。
+                            pending.clear();
+                            collect_deadline = None;
+                            collect_hard_deadline = None;
                         }
                         Some(SessionInput::Cancel) => {
                             process.kill().await;
                         }
                         None => break, // all input senders dropped (session removed)
                         _ => {} // ignore PTY commands
+                    }
+                }
+                // collect flush:收集窗口(防抖 OR 硬上限,取较早者)到期 → 合并发一条。
+                // 两个 deadline 在 turn 结束时一并 arm,故同 Some 同 None;只在 Idle 时触发。
+                _ = async {
+                    match (collect_deadline.as_mut(), collect_hard_deadline.as_mut()) {
+                        (Some(d), Some(h)) => { tokio::select! { _ = d.as_mut() => {}, _ = h.as_mut() => {} } }
+                        (Some(d), None) => d.as_mut().await,
+                        (None, Some(h)) => h.as_mut().await,
+                        (None, None) => std::future::pending::<()>().await,
+                    }
+                }, if collect_deadline.is_some() => {
+                    collect_deadline = None;
+                    collect_hard_deadline = None;
+                    if !pending.is_empty() {
+                        let merged = merge_pending(&pending);
+                        pending.clear();
+                        active_run_id = None; // 合并 turn 永不携带 run_id(C3)
+                        turn_seq += 1;
+                        local_running = true;
+                        if let Some(m) = mgr.upgrade() {
+                            m.mark_turn(&sid, TurnState::Running, turn_seq);
+                        }
+                        if let Err(e) = process.send_prompt(&merged).await {
+                            tracing::warn!("collect flush send_prompt failed for {}: {}", sid, e);
+                        }
                     }
                 }
             }
@@ -1691,16 +1769,26 @@ fn spawn_acp_fanout(
 }
 
 /// Running 期间追加、等待合并的一条用户 prompt。
-#[allow(dead_code)] // 由 Task 6 collect 接入后消费
 #[derive(Debug, Clone)]
 struct PendingPrompt {
     text: String,
     ts_ms: i64,
 }
 
+/// 向客户端广播一条 ephemeral `System{subtype:"queued"}` 事件,携带当前排队条数。
+/// 该事件在 ws_handler 侧被跳过 scrollback(E7),故重连回放不残留。三个 fanout 共用。
+fn emit_queued(event_tx: &broadcast::Sender<String>, count: usize) {
+    if let Ok(json) = serde_json::to_string(&AcpEvent::System {
+        subtype: std::borrow::Cow::Borrowed("queued"),
+        session_id: None,
+        count: Some(count as u32),
+    }) {
+        let _ = event_tx.send(json);
+    }
+}
+
 /// 把 Running 期间排队的追加 prompt 合并成一条带语义头的文本。
 /// 语义头让模型明确这是"上一条处理期间的追加",而非独立新请求。
-#[allow(dead_code)] // 由 Task 6 collect 接入后消费
 fn merge_pending(items: &[PendingPrompt]) -> String {
     use chrono::TimeZone;
     let mut out = String::from("[以下是你处理上一条消息期间用户追加发送的内容,请一并处理]\n");
@@ -1770,6 +1858,12 @@ fn spawn_kiro_fanout(
         let mut turn_seq: u64 = 0;
         let mut local_running = false;
         let mut boundary_count: u64 = 0;
+        // ── collect 队列状态(镜像 spawn_acp_fanout;见那里的不变量注释) ──
+        let mut pending: Vec<PendingPrompt> = Vec::new();
+        let mut collect_deadline: Option<std::pin::Pin<Box<tokio::time::Sleep>>> = None;
+        let mut collect_hard_deadline: Option<std::pin::Pin<Box<tokio::time::Sleep>>> = None;
+        const COLLECT_DEBOUNCE_MS: u64 = 500;
+        const COLLECT_MAX_MS: u64 = 3000;
         loop {
             tokio::select! {
                 event = process.event_rx.recv() => {
@@ -1812,6 +1906,13 @@ fn spawn_kiro_fanout(
                                 if let Some(m) = mgr.upgrade() {
                                     m.mark_turn(&sid, TurnState::Idle, boundary_count);
                                 }
+                                // collect:turn 结束(已 Idle)且有排队追加 → arm 收集窗口。
+                                if !local_running && !pending.is_empty() && collect_deadline.is_none() {
+                                    collect_deadline = Some(Box::pin(tokio::time::sleep(
+                                        std::time::Duration::from_millis(COLLECT_DEBOUNCE_MS))));
+                                    collect_hard_deadline = Some(Box::pin(tokio::time::sleep(
+                                        std::time::Duration::from_millis(COLLECT_MAX_MS))));
+                                }
                             }
                         }
                         None => break,
@@ -1819,19 +1920,42 @@ fn spawn_kiro_fanout(
                 }
                 input = input_rx.recv() => {
                     match input {
-                        Some(SessionInput::Prompt { text, run_id: _ }) => {
-                            if local_running {
-                                if let Err(e) = process.interrupt().await {
-                                    tracing::warn!("interrupt before resend failed for {}: {}", sid, e);
+                        Some(SessionInput::Prompt { text, run_id }) => {
+                            if run_id.is_some() {
+                                // C3:调度 prompt 绕过 collect(kiro 当前不跑调度,留此分支保持三 fanout 对称)
+                                pending.clear();
+                                collect_deadline = None;
+                                collect_hard_deadline = None;
+                                if local_running {
+                                    if let Err(e) = process.interrupt().await {
+                                        tracing::warn!("interrupt before resend failed for {}: {}", sid, e);
+                                    }
                                 }
-                            }
-                            turn_seq += 1;
-                            local_running = true;
-                            if let Some(m) = mgr.upgrade() {
-                                m.mark_turn(&sid, TurnState::Running, turn_seq);
-                            }
-                            if let Err(e) = process.send_prompt(&text).await {
-                                tracing::warn!("Kiro send_prompt failed for {}: {}", sid, e);
+                                turn_seq += 1;
+                                local_running = true;
+                                if let Some(m) = mgr.upgrade() {
+                                    m.mark_turn(&sid, TurnState::Running, turn_seq);
+                                }
+                                if let Err(e) = process.send_prompt(&text).await {
+                                    tracing::warn!("Kiro send_prompt failed for {}: {}", sid, e);
+                                }
+                            } else if local_running {
+                                pending.push(PendingPrompt { text, ts_ms: now_millis() });
+                                emit_queued(&event_tx, pending.len());
+                            } else if collect_deadline.is_some() {
+                                pending.push(PendingPrompt { text, ts_ms: now_millis() });
+                                collect_deadline = Some(Box::pin(tokio::time::sleep(
+                                    std::time::Duration::from_millis(COLLECT_DEBOUNCE_MS))));
+                                emit_queued(&event_tx, pending.len());
+                            } else {
+                                turn_seq += 1;
+                                local_running = true;
+                                if let Some(m) = mgr.upgrade() {
+                                    m.mark_turn(&sid, TurnState::Running, turn_seq);
+                                }
+                                if let Err(e) = process.send_prompt(&text).await {
+                                    tracing::warn!("Kiro send_prompt failed for {}: {}", sid, e);
+                                }
                             }
                         }
                         Some(SessionInput::Interrupt) => {
@@ -1840,6 +1964,10 @@ fn spawn_kiro_fanout(
                                     tracing::warn!("interrupt failed for {}: {}", sid, e);
                                 }
                             }
+                            // E5:无条件清队列 + 取消窗口
+                            pending.clear();
+                            collect_deadline = None;
+                            collect_hard_deadline = None;
                         }
                         Some(SessionInput::Cancel) => {
                             process.kill().await;
@@ -1849,6 +1977,29 @@ fn spawn_kiro_fanout(
                         // agent session — they only apply to PTY/tmux. Drop
                         // silently rather than mis-route into send_prompt.
                         _ => {}
+                    }
+                }
+                _ = async {
+                    match (collect_deadline.as_mut(), collect_hard_deadline.as_mut()) {
+                        (Some(d), Some(h)) => { tokio::select! { _ = d.as_mut() => {}, _ = h.as_mut() => {} } }
+                        (Some(d), None) => d.as_mut().await,
+                        (None, Some(h)) => h.as_mut().await,
+                        (None, None) => std::future::pending::<()>().await,
+                    }
+                }, if collect_deadline.is_some() => {
+                    collect_deadline = None;
+                    collect_hard_deadline = None;
+                    if !pending.is_empty() {
+                        let merged = merge_pending(&pending);
+                        pending.clear();
+                        turn_seq += 1;
+                        local_running = true;
+                        if let Some(m) = mgr.upgrade() {
+                            m.mark_turn(&sid, TurnState::Running, turn_seq);
+                        }
+                        if let Err(e) = process.send_prompt(&merged).await {
+                            tracing::warn!("collect flush send_prompt failed for {}: {}", sid, e);
+                        }
                     }
                 }
             }
@@ -1874,6 +2025,12 @@ fn spawn_codex_fanout(
         let mut turn_seq: u64 = 0;
         let mut local_running = false;
         let mut boundary_count: u64 = 0;
+        // ── collect 队列状态(镜像 spawn_acp_fanout;见那里的不变量注释) ──
+        let mut pending: Vec<PendingPrompt> = Vec::new();
+        let mut collect_deadline: Option<std::pin::Pin<Box<tokio::time::Sleep>>> = None;
+        let mut collect_hard_deadline: Option<std::pin::Pin<Box<tokio::time::Sleep>>> = None;
+        const COLLECT_DEBOUNCE_MS: u64 = 500;
+        const COLLECT_MAX_MS: u64 = 3000;
         loop {
             tokio::select! {
                 event = process.event_rx.recv() => {
@@ -1916,6 +2073,13 @@ fn spawn_codex_fanout(
                                 if let Some(m) = mgr.upgrade() {
                                     m.mark_turn(&sid, TurnState::Idle, boundary_count);
                                 }
+                                // collect:turn 结束(已 Idle)且有排队追加 → arm 收集窗口。
+                                if !local_running && !pending.is_empty() && collect_deadline.is_none() {
+                                    collect_deadline = Some(Box::pin(tokio::time::sleep(
+                                        std::time::Duration::from_millis(COLLECT_DEBOUNCE_MS))));
+                                    collect_hard_deadline = Some(Box::pin(tokio::time::sleep(
+                                        std::time::Duration::from_millis(COLLECT_MAX_MS))));
+                                }
                             }
                         }
                         None => break,
@@ -1923,19 +2087,42 @@ fn spawn_codex_fanout(
                 }
                 input = input_rx.recv() => {
                     match input {
-                        Some(SessionInput::Prompt { text, run_id: _ }) => {
-                            if local_running {
-                                if let Err(e) = process.interrupt().await {
-                                    tracing::warn!("interrupt before resend failed for {}: {}", sid, e);
+                        Some(SessionInput::Prompt { text, run_id }) => {
+                            if run_id.is_some() {
+                                // C3:调度 prompt 绕过 collect(codex 当前不跑调度,留此分支保持三 fanout 对称)
+                                pending.clear();
+                                collect_deadline = None;
+                                collect_hard_deadline = None;
+                                if local_running {
+                                    if let Err(e) = process.interrupt().await {
+                                        tracing::warn!("interrupt before resend failed for {}: {}", sid, e);
+                                    }
                                 }
-                            }
-                            turn_seq += 1;
-                            local_running = true;
-                            if let Some(m) = mgr.upgrade() {
-                                m.mark_turn(&sid, TurnState::Running, turn_seq);
-                            }
-                            if let Err(e) = process.send_prompt(&text).await {
-                                tracing::warn!("Codex send_prompt failed for {}: {}", sid, e);
+                                turn_seq += 1;
+                                local_running = true;
+                                if let Some(m) = mgr.upgrade() {
+                                    m.mark_turn(&sid, TurnState::Running, turn_seq);
+                                }
+                                if let Err(e) = process.send_prompt(&text).await {
+                                    tracing::warn!("Codex send_prompt failed for {}: {}", sid, e);
+                                }
+                            } else if local_running {
+                                pending.push(PendingPrompt { text, ts_ms: now_millis() });
+                                emit_queued(&event_tx, pending.len());
+                            } else if collect_deadline.is_some() {
+                                pending.push(PendingPrompt { text, ts_ms: now_millis() });
+                                collect_deadline = Some(Box::pin(tokio::time::sleep(
+                                    std::time::Duration::from_millis(COLLECT_DEBOUNCE_MS))));
+                                emit_queued(&event_tx, pending.len());
+                            } else {
+                                turn_seq += 1;
+                                local_running = true;
+                                if let Some(m) = mgr.upgrade() {
+                                    m.mark_turn(&sid, TurnState::Running, turn_seq);
+                                }
+                                if let Err(e) = process.send_prompt(&text).await {
+                                    tracing::warn!("Codex send_prompt failed for {}: {}", sid, e);
+                                }
                             }
                         }
                         Some(SessionInput::Interrupt) => {
@@ -1944,6 +2131,10 @@ fn spawn_codex_fanout(
                                     tracing::warn!("interrupt failed for {}: {}", sid, e);
                                 }
                             }
+                            // E5:无条件清队列 + 取消窗口
+                            pending.clear();
+                            collect_deadline = None;
+                            collect_hard_deadline = None;
                         }
                         Some(SessionInput::Cancel) => {
                             process.kill().await;
@@ -1952,6 +2143,29 @@ fn spawn_codex_fanout(
                         // See note in spawn_kiro_fanout: PTY-style inputs
                         // are silently dropped for MCP sessions.
                         _ => {}
+                    }
+                }
+                _ = async {
+                    match (collect_deadline.as_mut(), collect_hard_deadline.as_mut()) {
+                        (Some(d), Some(h)) => { tokio::select! { _ = d.as_mut() => {}, _ = h.as_mut() => {} } }
+                        (Some(d), None) => d.as_mut().await,
+                        (None, Some(h)) => h.as_mut().await,
+                        (None, None) => std::future::pending::<()>().await,
+                    }
+                }, if collect_deadline.is_some() => {
+                    collect_deadline = None;
+                    collect_hard_deadline = None;
+                    if !pending.is_empty() {
+                        let merged = merge_pending(&pending);
+                        pending.clear();
+                        turn_seq += 1;
+                        local_running = true;
+                        if let Some(m) = mgr.upgrade() {
+                            m.mark_turn(&sid, TurnState::Running, turn_seq);
+                        }
+                        if let Err(e) = process.send_prompt(&merged).await {
+                            tracing::warn!("collect flush send_prompt failed for {}: {}", sid, e);
+                        }
                     }
                 }
             }
@@ -2365,5 +2579,25 @@ mod turn_state_tests {
         assert_eq!(sanitize_title(long).unwrap().chars().count(), 16);
         assert_eq!(sanitize_title("   "), None);
         assert_eq!(sanitize_title(""), None);
+    }
+
+    #[test]
+    fn queued_event_serializes_to_ephemeral_contract() {
+        // Locks the cross-layer contract: ws_handler (E7 ephemeral skip) matches on
+        // type=="system" && subtype=="queued", and the frontend reads `count`.
+        // If serde tags drift, the scrollback skip silently breaks → phantom hints
+        // on reconnect. This test fails loudly if the wire shape changes.
+        let json = serde_json::to_string(&AcpEvent::System {
+            subtype: std::borrow::Cow::Borrowed("queued"),
+            session_id: None,
+            count: Some(3),
+        })
+        .unwrap();
+        let v: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(v.get("type").and_then(|t| t.as_str()), Some("system"));
+        assert_eq!(v.get("subtype").and_then(|s| s.as_str()), Some("queued"));
+        assert_eq!(v.get("count").and_then(|c| c.as_u64()), Some(3));
+        // session_id is None → skipped, so reconnect/init parsing stays clean.
+        assert!(v.get("session_id").is_none());
     }
 }

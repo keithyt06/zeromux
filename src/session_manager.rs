@@ -1331,6 +1331,14 @@ impl SessionManager {
             Some((pn, pd)) => {
                 if let Some(n) = pn {
                     let _ = self.store.update_name(id, &n);
+                    // 用户显式改名 → 锁定,auto-titler 不再覆盖(E12 保护)
+                    {
+                        let mut map = self.sessions.lock().unwrap();
+                        if let Some(s) = map.get_mut(id) {
+                            s.name_is_auto = false;
+                        }
+                    }
+                    let _ = self.store.update_name_is_auto(id, false);
                 }
                 if let Some(d) = pd {
                     let _ = self.store.update_description(id, &d);
@@ -2089,6 +2097,35 @@ mod decide_spawn_tests {
         // Name is the first title, not the second.
         let map = mgr.sessions.lock().unwrap();
         assert_eq!(map.get(&id).unwrap().name, "修复登录");
+    }
+
+    #[test]
+    fn user_rename_locks_name_is_auto() {
+        let (mgr, _dir) = test_manager();
+        let s = test_session(); // name_is_auto = true
+        let id = s.id.clone();
+        mgr.sessions.lock().unwrap().insert(id.clone(), s);
+
+        assert!(mgr.session_name_is_auto(&id));
+        // Rename with a name → locks
+        mgr.update_session_meta_named(&id, Some("我的名字".into()), None, None);
+        assert!(!mgr.session_name_is_auto(&id));
+    }
+
+    #[test]
+    fn description_only_update_does_not_lock_name_is_auto() {
+        let (mgr, _dir) = test_manager();
+        let s = test_session(); // name_is_auto = true
+        let id = s.id.clone();
+        mgr.sessions.lock().unwrap().insert(id.clone(), s);
+
+        assert!(mgr.session_name_is_auto(&id));
+        // Description-only update (name = None) → must NOT lock
+        mgr.update_session_meta_named(&id, None, Some("仅描述".into()), None);
+        assert!(
+            mgr.session_name_is_auto(&id),
+            "description-only update must not lock name_is_auto"
+        );
     }
 
     #[test]

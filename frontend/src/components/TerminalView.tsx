@@ -6,7 +6,7 @@ import { wsUrl, getSessionStatus } from '../lib/api'
 import type { SessionStatus } from '../lib/api'
 import type { Theme } from '../lib/theme'
 import { b64encode, b64decode } from '../lib/base64'
-import { GitBranch, Folder, Circle, Keyboard } from 'lucide-react'
+import { GitBranch, Folder, Circle } from 'lucide-react'
 import MobileKeyBar, { type BarKey } from './MobileKeyBar'
 import Composer from './Composer'
 import { arrowSequence, rowHeight, linesFromDrag, bracketedPaste, submitSequence, controlSequence, launchSequence, type ArrowKey } from '../lib/terminalInput'
@@ -80,8 +80,10 @@ export default function TerminalView({ sessionId, active, theme }: Props) {
       (typeof matchMedia !== 'undefined' && matchMedia('(any-pointer: coarse)').matches) ||
       (typeof navigator !== 'undefined' && navigator.maxTouchPoints > 0)
   )
-  const [composerOpen, setComposerOpen] = useState(false)
   const [composerText, setComposerText] = useState('')
+  // 软键盘是否弹起：仅触摸端用 VisualViewport 判断（见下方 effect）。
+  // 弹起时隐藏底部状态栏，把空间让给常驻 composer + 终端。
+  const [keyboardOpen, setKeyboardOpen] = useState(false)
 
   // Fetch status
   useEffect(() => {
@@ -322,13 +324,13 @@ export default function TerminalView({ sessionId, active, theme }: Props) {
     return () => window.removeEventListener('resize', handleResize)
   }, [handleResize])
 
-  // 键条 / composer 占用高度，改变终端可用区；渲染后重新 fit，
-  // 避免底部行被遮 / canvas 尺寸过期。composerOpen 切换也要重算。
+  // 键条 / composer / 状态栏占用高度，改变终端可用区；渲染后重新 fit，
+  // 避免底部行被遮 / canvas 尺寸过期。键盘弹起隐藏状态栏也会改变高度，需重算。
   useEffect(() => {
     if (!isTouch) return
     const t = setTimeout(handleResize, 50)
     return () => clearTimeout(t)
-  }, [isTouch, composerOpen, handleResize])
+  }, [isTouch, keyboardOpen, handleResize])
 
   // 软键盘遮挡补偿：仅触摸端 + active。用 VisualViewport 把容器底部内边距顶起
   // 键盘高度，使 composer 和终端区不被遮。只改 CSS（paddingBottom），不动
@@ -343,6 +345,8 @@ export default function TerminalView({ sessionId, active, theme }: Props) {
       const root = containerRef.current?.parentElement
       const overlap = Math.max(0, window.innerHeight - vv.height - vv.offsetTop)
       if (root) root.style.paddingBottom = `${overlap}px`
+      // overlap > 阈值 ≈ 软键盘弹起。阈值避开地址栏收合等小幅变化。
+      setKeyboardOpen(overlap > 120)
     }
     apply()
     vv.addEventListener('resize', apply)
@@ -352,38 +356,30 @@ export default function TerminalView({ sessionId, active, theme }: Props) {
       vv.removeEventListener('scroll', apply)
       const root = containerRef.current?.parentElement
       if (root) root.style.paddingBottom = ''
+      setKeyboardOpen(false)
     }
   }, [isTouch, active])
 
   return (
     <div className="flex flex-col h-full">
       <div ref={containerRef} className="xterm-container w-full flex-1 min-h-0" />
-      {isTouch && composerOpen && (
+      {/* 触摸端：方向/启动键栏在上，常驻输入框贴底（最靠近软键盘）。 */}
+      {isTouch && <MobileKeyBar onKey={handleBarKey} />}
+      {isTouch && (
         <div className="px-2 py-1.5 border-t border-[var(--border)] bg-[var(--bg-secondary)]">
           <Composer
             value={composerText}
             onChange={setComposerText}
             onSend={sendComposer}
             submitOnEnter={false}
-            placeholder="输入整段文字发送…（Enter 换行，点发送提交）"
+            placeholder="输入文字，点 ✈ 发送…"
           />
         </div>
       )}
-      {isTouch && (
-        <div className="flex items-stretch gap-1 px-2 pt-1.5 bg-[var(--bg-secondary)]">
-          <button
-            onPointerDown={(e) => { e.preventDefault(); setComposerOpen(v => !v) }}
-            aria-label="toggle-composer"
-            style={{ touchAction: 'manipulation' }}
-            className="flex items-center justify-center gap-1 px-3 py-1 rounded-md bg-[var(--bg-primary)] border border-[var(--border)] text-xs text-[var(--text-secondary)] active:text-[var(--text-primary)]"
-          >
-            <Keyboard size={14} />
-            {composerOpen ? '收起' : '打字'}
-          </button>
-        </div>
-      )}
-      {isTouch && <MobileKeyBar onKey={handleBarKey} />}
-      <div className="flex items-center gap-3 px-4 py-3 border-t border-[var(--border)] bg-[var(--bg-secondary)] min-h-[40px]">
+      {/* 状态栏：软键盘弹起时隐藏，把空间让给终端 + 常驻输入框。 */}
+      <div
+        className={`${isTouch && keyboardOpen ? 'hidden' : 'flex'} items-center gap-3 px-4 py-3 border-t border-[var(--border)] bg-[var(--bg-secondary)] min-h-[40px]`}
+      >
         {status ? (
           <>
             <div className="flex items-center gap-1.5 text-xs text-[var(--text-secondary)]">

@@ -32,18 +32,26 @@ Release profile is size-optimized (`opt-level = "z"`, `lto = true`, `strip = tru
 
 ## Deploying to the live server (zeromux.keithyu.cloud)
 
-**Always deploy with `./deploy.sh`. Never hand-run `systemctl stop` + `cp` + `systemctl start`.**
+**Always deploy with `./deploy.sh`. Never hand-run `systemctl stop` + `cp` + `systemctl start` — especially not from a zeromux terminal.**
 
-The live site runs from `/usr/local/bin/zeromux` under systemd unit `zeromux.service` (port 8090). Replacing it requires stopping the service first (the running process holds the binary open, so `cp` over it fails with "Text file busy"). The manual stop→cp→start sequence has repeatedly caused outages: a deploy interrupted *between* `stop` and `start` leaves the service `inactive` and the public URL returning **502**. This has happened multiple times.
+The live site runs from `/usr/local/bin/zeromux` under systemd unit `zeromux.service` (port 8090). Replacing it requires stopping the service first (the running process holds the binary open, so `cp` over it fails with "Text file busy").
 
-`./deploy.sh` makes the swap atomic and self-verifying — it does smoke-test → backup → stop → cp → start → curl health-check, and **auto-rolls-back** to the backup if the health check fails. It never leaves the service stopped.
+### The cgroup self-kill trap (the real cause of repeated 502s)
+
+The 502s were **not** just "someone forgot to run `start`". There is a deterministic trap: **zeromux spawns its PTY shells as child processes, so every terminal it hosts lives inside the `zeromux.service` cgroup.** The unit's `KillMode=control-group` means `systemctl stop zeromux` kills the **entire cgroup**.
+
+So if you run *any* deploy command (even `./deploy.sh`) **from a zeromux terminal** — which is the only terminal you have on a phone — the deploy process is itself in that cgroup. The instant it reaches `systemctl stop zeromux`, systemd kills the deploy process too, *before* it can `start` again. Service stays down → 502, and an auto-rollback can't save it because the rollback code was killed along with everything else. This is why it recurred every time and looked random.
+
+`./deploy.sh` now **escapes the cgroup automatically**: if it detects it is running inside `zeromux.service`'s cgroup, it re-runs the stop→cp→start→health-check→rollback step as a **transient systemd service** (`systemd-run --wait --pipe`), which PID 1 owns in its own cgroup under `system.slice`. `systemctl stop zeromux` can't reach it, so the swap always completes. (It must be a *service*, not `systemd-run --scope` — a scope stays attached to the launching session's cgroup and dies with it; this was verified empirically.) From SSH / code-server / CI (not in the zeromux cgroup) it swaps directly. Either way the swap is atomic, self-verifying, and auto-rolls-back — it never leaves the service stopped.
 
 ```bash
 ./deploy.sh            # reinstall the already-built target/release/zeromux, restart, verify
 ./deploy.sh --build    # build frontend + cargo release first, then deploy
 ```
 
-Recovery if found 502 / `inactive`: if the installed binary is already the intended one, `sudo systemctl start zeromux`; otherwise just run `./deploy.sh`. Do **not** switch the unit to `systemctl restart` (it keeps the OLD binary, since `cp` can't overwrite a running binary).
+The `--build` step runs as your normal user *before* the cgroup escape, so `npm`/`cargo` never run as root (no `node_modules`/`target` ownership pollution). Only the root-safe swap is detached.
+
+Recovery if found 502 / `inactive`: if the installed binary is already the intended one, `sudo systemctl start zeromux`; otherwise just run `./deploy.sh`. Do **not** switch the unit to `systemctl restart` (it keeps the OLD binary, since `cp` can't overwrite a running binary). And do **not** hand-run `systemctl stop` from a zeromux terminal — that is the trap above; you'll kill your own shell mid-command.
 
 ## Architecture
 

@@ -1690,6 +1690,70 @@ fn spawn_acp_fanout(
     });
 }
 
+/// Running 期间追加、等待合并的一条用户 prompt。
+#[allow(dead_code)] // 由 Task 6 collect 接入后消费
+#[derive(Debug, Clone)]
+struct PendingPrompt {
+    text: String,
+    ts_ms: i64,
+}
+
+/// 把 Running 期间排队的追加 prompt 合并成一条带语义头的文本。
+/// 语义头让模型明确这是"上一条处理期间的追加",而非独立新请求。
+#[allow(dead_code)] // 由 Task 6 collect 接入后消费
+fn merge_pending(items: &[PendingPrompt]) -> String {
+    use chrono::TimeZone;
+    let mut out = String::from("[以下是你处理上一条消息期间用户追加发送的内容,请一并处理]\n");
+    for p in items {
+        let hhmm = chrono_tz::Asia::Shanghai
+            .timestamp_millis_opt(p.ts_ms)
+            .single()
+            .map(|dt| dt.format("%H:%M").to_string())
+            .unwrap_or_else(|| "--:--".into());
+        out.push_str(&format!("[{}] {}\n", hhmm, p.text));
+    }
+    out
+}
+
+/// 判定一条 prompt 是否"实质"——值得用它生成会话标题。
+/// 规则:trim 后,含空白(多词/含说明)即实质;否则要求字符数 >= 6。
+/// 挡掉 hi/ls/继续/y/q/ok 这类单 token 短命令开场(评审 P1)。
+#[allow(dead_code)] // 由 Task 6 collect 接入后消费
+fn is_substantive_prompt(text: &str) -> bool {
+    let t = text.trim();
+    if t.is_empty() {
+        return false;
+    }
+    if t.chars().any(|c| c.is_whitespace()) {
+        return true;
+    }
+    t.chars().count() >= 6
+}
+
+/// 清洗 LLM 返回的标题:取第一行、去引号/常见前缀、按字符截断 16、空→None。
+#[allow(dead_code)] // 由 Task 6 collect 接入后消费
+fn sanitize_title(raw: &str) -> Option<String> {
+    let first_line = raw.lines().next().unwrap_or("").trim();
+    let stripped = first_line
+        .strip_prefix("标题：")
+        .or_else(|| first_line.strip_prefix("标题:"))
+        .or_else(|| first_line.strip_prefix("Title:"))
+        .or_else(|| first_line.strip_prefix("title:"))
+        .unwrap_or(first_line)
+        .trim();
+    let quotes: &[char] = &['"', '\'', '\u{201c}', '\u{201d}', '\u{2018}', '\u{2019}', '\u{300c}', '\u{300d}', '\u{300e}', '\u{300f}', '`'];
+    let unquoted = stripped.trim_matches(|c| quotes.contains(&c)).trim();
+    if unquoted.is_empty() {
+        return None;
+    }
+    let truncated: String = unquoted.chars().take(16).collect();
+    if truncated.trim().is_empty() {
+        None
+    } else {
+        Some(truncated)
+    }
+}
+
 fn spawn_kiro_fanout(
     sid: String,
     mut process: KiroProcess,
@@ -2265,5 +2329,41 @@ mod turn_state_tests {
         assert_eq!(s.name, "renamed");
         assert_eq!(pn.as_deref(), Some("renamed"));
         assert_eq!(pd, None);
+    }
+
+    #[test]
+    fn merge_pending_formats_with_header_and_timestamps() {
+        let items = vec![
+            PendingPrompt { text: "先看安全".into(), ts_ms: 1_700_000_000_000 },
+            PendingPrompt { text: "重点 SQL 注入".into(), ts_ms: 1_700_000_060_000 },
+        ];
+        let out = merge_pending(&items);
+        assert!(out.starts_with("[以下是你处理上一条消息期间用户追加发送的内容"));
+        assert!(out.contains("先看安全"));
+        assert!(out.contains("重点 SQL 注入"));
+        assert!(out.find("先看安全").unwrap() < out.find("重点 SQL 注入").unwrap());
+        assert!(out.matches('[').count() >= 3); // header + 2 timestamps
+    }
+
+    #[test]
+    fn is_substantive_prompt_filters_trivial_openers() {
+        for t in ["hi", "ls", "继续", "y", "q", "  ", "ok"] {
+            assert!(!is_substantive_prompt(t), "expected non-substantive: {:?}", t);
+        }
+        for t in ["帮我 review 这段代码", "fix the auth bug", "解释一下这个函数的作用"] {
+            assert!(is_substantive_prompt(t), "expected substantive: {:?}", t);
+        }
+    }
+
+    #[test]
+    fn sanitize_title_cleans_and_truncates() {
+        assert_eq!(sanitize_title("  修复登录 bug  "), Some("修复登录 bug".to_string()));
+        assert_eq!(sanitize_title("\"带引号标题\""), Some("带引号标题".to_string()));
+        assert_eq!(sanitize_title("标题：配置中心重构"), Some("配置中心重构".to_string()));
+        assert_eq!(sanitize_title("第一行\n第二行"), Some("第一行".to_string()));
+        let long = "一二三四五六七八九十一二三四五六七八";
+        assert_eq!(sanitize_title(long).unwrap().chars().count(), 16);
+        assert_eq!(sanitize_title("   "), None);
+        assert_eq!(sanitize_title(""), None);
     }
 }

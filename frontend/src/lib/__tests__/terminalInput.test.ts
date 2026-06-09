@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest'
-import { arrowSequence, rowHeight, linesFromDrag, bracketedPaste, submitSequence, controlSequence } from '../terminalInput'
+import { arrowSequence, rowHeight, linesFromDrag, bracketedPaste, submitSequence, controlSequence, launchSequence } from '../terminalInput'
 
 describe('arrowSequence', () => {
   it('普通光标键模式用 CSI（\\x1b[）', () => {
@@ -80,10 +80,13 @@ describe('submitSequence', () => {
 })
 
 describe('controlSequence', () => {
-  it('esc → ESC 字节', () => { expect(controlSequence('esc')).toBe('\x1b') })
   it('ctrl-c → ETX (0x03)', () => { expect(controlSequence('ctrl-c')).toBe('\x03') })
-  it('y / n → 字面字符', () => {
-    expect(controlSequence('y')).toBe('y')
-    expect(controlSequence('n')).toBe('n')
+})
+
+describe('launchSequence', () => {
+  it('agent 别名 + 回车，直接在当前 shell 启动', () => {
+    expect(launchSequence('claude')).toBe('claude\r')
+    expect(launchSequence('codex')).toBe('codex\r')
+    expect(launchSequence('kiro')).toBe('kiro\r')
   })
 })

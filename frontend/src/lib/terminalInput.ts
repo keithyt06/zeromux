@@ -65,15 +65,20 @@ export function submitSequence(bracketedPasteMode: boolean): string {
 }
 
 // 单键 / 控制键 → 直发字节。与方向键分开：这些走 MobileKeyBar，不经 composer。
-export type ControlKey = 'esc' | 'ctrl-c' | 'y' | 'n'
+export type ControlKey = 'ctrl-c'
 
 const CONTROL: Record<ControlKey, string> = {
-  esc: '\x1b',
   'ctrl-c': '\x03',
-  y: 'y',
-  n: 'n',
 }
 
 export function controlSequence(key: ControlKey): string {
   return CONTROL[key]
+}
+
+// agent CLI 一键启动 → 发别名 + 回车，在当前 shell 立即运行。
+// 别名（claude/codex/kiro）已在用户 shell 配置为最高权限，不带参数。
+export type AgentKey = 'claude' | 'codex' | 'kiro'
+
+export function launchSequence(agent: AgentKey): string {
+  return `${agent}\r`
 }

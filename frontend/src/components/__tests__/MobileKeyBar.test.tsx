@@ -3,10 +3,17 @@ import { describe, it, expect, vi } from 'vitest'
 import MobileKeyBar from '../MobileKeyBar'
 
 describe('MobileKeyBar', () => {
-  it('渲染方向键/Enter + 控制键', () => {
+  it('渲染 ↑↓ + ^C + 三个 agent 启动键', () => {
     render(<MobileKeyBar onKey={() => {}} />)
-    for (const k of ['left', 'up', 'down', 'right', 'enter', 'esc', 'ctrl-c', 'y', 'n']) {
+    for (const k of ['up', 'down', 'ctrl-c', 'claude', 'codex', 'kiro']) {
       expect(screen.getByLabelText(k)).toBeInTheDocument()
+    }
+  })
+
+  it('不再渲染已删除的键', () => {
+    render(<MobileKeyBar onKey={() => {}} />)
+    for (const k of ['esc', 'left', 'right', 'enter', 'y', 'n']) {
+      expect(screen.queryByLabelText(k)).toBeNull()
     }
   })
 
@@ -15,11 +22,9 @@ describe('MobileKeyBar', () => {
     render(<MobileKeyBar onKey={onKey} />)
     fireEvent.pointerDown(screen.getByLabelText('up'))
     expect(onKey).toHaveBeenCalledWith('up')
-    fireEvent.pointerDown(screen.getByLabelText('enter'))
-    expect(onKey).toHaveBeenCalledWith('enter')
-    fireEvent.pointerDown(screen.getByLabelText('esc'))
-    expect(onKey).toHaveBeenCalledWith('esc')
     fireEvent.pointerDown(screen.getByLabelText('ctrl-c'))
     expect(onKey).toHaveBeenCalledWith('ctrl-c')
+    fireEvent.pointerDown(screen.getByLabelText('claude'))
+    expect(onKey).toHaveBeenCalledWith('claude')
   })
 })

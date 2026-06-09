@@ -1,22 +1,22 @@
-import { ArrowUp, ArrowDown, ArrowLeft, ArrowRight, CornerDownLeft, type LucideIcon } from 'lucide-react'
-import type { ArrowKey, ControlKey } from '../lib/terminalInput'
+import { ArrowUp, ArrowDown, type LucideIcon } from 'lucide-react'
+import type { AgentKey } from '../lib/terminalInput'
 
-export type BarKey = ArrowKey | ControlKey
+export type BarKey = 'up' | 'down' | 'ctrl-c' | AgentKey
 
-// 方向键/Enter 用图标；控制键用文字标签。aria-label 用逻辑键名，便于测试与无障碍。
-const ARROW_KEYS: { key: ArrowKey; Icon: LucideIcon }[] = [
-  { key: 'left', Icon: ArrowLeft },
+// 方向键用图标；^C 与 agent 启动键用文字标签。aria-label 用逻辑键名，便于测试与无障碍。
+const ARROW_KEYS: { key: 'up' | 'down'; Icon: LucideIcon }[] = [
   { key: 'up', Icon: ArrowUp },
   { key: 'down', Icon: ArrowDown },
-  { key: 'right', Icon: ArrowRight },
-  { key: 'enter', Icon: CornerDownLeft },
 ]
 
-const CONTROL_KEYS: { key: ControlKey; label: string }[] = [
-  { key: 'esc', label: 'Esc' },
+const CONTROL_KEYS: { key: 'ctrl-c'; label: string }[] = [
   { key: 'ctrl-c', label: '^C' },
-  { key: 'y', label: 'y' },
-  { key: 'n', label: 'n' },
+]
+
+const AGENT_KEYS: { key: AgentKey; label: string }[] = [
+  { key: 'claude', label: 'claude' },
+  { key: 'codex', label: 'codex' },
+  { key: 'kiro', label: 'kiro' },
 ]
 
 export default function MobileKeyBar({ onKey }: { onKey: (key: BarKey) => void }) {
@@ -36,7 +36,7 @@ export default function MobileKeyBar({ onKey }: { onKey: (key: BarKey) => void }
           <Icon size={18} />
         </button>
       ))}
-      {CONTROL_KEYS.map(({ key, label }) => (
+      {[...CONTROL_KEYS, ...AGENT_KEYS].map(({ key, label }) => (
         <button
           key={key}
           aria-label={key}

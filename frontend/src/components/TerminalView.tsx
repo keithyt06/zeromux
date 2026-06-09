@@ -9,7 +9,7 @@ import { b64encode, b64decode } from '../lib/base64'
 import { GitBranch, Folder, Circle, Keyboard } from 'lucide-react'
 import MobileKeyBar, { type BarKey } from './MobileKeyBar'
 import Composer from './Composer'
-import { arrowSequence, rowHeight, linesFromDrag, bracketedPaste, submitSequence, controlSequence, type ArrowKey } from '../lib/terminalInput'
+import { arrowSequence, rowHeight, linesFromDrag, bracketedPaste, submitSequence, controlSequence, launchSequence, type ArrowKey } from '../lib/terminalInput'
 
 const FONT_SIZE = 14
 
@@ -113,8 +113,10 @@ export default function TerminalView({ sessionId, active, theme }: Props) {
     const term = termRef.current
     if (!term) return
     term.scrollToBottom()
-    if (key === 'esc' || key === 'ctrl-c' || key === 'y' || key === 'n') {
+    if (key === 'ctrl-c') {
       sendInput(controlSequence(key))
+    } else if (key === 'claude' || key === 'codex' || key === 'kiro') {
+      sendInput(launchSequence(key))
     } else {
       sendInput(arrowSequence(key as ArrowKey, term.modes.applicationCursorKeysMode))
     }

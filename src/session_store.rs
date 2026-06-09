@@ -21,6 +21,7 @@ pub struct PersistedSession {
     pub worktree_path: Option<String>,
     pub created_ms: i64,
     pub source_task_id: Option<String>,
+    pub name_is_auto: bool,   // true=占位名/可自动命名; false=用户已锁定
 }
 
 pub struct SessionStore {
@@ -52,6 +53,8 @@ impl SessionStore {
         .map_err(|e| format!("Failed to create sessions table: {}", e))?;
         // Best-effort migration for older DBs (ignores duplicate-column error).
         let _ = conn.execute("ALTER TABLE sessions ADD COLUMN source_task_id TEXT", []);
+        // name_is_auto: 1 = 占位名/可自动命名; 0 = 用户已锁定。旧行默认 1。
+        let _ = conn.execute("ALTER TABLE sessions ADD COLUMN name_is_auto INTEGER NOT NULL DEFAULT 1", []);
         Ok(Self { conn: Mutex::new(conn) })
     }
 
@@ -62,13 +65,14 @@ impl SessionStore {
         };
         let conn = self.conn.lock().unwrap();
         conn.execute(
-            "INSERT INTO sessions (id,name,type,work_dir,owner_id,description,resume_kind,resume_value,worktree_path,created_ms,source_task_id)
-             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11)
+            "INSERT INTO sessions (id,name,type,work_dir,owner_id,description,resume_kind,resume_value,worktree_path,created_ms,source_task_id,name_is_auto)
+             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12)
              ON CONFLICT(id) DO UPDATE SET
                name=?2, type=?3, work_dir=?4, owner_id=?5, description=?6,
-               resume_kind=?7, resume_value=?8, worktree_path=?9",
+               resume_kind=?7, resume_value=?8, worktree_path=?9, name_is_auto=?12",
             params![s.id, s.name, s.session_type.to_string(), s.work_dir, s.owner_id,
-                    s.description, rk, rv, s.worktree_path, s.created_ms, s.source_task_id],
+                    s.description, rk, rv, s.worktree_path, s.created_ms, s.source_task_id,
+                    s.name_is_auto as i64],
         )
         .map_err(|e| format!("upsert failed: {}", e))?;
         Ok(())
@@ -93,6 +97,14 @@ impl SessionStore {
         Ok(())
     }
 
+    pub fn update_name_is_auto(&self, id: &str, is_auto: bool) -> Result<(), String> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute("UPDATE sessions SET name_is_auto=?2 WHERE id=?1",
+                     params![id, is_auto as i64])
+            .map_err(|e| format!("update_name_is_auto failed: {}", e))?;
+        Ok(())
+    }
+
     pub fn update_description(&self, id: &str, description: &str) -> Result<(), String> {
         let conn = self.conn.lock().unwrap();
         conn.execute("UPDATE sessions SET description=?2 WHERE id=?1", params![id, description])
@@ -110,7 +122,7 @@ impl SessionStore {
     pub fn load_all(&self) -> Result<Vec<PersistedSession>, String> {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(
-            "SELECT id,name,type,work_dir,owner_id,description,resume_kind,resume_value,worktree_path,created_ms,source_task_id FROM sessions")
+            "SELECT id,name,type,work_dir,owner_id,description,resume_kind,resume_value,worktree_path,created_ms,source_task_id,name_is_auto FROM sessions")
             .map_err(|e| format!("prepare failed: {}", e))?;
         let rows = stmt.query_map([], |row| {
             let type_str: String = row.get(2)?;
@@ -131,6 +143,7 @@ impl SessionStore {
                 worktree_path: row.get(8)?,
                 created_ms: row.get(9)?,
                 source_task_id: row.get(10)?,
+                name_is_auto: row.get::<_, i64>(11)? != 0,
             })
         }).map_err(|e| format!("query failed: {}", e))?;
         let mut out = Vec::new();
@@ -156,6 +169,7 @@ mod tests {
             work_dir: "/w".into(), owner_id: "u".into(), description: "d".into(),
             resume_token: token, worktree_path: Some("/wt".into()), created_ms: 1000,
             source_task_id: None,
+            name_is_auto: true,
         }
     }
 

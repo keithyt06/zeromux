@@ -155,6 +155,9 @@ pub struct Session {
     pub work_dir: String,
     pub owner_id: String,
     pub description: String,
+    /// true = 名字是占位名/自动命名,可被 auto-titler 覆盖;
+    /// false = 用户已手动改名(或已自动命名一次),永不再自动命名。
+    pub name_is_auto: bool,
     pub status: SessionMeta,
     resume_token: Option<ResumeToken>,
     /// Git worktree path for ACP sessions (cleaned up on delete)
@@ -513,6 +516,7 @@ impl SessionManager {
             worktree_path: s.worktree_path.as_ref().map(|p| p.to_string_lossy().to_string()),
             created_ms: s.created_ms,
             source_task_id: s.source_task_id.clone(),
+            name_is_auto: s.name_is_auto,
         };
         if let Err(e) = self.store.upsert(&pj) {
             tracing::warn!("persist session {} failed: {}", s.id, e);
@@ -629,6 +633,7 @@ impl SessionManager {
             work_dir: effective_dir,
             owner_id: owner_id.to_string(),
             description: String::new(),
+            name_is_auto: true,
             status: SessionMeta::Running,
             resume_token: tmux_target.map(|t| ResumeToken::Tmux(t.to_string())),
             worktree_path: None,
@@ -734,6 +739,7 @@ impl SessionManager {
             work_dir: effective_dir.to_string_lossy().to_string(),
             owner_id: owner_id.to_string(),
             description: String::new(),
+            name_is_auto: true,
             status: SessionMeta::Running,
             resume_token: None,
             worktree_path,
@@ -920,6 +926,7 @@ impl SessionManager {
             work_dir: effective_dir.to_string_lossy().to_string(),
             owner_id: owner_id.to_string(),
             description: String::new(),
+            name_is_auto: true,
             status: SessionMeta::Running,
             resume_token: None,
             worktree_path,
@@ -1021,6 +1028,7 @@ impl SessionManager {
             work_dir: effective_dir.to_string_lossy().to_string(),
             owner_id: owner_id.to_string(),
             description: String::new(),
+            name_is_auto: true,
             status: SessionMeta::Running,
             resume_token: None,
             worktree_path,
@@ -1376,6 +1384,7 @@ impl SessionManager {
                     work_dir: p.work_dir,
                     owner_id: p.owner_id,
                     description: p.description,
+                    name_is_auto: p.name_is_auto,
                     status: SessionMeta::Idle,
                     resume_token: p.resume_token,
                     worktree_path: p.worktree_path.map(std::path::PathBuf::from),
@@ -1919,6 +1928,7 @@ mod decide_spawn_tests {
             work_dir: "/tmp".into(),
             owner_id: "o".into(),
             description: String::new(),
+            name_is_auto: true,
             status: SessionMeta::Idle,
             resume_token: None,
             worktree_path: None,
@@ -2052,6 +2062,7 @@ mod turn_state_tests {
             session_type: SessionType::Claude,
             cols: 80, rows: 24, work_dir: "/tmp".into(),
             owner_id: "u".into(), description: String::new(),
+            name_is_auto: true,
             status: SessionMeta::Running,
             resume_token: None, worktree_path: None, created_ms: 0,
             source_task_id: None,

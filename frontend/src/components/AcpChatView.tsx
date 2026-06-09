@@ -49,6 +49,7 @@ interface ServerEvent {
   code?: number
   streaming?: boolean
   summary?: string
+  count?: number
 }
 
 interface Props {
@@ -64,6 +65,9 @@ export default function AcpChatView({ sessionId, agentType = 'claude' }: Props) 
   const [messages, setMessages] = useState<ChatMessage[]>([])
   const [input, setInput] = useState('')
   const [busy, setBusy] = useState(false)
+  // collect:本轮进行中追加排队的条数(后端 ephemeral System{subtype:"queued"})。
+  // 合并 turn 发出(下一个 Running)或 turn 结束时清零。
+  const [queuedCount, setQueuedCount] = useState(0)
   const [turnStartedMs, setTurnStartedMs] = useState<number | null>(null)
   const [nowMs, setNowMs] = useState(() => Date.now())
   const wsRef = useRef<WebSocket | null>(null)
@@ -149,6 +153,11 @@ export default function AcpChatView({ sessionId, agentType = 'claude' }: Props) 
   const handleEvent = useCallback((evt: ServerEvent) => {
     switch (evt.type) {
       case 'system': {
+        // collect:排队提示是 ephemeral 状态行,不进消息气泡列表。
+        if (evt.subtype === 'queued') {
+          setQueuedCount(evt.count ?? 0)
+          break
+        }
         const labelMap: Record<string, string> = {
           init: 'session ready',
           resume_failed: '⚠ 上下文恢复失败，已重置为新会话',
@@ -166,6 +175,11 @@ export default function AcpChatView({ sessionId, agentType = 'claude' }: Props) 
           const msg: AssistantMsg = { id: newId(), kind: 'assistant', blocks: [], complete: false }
           currentAssistant.current = msg
           setMessages(prev => [...prev, msg])
+          // A brand-new assistant turn is starting. If a collect batch was queued,
+          // this is the merged turn beginning to produce output → clear the hint.
+          // (Mid-turn streaming keeps currentAssistant non-null, so this never
+          // erases the hint while the prior turn is still running.)
+          setQueuedCount(0)
         }
         const activeId = currentAssistant.current.id
         setMessages(prev => prev.map(m => {
@@ -265,6 +279,9 @@ export default function AcpChatView({ sessionId, agentType = 'claude' }: Props) 
         currentAssistant.current = null
         setBusy(false)
         setTurnStartedMs(null)
+        // Reconnect replay finished — clear any stale queued hint (backend also
+        // makes the queued event ephemeral; this is the frontend safety net).
+        setQueuedCount(0)
         break
       }
     }
@@ -297,6 +314,8 @@ export default function AcpChatView({ sessionId, agentType = 'claude' }: Props) 
     if (wsRef.current?.readyState === WebSocket.OPEN) {
       wsRef.current.send(JSON.stringify({ type: 'interrupt' }))
     }
+    // Backend clears the pending collect queue on interrupt (E5); mirror locally.
+    setQueuedCount(0)
   }, [])
 
   return (
@@ -313,6 +332,11 @@ export default function AcpChatView({ sessionId, agentType = 'claude' }: Props) 
             {transcribe.error
               ? <span className="text-[var(--accent-red)]">⚠ {transcribe.error}</span>
               : transcribe.partial}
+          </div>
+        )}
+        {queuedCount > 0 && (
+          <div className="px-2 pb-1 text-xs text-[var(--text-muted)]">
+            已排队 {queuedCount} 条，本轮结束后合并发送
           </div>
         )}
         {busy && (

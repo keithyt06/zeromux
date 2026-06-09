@@ -1,5 +1,11 @@
 # 消息队列 collect + auto-titler 实现计划
 
+> **实现进度(2026-06-09 code review 后更新):**
+> - ✅ **Task 1–4 已合并**:`name_is_auto` 持久化、用户改名锁定、`set_auto_title`/`session_name_is_auto`/`titler_cli_for` 访问器、三个纯函数(`merge_pending`/`is_substantive_prompt`/`sanitize_title`)含单测。
+> - ✅ **Task 6/7/9/10 已实现(collect 全功能)**:三个 fanout 接入排队+防抖(500ms)+硬上限(3000ms)+第三 select 臂 flush;`run_id` prompt 绕行(C3);Interrupt 无条件清队列(E5);`queued` 事件 ephemeral(E7,ws_handler 跳过 scrollback);前端「已排队 N 条」提示。
+>   - **评审修订(E-collect-window)**:原计划在"入队时(Running 期间)"arm 防抖窗口——但 turn 通常远长于 500ms,窗口会在 turn 进行中到期、把合并 prompt flush 进一个未结束的 turn(等于乱序强打断,正是 collect 要消灭的)。已改为**仅在 turn 结束(翻 Idle)后才 arm 窗口**,不变量:两个 deadline 仅在 `!local_running && !pending.is_empty()` 时为 Some。新增 `queued_event_serializes_to_ephemeral_contract` 测试锁住跨层 JSON 契约。
+> - ⏸ **Task 5/8 已延后(auto-titler)**:`auto_titler.rs` + 三后端(Claude NDJSON / Kiro JSON-RPC / Codex MCP-notification)沙箱无工具 spawn。spec 自标 C2 高复杂度;三套 wire protocol 的 Result 提取需 live agent CLI 端到端验证,当前环境无法验证,作为独立已验证 PR 落地。titler 的纯函数/访问器(`sanitize_title`/`set_auto_title`/`session_name_is_auto`/`titler_cli_for`/`name_is_auto`)已作为地基保留。
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** 给 zeromux agent 会话加两个能力——(1) collect:turn 进行中的追加 prompt 排队、turn 结束后合并发一条;(2) auto-titler:首条实质 prompt 后用沙箱无工具 LLM 调用生成中文标题写回会话名。

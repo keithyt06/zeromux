@@ -51,6 +51,10 @@ pub enum SessionType {
     Codex,
 }
 
+/// 自动命名器后端：决定 auto-titler 调用哪个 CLI。
+#[derive(Debug, Clone, Copy)]
+pub enum TitlerBackend { Claude, Kiro, Codex }
+
 impl std::fmt::Display for SessionType {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
@@ -1337,6 +1341,47 @@ impl SessionManager {
         }
     }
 
+    /// 只读:该会话名字当前是否仍可被自动命名覆盖。
+    pub fn session_name_is_auto(&self, id: &str) -> bool {
+        self.sessions.lock().unwrap()
+            .get(id)
+            .map(|s| s.name_is_auto)
+            .unwrap_or(false)
+    }
+
+    /// auto-titler 写回标题:仅当仍为 auto 时写入,写入后锁定(E12:一生只一次)。
+    /// 返回 true 表示实际写入。与用户改名路径解耦——不复用 update_session_meta_named。
+    pub fn set_auto_title(&self, id: &str, title: &str) -> bool {
+        let wrote = {
+            let mut map = self.sessions.lock().unwrap();
+            match map.get_mut(id) {
+                Some(s) if s.name_is_auto => {
+                    s.name = title.to_string();
+                    s.name_is_auto = false; // E12:命名后锁定,重启/resume 不再 re-title
+                    true
+                }
+                _ => false,
+            }
+        };
+        if wrote {
+            let _ = self.store.update_name(id, title);
+            let _ = self.store.update_name_is_auto(id, false);
+            // 名字变化经现有 SessionInfo 下发机制自动广播给客户端
+        }
+        wrote
+    }
+
+    /// 给 auto-titler 解析它该用哪个后端 + CLI 路径(跟随会话 agent)。
+    /// 返回 None 表示该会话类型不支持自动命名(如 tmux)。
+    pub fn titler_cli_for(&self, agent_label: &str) -> Option<(TitlerBackend, String)> {
+        match agent_label {
+            "claude-code" => Some((TitlerBackend::Claude, self.claude_path.clone())),
+            "kiro" => Some((TitlerBackend::Kiro, self.kiro_path.clone())),
+            "codex" => Some((TitlerBackend::Codex, self.codex_path.clone())),
+            _ => None,
+        }
+    }
+
     /// Set a session's resume token, persisting only if it actually changed.
     /// Used by fan-out tasks (Task 6/7) to record cross-process resume context.
     pub fn set_resume_token(&self, id: &str, token: ResumeToken) {
@@ -2024,6 +2069,26 @@ mod decide_spawn_tests {
 
         let map = mgr.sessions.lock().unwrap();
         assert!(!map.get("sid").unwrap().spawning, "armed guard must reset spawning on drop");
+    }
+
+    #[test]
+    fn set_auto_title_writes_once_then_locks() {
+        let (mgr, _dir) = test_manager();
+        // One session, name "claude-1", name_is_auto = true (test_session default).
+        let mut s = test_session();
+        s.name = "claude-1".into();
+        let id = s.id.clone();
+        mgr.sessions.lock().unwrap().insert(id.clone(), s);
+
+        assert!(mgr.session_name_is_auto(&id));
+        // First call: writes and locks.
+        assert!(mgr.set_auto_title(&id, "修复登录"));
+        assert!(!mgr.session_name_is_auto(&id)); // E12: locked after naming
+        // Second call: already locked, refuses.
+        assert!(!mgr.set_auto_title(&id, "另一个名字"));
+        // Name is the first title, not the second.
+        let map = mgr.sessions.lock().unwrap();
+        assert_eq!(map.get(&id).unwrap().name, "修复登录");
     }
 
     #[test]

@@ -1,5 +1,6 @@
 // Output-side density filter (spec G2b). concise = mobile triage: show signal
-// (text, errors, tool "what" summary), collapse noise (thinking, raw tool input).
+// (text, tool_result, tool "what" summary), collapse noise (thinking, raw tool input).
+// Agent errors surface separately as Notice bubbles, not Blocks, so they always show.
 // Lossless: nothing is dropped from the underlying data — collapsedCount drives a
 // visible "+N · 展开" placeholder so users never think the agent skipped steps (P2).
 import type { Block } from './transcript'

@@ -1,9 +1,8 @@
 import { useState, useEffect, useRef, useCallback, memo, createElement } from 'react'
-import { wsUrl } from '../lib/api'
+import { wsUrl, uploadSessionFile } from '../lib/api'
 import { ChevronDown, Wrench, Brain, AlertCircle, FileText, Terminal, Search, Bot, Paperclip, X, type LucideIcon } from 'lucide-react'
 import MarkdownContent from './markdown/MarkdownContent'
 import Composer from './Composer'
-import { uploadSessionFile } from '../lib/api'
 import { buildPromptWithAttachments } from '../lib/attachments'
 import { MicButton } from './MicButton'
 import { useTranscribe } from '../lib/transcribe'
@@ -395,9 +394,9 @@ export default function AcpChatView({ sessionId, agentType = 'claude' }: Props) 
         {(pending.length > 0 || uploading > 0) && (
           <div className="flex flex-wrap gap-1.5 px-1 pb-1.5">
             {pending.map(p => (
-              <span key={p} className="inline-flex items-center gap-1 text-xs bg-[var(--bg-primary)] border border-[var(--border)] rounded px-2 py-1 text-[var(--text-primary)]">
-                {p}
-                <button onClick={() => removePending(p)} aria-label={`remove ${p}`} className="text-[var(--text-muted)] hover:text-[var(--text-primary)]">
+              <span key={p} className="inline-flex items-center gap-1 max-w-[160px] text-xs bg-[var(--bg-primary)] border border-[var(--border)] rounded px-2 py-1 text-[var(--text-primary)]">
+                <span className="truncate">{p.split('/').pop()}</span>
+                <button onClick={() => removePending(p)} aria-label={`remove ${p}`} className="shrink-0 text-[var(--text-muted)] hover:text-[var(--text-primary)]">
                   <X size={12} />
                 </button>
               </span>

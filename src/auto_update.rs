@@ -5,7 +5,10 @@
 
 use std::io::Read;
 use std::path::{Path, PathBuf};
+use std::sync::Weak;
+use std::time::Instant;
 use crate::session_manager::RunningSummary;
+use crate::session_manager::SessionManager;
 
 /// 自动更新配置。字段来自受信启动 flag(运维提供,非用户输入),
 /// 故可安全插值进 swap 脚本(评审 E8 插值安全说明)。
@@ -89,6 +92,132 @@ exit 1
         health = cfg.health_url,
         built = cfg.watch_path.display(),
     )
+}
+
+/// 启动后台 watcher。仅当 --watch-build 提供时由 main 调用。
+pub fn spawn_auto_updater(cfg: AutoUpdateConfig, mgr: Weak<SessionManager>) {
+    tokio::spawn(async move {
+        // 自身 baseline:读 /proc/self/exe 指向的真实文件(即使 installed 被替换,
+        // 仍指向正在执行的 inode)。算一次即可。
+        let self_sha = match sha256_file(std::path::Path::new("/proc/self/exe")) {
+            Ok(s) => s,
+            Err(e) => {
+                tracing::warn!("auto-update: cannot hash /proc/self/exe: {e}; disabling");
+                return;
+            }
+        };
+        tracing::info!(
+            "auto-update enabled, watching {}, self-sha={}",
+            cfg.watch_path.display(),
+            &self_sha[..8.min(self_sha.len())]
+        );
+
+        let mut tick = tokio::time::interval(std::time::Duration::from_secs(cfg.poll_secs));
+        // sha 稳定门(E5):上一轮算出的 watch sha;连续两轮相同才认稳定。
+        let mut last_seen_sha: Option<String> = None;
+        // 进入「待升级」的时刻(单调钟);None = 当前不在待升级。
+        let mut pending_since: Option<Instant> = None;
+        // 上一轮 stat 的 (mtime, size),用于跳过未变文件。
+        let mut last_stat: Option<(std::time::SystemTime, u64)> = None;
+        // swap 经 launch_swap().await 内联等待,单任务循环天然无法在 swap 中途重入;
+        // 若进程从失败 swap 存活,下一轮 tick 经 pending_since 从头重新评估。
+
+        loop {
+            tick.tick().await;
+
+            // 1. stat:未变则跳过哈希
+            let meta = match std::fs::metadata(&cfg.watch_path) {
+                Ok(m) => m,
+                Err(_) => { tracing::debug!("auto-update: watch_path stat failed, skip"); continue; }
+            };
+            let stat = (meta.modified().unwrap_or(std::time::UNIX_EPOCH), meta.len());
+            if last_stat == Some(stat) {
+                continue; // 文件未变
+            }
+            last_stat = Some(stat);
+
+            // 2. 算 sha
+            let sha = match sha256_file(&cfg.watch_path) {
+                Ok(s) => s,
+                Err(_) => { continue; }
+            };
+
+            // 3. sha 稳定门(E5):连续两轮相同才算写完
+            if last_seen_sha.as_deref() != Some(sha.as_str()) {
+                tracing::info!("auto-update: build sha changed, waiting for stable (anti half-write)");
+                last_seen_sha = Some(sha);
+                continue;
+            }
+
+            // 4/5. 与 self 比
+            if sha == self_sha {
+                if pending_since.is_some() {
+                    tracing::info!("auto-update: build sha == self, clearing pending");
+                }
+                pending_since = None;
+                continue;
+            }
+            // 进入/保持 pending
+            if pending_since.is_none() {
+                pending_since = Some(Instant::now());
+                tracing::info!("auto-update: new build sha={} (self={}), entering pending",
+                    &sha[..8.min(sha.len())], &self_sha[..8.min(self_sha.len())]);
+            }
+
+            // 6. gate
+            let Some(m) = mgr.upgrade() else {
+                tracing::warn!("auto-update: SessionManager gone, disabling");
+                return;
+            };
+            let summary = m.running_summary();
+            let waited = pending_since.map(|t| t.elapsed().as_secs()).unwrap_or(0);
+            match gate_decision(summary, waited, cfg.max_wait_secs) {
+                GateDecision::BlockedByScheduled => {
+                    tracing::info!("auto-update: pending blocked by scheduled run(s), max_wait NOT applied");
+                    continue;
+                }
+                GateDecision::WaitInteractive => {
+                    tracing::info!("auto-update: pending, interactive={} scheduled={}, waiting",
+                        summary.interactive, summary.scheduled);
+                    continue;
+                }
+                GateDecision::Upgrade => {
+                    // E6: stop 前先冒烟新 binary
+                    let smoke = std::process::Command::new(&cfg.watch_path)
+                        .arg("--help")
+                        .stdout(std::process::Stdio::null())
+                        .stderr(std::process::Stdio::null())
+                        .status();
+                    if !matches!(smoke, Ok(st) if st.success()) {
+                        tracing::warn!("auto-update: new build failed --help smoke, skipping swap (no service disruption)");
+                        // 清 pending:坏 build 不会自己变好;运维替换文件(stat 变)才重新触发。
+                        pending_since = None;
+                        continue;
+                    }
+                    tracing::info!("auto-update: upgradeable, launching swap via systemd-run");
+                    let script = render_swap_script(&cfg);
+                    launch_swap(&script).await;
+                    // 到这里通常本进程已被 systemctl stop;若 systemd-run 返回了(swap 失败
+                    // 但服务被 rollback 拉起),下一轮 tick 从头重试。
+                }
+            }
+        }
+    });
+}
+
+/// 经 detached systemd-run 跑 swap 脚本(cgroup 逃逸,评审 A/E8)。
+async fn launch_swap(script: &str) {
+    let unit = format!("zeromux-selfupdate-{}", std::process::id());
+    let res = tokio::process::Command::new("sudo")
+        .args(["systemd-run", "--wait", "--pipe", "--collect", "--quiet"])
+        .arg(format!("--unit={unit}"))
+        .args(["/bin/bash", "-c", script])
+        .status()
+        .await;
+    match res {
+        Ok(st) => tracing::info!("auto-update: swap systemd-run exited: {st}"),
+        Err(e) => tracing::warn!("auto-update: swap systemd-run failed to launch: {e}"),
+    }
 }
 
 #[cfg(test)]

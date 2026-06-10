@@ -4,8 +4,20 @@
 //! docs/superpowers/specs/2026-06-10-background-auto-update-design.md。
 
 use std::io::Read;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use crate::session_manager::RunningSummary;
+
+/// 自动更新配置。字段来自受信启动 flag(运维提供,非用户输入),
+/// 故可安全插值进 swap 脚本(评审 E8 插值安全说明)。
+#[derive(Debug, Clone)]
+pub struct AutoUpdateConfig {
+    pub watch_path: PathBuf,     // --watch-build
+    pub installed_path: PathBuf, // /usr/local/bin/zeromux(或 /proc/self/exe 解析)
+    pub service_name: String,    // "zeromux"
+    pub health_url: String,      // http://127.0.0.1:<port>/
+    pub max_wait_secs: u64,      // --auto-update-max-wait
+    pub poll_secs: u64,          // 固定 30
+}
 
 /// 算文件的 SHA256 十六进制串。读不到 → Err(放弃本轮,不崩)。
 fn sha256_file(path: &Path) -> std::io::Result<String> {
@@ -45,6 +57,38 @@ fn gate_decision(summary: RunningSummary, waited_secs: u64, max_wait_secs: u64) 
     } else {
         GateDecision::WaitInteractive
     }
+}
+
+/// 渲染内嵌 swap 脚本(评审 E3 backup 轮转 + 复刻 deploy.sh do_swap)。
+/// 经 `bash -c` 内联传入,不落临时文件(评审 E8)。
+fn render_swap_script(cfg: &AutoUpdateConfig) -> String {
+    format!(
+        r#"set -euo pipefail
+SERVICE="{service}"
+INSTALLED="{installed}"
+HEALTH="{health}"
+BUILT="{built}"
+backup="${{INSTALLED}}.bak-$(date +%Y%m%d-%H%M%S)"
+cp "$INSTALLED" "$backup"
+ls -1t "${{INSTALLED}}".bak-* 2>/dev/null | tail -n +4 | xargs -r rm -f
+systemctl stop "$SERVICE"
+cp "$BUILT" "$INSTALLED"
+systemctl start "$SERVICE"
+for _ in $(seq 1 10); do
+  code="$(curl -s -o /dev/null -w '%{{http_code}}' "$HEALTH" || true)"
+  [ "$code" = "200" ] && exit 0
+  sleep 1
+done
+systemctl stop "$SERVICE"
+cp "$backup" "$INSTALLED"
+systemctl start "$SERVICE"
+exit 1
+"#,
+        service = cfg.service_name,
+        installed = cfg.installed_path.display(),
+        health = cfg.health_url,
+        built = cfg.watch_path.display(),
+    )
 }
 
 #[cfg(test)]
@@ -103,5 +147,28 @@ mod tests {
     #[test]
     fn sha256_missing_file_is_err() {
         assert!(sha256_file(Path::new("/nonexistent/zmx/xyz")).is_err());
+    }
+
+    #[test]
+    fn swap_script_interpolates_and_has_rotation() {
+        let cfg = AutoUpdateConfig {
+            watch_path: "/home/ubuntu/rel/zeromux".into(),
+            installed_path: "/usr/local/bin/zeromux".into(),
+            service_name: "zeromux".into(),
+            health_url: "http://127.0.0.1:8090/".into(),
+            max_wait_secs: 600,
+            poll_secs: 30,
+        };
+        let s = render_swap_script(&cfg);
+        assert!(s.contains("SERVICE=\"zeromux\""));
+        assert!(s.contains("INSTALLED=\"/usr/local/bin/zeromux\""));
+        assert!(s.contains("HEALTH=\"http://127.0.0.1:8090/\""));
+        assert!(s.contains("BUILT=\"/home/ubuntu/rel/zeromux\""));
+        // E3: backup 轮转(保留最近 3 个)
+        assert!(s.contains("tail -n +4"), "must keep only newest 3 backups");
+        // rollback 路径存在
+        assert!(s.contains("cp \"$backup\" \"$INSTALLED\""));
+        // health-check 重试循环
+        assert!(s.contains("seq 1 10"));
     }
 }

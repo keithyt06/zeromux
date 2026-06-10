@@ -7,6 +7,7 @@ import { buildPromptWithAttachments } from '../lib/attachments'
 import { MicButton } from './MicButton'
 import { useTranscribe } from '../lib/transcribe'
 import { foldTranscript, type WireEvent, type Block, type TurnGroup } from '../lib/transcript'
+import { partitionBlocks, type Density } from '../lib/density'
 
 // ── Message types ──
 
@@ -76,6 +77,17 @@ export default function AcpChatView({ sessionId, agentType = 'claude', onRegiste
   const [queuedCount, setQueuedCount] = useState(0)
   const [turnStartedMs, setTurnStartedMs] = useState<number | null>(null)
   const [nowMs, setNowMs] = useState(() => Date.now())
+  // 输出密度(G2b/P2):concise(默认)折叠思考+原始工具输入;full 全显。
+  const [density, setDensity] = useState<Density>('concise')
+  // 首次精简提示:一次性、可关。localStorage 跨会话只显示一次。
+  const [showDensityHint, setShowDensityHint] = useState(
+    () => typeof localStorage !== 'undefined' && localStorage.getItem('zeromux:density-hint') == null
+  )
+  const dismissDensityHint = useCallback(() => {
+    setShowDensityHint(false)
+    try { localStorage.setItem('zeromux:density-hint', '1') } catch { /* ignore */ }
+  }, [])
+  const expandDensity = useCallback(() => setDensity('full'), [])
   const wsRef = useRef<WebSocket | null>(null)
   const scrollRef = useRef<HTMLDivElement>(null)
 
@@ -318,11 +330,22 @@ export default function AcpChatView({ sessionId, agentType = 'claude', onRegiste
   return (
     <div className="flex flex-col h-full">
       <div ref={scrollRef} className="flex-1 overflow-y-auto px-5 py-4 space-y-4">
+        {showDensityHint && (
+          <div className="flex items-center gap-2 text-[11px] text-[var(--text-muted)] bg-[var(--bg-secondary)] border border-[var(--border)] rounded px-2 py-1">
+            <span className="flex-1">已为你精简显示，可切完整</span>
+            <button onClick={dismissDensityHint} aria-label="dismiss hint"
+              className="shrink-0 text-[var(--text-muted)] hover:text-[var(--text-primary)]">
+              <X size={12} />
+            </button>
+          </div>
+        )}
         {groups.map(g => (
           <TurnGroupView
             key={g.turnId}
             group={g}
             agentName={agentType === 'kiro' ? 'Kiro' : agentType === 'codex' ? 'Codex' : 'Claude'}
+            density={density}
+            onExpand={expandDensity}
           />
         ))}
         {notices.map(n => <NoticeBubble key={n.id} notice={n} />)}
@@ -419,7 +442,10 @@ export default function AcpChatView({ sessionId, agentType = 'claude', onRegiste
 // collect-merged turn has N userPrompts (P1) → N "You" bubbles, then one
 // assistant section. A turn with no blocks yet (prompt sent, nothing streamed)
 // renders just the user bubble(s).
-function TurnGroupViewImpl({ group, agentName = 'Claude' }: { group: TurnGroup; agentName?: string }) {
+function TurnGroupViewImpl({ group, agentName = 'Claude', density = 'concise', onExpand }: {
+  group: TurnGroup; agentName?: string; density?: Density; onExpand?: () => void
+}) {
+  const { visible, collapsedCount } = partitionBlocks(group.blocks, density)
   return (
     <div className="space-y-4">
       {group.userPrompts.map((p, i) => (
@@ -431,7 +457,13 @@ function TurnGroupViewImpl({ group, agentName = 'Claude' }: { group: TurnGroup; 
       {group.blocks.length > 0 && (
         <div className="space-y-2">
           <p className="text-[11px] font-semibold text-[var(--accent-purple)] mb-0.5">{agentName}</p>
-          {group.blocks.map((b, i) => <BlockView key={i} block={b} isComplete={group.complete} />)}
+          {visible.map((b, i) => <BlockView key={i} block={b} isComplete={group.complete} />)}
+          {collapsedCount > 0 && (
+            <button onClick={onExpand}
+              className="text-[11px] text-[var(--text-muted)] hover:text-[var(--accent-blue)] border border-[var(--border)] rounded px-2 py-0.5 transition-colors">
+              +{collapsedCount} 条思考/工具 · 展开
+            </button>
+          )}
           {group.cost != null && (
             <p className="text-[10px] text-[var(--text-muted)] border-t border-[var(--border-light)] pt-1 mt-1">
               cost: ${group.cost.toFixed(4)}
@@ -445,7 +477,11 @@ function TurnGroupViewImpl({ group, agentName = 'Claude' }: { group: TurnGroup; 
 
 const TurnGroupView = memo(
   TurnGroupViewImpl,
-  (prev, next) => prev.group === next.group && prev.agentName === next.agentName
+  (prev, next) =>
+    prev.group === next.group &&
+    prev.agentName === next.agentName &&
+    prev.density === next.density &&
+    prev.onExpand === next.onExpand
 )
 
 function NoticeBubble({ notice }: { notice: Notice }) {

@@ -1625,11 +1625,7 @@ fn spawn_acp_fanout(
         // 不变量:两个 deadline 仅在 `!local_running && !pending.is_empty()` 时为 Some。
         // 入队只在 turn 进行中(Running)发生;flush 窗口只在 turn 结束(Idle)后 arm,
         // 因此合并 prompt 永不在一个进行中的 turn 里发出(否则会变成 mid-turn 强打断)。
-        let mut pending: Vec<PendingPrompt> = Vec::new();
-        let mut collect_deadline: Option<std::pin::Pin<Box<tokio::time::Sleep>>> = None;
-        let mut collect_hard_deadline: Option<std::pin::Pin<Box<tokio::time::Sleep>>> = None;
-        const COLLECT_DEBOUNCE_MS: u64 = 500; // 防抖:窗口内新 prompt 重置
-        const COLLECT_MAX_MS: u64 = 3000;     // 硬上限:首条入队起最多等这么久必 flush(E3)
+        let mut queue = PromptQueue::new();
         loop {
             tokio::select! {
                 event = process.event_rx.recv() => {
@@ -1686,11 +1682,8 @@ fn spawn_acp_fanout(
                                 }
                                 // collect:turn 真正结束(已翻 Idle)且有排队的追加 →
                                 // arm 收集窗口。只在这里 arm,保证 flush 永不发生在进行中的 turn 里。
-                                if !local_running && !pending.is_empty() && collect_deadline.is_none() {
-                                    collect_deadline = Some(Box::pin(tokio::time::sleep(
-                                        std::time::Duration::from_millis(COLLECT_DEBOUNCE_MS))));
-                                    collect_hard_deadline = Some(Box::pin(tokio::time::sleep(
-                                        std::time::Duration::from_millis(COLLECT_MAX_MS))));
+                                if !local_running {
+                                    queue.arm();
                                 }
                                 // auto-titler:首条实质 prompt 的首个 Result 触发一次性命名。
                                 // first_substantive_prompt 仅在普通(非 run_id)turn 记录,故调度
@@ -1726,9 +1719,7 @@ fn spawn_acp_fanout(
                                 // 待合并队列+窗口,保证调度 turn 不被用户闲聊追加污染,且收集
                                 // 窗口不会在调度 turn 进行中 flush(verdict 不会 finalize 在混入
                                 // 对话的合并 turn 上)。
-                                pending.clear();
-                                collect_deadline = None;
-                                collect_hard_deadline = None;
+                                queue.clear();
                                 active_run_id = run_id.clone();
                                 if local_running {
                                     if let Err(e) = process.interrupt().await {
@@ -1745,14 +1736,13 @@ fn spawn_acp_fanout(
                                 }
                             } else if local_running {
                                 // turn 进行中:入队,不打断(collect 核心)。窗口在 turn 结束后才 arm。
-                                pending.push(PendingPrompt { text, ts_ms: now_millis() });
-                                emit_queued(&event_tx, pending.len());
-                            } else if collect_deadline.is_some() {
+                                queue.enqueue(text);
+                                emit_queued(&event_tx, queue.pending.len());
+                            } else if queue.debounce.is_some() {
                                 // 收集窗口开着(已 Idle,等 flush):继续入队 + 重置防抖,硬上限保持。
-                                pending.push(PendingPrompt { text, ts_ms: now_millis() });
-                                collect_deadline = Some(Box::pin(tokio::time::sleep(
-                                    std::time::Duration::from_millis(COLLECT_DEBOUNCE_MS))));
-                                emit_queued(&event_tx, pending.len());
+                                queue.enqueue(text);
+                                queue.bump_debounce();
+                                emit_queued(&event_tx, queue.pending.len());
                             } else {
                                 // 真正空闲:立即发送(原行为)
                                 // auto-titler:记录首条实质 prompt(P1:跳过 hi/ls/继续 等开场)
@@ -1779,9 +1769,7 @@ fn spawn_acp_fanout(
                             }
                             // E5:无条件清队列 + 取消窗口。用户中断意图含"别发那批排队的了",
                             // 即使 turn 已结束、窗口正等 flush(local_running==false)也要清。
-                            pending.clear();
-                            collect_deadline = None;
-                            collect_hard_deadline = None;
+                            queue.clear();
                         }
                         Some(SessionInput::Cancel) => {
                             process.kill().await;
@@ -1793,19 +1781,17 @@ fn spawn_acp_fanout(
                 // collect flush:收集窗口(防抖 OR 硬上限,取较早者)到期 → 合并发一条。
                 // 两个 deadline 在 turn 结束时一并 arm,故同 Some 同 None;只在 Idle 时触发。
                 _ = async {
-                    match (collect_deadline.as_mut(), collect_hard_deadline.as_mut()) {
+                    match (queue.debounce.as_mut(), queue.hard_cap.as_mut()) {
                         (Some(d), Some(h)) => { tokio::select! { _ = d.as_mut() => {}, _ = h.as_mut() => {} } }
                         (Some(d), None) => d.as_mut().await,
                         (None, Some(h)) => h.as_mut().await,
                         (None, None) => std::future::pending::<()>().await,
                     }
-                }, if collect_deadline.is_some() => {
-                    collect_deadline = None;
-                    collect_hard_deadline = None;
-                    if !pending.is_empty() {
-                        tracing::info!("collect[{}]: flushing {} queued prompt(s) as one merged turn", sid, pending.len());
-                        let merged = merge_pending(&pending);
-                        pending.clear();
+                }, if queue.debounce.is_some() => {
+                    queue.disarm();
+                    if !queue.pending.is_empty() {
+                        tracing::info!("collect[{}]: flushing {} queued prompt(s) as one merged turn", sid, queue.pending.len());
+                        let merged = queue.drain_merged();
                         active_run_id = None; // 合并 turn 永不携带 run_id(C3)
                         turn_seq += 1;
                         local_running = true;

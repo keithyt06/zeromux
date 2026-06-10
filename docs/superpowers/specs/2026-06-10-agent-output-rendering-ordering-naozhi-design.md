@@ -55,46 +55,59 @@
 
 ### 后端（`src/acp/process.rs`, `src/session_manager.rs`）
 
-1. `AcpEvent` 新增变体：
+> **CTO 评审修正（D2 + 外部 codex 评审 T2）**：当前 scrollback 写入在**每个 WS 连接的事件循环里**（`ws_handler.rs:143`），多设备连同一会话会重复存储事件 → 重连回放双影。`UserPrompt` 走同一路径会被多写。**本次把 scrollback 写入从 per-连接移到 fan-out 任务内部写一次**，fan-out 是进程唯一所有者（核心不变量）。
+> **关键（T2）**：写入必须**无条件**，与 `event_tx.send` 是否成功**解耦**——`broadcast::send` 在零订阅者时返回 `Err`，若把写档绑在 send 成功上，断开所有设备期间（手机锁屏后台跑 agent）的输出会丢。顺序：先 `push_scrollback(...)`，再 `let _ = event_tx.send(...)`（忽略零订阅者 Err）。`ws_handler.rs:143` 的 `push_scrollback` 删除。（`session_manager.rs:1248` 的 resume_failed 一次性写入是特例，保留。）
+> **集中持久化点（codex 评审）**：为避免「每个 send site 都要判断事件是否 durable」（queued 是 ephemeral、user_prompt 要持久化、resume_failed 是特例），引入一个**单一 emit/persist helper**：`fn emit(event_tx, scrollback, evt)`，内部决定 durable 与否（ephemeral 集合：`System{queued}`），所有 fan-out 经它发事件。三个 fan-out 不再各自调 `event_tx.send` + `push_scrollback`。
+
+#### turn_id —— 发收对齐的真正基础（外部 codex 评审 T1，最重要）
+
+> **原设计缺陷**：spec 原假设「事件到达顺序 = 真相」。但**边流式边发**场景下不成立：用户在 assistant 仍在流式输出时发一条，入队即 emit 会把 `user_prompt` 插进上一个 assistant turn 的 ContentBlock 中间。重连回放得到 `[assistant块][assistant块][user_prompt][assistant块]` —— prompt 被插进上一个回答里。**这正是用户报告的「上下错位」症状**，raw 交织顺序无法表达「哪条 prompt 对应哪个回答」。
+
+- **每个事件带 `turn_id`**（`UserPrompt` 和所有 assistant `ContentBlock`/`Result`）。后端已有 `turn_seq`（`mark_turn`）可复用为 turn 标识。
+- 用户 prompt 携带它**所属/触发的 turn** 标识；assistant 输出携带**它属于哪个 turn**。
+- **前端按 turn_id 分组渲染**，而非信任原始事件交织顺序。同一 turn 的 user prompt(s) + assistant 输出归为一组，跨 turn 按 turn_id 排序。
+- 这样「边流边发」时，新 prompt 归入它自己的（下一个）turn 分组，不会插进上一个回答中间。
+
+1. `AcpEvent` 新增变体 + 现有变体加 `turn_id`：
    ```rust
-   /// 用户 prompt 回显。fan-out 在实际把 prompt 送入 CLI 的那一刻 emit，
-   /// 用于持久化到 scrollback，保证重连回放时用户气泡与回复对齐。
-   /// collect 合并后只在 flush 那条 emit 一次（修掉 N→1 错位）。
+   /// 用户 prompt 回显。每条用户 prompt 入队即 emit 一个（collect 合并成一个
+   /// turn 时仍 N 个事件，见 P1）。turn_id 标识它触发/归属的 turn，前端据此分组。
    UserPrompt {
-       text: String,
-       /// 发起客户端的乐观气泡 id；同一客户端收到后据此去重，
-       /// 其他设备 / 重连回放时为 None 或不匹配 → 正常 push 气泡。
+       text: String,        // 进 scrollback 前按单条上限截断（T3，见下）
+       turn_id: u64,        // = 该 prompt 归属的 turn_seq
        #[serde(skip_serializing_if = "Option::is_none")]
-       client_id: Option<String>,
+       client_id: Option<String>,  // 乐观气泡去重
    },
+   // ContentBlock / Result 增加 turn_id: u64 字段
    ```
-   序列化为 `{"type":"user_prompt", "text":..., "client_id":...}`。
+   序列化 `{"type":"user_prompt","text":...,"turn_id":N,"client_id":...}`。
 
-2. fan-out 为**每一条用户 prompt** emit 一个 `UserPrompt` 事件（PM 评审 P1 决定）：
-   - 三个 agent 后端的 `SessionInput::Prompt` 处理点（`session_manager.rs` 约 1727 / 2004 / 2171，对应 Claude / Codex / Kiro fan-out）。
-   - **emit 时机 = 入队那一刻**（每条都 emit），而非 flush 合并那一刻。即使 collect 把 N 条合并成一个 turn，转录里仍忠实保留 N 个 `UserPrompt` 事件。
-   - **理由（P1）**：若只在 flush emit 一条合并 prompt，会出现「发送时 N 个气泡、重连后 1 个合并气泡」的新错位——恰好是本设计要消灭的问题的另一种形态。每条各自 emit 保证发送与重连一致；turn 合并只影响 agent 实际收到的 prompt，不改变转录事实。
-   - `interrupt` / `passthrough`：同样每条送出时 emit。
+2. fan-out 为**每一条用户 prompt** emit 一个 `UserPrompt`（P1）：
+   - 三个 `SessionInput::Prompt` 处理点（`session_manager.rs` 1727 / 2004 / 2158 对应 Claude / Kiro / Codex）。**注意：collect 三处已是近重复，按 G2a 先抽象再改。**
+   - emit 时机 = 入队那一刻；turn_id 取该 prompt 将归属的 turn_seq。collect 合并成一个 turn 时，N 条 UserPrompt 共享同一 turn_id（它们确实合并进了同一个 agent turn），但仍是 N 个事件 → 前端同组显示 N 个用户气泡 + 1 个回答，发送与重连一致。
+   - `interrupt` / `passthrough`：每条送出时 emit，各自 turn_id。
 
-3. 该事件走正常 `event_tx` → 自动进 scrollback。**与 queued 事件相反**（queued 是 ephemeral 被 `ws_handler.rs:124-144` 排除持久化），`user_prompt` **要持久化**，无需特判。
+3. **T3 安全/保留**：`UserPrompt.text` 进 scrollback 前加**单条字节上限**（如 64KB），超出截断并标记 `[已截断 N 字节]`。防一条大粘贴冲爆 2MB scrollback。**不做** redaction（密钥扫描，太重、误报风险，记 P3 TODO）。仓库「不存密钥」铁律：scrollback 是内存环形缓冲、不落盘（除非 `--log-dir`），文档需提示用户调试日志慎开。
 
-4. `client_id` 透传：`SessionInput::Prompt` 需携带可选 `client_id`（来自 ws `ClientMsg::Prompt`），fan-out emit 时原样带回。
+4. `client_id` 透传：`SessionInput::Prompt` 加可选 `client_id`（来自 ws `ClientMsg::Prompt`），emit 时带回。
 
 ### 前端（`AcpChatView.tsx`, ws ClientMsg）
 
-5. `sendPrompt` 仍乐观插入用户气泡，气泡 `id` 即 `clientMsgId`；ws `prompt` 消息带上 `client_id: clientMsgId`。
+5. `sendPrompt` 仍乐观插入用户气泡，气泡 `id` = `clientMsgId`；ws `prompt` 带 `client_id`。
 
-6. 新增 `case 'user_prompt'`：
-   - 若本地 `messages` 已存在该 `client_id` 的用户气泡 → 跳过（去重，本机乐观插入已显示）。
-   - 否则（别的设备发的 / 重连回放）→ push 一条用户气泡，顺序由事件流决定。
+6. 新增 `case 'user_prompt'`：本地已存在该 `client_id` 气泡 → 跳过去重；否则按 turn_id 分组插入。
 
-7. 重连 `setMessages([])` 后只信任回放事件流 → 用户气泡随 `user_prompt` 事件按正确顺序回填 → 发/收对齐，多设备一致。
+7. **消息列表改为按 turn_id 分组的结构**，而非纯 append 数组。重连 `setMessages([])` 后按回放事件的 turn_id 重建分组 → 发/收对齐，多设备一致，边流边发不插中间。
 
 ### 验收
 
-- **后端单测**：collect 合并 N 条 → 只 emit 1 条 `UserPrompt`（合并文本）。
-- **前端单测**：给定回放事件序列 `[user_prompt(c1), content_block, result, user_prompt(c2), ...]`，断言消息数组顺序为 `user→assistant→user→...`；带本地乐观气泡 `c1` 时收到 `user_prompt(c1)` 不重复插入。
-- **手测**：重连后历史完整、用户气泡与回复上下对齐；第二设备能看到对方发的 prompt。
+- **后端单测**：collect 合并 N 条 → 仍 emit N 条 `UserPrompt`，共享同一 turn_id（P1 + T1）。
+- **后端单测（T2 CRITICAL 回归）**：无订阅者时 fan-out emit → scrollback 仍写入（不依赖 send 成功）。
+- **后端单测（D2 CRITICAL 回归）**：两个 subscribe() 模拟双连接 → scrollback 仍 N 条（非 2N）。
+- **后端单测（T3）**：超长 UserPrompt → scrollback 中被截断 + 标记。
+- **前端单测（T1 CRITICAL）**：边流边发序列 `[ContentBlock(t1), ContentBlock(t1), UserPrompt(t2), ContentBlock(t1)]` → 按 turn 分组后 t1 的回答完整成组、t2 prompt 不插进 t1 中间。
+- **前端单测**：回放 `[user_prompt(c1,t1), content_block(t1), result(t1), user_prompt(c2,t2), ...]` → 顺序 `user→assistant→user`；本地乐观气泡 c1 收到 user_prompt(c1) 不重复。
+- **手测**：重连历史完整对齐；第二设备见对方 prompt；流式中发新消息不插进上一回答。
 
 ---
 
@@ -113,6 +126,8 @@
 `isComplete` 后用**原始 `text`**（不 sanitize），保证最终渲染 100% 准确。
 
 `MarkdownContent.tsx` 改动：`const rendered = isComplete ? deferredText : sanitizeStreamingMarkdown(deferredText)`，喂给 `<ReactMarkdown>`。
+
+> **CTO 评审（D3）— 已知性能债（本次不做，记为 P2 TODO）**：sanitize 修的是**正确性**（半截 markdown 不再误判），但不修**成本**：`MarkdownContent` 仍在每个 delta 对整条累加文本重新解析一次（O(n²)：一段 500 行输出流式 200 个 delta = 200 次对增长串的全解析）。短消息不疼，手机端长输出会可见卡顿，`useDeferredValue` 只缓解不消除。**根治方案 = block-freezing**（已闭合的 markdown block 冻结不再重解析，只 sanitize + 重解析末尾进行中的那一块，即 streamdown/marked-streaming 的做法）。本次保留小 diff，block-freezing 显式记为 P2 TODO，不静默丢。
 
 ### ② 重组件只在完成态渲染
 
@@ -139,12 +154,14 @@ sanitize 是**启发式**，只覆盖三类高频形态，不追求覆盖全部 
 
 ### 输入侧：collect 抽象为 per-session 可切策略
 
+> **CTO 评审修正（D1）— 前提纠错**：spec 原写「collect 是 Claude-only，扩展到 Codex/Kiro」。**这是错的**。读代码确认三个 fan-out 都已有一模一样的 collect 逻辑：`spawn_acp_fanout`（Claude，1727-1822）、`spawn_kiro_fanout`（2004-2082）、`spawn_codex_fanout`（2158-2240），均含 pending 队列 + 500ms 防抖（`COLLECT_DEBOUNCE_MS`）+ 3000ms 硬上限（`COLLECT_MAX_MS`）+ `merge_pending` + `emit_queued`。collect 早已全后端覆盖。**真正净新增的只有 `QueueMode` 可切策略**。
+
 **后端（`session_manager.rs`）**
 
-- 现有 Claude collect 逻辑抽象为 `QueueMode` 枚举：`Collect`（默认） / `Interrupt` / `Passthrough`。
-- 扩展到 Codex / Kiro 的 `SessionInput::Prompt` 分支，复用已验证的 collect 核心（pending 队列 + settle 防抖 + 硬上限）。
-- `Passthrough` 对 ACP 后端（Kiro）自动回退 `Collect`（与 naozhi 一致）。
-- 与 G3 合流：collect flush 那条就是 `UserPrompt` emit 点。
+- **先抽象再加策略（D1，Beck「make the change easy then make the easy change」）**：三个 fan-out 是 ~165 行的近重复。直接在三处各加 `QueueMode` 状态机 = 把状态机复制三份（违反 DRY）。**先把三个 fan-out 的 collect/队列循环抽成一个共享 helper**（输入分支处理 + flush + emit_queued 已经是逐字相同的），再在这一处实现 `QueueMode`。
+- `QueueMode` 枚举：`Collect`（默认，= 现有行为） / `Interrupt`（每条打断当前 turn） / `Passthrough`（每条独立转发）。
+- `Passthrough` 对 ACP 后端（Kiro）自动回退 `Collect`（与 naozhi 一致；ACP 无独立并发 turn 语义）。
+- 与 G3 合流：每条 prompt 入队即 emit `UserPrompt`（见 G3 P1 决定），与 QueueMode 无关。
 
 **控制面（克制）**
 
@@ -173,11 +190,58 @@ sanitize 是**启发式**，只覆盖三类高频形态，不追求覆盖全部 
 
 ---
 
-## 实现顺序与依赖
+## 实现顺序与依赖（CTO 评审后修订）
 
-1. **G3**（后端 `UserPrompt` 事件 + 前端去重回填）—— 先做，建立单一真相源。
-2. **G1**（前端 sanitize + mermaid 缓存）—— 独立，纯前端。
-3. **G2**（输入侧 QueueMode 抽象复用 G3 emit 点 + 输出侧 density）—— 最后，依赖 G3 的 emit 点。
+> **CTO + codex 评审后的关键修订**：先做集中 emit/persist helper 抽象，再在其上加 UserPrompt/turn_id，避免在三个重复 fan-out 上反复改（codex 指出原 G3-先-G2 顺序是 churn）。
+
+1. **G0 — 集中 emit/persist helper（D2 + T2 + codex）**：引入 `emit(event_tx, scrollback, evt)` 单一持久化点，无条件写 scrollback、与 send 解耦、内部判 ephemeral。三个 fan-out 改用它。删 `ws_handler.rs:143` 的 push_scrollback。**这一步同时修好多设备双写 + 无订阅者丢输出两个既有 bug。**
+2. **G2a — 抽象三个 fan-out 的 collect/队列共享 helper（D1）**：与 G0 相邻做（都在动这三处）。无行为变化，现有 collect 测试应全绿。
+3. **G3 — `turn_id` + `UserPrompt` 事件 + 前端按 turn 分组（T1 + P1 + T3）**：建立发收对齐。依赖 G0（持久化）+ G2a（单一改点）。前端消息结构改 turn 分组。
+4. **G1 — 前端 sanitize + mermaid 缓存**：独立，纯前端，可与后端并行。
+5. **G2b — 在共享 helper 加 `QueueMode` + 前端 density 精简**：依赖 G2a + G3。
+
+## 测试覆盖（CTO 评审 — 必须随实现一起写）
+
+```
+后端 (Rust #[cfg(test)])
+[+] emit/persist helper (G0, D2+T2)
+  ├── [GAP] 单 fan-out emit N 事件 → scrollback 恰好 N 条(非 2N)
+  ├── [GAP] [→集成] 两个 subscribe() 模拟双连接 → scrollback 仍 N 条(D2 回归,CRITICAL)
+  ├── [GAP] 无订阅者 emit → scrollback 仍写入(T2 回归,CRITICAL)
+  └── [GAP] System{queued} 不进 scrollback(ephemeral 仍被正确排除)
+[+] UserPrompt + turn_id emit (G3)
+  ├── [GAP] 每条 prompt 入队 → 一个 UserPrompt 事件(含 client_id + turn_id)
+  ├── [GAP] collect 合并 N 条成 1 turn → 仍 N 个 UserPrompt,共享同一 turn_id(P1+T1 回归,CRITICAL)
+  ├── [GAP] 超长 UserPrompt.text → scrollback 中截断+标记(T3)
+  └── [GAP] UserPrompt 进 scrollback(非 ephemeral)
+[+] QueueMode (G2b)
+  ├── [GAP] Collect = 现有行为(复用现有 collect 测试)
+  ├── [GAP] Interrupt 每条打断 turn
+  ├── [GAP] Passthrough 每条独立发送
+  └── [GAP] Passthrough 在 Kiro 回退 Collect
+[+] collect 共享 helper (G2a)
+  └── [★ 现有] merge_pending 测试已存在(2630);抽象后应不变
+
+前端 (vitest)
+[+] sanitize.ts (G1)
+  ├── [GAP] 未闭合 ``` → 补栅栏,后续正文不被吞
+  ├── [GAP] 半截表格行 → 降级纯文本
+  ├── [GAP] 未配对 $ → 补/回退字面量
+  └── [GAP] 完整 markdown → 原样返回(isComplete 不 sanitize)
+[+] mermaid 缓存 (G1)
+  ├── [GAP] key 用 fnv1a(code)
+  └── [GAP] 渲染失败态不写缓存
+[+] user_prompt + turn 分组 (G3)
+  ├── [GAP] 边流边发 [ContentBlock(t1),ContentBlock(t1),UserPrompt(t2),ContentBlock(t1)] → t1 回答成组,t2 不插中间(T1 CRITICAL)
+  ├── [GAP] 回放 [user_prompt(c1,t1),content_block(t1),result(t1),user_prompt(c2,t2)] → 顺序 user→assistant→user
+  └── [GAP] 本地乐观气泡 c1 + 收到 user_prompt(c1) → 不重复插入(去重)
+[+] density 精简 (G2b)
+  ├── [GAP] concise: thinking/raw-input 不渲染,text+工具一行摘要渲染
+  ├── [GAP] concise: 折叠处显示 "+N 条" 占位(非静默消失)
+  └── [GAP] full: 全部显示
+```
+
+**关键回归测试（IRON RULE）**：(1) 多设备 scrollback 不双写；(2) collect 合并后 UserPrompt 数 = 用户实际发送条数。两者都是「修一个错位时别引入另一个错位」的证明。
 
 每组各自有可验收的单测，分别提交。
 
@@ -199,3 +263,25 @@ sanitize 是**启发式**，只覆盖三类高频形态，不追求覆盖全部 
 - markdown sanitize 不追求覆盖全部语法，只收窄三类高频崩溃形态。
 - 不引入全局事件序号 / 时间戳排序（scrollback 事件流顺序即真相）。
 - **不做服务端对话持久化**（12 个月方向，见上；本次仅把 `UserPrompt` 设计成日后可重定向）。
+
+## 延迟事项（TODOS — CTO 评审surfaced）
+
+- **P2 — markdown block-freezing**（D3）：根治流式 O(n²) 重解析。冻结已闭合 block，只重解析末尾进行中块。手机端长输出卡顿的真正解法。本次 sanitize 只修正确性。
+- **P2 — scrollback durability**：当前 2MB `VecDeque` 从头淘汰，长会话重连丢开头。属 12 个月「服务端持久化转录」方向的一部分。G3 修短会话对齐，不修 durability。
+- **P3 — naozhi `/stop` `/urgent` 抢占动词、群聊 @mention 门控、IM 网关**：naozhi 有但 zeromux 本次不做（YAGNI，已有 interrupt-resend）。
+- **P3 — UserPrompt redaction（密钥扫描）**：T3 只做大小上限，不做密钥脱敏（误报风险）。若日后开 `--log-dir` 落盘需重新评估。
+
+## GSTACK REVIEW REPORT
+
+| Review | Trigger | Why | Runs | Status | Findings |
+|--------|---------|-----|------|--------|----------|
+| CEO Review | `/plan-ceo-review` | Scope & strategy | 1 | clean | 3 proposals (premise reframe + P1 + P2), guardrails folded |
+| Eng Review | `/plan-eng-review` | Architecture & tests (required) | 1 | clean | 4 issues (D1 collect-already-shipped, D2 scrollback double-write, D3 O(n²) perf, helper DRY) |
+| Codex Review | codex outside voice | Independent 2nd opinion | 1 | issues_found | 3 design-changing (T1 turn_id, T2 no-subscriber persist, T3 prompt size/secrets) + 1 doc contradiction |
+| Design Review | `/plan-design-review` | UI/UX gaps | 0 | — | concise-mode UX has trust guardrails (P2); full visual review optional |
+| DX Review | `/plan-devex-review` | Developer experience | 0 | — | n/a |
+
+- **CODEX:** caught a spec self-contradiction (N→1 vs N, fixed) and the single most important finding — emit-at-enqueue interleaves `user_prompt` into the prior streaming turn, so G3 needed `turn_id` grouping to actually fix 错位 rather than reshape it.
+- **CROSS-MODEL:** PM+CTO (Claude) and codex agreed the 3 bugs share one transcript-ownership root. Codex went deeper on ordering semantics (turn_id) and the broadcast/persistence coupling that the Claude passes under-specified. All 3 codex tensions accepted by user.
+- **UNRESOLVED:** 0. All decisions (D1-D4, P1-P2, T1-T3) resolved on recommended options.
+- **VERDICT:** CEO + ENG CLEARED, codex incorporated — ready for writing-plans. Implementation order revised to G0(helper)→G2a(collect abstract)→G3(turn_id)→G1→G2b.

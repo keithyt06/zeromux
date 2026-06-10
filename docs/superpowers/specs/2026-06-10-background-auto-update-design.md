@@ -31,11 +31,21 @@
 | 自动程度 | **全自动**(检测到新 build 即在空闲时自动 swap+restart,无人值守) |
 | 升级时机 | **等所有 agent 会话 Idle 再升级** + 硬上限兜底(默认 10min 强制) |
 | 检测机制 | `--watch-build <path>` 显式指定监视路径 + mtime→SHA256 轮询(默认不给 flag = 功能关闭) |
-| swap 机制 | **方案 A**:detached `systemd-run` 跑 swap(字节级复刻 deploy.sh `do_swap`,保留全部自愈/回滚能力) |
-| swap 脚本来源 | **binary 内嵌**(自包含,live binary 不依赖 repo/deploy.sh 存在;逻辑随版本走) |
+| swap 机制 | **方案 A**:detached `systemd-run` 跑 swap(复刻 deploy.sh `do_swap`,保留全部自愈/回滚能力) |
+| swap 脚本来源 | **binary 内嵌,经 `systemd-run bash -c '<内联脚本>'` 传入,不落临时文件**(评审 E8:消除 root 路径的 tmpfile 篡改窗口) |
 | tmux 是否阻塞 | **tmux PTY 不阻塞升级**(无 turn 概念;只看 agent 会话 Running) |
+| **run_id turn 是否可被强制穿透** | **否(硬阻塞,评审 E1)**:`max_wait` 强制升级只对**交互** turn 生效;携带 `run_id` 的调度运行 Running turn 永不被穿透。调度运行有 30min 看门狗自我了断,等待有界。保护 collect C3 的 run_id verdict 完整性 |
+| 检测稳定性 | **sha 连续两轮相同才动手**(评审 E5:杀掉「release slot 半写被 sha 到」竞态)+ **stop 前先冒烟 `<watch> --help`**(评审 E6:坏 build 不进停服路径) |
+| backup 轮转 | **保留最近 3 个 `.bak-*`**(评审 E3:deploy.sh 从不清理 backup,全自动 + 无黑名单下坏 build 每窗口造一个 → 撑爆 `/usr/local/bin`) |
 | 升级失败重试 | **不做 failed-hash 黑名单**(每轮都重试;churn 是响亮信号,见「已知风险」)。失败守卫记为未来可选开关 |
 | 用户可见性 | **静默升级**,前端零改动,只靠 INFO 日志字段可诊断 |
+
+> **CTO/PM 评审修订(2026-06-10)**:本 spec 经 PM(scope/真问题)+ CTO(failure-mode)双帽走查后修订。
+> - **E1(critical,run_id 完整性)**:`max_wait` 强制升级**不穿透** run_id Running turn(调度运行单次最长 30min,有看门狗;若 10min `max_wait` 能砍它 = 例行性误杀调度运行 + verdict 丢失,重新引入 collect C3 拼命保护的东西)。
+> - **E3(critical,磁盘泄漏)**:内嵌 swap 脚本加 backup 轮转(deploy.sh 现状从不清理 `.bak-*`)。
+> - **E5+E6(correctness/race)**:sha 连续两轮稳定再动手(防半写)+ stop 前冒烟新 binary(防坏 build 进停服路径造成本可避免的服务抖动),对齐 deploy.sh:92。
+> - **E8(security,P1)**:swap 脚本走 `bash -c` 内联,**不写临时文件**——自主 root 路径下 world-writable tmpfile 在「写入→exec」间被替换 = root RCE。比 deploy.sh 的 tmpfile 路子更安全。
+> - **build=deploy footgun(PM,已接受裸路径)**:见下「关键风险」。监视裸 `target/release/zeromux` 时,**任何** `cargo build --release`(含本地测试)都会让 live 在空闲时静默换上去——「build 来测一下」静默变成「部署到生产」。已接受(本机通常只在打算部署时才 release build;sha 稳定 + idle gate 收窄爆炸半径),但醒目记录。
 
 ---
 
@@ -82,25 +92,33 @@ pub fn spawn_auto_updater(cfg: AutoUpdateConfig, mgr: Weak<SessionManager>);
 
 1. `stat` watch_path 取 mtime + size。与上轮记录比:**未变则跳过本轮**(省去哈希计算)。
 2. mtime/size 变了 → 算 watch_path 的 SHA256。
-3. `watch_sha == self_baseline_sha` → 当前 installed 就是这个 build,**无需升级**,清「待升级」状态(覆盖「build 又被改回与当前相同」的情况)。
-4. `watch_sha != self_baseline_sha` → 进入/保持「待升级」状态,记录 `pending_since = now`(仅首次进入时锚定)。
-5. 「待升级」状态下,每轮检查 Idle gate:
-   - **全 Idle**(无任何 agent 会话 Running)→ 触发 swap。
-   - **非全 Idle 但 `now - pending_since >= max_wait`** → 硬上限到,**强制**触发 swap。
+3. **sha 稳定门(评审 E5)**:与**上一轮算出的 watch_sha** 比。若不同 → 记下本轮 sha,**本轮不动手**(可能正被 `cp`/`mv` 半写)。仅当**连续两轮 sha 相同**才认为文件写入完成,进入下面的判定。这杀掉「watcher 在 release slot 写到一半时 sha 到一个残缺文件」的竞态。
+4. `watch_sha == self_baseline_sha` → 当前 installed 就是这个 build,**无需升级**,清「待升级」状态(覆盖「build 又被改回与当前相同」的情况)。
+5. `watch_sha != self_baseline_sha`(且已稳定)→ 进入/保持「待升级」状态,记录 `pending_since = now`(仅首次进入时锚定)。
+6. 「待升级」状态下,每轮检查 Idle gate(见下):
+   - **可升级**(无阻塞 turn)→ 触发 swap。
+   - **仅被交互 turn 阻塞 且 `now - pending_since >= max_wait`** → 硬上限到,**强制**触发 swap。
+   - **被 run_id(调度运行)turn 阻塞** → **永不强制穿透**,继续等(评审 E1)。
    - 否则继续等下一轮。
 
 > **时间来源**:轮询用 `tokio::time::interval`;`pending_since` 用 `tokio::time::Instant`(单调钟,不受墙钟跳变影响)。不引入 `chrono` 依赖。
 
-### Idle gate 判定
+### Idle gate 判定(区分交互 turn 与 run_id turn,评审 E1)
 
-`SessionManager` 已有 `TurnState{Idle,Running}` + `mark_turn` + per-session turn 状态(B-2)。新增一个只读访问器:
+`SessionManager` 已有 `TurnState{Idle,Running}` + per-session turn 状态(B-2),且 `SessionInput::Prompt` 已带 `run_id: Option<String>`,fanout 已知道当前 Running turn 是否携带 run_id(`active_run_id`)。新增一个只读访问器,返回**两个维度**:
 
 ```rust
 // SessionManager
-pub fn any_agent_running(&self) -> bool;
+pub struct RunningSummary { pub interactive: usize, pub scheduled: usize }
+pub fn running_summary(&self) -> RunningSummary;
 ```
 
-遍历会话,**仅** Claude/Kiro/Codex 类型且 `TurnState == Running` 才算「忙」。**Tmux 会话跳过**(无 turn 概念,不阻塞升级)。`!any_agent_running()` 即「全 Idle」。
+遍历会话,**仅** Claude/Kiro/Codex 类型且 `TurnState == Running` 才计数;按该 Running turn 是否携带 `run_id` 分入 `scheduled` / `interactive`。**Tmux 会话跳过**(无 turn 概念,不阻塞升级)。
+
+gate 决策(纯函数,可单测):
+- `scheduled == 0 && interactive == 0` → **可升级**(全 Idle)。
+- `scheduled > 0` → **阻塞,且 max_wait 不适用**(调度运行有 30min 看门狗自我了断 `scheduled_tasks.rs:363`,等待有界;强制砍它 = 误杀 + verdict 丢失,违背 collect C3)。
+- `scheduled == 0 && interactive > 0` → 阻塞,但 `max_wait` 到时**可强制**(交互 turn 无 verdict 完整性约束,B-1 恢复 scrollback;这是「等 Idle」与「升级不能无限拖」的取舍点)。
 
 ---
 
@@ -109,25 +127,29 @@ pub fn any_agent_running(&self) -> bool;
 触发后:
 
 1. 置「升级进行中」标志(并发保护,见下)。
-2. 把**内嵌的 swap shell 脚本**写到临时文件(`std::env::temp_dir()/zeromux-selfupdate-<pid>.sh`)。
-3. `sudo systemd-run --wait --pipe --collect --quiet --unit=zeromux-selfupdate-<pid> bash <tmpfile> <watch_path>`
+2. **冒烟新 binary(评审 E6)**:`<watch_path> --help` 退出码非 0 → 这是个坏/截断的 build,**不进入停服路径**,记日志放弃本轮(下一轮若 sha 仍稳定且仍 != self 会再来,但服务从未抖动)。对齐 deploy.sh:92。
+3. 用 `AutoUpdateConfig` 字段把内嵌脚本模板做字符串插值,得到完整 swap 脚本字符串(`SERVICE`/`INSTALLED`/`HEALTH`/`BUILT` 全部填好)。**不写临时文件**(评审 E8)。
+4. `sudo systemd-run --wait --pipe --collect --quiet --unit=zeromux-selfupdate-<pid> /bin/bash -c '<内联脚本>'`
+   - **脚本经 `bash -c` 内联传入,不落盘**:消除「world-writable 临时文件在写入→exec 之间被替换 → root RCE」的窗口(自主 root 路径比手动 deploy.sh 风险更高,故比 deploy.sh 的 tmpfile 路子更严)。
    - transient service 由 PID 1 拥有,在 `system.slice` 自己的 cgroup 里 —— `systemctl stop zeromux` **够不到它**(这正是 deploy.sh 验证过的 cgroup 逃逸,binary 触发时面临完全相同的 self-kill 陷阱,解法相同)。
    - `--service` 而非 `--scope`(scope 会留在调用者 cgroup 里被一起杀,deploy.sh 已实证)。
-4. swap 脚本会 `systemctl stop zeromux` —— **本进程在此刻被 systemd 终止**。这是预期的:旧进程的使命到此结束。systemd 随后 start 新 binary。
-5. 若 swap 脚本 health-check 失败 → 它自己 rollback 到旧 binary 并 start —— 服务恢复旧版运行(本进程已死,但 rollback 由 detached service 完成,不受影响)。
+5. swap 脚本会 `systemctl stop zeromux` —— **本进程在此刻被 systemd 终止**。这是预期的:旧进程的使命到此结束。systemd 随后 start 新 binary。
+6. 若 swap 脚本 health-check 失败 → 它自己 rollback 到旧 binary 并 start —— 服务恢复旧版运行(本进程已死,但 rollback 由 detached service 完成,不受影响)。
 
 ### 内嵌 swap 脚本
 
-字节级复刻 `deploy.sh` 的 `do_swap`,作为 Rust 字符串常量内嵌。接收 `$1 = built_path`,内部 `INSTALLED`/`SERVICE`/`HEALTH` 由脚本顶部变量定义(从 systemd-run 命令行参数或脚本内常量传入):
+复刻 `deploy.sh` 的 `do_swap` 并加两处评审加固(冒烟已在 binary 侧做过、backup 轮转),作为 Rust 字符串模板内嵌,插值后经 `bash -c` 传入:
 
 ```bash
 set -euo pipefail
 SERVICE="zeromux"
 INSTALLED="/usr/local/bin/zeromux"
 HEALTH="http://127.0.0.1:<PORT>/"
-BUILT="$1"
+BUILT="<WATCH_PATH>"
 backup="${INSTALLED}.bak-$(date +%Y%m%d-%H%M%S)"
 cp "$INSTALLED" "$backup"
+# backup 轮转(评审 E3):保留最近 3 个,防全自动+无黑名单下坏 build 每窗口造一个撑爆磁盘
+ls -1t "${INSTALLED}".bak-* 2>/dev/null | tail -n +4 | xargs -r rm -f
 systemctl stop "$SERVICE"
 cp "$BUILT" "$INSTALLED"
 systemctl start "$SERVICE"
@@ -143,7 +165,8 @@ systemctl start "$SERVICE"
 exit 1
 ```
 
-> `SERVICE`/`INSTALLED`/`PORT` 这些值在 binary 内嵌时用 `AutoUpdateConfig` 的字段做字符串插值后写入临时文件,避免脚本内硬编码与 config 漂移。`sudo` 由 systemd-run 整条命令带,前提是 passwordless sudo(deploy.sh 已依赖,live 主机已配)。
+> `<PORT>`/`<WATCH_PATH>`/`SERVICE`/`INSTALLED` 在 binary 内嵌时用 `AutoUpdateConfig` 字段插值,避免脚本内硬编码与 config 漂移。`sudo` 由 systemd-run 整条命令带,前提是 passwordless sudo(deploy.sh 已依赖,live 主机已配)。
+> **插值安全**:`AutoUpdateConfig` 的路径/端口来自 CLI flag(运维自己给的,非用户输入),非注入面;但实现期仍应避免把任意外部字符串拼进 `bash -c`(当前字段都是受信启动配置,满足)。
 
 ### 为什么不退而求其次用 rename + 干净退出
 
@@ -159,8 +182,13 @@ exit 1
 
 ## 已知风险与边界
 
-- **失败 build 的反复 churn(已接受,不做黑名单)**:坏 build 会每 30s 触发「试→health 失败→rollback」。但方案 A 的 auto-rollback 每轮都让服务回到旧 binary 运行 —— **不是宕机,是每 30s 抖动一次重启**(会断当前会话)。直到修好 build 或删改 built 文件。churn 本身是响亮信号(服务反复重启 + 日志刷屏),不会静默坏掉。**未来可选开关**:记录 failed-hash,对同一失败 hash 不再重试,直到出现不同 hash 才解禁 —— trivial,需要时加。
+- **⚠️ build = deploy footgun(PM 评审,已接受裸路径)**:监视裸 `target/release/zeromux` 时,**任何一次** `cargo build --release` —— 哪怕只是本地迭代、测试别的东西 —— 都会让 live server 在下次空闲时静默换上去。「我只是 build 来测一下」会**静默变成「我部署到生产了」**。已接受(本机通常只在打算部署时才跑 release build;sha 稳定门 + idle gate 收窄爆炸半径),但这是真陷阱:**若将来发现误触发,改用专用 release slot(`--watch-build /home/ubuntu/zeromux-release/zeromux`,部署 = 显式 `mv` 进去)即可恢复 build≠deploy 的意图边界。**
+- **失败 build 的反复 churn(已接受,不做黑名单)**:坏 build 会每个空闲窗口触发「冒烟…」——但 E6 冒烟(`<watch> --help`)会先挡掉**进程能起但 --help 都跑不过**的坏 build(不进停服路径,零抖动);只有「冒烟过、但运行起来 health 不过」的 build 才会走到 swap→rollback(每轮一次抖动重启)。E3 backup 轮转保证不撑爆磁盘。churn 本身是响亮信号(反复重启 + 日志刷屏),不静默坏掉。**未来可选开关**:failed-hash 黑名单,trivial,需要时加。
 - **cgroup self-kill(已解)**:binary 触发 swap 时和 deploy.sh 一样身处 `zeromux.service` cgroup,故必须 detached `systemd-run --service`,绝不能直接 `systemctl stop`。
+- **自主 root 路径(E8,已解)**:auto-update 让 binary 能自主 `sudo systemd-run`。swap 脚本走 `bash -c` 内联、不落临时文件,消除 tmpfile 篡改→RCE 窗口。`AutoUpdateConfig` 的插值字段均来自受信启动 flag,非用户输入。
+- **release slot 半写竞态(E5,已解)**:sha 连续两轮稳定才动手,避免 sha 到半写文件。
+- **坏 build 进停服路径(E6,已解)**:stop 前先 `<watch> --help` 冒烟,坏 build 不造成本可避免的服务抖动。
+- **scheduled-run 饿死(E1,已解)**:run_id Running turn 硬阻塞,`max_wait` 不穿透;调度运行有 30min 看门狗自我了断,等待有界,verdict 完整性不被破坏(collect C3 一致)。
 - **全自动重启断会话(已接受)**:升级会重启进程 → 断所有会话。B-1 恢复持久会话的 scrollback,但 **in-flight 的 Running turn 会丢**。「等全 Idle 再升级」正是为消除这一点 —— 正常情况不切断任何正在跑的 turn;只有硬上限到时才可能切断(此时已等满 max_wait,视为可接受的让步)。
 - **max_wait 永远等不到全 Idle**:若总有 agent 在忙,硬上限保证最终必升(默认 10min)。这是「等 Idle」与「升级不能无限拖」之间的取舍点。
 - **sudo 前提**:`systemd-run` 需 sudo;live 进程以 `ubuntu` 跑、deploy.sh 已依赖 passwordless sudo,前提成立。非此环境(无 sudo)则 swap 失败、记日志、服务继续跑旧版(不崩)。
@@ -173,8 +201,11 @@ exit 1
 watcher 在每个决策点打 INFO 日志(titler 的教训:默认 INFO 下不能是黑盒):
 - 启动:`auto-update enabled, watching <path>, self-sha=<8 chars>`
 - 检测到新 build:`new build detected sha=<8> (self=<8>), entering pending state`
-- 等 Idle:`pending upgrade, N agent(s) running, waiting`(节流,避免每 30s 刷)
-- 触发:`all idle (or max_wait reached), launching swap via systemd-run`
+- sha 未稳定:`build sha changed, waiting for stable (anti half-write)`
+- 等 Idle:`pending upgrade, interactive=N scheduled=M running, waiting`(节流,避免每 30s 刷)
+- 被调度运行阻塞:`pending upgrade blocked by scheduled run(s), max_wait NOT applied`(E1 可见)
+- 冒烟失败:`new build failed --help smoke, skipping swap (no service disruption)`(E6 可见)
+- 触发:`upgradeable (idle or interactive max_wait reached), launching swap via systemd-run`
 - swap 结果:由 detached service 的输出 + systemd-run `--pipe` 回传(本进程可能已被 stop,故结果主要看 `journalctl -u zeromux-selfupdate-*` 与新进程启动日志)
 - 跳过/失败:`watch_path stat failed`、`build sha == self, no upgrade needed`
 
@@ -186,11 +217,13 @@ watcher 在每个决策点打 INFO 日志(titler 的教训:默认 INFO 下不能
 |---|---|---|
 | SHA256 计算 | 已知文件 → 已知 hash | 纯函数,文件 fixture |
 | 升级判定 | self==watch 不触发;不同则进 pending | 纯函数 / 内存状态机 |
-| Idle gate | 注入有 Running agent → false;全 Idle → true;tmux Running 不算忙;`pending_since` 超 max_wait → 强制 true | `any_agent_running` + gate 决策可单测(mock 会话集合) |
+| **sha 稳定门(E5)** | 一轮 sha 变、下一轮再变 → 不动手;连续两轮同 → 才进 pending | 状态转移单测 |
+| Idle gate 决策(E1) | `scheduled>0` → 阻塞且 max_wait **不**穿透;`scheduled==0 && interactive>0` 且超 max_wait → 强制;全 0 → 可升级;tmux Running 不计数 | 纯函数 `gate_decision(RunningSummary, elapsed, max_wait)` 可单测;`running_summary` mock 会话集合 |
 | pending 状态机 | build 改回与 self 相同 → 清 pending;新 hash → 重锚 pending_since | 状态转移单测 |
 | 并发保护 | swap 进行中第二次 tick 不重复触发 | 标志位单测 |
-| swap 脚本 | 复用 deploy.sh 已验证逻辑;health 失败 → rollback | 手动/集成(需 systemd 环境);脚本生成的字符串可断言含正确 SERVICE/INSTALLED/PORT |
-| 端到端(手动) | 本机改 build → 观察 live:检测→等 Idle(开个 Running agent 验证阻塞)→空闲后自动 swap→新版起来;故意给坏 build → 观察 rollback + churn 日志 | journald + 版本确认 |
+| swap 脚本生成 | 插值后字符串含正确 SERVICE/INSTALLED/PORT/WATCH_PATH;含 backup 轮转行(E3) | 字符串断言(纯函数 `render_swap_script(cfg) -> String`) |
+| swap 执行 | 冒烟挡坏 build(E6,不进停服);health 失败 → rollback | 手动/集成(需 systemd 环境) |
+| 端到端(手动) | 改 build → 观察 live:检测→sha 稳定→等 Idle(开 Running agent 验证阻塞;开调度运行验证 max_wait 不穿透 E1)→空闲后自动 swap→新版起来;给「--help 都跑不过」的坏 build → 观察冒烟挡下零抖动;给「health 不过」的坏 build → 观察 rollback + backup 只留 3 个(E3) | journald + 版本确认 + `ls /usr/local/bin/zeromux.bak-*` |
 
 命令:`cargo test`、`cargo check`(release 慢,迭代用 debug)。
 
@@ -200,10 +233,10 @@ watcher 在每个决策点打 INFO 日志(titler 的教训:默认 INFO 下不能
 
 | 文件 | 改动 |
 |---|---|
-| `src/auto_update.rs`(新) | `AutoUpdateConfig` + `spawn_auto_updater` watcher 任务(检测循环 + Idle gate + 内嵌 swap 脚本 + detached systemd-run);SHA256 计算、升级判定、状态机为可单测单元 |
+| `src/auto_update.rs`(新) | `AutoUpdateConfig` + `RunningSummary` + `spawn_auto_updater` watcher 任务(检测循环 + sha 稳定门 E5 + Idle gate);可单测纯函数:SHA256 计算、`gate_decision`、`render_swap_script`(E3 backup 轮转)、pending 状态机;swap 经 `bash -c` 内联 detached systemd-run(E8),stop 前冒烟(E6) |
 | `src/main.rs` | 新增 `--watch-build <path>`、`--auto-update-max-wait <secs>` flag;router 起来后若 watch-build 提供则 `spawn_auto_updater` |
-| `src/session_manager.rs` | 新增只读访问器 `any_agent_running(&self) -> bool`(仅 agent 会话 Running 才算忙,tmux 跳过) |
-| `zeromux.service`(live 单元,文档说明) | `ExecStart` 加 `--watch-build /home/ubuntu/.../target/release/zeromux`;部署文档记录开启方式 |
+| `src/session_manager.rs` | 新增只读访问器 `running_summary(&self) -> RunningSummary`(仅 agent 会话 Running 才计数,按是否携带 run_id 分 interactive/scheduled,tmux 跳过) |
+| `zeromux.service`(live 单元,文档说明) | `ExecStart` 加 `--watch-build /home/ubuntu/.../target/release/zeromux`;部署文档记录开启方式 + **build=deploy 警告** |
 | 前端 | **无改动** |
 
 > systemd 单元的修改不在 repo 里(它在 `/etc/systemd/system/`);spec 仅说明上线时如何加 flag,实际改单元是部署动作。
@@ -215,6 +248,5 @@ watcher 在每个决策点打 INFO 日志(titler 的教训:默认 INFO 下不能
 - **GitHub Releases 轮询 + 异地分发**:naozhi 原型的完整形态。本期只做本机原地升级。需要多机/异地分发时再写 spec(那时才需要 download + 签名验证)。
 - **三档 notify/download/auto**:本期单档全自动。若将来想要「检测到但等我手动点」,可加档位 + 前端提示(本期决策为静默全自动)。
 - **failed-hash 黑名单**:见「已知风险」,trivial 的未来可选开关。
+- **专用 release slot**:本期接受裸 `target/release` + build=deploy 警告。若误触发成为实际问题,改用 `--watch-build` 指向专用 slot(部署 = 显式 `mv` 进去)即可恢复意图边界——纯运维改动,无需改码。
 - **前端可见性**:本期静默。将来若要「检测到新版/即将升级」横幅,加一个轻量事件 + 一行 UI。
-</content>
-</invoke>

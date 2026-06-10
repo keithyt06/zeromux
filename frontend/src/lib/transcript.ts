@@ -36,7 +36,6 @@ export interface TurnGroup {
 
 export function foldTranscript(
   events: WireEvent[],
-  seenClientIds: Set<string> = new Set(),
 ): TurnGroup[] {
   const byTurn = new Map<number, TurnGroup>()
   const order: number[] = []
@@ -62,7 +61,11 @@ export function foldTranscript(
   for (const e of events) {
     const tid = e.turn_id ?? 0
     if (e.type === 'user_prompt') {
-      if (e.client_id && seenClientIds.has(e.client_id)) continue // dedupe optimistic
+      // No dedupe here: AcpChatView handles the server echo by rewriting the
+      // optimistic entry's turn_id in place (replace, not append), so there is
+      // only ever one user_prompt per client_id in `events`. Deduping by a
+      // seenClientIds set would skip the optimistic entry itself — hiding the
+      // user's own prompt until reconnect.
       group(tid).userPrompts.push({ text: e.text ?? '', clientId: e.client_id })
     } else if (e.type === 'content_block') {
       const g = group(tid)

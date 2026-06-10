@@ -33,12 +33,14 @@ describe('foldTranscript — turn grouping (T1)', () => {
     expect(groups[0].assistantText()).toBe('a1')
   })
 
-  it('dedupes a user_prompt that matches an existing optimistic client_id', () => {
+  it('renders the local optimistic user_prompt as its own bubble', () => {
+    // foldTranscript does NOT dedupe by client_id — AcpChatView handles the
+    // server echo by rewriting the optimistic entry's turn_id in place, so
+    // there is only ever one user_prompt per cid. The folder must render it.
     const events: WireEvent[] = [
       { type: 'user_prompt', text: 'q1', turn_id: 1, client_id: 'c1' },
     ]
-    const groups = foldTranscript(events, new Set(['c1']))
-    // optimistic bubble c1 already shown → not re-added
-    expect(groups.find(g => g.turnId === 1)?.userPrompts ?? []).toHaveLength(0)
+    const groups = foldTranscript(events)
+    expect(groups.find(g => g.turnId === 1)?.userPrompts.map(p => p.text)).toEqual(['q1'])
   })
 })

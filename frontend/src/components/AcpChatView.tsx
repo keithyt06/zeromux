@@ -56,8 +56,11 @@ export default function AcpChatView({ sessionId, agentType = 'claude' }: Props) 
   // a new prompt carries the NEXT turn_id, so it folds into its own group
   // instead of splicing into the still-streaming prior turn's blocks.
   const [events, setEvents] = useState<WireEvent[]>([])
+  // seenClientIds is NOT passed to foldTranscript (that would double-dedupe and
+  // hide the local optimistic bubble). It's used only by the WS handler to
+  // decide append-vs-replace for the server echo of a prompt we inserted.
   const seenClientIds = useRef<Set<string>>(new Set())
-  const groups = useMemo(() => foldTranscript(events, seenClientIds.current), [events])
+  const groups = useMemo(() => foldTranscript(events), [events])
   const [notices, setNotices] = useState<Notice[]>([])
   const [input, setInput] = useState('')
   const [busy, setBusy] = useState(false)

@@ -880,6 +880,26 @@ fn sanitize_filename(name: &str) -> String {
     if cleaned.is_empty() { "upload".to_string() } else { cleaned }
 }
 
+/// 原子"不存在才建":用 create_new(true) 占位,AlreadyExists 则递增后缀重试。
+/// 返回 (打开的写句柄, 实际文件名)。消除 check-then-write 的并发覆盖窗口(E2)。
+fn dedupe_and_create(dir: &std::path::Path, name: &str) -> std::io::Result<(std::fs::File, String)> {
+    use std::fs::OpenOptions;
+    match OpenOptions::new().write(true).create_new(true).open(dir.join(name)) {
+        Ok(f) => return Ok((f, name.to_string())),
+        Err(e) if e.kind() != std::io::ErrorKind::AlreadyExists => return Err(e),
+        Err(_) => {}
+    }
+    for n in 1..10_000 {
+        let candidate = next_candidate(name, n);
+        match OpenOptions::new().write(true).create_new(true).open(dir.join(&candidate)) {
+            Ok(f) => return Ok((f, candidate)),
+            Err(e) if e.kind() != std::io::ErrorKind::AlreadyExists => return Err(e),
+            Err(_) => continue,
+        }
+    }
+    Err(std::io::Error::new(std::io::ErrorKind::AlreadyExists, "too many name collisions"))
+}
+
 #[derive(serde::Deserialize)]
 struct UploadReq {
     path: String,
@@ -1511,5 +1531,24 @@ mod upload_helpers_tests {
         assert_eq!(sanitize_filename(""), "upload");
         assert_eq!(sanitize_filename("///"), "upload");
         assert_eq!(sanitize_filename("\n\n"), "upload");
+    }
+
+    #[test]
+    fn dedupe_creates_first_then_suffixes() {
+        let dir = tempfile::tempdir().unwrap();
+        let d = dir.path();
+
+        let (mut f1, n1) = dedupe_and_create(d, "a.png").unwrap();
+        assert_eq!(n1, "a.png");
+        use std::io::Write;
+        f1.write_all(b"one").unwrap();
+
+        let (_f2, n2) = dedupe_and_create(d, "a.png").unwrap();
+        assert_eq!(n2, "a-1.png");
+
+        let (_f3, n3) = dedupe_and_create(d, "a.png").unwrap();
+        assert_eq!(n3, "a-2.png");
+
+        assert_eq!(std::fs::read(d.join("a.png")).unwrap(), b"one");
     }
 }

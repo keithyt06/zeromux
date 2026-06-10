@@ -100,6 +100,17 @@ struct Args {
     /// External URL for OAuth callback (e.g. https://myserver.com)
     #[arg(long, env = "ZEROMUX_EXTERNAL_URL")]
     external_url: Option<String>,
+
+    /// 监视的 build 产物路径;给定则启用后台自动更新(本机原地升级)。
+    /// ⚠️ 监视裸 target/release/zeromux 时,任何 cargo build --release 都会让
+    /// live server 在空闲时静默换上去(build=deploy footgun,见 spec)。
+    #[arg(long)]
+    watch_build: Option<String>,
+
+    /// 自动更新:进入待升级后,等交互会话全空闲的硬上限(秒)。
+    /// 调度运行不受此限(永不强制穿透,E1)。默认 600。
+    #[arg(long, default_value = "600")]
+    auto_update_max_wait: u64,
 }
 
 pub struct AppState {
@@ -294,6 +305,22 @@ async fn main() {
                 }
             }
         });
+    }
+
+    // 后台自动更新:仅当 --watch-build 提供时启用(默认关闭)。
+    if let Some(watch) = args.watch_build.clone() {
+        // 自身实际安装路径:优先 /proc/self/exe 解析,回退 /usr/local/bin/zeromux。
+        let installed = std::fs::read_link("/proc/self/exe")
+            .unwrap_or_else(|_| std::path::PathBuf::from("/usr/local/bin/zeromux"));
+        let cfg = auto_update::AutoUpdateConfig {
+            watch_path: std::path::PathBuf::from(watch),
+            installed_path: installed,
+            service_name: "zeromux".to_string(),
+            health_url: format!("http://127.0.0.1:{}/", args.port),
+            max_wait_secs: args.auto_update_max_wait,
+            poll_secs: 30,
+        };
+        auto_update::spawn_auto_updater(cfg, Arc::downgrade(&state.sessions));
     }
 
     let app = web::build_router(state.clone());

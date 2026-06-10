@@ -19,8 +19,11 @@ pub struct AutoUpdateConfig {
     pub service_name: String,    // "zeromux"
     pub health_url: String,      // http://127.0.0.1:<port>/
     pub max_wait_secs: u64,      // --auto-update-max-wait
-    pub poll_secs: u64,          // 固定 30
+    pub poll_secs: u64,          // 固定 POLL_SECS(非 flag,设计如此)
 }
+
+/// 轮询间隔(秒)。刻意非 flag:30s 延迟对升级场景无所谓,见 spec。
+pub const POLL_SECS: u64 = 30;
 
 /// 算文件的 SHA256 十六进制串。读不到 → Err(放弃本轮,不崩)。
 fn sha256_file(path: &Path) -> std::io::Result<String> {

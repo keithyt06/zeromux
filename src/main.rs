@@ -309,7 +309,9 @@ async fn main() {
 
     // 后台自动更新:仅当 --watch-build 提供时启用(默认关闭)。
     if let Some(watch) = args.watch_build.clone() {
-        // 自身实际安装路径:优先 /proc/self/exe 解析,回退 /usr/local/bin/zeromux。
+        // installed_path = swap 的目标(被替换的文件);self baseline 则取 /proc/self/exe
+        // 的内容哈希。正常 systemd 部署下两者是同一文件,故一致。read_link 解析失败
+        // (或带 " (deleted)" 后缀,即运行中 binary 已被带外替换)时回退到约定安装路径。
         let installed = std::fs::read_link("/proc/self/exe")
             .unwrap_or_else(|_| std::path::PathBuf::from("/usr/local/bin/zeromux"));
         let cfg = auto_update::AutoUpdateConfig {
@@ -318,7 +320,7 @@ async fn main() {
             service_name: "zeromux".to_string(),
             health_url: format!("http://127.0.0.1:{}/", args.port),
             max_wait_secs: args.auto_update_max_wait,
-            poll_secs: 30,
+            poll_secs: auto_update::POLL_SECS,
         };
         auto_update::spawn_auto_updater(cfg, Arc::downgrade(&state.sessions));
     }

@@ -1,8 +1,10 @@
 import { useState, useEffect, useRef, useCallback, memo, createElement } from 'react'
 import { wsUrl } from '../lib/api'
-import { ChevronDown, Wrench, Brain, AlertCircle, FileText, Terminal, Search, Bot, type LucideIcon } from 'lucide-react'
+import { ChevronDown, Wrench, Brain, AlertCircle, FileText, Terminal, Search, Bot, Paperclip, X, type LucideIcon } from 'lucide-react'
 import MarkdownContent from './markdown/MarkdownContent'
 import Composer from './Composer'
+import { uploadSessionFile } from '../lib/api'
+import { buildPromptWithAttachments } from '../lib/attachments'
 import { MicButton } from './MicButton'
 import { useTranscribe } from '../lib/transcribe'
 
@@ -65,6 +67,10 @@ export default function AcpChatView({ sessionId, agentType = 'claude' }: Props) 
   const [messages, setMessages] = useState<ChatMessage[]>([])
   const [input, setInput] = useState('')
   const [busy, setBusy] = useState(false)
+  const [pending, setPending] = useState<string[]>([])   // 已上传待发的实际路径
+  const [uploading, setUploading] = useState(0)           // 上传中计数
+  const imageInputRef = useRef<HTMLInputElement>(null)
+  const fileInputRef = useRef<HTMLInputElement>(null)
   // collect:本轮进行中追加排队的条数(后端 ephemeral System{subtype:"queued"})。
   // 合并 turn 发出(下一个 Running)或 turn 结束时清零。
   const [queuedCount, setQueuedCount] = useState(0)
@@ -289,14 +295,44 @@ export default function AcpChatView({ sessionId, agentType = 'claude' }: Props) 
 
   // Composer 已 trim 且非空才回调；后端 fan-out 会在重发前自动打断在途轮次，
   // 前端只需发 prompt。
+  // 串行上传(手机内存),每个成功 push 实际路径到 pending。
+  const handleFiles = useCallback(async (files: FileList | null) => {
+    if (!files || files.length === 0) return
+    const list = Array.from(files)
+    setUploading(u => u + list.length)
+    for (const file of list) {
+      try {
+        const dataUrl: string = await new Promise((resolve, reject) => {
+          const r = new FileReader()
+          r.onload = () => resolve(r.result as string)
+          r.onerror = () => reject(r.error)
+          r.readAsDataURL(file)
+        })
+        const base64 = dataUrl.split(',')[1] ?? ''
+        const actual = await uploadSessionFile(sessionId, file.name, base64)
+        setPending(p => [...p, actual])
+      } catch (e) {
+        alert(`上传失败 ${file.name}: ${e instanceof Error ? e.message : String(e)}`)
+      } finally {
+        setUploading(u => u - 1)
+      }
+    }
+  }, [sessionId])
+
+  const removePending = useCallback((path: string) => {
+    setPending(p => p.filter(x => x !== path))
+  }, [])
+
   const sendPrompt = useCallback((text: string) => {
     if (!wsRef.current || wsRef.current.readyState !== WebSocket.OPEN) return
-    pushMessage({ id: newId(), kind: 'user', text })
-    wsRef.current.send(JSON.stringify({ type: 'prompt', text }))
+    const full = buildPromptWithAttachments(text, pending)
+    pushMessage({ id: newId(), kind: 'user', text: full })
+    wsRef.current.send(JSON.stringify({ type: 'prompt', text: full }))
     setInput('')
+    setPending([])
     setBusy(true)
     setTurnStartedMs(Date.now())
-  }, [pushMessage])
+  }, [pushMessage, pending])
 
   // Stuck-turn timer: tick a 1s clock while busy so the elapsed display
   // updates. turnStartedMs is stamped in the event handlers (turn start) and
@@ -356,6 +392,31 @@ export default function AcpChatView({ sessionId, agentType = 'claude' }: Props) 
             )}
           </div>
         )}
+        {(pending.length > 0 || uploading > 0) && (
+          <div className="flex flex-wrap gap-1.5 px-1 pb-1.5">
+            {pending.map(p => (
+              <span key={p} className="inline-flex items-center gap-1 text-xs bg-[var(--bg-primary)] border border-[var(--border)] rounded px-2 py-1 text-[var(--text-primary)]">
+                {p}
+                <button onClick={() => removePending(p)} aria-label={`remove ${p}`} className="text-[var(--text-muted)] hover:text-[var(--text-primary)]">
+                  <X size={12} />
+                </button>
+              </span>
+            ))}
+            {uploading > 0 && (
+              <span className="text-xs text-[var(--text-muted)] px-1 py-1">上传中 {uploading} 个…</span>
+            )}
+            {pending.length > 0 && !input.trim() && (
+              <button onClick={() => sendPrompt('')} aria-label="send attachments"
+                className="text-xs bg-[var(--accent-green)] hover:bg-[var(--accent-green-hover)] text-white rounded px-2 py-1">
+                发送
+              </button>
+            )}
+          </div>
+        )}
+        <input ref={imageInputRef} type="file" accept="image/*" multiple className="hidden"
+          onChange={e => { handleFiles(e.target.files); e.target.value = '' }} />
+        <input ref={fileInputRef} type="file" accept="*/*" multiple className="hidden"
+          onChange={e => { handleFiles(e.target.files); e.target.value = '' }} />
         <Composer
           value={input}
           onChange={setInput}
@@ -363,12 +424,22 @@ export default function AcpChatView({ sessionId, agentType = 'claude' }: Props) 
           submitOnEnter={true}
           placeholder={`Send a message to ${agentType === 'kiro' ? 'Kiro' : agentType === 'codex' ? 'Codex' : 'Claude'}...`}
           rightSlot={
-            <MicButton
-              isRecording={transcribe.isRecording}
-              supported={transcribe.supported}
-              onPressStart={transcribe.start}
-              onPressEnd={transcribe.stop}
-            />
+            <div className="flex items-end gap-1">
+              <button onClick={() => imageInputRef.current?.click()} aria-label="attach image"
+                className="self-end p-2 text-[var(--text-muted)] hover:text-[var(--text-primary)] rounded-lg transition-colors" title="图片">
+                <Paperclip size={16} />
+              </button>
+              <button onClick={() => fileInputRef.current?.click()} aria-label="attach file"
+                className="self-end p-2 text-[var(--text-muted)] hover:text-[var(--text-primary)] rounded-lg transition-colors" title="文件">
+                <FileText size={16} />
+              </button>
+              <MicButton
+                isRecording={transcribe.isRecording}
+                supported={transcribe.supported}
+                onPressStart={transcribe.start}
+                onPressEnd={transcribe.stop}
+              />
+            </div>
           }
         />
       </div>

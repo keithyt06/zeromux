@@ -1564,4 +1564,18 @@ mod upload_helpers_tests {
 
         assert_eq!(std::fs::read(d.join("a.png")).unwrap(), b"one");
     }
+
+    #[test]
+    fn traversal_names_collapse_to_safe_basename() {
+        use std::path::Path;
+        // 模拟 handler 的取名两步:file_name() 取末段 → sanitize。
+        // 任何 ../ 前缀在 file_name() 处被剥掉,绝不逃出 work_dir。
+        let take = |p: &str| -> String {
+            sanitize_filename(Path::new(p).file_name().and_then(|s| s.to_str()).unwrap_or("upload"))
+        };
+        assert_eq!(take("../../../etc/passwd"), "passwd");
+        assert_eq!(take("a/../../etc/x"), "x");
+        assert_eq!(take(".."), "upload");        // file_name() 对 ".." 返回 None
+        assert_eq!(take("/abs/path/file.png"), "file.png");
+    }
 }

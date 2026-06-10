@@ -21,7 +21,7 @@ pub struct WsQuery {
 #[serde(tag = "type")]
 enum ClientMsg {
     #[serde(rename = "prompt")]
-    Prompt { text: String },
+    Prompt { text: String, #[serde(default)] client_id: Option<String> },
     #[serde(rename = "cancel")]
     Cancel,
     #[serde(rename = "interrupt")]
@@ -147,11 +147,11 @@ async fn handle_acp_ws(socket: WebSocket, session_id: String, state: Arc<AppStat
                     Some(Ok(Message::Text(text))) => {
                         if let Ok(client_msg) = serde_json::from_str::<ClientMsg>(&text) {
                             match client_msg {
-                                ClientMsg::Prompt { text } => {
+                                ClientMsg::Prompt { text, client_id } => {
                                     if let Some(ref log) = logger {
                                         log.log_acp_input(&session_id, &text);
                                     }
-                                    let _ = input_tx.send(SessionInput::Prompt { text, run_id: None }).await;
+                                    let _ = input_tx.send(SessionInput::Prompt { text, run_id: None, client_id }).await;
                                 }
                                 ClientMsg::Cancel => {
                                     let _ = input_tx.send(SessionInput::Cancel).await;

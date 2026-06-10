@@ -117,8 +117,10 @@ pub enum SessionInput {
     /// PTY: resize
     PtyResize(u16, u16),
     /// ACP/Kiro: prompt text + optional scheduled-run id for exactly-once
-    /// finalization (None for manual user prompts).
-    Prompt { text: String, run_id: Option<String> },
+    /// finalization (None for manual user prompts). `client_id` is the optional
+    /// browser-generated id used to dedupe the optimistic user bubble against the
+    /// server echo (G3, T1); None for scheduled runs.
+    Prompt { text: String, run_id: Option<String>, client_id: Option<String> },
     /// ACP/Kiro: cancel/kill
     Cancel,
     /// ACP/Kiro: turn-level interrupt (abort current turn, keep process alive)
@@ -856,6 +858,7 @@ impl SessionManager {
                 .send(SessionInput::Prompt {
                     text: goal,
                     run_id: Some(run_id.to_string()),
+                    client_id: None,
                 })
                 .await
             {
@@ -1713,7 +1716,7 @@ fn spawn_acp_fanout(
                 }
                 input = input_rx.recv() => {
                     match input {
-                        Some(SessionInput::Prompt { text, run_id }) => {
+                        Some(SessionInput::Prompt { text, run_id, client_id }) => {
                             if run_id.is_some() {
                                 // C3:调度运行 prompt 绕过 collect,自成干净 turn。先丢弃任何
                                 // 待合并队列+窗口,保证调度 turn 不被用户闲聊追加污染,且收集
@@ -2082,7 +2085,7 @@ fn spawn_kiro_fanout(
                 }
                 input = input_rx.recv() => {
                     match input {
-                        Some(SessionInput::Prompt { text, run_id }) => {
+                        Some(SessionInput::Prompt { text, run_id, client_id }) => {
                             if run_id.is_some() {
                                 // C3:调度 prompt 绕过 collect(kiro 当前不跑调度,留此分支保持三 fanout 对称)
                                 queue.clear();
@@ -2231,7 +2234,7 @@ fn spawn_codex_fanout(
                 }
                 input = input_rx.recv() => {
                     match input {
-                        Some(SessionInput::Prompt { text, run_id }) => {
+                        Some(SessionInput::Prompt { text, run_id, client_id }) => {
                             if run_id.is_some() {
                                 // C3:调度 prompt 绕过 collect(codex 当前不跑调度,留此分支保持三 fanout 对称)
                                 queue.clear();

@@ -70,10 +70,11 @@
    ```
    序列化为 `{"type":"user_prompt", "text":..., "client_id":...}`。
 
-2. fan-out 在**实际把 prompt 送入 CLI 的那一刻** emit `UserPrompt`：
+2. fan-out 为**每一条用户 prompt** emit 一个 `UserPrompt` 事件（PM 评审 P1 决定）：
    - 三个 agent 后端的 `SessionInput::Prompt` 处理点（`session_manager.rs` 约 1727 / 2004 / 2171，对应 Claude / Codex / Kiro fan-out）。
-   - collect 模式下：**只在 flush（合并送出）那条 emit 一次**，合并文本即 emit 的 text。这自动修掉 N→1 错位。
-   - `interrupt` / `passthrough`：每条送出时 emit。
+   - **emit 时机 = 入队那一刻**（每条都 emit），而非 flush 合并那一刻。即使 collect 把 N 条合并成一个 turn，转录里仍忠实保留 N 个 `UserPrompt` 事件。
+   - **理由（P1）**：若只在 flush emit 一条合并 prompt，会出现「发送时 N 个气泡、重连后 1 个合并气泡」的新错位——恰好是本设计要消灭的问题的另一种形态。每条各自 emit 保证发送与重连一致；turn 合并只影响 agent 实际收到的 prompt，不改变转录事实。
+   - `interrupt` / `passthrough`：同样每条送出时 emit。
 
 3. 该事件走正常 `event_tx` → 自动进 scrollback。**与 queued 事件相反**（queued 是 ephemeral 被 `ws_handler.rs:124-144` 排除持久化），`user_prompt` **要持久化**，无需特判。
 
@@ -156,8 +157,13 @@ sanitize 是**启发式**，只覆盖三类高频形态，不追求覆盖全部 
 **纯前端（`AcpChatView.tsx` + block 渲染）**
 
 - 新增 per-session `density: 'concise' | 'full'`，**默认 `concise`**。
-- `concise` 模式：只渲染 `text` 正文 + `tool_use` 的一行摘要（`name · summary`）；`thinking` 块和 `tool_use` 原始 `input` 折叠隐藏。
-- 顶部 / 每条 assistant 气泡可切 `full` 展开全部。
+- 按「signal vs noise 分类规则」组织（护栏二，移动 triage 第一步），而非硬编码隐藏 thinking：
+  - **signal（concise 下始终显示）**：`text` 正文、错误、turn 完成、（未来）权限请求。
+  - **noise（concise 下折叠）**：`thinking` 块、`tool_use` 原始 `input`。`tool_use` 保留一行摘要（`name · summary`）作为「做了什么」的最小信号。
+- **信任护栏（P2）**：默认 concise 是行为改变，必须让被折叠内容**可见且可逆**：
+  - 每处折叠显示一个明确的占位（如 `+N 条思考/工具 · 点击展开`），而非静默消失——避免用户以为 agent 跳了步骤。
+  - 每条 assistant 气泡可单独展开；顶部 per-session 开关切 `full`。
+  - 首次进入会话时一次性提示「已为你精简显示，可切完整」（一次性，记 localStorage 标志）。
 - **无损**：scrollback / blocks 数据完整保留，只是渲染层过滤，随时可展开。
 
 ### 验收
@@ -175,9 +181,21 @@ sanitize 是**启发式**，只覆盖三类高频形态，不追求覆盖全部 
 
 每组各自有可验收的单测，分别提交。
 
+## 12 个月方向（命名原则，本次不实现）
+
+经 PM/CEO 评审（2026-06-10），三个问题的共同根因被命名为：**对话转录缺少一个「服务端拥有、持久」的单一真相源**。当前前端持有用户气泡（React state）、后端持有 agent 事件（2MB `VecDeque` 环形缓冲），两者从不和解。
+
+本次选 **方案 A**（三个独立手术刀式补丁），但带两条护栏，避免日后返工：
+
+1. **护栏一 — 命名 12 个月方向**：理想终态是「服务端拥有完整有序的转录（持久化，非环形缓冲），客户端是纯投影」。这解锁历史/搜索/多设备恢复/导出/为已上线的 auto-titler 提供真实数据/naozhi 式 IM 桥。**本次不做**，但 `UserPrompt` 事件必须设计成「日后可无痛重定向到真实存储」——即事件 schema 自带顺序语义、不依赖前端 state。
+2. **护栏二 — concise 模式是移动端 triage 第一步**：输出侧精简模式不是一次性开关，而是「在小屏 + 间歇性注意力下，突出需要我的内容（提问/完成/错误/权限请求），抑制工具调用噪音」这一移动 triage 能力的 MVP wedge。设计时按「分类规则」组织（哪些块属于 signal、哪些属于 noise），而非硬编码隐藏 thinking。
+
+**已知残留缺口（方案 A 不消除，留给 CTO 评审压测）**：scrollback 是 2MB 环形缓冲，从头淘汰。G3 修好后短会话发收对齐正确，但重连一个 2 小时前的长会话，开头仍可能已被淘汰。durability 不在本次范围。
+
 ## 非目标（YAGNI）
 
 - 不实现 naozhi 的 IM 网关（Feishu/Slack/Discord）、`/stop` `/urgent` slash 命令、群聊 @mention 门控。
 - 不做后端层面丢弃噪音块（输出侧过滤纯前端、无损）。
 - markdown sanitize 不追求覆盖全部语法，只收窄三类高频崩溃形态。
 - 不引入全局事件序号 / 时间戳排序（scrollback 事件流顺序即真相）。
+- **不做服务端对话持久化**（12 个月方向，见上；本次仅把 `UserPrompt` 设计成日后可重定向）。

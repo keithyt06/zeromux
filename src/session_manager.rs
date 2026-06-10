@@ -1649,11 +1649,7 @@ fn spawn_acp_fanout(
                                 evt,
                                 AcpEvent::Result { .. } | AcpEvent::Error { .. } | AcpEvent::Exit { .. }
                             );
-                            let json = match serde_json::to_string(&evt) {
-                                Ok(j) => j,
-                                Err(_) => continue,
-                            };
-                            let _ = event_tx.send(json);
+                            emit(&mgr, &sid, &event_tx, &evt);
                             if is_boundary {
                                 // Each started turn emits exactly one boundary
                                 // (Result/Error/Exit), in FIFO order, so the

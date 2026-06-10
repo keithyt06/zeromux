@@ -5,6 +5,7 @@
 
 use std::io::Read;
 use std::path::Path;
+use crate::session_manager::RunningSummary;
 
 /// 算文件的 SHA256 十六进制串。读不到 → Err(放弃本轮,不崩)。
 fn sha256_file(path: &Path) -> std::io::Result<String> {
@@ -20,10 +21,70 @@ fn sha256_file(path: &Path) -> std::io::Result<String> {
     Ok(hex::encode(hasher.finalize()))
 }
 
+/// gate 决策结果。纯数据,便于单测。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum GateDecision {
+    /// 可升级(全 Idle,或仅交互 turn 且已到 max_wait)。
+    Upgrade,
+    /// 被调度运行阻塞,max_wait 不适用(E1:绝不强制砍调度运行)。
+    BlockedByScheduled,
+    /// 被交互 turn 阻塞,但未到 max_wait,继续等。
+    WaitInteractive,
+}
+
+/// 纯函数:给定运行摘要、已等待秒数、max_wait 秒数,决定能否升级(评审 E1)。
+fn gate_decision(summary: RunningSummary, waited_secs: u64, max_wait_secs: u64) -> GateDecision {
+    if summary.scheduled > 0 {
+        return GateDecision::BlockedByScheduled; // 永不强制穿透
+    }
+    if summary.interactive == 0 {
+        return GateDecision::Upgrade; // 全 Idle
+    }
+    if waited_secs >= max_wait_secs {
+        GateDecision::Upgrade // 交互 turn 等满了,可强制
+    } else {
+        GateDecision::WaitInteractive
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::io::Write;
+
+    #[test]
+    fn gate_all_idle_upgrades() {
+        let d = gate_decision(RunningSummary { interactive: 0, scheduled: 0 }, 0, 600);
+        assert_eq!(d, GateDecision::Upgrade);
+    }
+
+    #[test]
+    fn gate_scheduled_never_forced_even_past_max_wait() {
+        // 调度运行在跑,即使等了远超 max_wait,也绝不强制(E1)
+        let d = gate_decision(RunningSummary { interactive: 0, scheduled: 1 }, 99999, 600);
+        assert_eq!(d, GateDecision::BlockedByScheduled);
+    }
+
+    #[test]
+    fn gate_interactive_waits_then_forces() {
+        // 交互 turn 在跑,未到 max_wait → 等
+        assert_eq!(
+            gate_decision(RunningSummary { interactive: 1, scheduled: 0 }, 100, 600),
+            GateDecision::WaitInteractive
+        );
+        // 到了 max_wait → 强制
+        assert_eq!(
+            gate_decision(RunningSummary { interactive: 1, scheduled: 0 }, 600, 600),
+            GateDecision::Upgrade
+        );
+    }
+
+    #[test]
+    fn gate_scheduled_takes_priority_over_interactive() {
+        // 两者都在跑:scheduled 优先,永不强制
+        let d = gate_decision(RunningSummary { interactive: 2, scheduled: 1 }, 99999, 600);
+        assert_eq!(d, GateDecision::BlockedByScheduled);
+    }
 
     #[test]
     fn sha256_of_known_bytes() {

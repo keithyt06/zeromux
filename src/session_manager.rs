@@ -1717,6 +1717,21 @@ fn spawn_acp_fanout(
                 input = input_rx.recv() => {
                     match input {
                         Some(SessionInput::Prompt { text, run_id, client_id }) => {
+                            // Echo each user prompt as its own UserPrompt event (P1):
+                            // N collect-merged messages still surface as N bubbles.
+                            // turn_id = the turn this prompt will belong to. In the
+                            // idle/run_id branches turn_seq is incremented below to
+                            // start the turn, so prompt_turn (turn_seq+1) matches. In
+                            // the collect path queued prompts each use turn_seq+1; since
+                            // turn_seq stays fixed while running/in-window until the
+                            // merged flush does turn_seq+=1, all share the same next-turn
+                            // id, matching the merged assistant turn (T1).
+                            let prompt_turn = turn_seq + 1;
+                            emit(&mgr, &sid, &event_tx, prompt_turn, &AcpEvent::UserPrompt {
+                                text: truncate_prompt_for_scrollback(&text),
+                                turn_id: prompt_turn,
+                                client_id: client_id.clone(),
+                            });
                             if run_id.is_some() {
                                 // C3:调度运行 prompt 绕过 collect,自成干净 turn。先丢弃任何
                                 // 待合并队列+窗口,保证调度 turn 不被用户闲聊追加污染,且收集
@@ -1934,6 +1949,23 @@ fn emit(
     let _ = event_tx.send(json); // Err == zero subscribers; ignore (T2)
 }
 
+/// Cap a user prompt before it enters scrollback (T3). A single huge paste
+/// must not blow the 2MB scrollback ring. NOT redaction — see spec P3 TODO.
+const USER_PROMPT_SCROLLBACK_CAP: usize = 64 * 1024;
+fn truncate_prompt_for_scrollback(text: &str) -> String {
+    if text.len() <= USER_PROMPT_SCROLLBACK_CAP {
+        return text.to_string();
+    }
+    let cut = text
+        .char_indices()
+        .take_while(|(i, _)| *i < USER_PROMPT_SCROLLBACK_CAP)
+        .last()
+        .map(|(i, c)| i + c.len_utf8())
+        .unwrap_or(0);
+    let dropped = text.len() - cut;
+    format!("{}\n[已截断 {} 字节]", &text[..cut], dropped)
+}
+
 fn with_turn_id(mut evt: AcpEvent, tid: u64) -> AcpEvent {
     match &mut evt {
         AcpEvent::ContentBlock { turn_id, .. } => *turn_id = tid,
@@ -2086,6 +2118,21 @@ fn spawn_kiro_fanout(
                 input = input_rx.recv() => {
                     match input {
                         Some(SessionInput::Prompt { text, run_id, client_id }) => {
+                            // Echo each user prompt as its own UserPrompt event (P1):
+                            // N collect-merged messages still surface as N bubbles.
+                            // turn_id = the turn this prompt will belong to. In the
+                            // idle/run_id branches turn_seq is incremented below to
+                            // start the turn, so prompt_turn (turn_seq+1) matches. In
+                            // the collect path queued prompts each use turn_seq+1; since
+                            // turn_seq stays fixed while running/in-window until the
+                            // merged flush does turn_seq+=1, all share the same next-turn
+                            // id, matching the merged assistant turn (T1).
+                            let prompt_turn = turn_seq + 1;
+                            emit(&mgr, &sid, &event_tx, prompt_turn, &AcpEvent::UserPrompt {
+                                text: truncate_prompt_for_scrollback(&text),
+                                turn_id: prompt_turn,
+                                client_id: client_id.clone(),
+                            });
                             if run_id.is_some() {
                                 // C3:调度 prompt 绕过 collect(kiro 当前不跑调度,留此分支保持三 fanout 对称)
                                 queue.clear();
@@ -2235,6 +2282,21 @@ fn spawn_codex_fanout(
                 input = input_rx.recv() => {
                     match input {
                         Some(SessionInput::Prompt { text, run_id, client_id }) => {
+                            // Echo each user prompt as its own UserPrompt event (P1):
+                            // N collect-merged messages still surface as N bubbles.
+                            // turn_id = the turn this prompt will belong to. In the
+                            // idle/run_id branches turn_seq is incremented below to
+                            // start the turn, so prompt_turn (turn_seq+1) matches. In
+                            // the collect path queued prompts each use turn_seq+1; since
+                            // turn_seq stays fixed while running/in-window until the
+                            // merged flush does turn_seq+=1, all share the same next-turn
+                            // id, matching the merged assistant turn (T1).
+                            let prompt_turn = turn_seq + 1;
+                            emit(&mgr, &sid, &event_tx, prompt_turn, &AcpEvent::UserPrompt {
+                                text: truncate_prompt_for_scrollback(&text),
+                                turn_id: prompt_turn,
+                                client_id: client_id.clone(),
+                            });
                             if run_id.is_some() {
                                 // C3:调度 prompt 绕过 collect(codex 当前不跑调度,留此分支保持三 fanout 对称)
                                 queue.clear();
@@ -2871,5 +2933,15 @@ mod emit_tests {
             count: None,
         };
         assert!(!is_ephemeral_event(&init));
+    }
+
+    #[test]
+    fn truncate_prompt_for_scrollback_caps_and_marks() {
+        let short = "hello";
+        assert_eq!(truncate_prompt_for_scrollback(short), "hello");
+        let big = "x".repeat(70_000);
+        let out = truncate_prompt_for_scrollback(&big);
+        assert!(out.len() < 70_000);
+        assert!(out.contains("已截断"));
     }
 }

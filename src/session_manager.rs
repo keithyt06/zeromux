@@ -1777,6 +1777,7 @@ fn spawn_acp_fanout(
                     collect_deadline = None;
                     collect_hard_deadline = None;
                     if !pending.is_empty() {
+                        tracing::info!("collect[{}]: flushing {} queued prompt(s) as one merged turn", sid, pending.len());
                         let merged = merge_pending(&pending);
                         pending.clear();
                         active_run_id = None; // 合并 turn 永不携带 run_id(C3)
@@ -1807,6 +1808,7 @@ struct PendingPrompt {
 /// 向客户端广播一条 ephemeral `System{subtype:"queued"}` 事件,携带当前排队条数。
 /// 该事件在 ws_handler 侧被跳过 scrollback(E7),故重连回放不残留。三个 fanout 共用。
 fn emit_queued(event_tx: &broadcast::Sender<String>, count: usize) {
+    tracing::info!("collect: enqueued appended prompt while turn running, {} queued", count);
     if let Ok(json) = serde_json::to_string(&AcpEvent::System {
         subtype: std::borrow::Cow::Borrowed("queued"),
         session_id: None,

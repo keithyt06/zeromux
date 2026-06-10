@@ -1,5 +1,5 @@
 use axum::{
-    extract::{Query, State},
+    extract::{DefaultBodyLimit, Query, State},
     http::StatusCode,
     middleware,
     response::{IntoResponse, Response},
@@ -29,7 +29,8 @@ pub fn build_router(state: Arc<AppState>) -> Router {
         .route("/api/sessions/{id}/file", post(write_session_file))
         .route("/api/sessions/{id}/file", delete(delete_session_file))
         .route("/api/sessions/{id}/file/rename", post(rename_session_file))
-        .route("/api/sessions/{id}/upload", post(upload_session_file))
+        .route("/api/sessions/{id}/upload", post(upload_session_file)
+            .layer(DefaultBodyLimit::max(28_311_552)))
         .route("/api/sessions/{id}/dir", post(create_session_dir))
         .route("/api/sessions/{id}/dir", delete(delete_session_dir))
         .route("/api/sessions/{id}/dir/rename", post(rename_session_dir))
@@ -907,30 +908,42 @@ struct UploadReq {
     data: String,
 }
 
+#[derive(serde::Serialize)]
+struct UploadResp {
+    /// 实际写入的文件名(去重 + sanitize 后),前端注入 prompt 用。
+    path: String,
+}
+
 async fn upload_session_file(
     State(state): State<Arc<AppState>>,
     axum::extract::Path(id): axum::extract::Path<String>,
     Json(req): Json<UploadReq>,
-) -> Result<StatusCode, (StatusCode, String)> {
-    let (_base, file_path) = resolve_session_path(&state, &id, &req.path)?;
+) -> Result<Json<UploadResp>, (StatusCode, String)> {
+    let safe_name = sanitize_filename(
+        std::path::Path::new(&req.path)
+            .file_name()
+            .and_then(|s| s.to_str())
+            .unwrap_or("upload"),
+    );
+    let (base, _joined) = resolve_session_path(&state, &id, &safe_name)?;
 
     let bytes = base64::Engine::decode(&base64::engine::general_purpose::STANDARD, &req.data)
         .map_err(|e| (StatusCode::BAD_REQUEST, format!("Invalid base64: {}", e)))?;
 
-    // 10MB limit for uploads
-    if bytes.len() > 10_485_760 {
-        return Err((StatusCode::BAD_REQUEST, "File too large (max 10MB)".to_string()));
+    if bytes.len() > 20_971_520 {
+        return Err((StatusCode::BAD_REQUEST, "File too large (max 20MB)".to_string()));
     }
 
-    if let Some(parent) = file_path.parent() {
-        std::fs::create_dir_all(parent)
-            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("Cannot create dir: {}", e)))?;
-    }
+    std::fs::create_dir_all(&base)
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("Cannot create dir: {}", e)))?;
 
-    std::fs::write(&file_path, &bytes)
+    let (mut file, actual_name) = dedupe_and_create(&base, &safe_name)
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("Create failed: {}", e)))?;
+    use std::io::Write;
+    file.write_all(&bytes)
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("Write failed: {}", e)))?;
 
-    Ok(StatusCode::OK)
+    Ok(Json(UploadResp { path: actual_name }))
 }
 
 // ── Directory operations ──

@@ -1848,6 +1848,42 @@ fn emit_queued(event_tx: &broadcast::Sender<String>, count: usize) {
     }
 }
 
+/// True for events that are forwarded live but NOT persisted to scrollback.
+/// Currently only `System{subtype:"queued"}` (the collect enqueue hint): a
+/// reconnect must not replay a phantom "已排队 N 条" for a batch already flushed.
+fn is_ephemeral_event(evt: &AcpEvent) -> bool {
+    matches!(
+        evt,
+        AcpEvent::System { subtype, .. } if subtype.as_ref() == "queued"
+    )
+}
+
+/// Single emit/persist chokepoint for all fan-out events.
+/// Invariant (T2): scrollback is written UNCONDITIONALLY, before and
+/// independent of `event_tx.send`. `broadcast::send` returns Err when there
+/// are zero subscribers (all clients disconnected) — gating persistence on
+/// send success would drop output produced while the phone is backgrounded.
+/// Invariant (D2): this is the ONLY scrollback write path for live events, so
+/// multiple connected clients can never double-record (the per-connection
+/// write in ws_handler is removed in Task G0.3).
+fn emit(
+    mgr: &Weak<SessionManager>,
+    sid: &str,
+    event_tx: &broadcast::Sender<String>,
+    evt: &AcpEvent,
+) {
+    let json = match serde_json::to_string(evt) {
+        Ok(j) => j,
+        Err(_) => return,
+    };
+    if !is_ephemeral_event(evt) {
+        if let Some(m) = mgr.upgrade() {
+            m.push_scrollback(sid, json.clone());
+        }
+    }
+    let _ = event_tx.send(json); // Err == zero subscribers; ignore (T2)
+}
+
 /// 把 Running 期间排队的追加 prompt 合并成一条带语义头的文本。
 /// 语义头让模型明确这是"上一条处理期间的追加",而非独立新请求。
 fn merge_pending(items: &[PendingPrompt]) -> String {
@@ -2779,5 +2815,26 @@ mod running_summary_tests {
         let s = m.running_summary();
         assert_eq!(s.scheduled, 0);
         assert_eq!(s.interactive, 0);
+    }
+}
+
+#[cfg(test)]
+mod emit_tests {
+    use super::*;
+
+    #[test]
+    fn is_ephemeral_event_only_matches_queued() {
+        let queued = AcpEvent::System {
+            subtype: std::borrow::Cow::Borrowed("queued"),
+            session_id: None,
+            count: Some(3),
+        };
+        assert!(is_ephemeral_event(&queued));
+        let init = AcpEvent::System {
+            subtype: std::borrow::Cow::Borrowed("init"),
+            session_id: None,
+            count: None,
+        };
+        assert!(!is_ephemeral_event(&init));
     }
 }

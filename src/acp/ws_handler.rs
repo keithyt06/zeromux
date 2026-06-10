@@ -121,28 +121,16 @@ async fn handle_acp_ws(socket: WebSocket, session_id: String, state: Arc<AppStat
             result = event_rx.recv() => {
                 match result {
                     Ok(json) => {
-                        // Parse once: reused for logging and the ephemeral-queued check.
-                        let parsed = serde_json::from_str::<serde_json::Value>(&json).ok();
-
-                        // Log ACP event
+                        // Log ACP event (logging is per-connection by design —
+                        // each client's ring buffer is independent).
                         if let Some(ref log) = logger {
-                            if let Some(ref val) = parsed {
-                                log.log_acp_event(&session_id, val);
+                            if let Ok(val) = serde_json::from_str::<serde_json::Value>(&json) {
+                                log.log_acp_event(&session_id, &val);
                             }
                         }
-
-                        // E7: `System{subtype:"queued"}` is an ephemeral collect hint.
-                        // Forward it to the live client but DON'T persist to scrollback,
-                        // else reconnect replay shows a phantom "已排队 N 条" for a batch
-                        // that was already flushed.
-                        let is_ephemeral_queued = parsed.as_ref().is_some_and(|v| {
-                            v.get("type").and_then(|t| t.as_str()) == Some("system")
-                                && v.get("subtype").and_then(|s| s.as_str()) == Some("queued")
-                        });
-                        if !is_ephemeral_queued {
-                            state.sessions.push_scrollback(&session_id, json.clone());
-                        }
-
+                        // NOTE: scrollback is written once by the fan-out task
+                        // (session_manager::emit), NOT here — see G0. Writing per
+                        // connection double-recorded under multi-client (D2).
                         if ws_sink.send(Message::Text(json.into())).await.is_err() {
                             break;
                         }

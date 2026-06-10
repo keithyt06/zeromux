@@ -1846,16 +1846,38 @@ fn is_substantive_prompt(text: &str) -> bool {
     t.chars().count() >= 6
 }
 
-/// 清洗 LLM 返回的标题:取第一行、去引号/常见前缀、按字符截断 16、空→None。
+/// 若 `s` 以一个"标签词 + 冒号"前缀开头(如 `标题:`、`中文标题：`、`Title:`、
+/// `Session Title:`),返回冒号之后的内容;否则返回 None。
+///
+/// 通用化(评审 A,修 live bug `中文标题:Claude 模型默认`):不再硬编固定串。
+/// 规则:取第一个中英文冒号(`:` / `：`)之前的片段,若它"短"(≤8 字符)且
+/// 含标签关键词(标题/题/title/name/名称/会话/session),则判定为标签前缀并剥离。
+/// "短 + 含关键词"双条件避免误伤正文(如 `给文章起标题` 无冒号、`实现:配置中心`
+/// 冒号前是正文词而非标签词,均不剥)。
+fn strip_label_prefix(s: &str) -> Option<&str> {
+    let idx = s.find(|c| c == ':' || c == '：')?;
+    let (label, rest) = s.split_at(idx);
+    // 跳过冒号本身(可能是 1 或 3 字节)
+    let rest = &rest[rest.chars().next().map(|c| c.len_utf8()).unwrap_or(0)..];
+    let label_lower = label.trim().to_lowercase();
+    // 关键词是主门槛;长度上限是次级防护(挡掉"某段正文:..."这类冒号在很靠后的句子)。
+    if label.chars().count() > 24 {
+        return None;
+    }
+    // 注意:不要用裸 "题"(会误伤 问题:/话题:);"标题" 已覆盖 标题/中文标题/会话标题。
+    const KEYWORDS: &[&str] = &["标题", "title", "名称", "会话", "session"];
+    if KEYWORDS.iter().any(|k| label_lower.contains(k)) {
+        Some(rest.trim())
+    } else {
+        None
+    }
+}
+
+/// 清洗 LLM 返回的标题:取第一行、剥标签前缀、去引号、按字符截断 16、空→None。
 pub fn sanitize_title(raw: &str) -> Option<String> {
     let first_line = raw.lines().next().unwrap_or("").trim();
-    let stripped = first_line
-        .strip_prefix("标题：")
-        .or_else(|| first_line.strip_prefix("标题:"))
-        .or_else(|| first_line.strip_prefix("Title:"))
-        .or_else(|| first_line.strip_prefix("title:"))
-        .unwrap_or(first_line)
-        .trim();
+    // 标签前缀可能出现在引号外层,故先剥前缀;剥不到则保留原文。
+    let stripped = strip_label_prefix(first_line).unwrap_or(first_line).trim();
     let quotes: &[char] = &['"', '\'', '\u{201c}', '\u{201d}', '\u{2018}', '\u{2019}', '\u{300c}', '\u{300d}', '\u{300e}', '\u{300f}', '`'];
     let unquoted = stripped.trim_matches(|c| quotes.contains(&c)).trim();
     if unquoted.is_empty() {
@@ -2606,6 +2628,21 @@ mod turn_state_tests {
         assert_eq!(sanitize_title(long).unwrap().chars().count(), 16);
         assert_eq!(sanitize_title("   "), None);
         assert_eq!(sanitize_title(""), None);
+    }
+
+    #[test]
+    fn sanitize_title_strips_label_prefixes() {
+        // 真实 live bad sample:模型受 prompt "Language: Chinese" 影响,把
+        // "中文标题:" 当成内容输出 → 名字坏成 "中文标题:Claude 模型默认"。
+        // sanitize 必须剥掉任意 <标签词><冒号> 前缀,而非硬编几个固定串。
+        assert_eq!(sanitize_title("中文标题:Claude 模型默认"), Some("Claude 模型默认".to_string()));
+        assert_eq!(sanitize_title("中文标题：配置中心"), Some("配置中心".to_string()));
+        assert_eq!(sanitize_title("会话标题: 项目架构"), Some("项目架构".to_string()));
+        assert_eq!(sanitize_title("Session Title: Deploy LiteLLM"), Some("Deploy LiteLLM".to_string()));
+        // 前缀剥离后再去引号:剥 + 去引号叠加。
+        assert_eq!(sanitize_title("标题：\"重构\""), Some("重构".to_string()));
+        // 不该误伤:正文里含"标题"二字但不是前缀冒号形态 → 整体保留。
+        assert_eq!(sanitize_title("给文章起标题"), Some("给文章起标题".to_string()));
     }
 
     #[test]

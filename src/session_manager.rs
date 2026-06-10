@@ -125,6 +125,37 @@ pub enum SessionInput {
     Cancel,
     /// ACP/Kiro: turn-level interrupt (abort current turn, keep process alive)
     Interrupt,
+    /// ACP/Kiro/Codex: switch the per-session queue handling mode for
+    /// multiple in-flight prompts (collect / interrupt / passthrough).
+    SetQueueMode(QueueMode),
+}
+
+/// How a fan-out handles a new prompt that arrives while a turn is running.
+/// Per-session, switchable from the UI (G2b). Default Collect (debounce-merge).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum QueueMode {
+    /// Debounce-merge appended prompts into one follow-up turn (existing behavior).
+    Collect,
+    /// Interrupt the running turn and immediately send the new prompt.
+    Interrupt,
+    /// Send the new prompt immediately without interrupting (concurrent turns).
+    Passthrough,
+}
+
+impl QueueMode {
+    fn from_str(s: &str) -> Self {
+        match s {
+            "interrupt" => QueueMode::Interrupt,
+            "passthrough" => QueueMode::Passthrough,
+            _ => QueueMode::Collect,
+        }
+    }
+
+    /// ACP backends (Kiro) lack independent concurrent-turn semantics, so
+    /// passthrough degrades to collect there (matches naozhi).
+    fn effective_for_acp(self, is_acp: bool) -> QueueMode {
+        if is_acp && self == QueueMode::Passthrough { QueueMode::Collect } else { self }
+    }
 }
 
 #[derive(Clone, Copy, PartialEq, Debug)]
@@ -2759,6 +2790,20 @@ mod turn_state_tests {
         assert!(out.contains("重点 SQL 注入"));
         assert!(out.find("先看安全").unwrap() < out.find("重点 SQL 注入").unwrap());
         assert!(out.matches('[').count() >= 3); // header + 2 timestamps
+    }
+
+    #[test]
+    fn queue_mode_parses_and_defaults_collect() {
+        assert_eq!(QueueMode::from_str("collect"), QueueMode::Collect);
+        assert_eq!(QueueMode::from_str("interrupt"), QueueMode::Interrupt);
+        assert_eq!(QueueMode::from_str("passthrough"), QueueMode::Passthrough);
+        assert_eq!(QueueMode::from_str("garbage"), QueueMode::Collect);
+    }
+
+    #[test]
+    fn passthrough_falls_back_to_collect_for_acp() {
+        assert_eq!(QueueMode::Passthrough.effective_for_acp(true), QueueMode::Collect);
+        assert_eq!(QueueMode::Passthrough.effective_for_acp(false), QueueMode::Passthrough);
     }
 
     #[test]

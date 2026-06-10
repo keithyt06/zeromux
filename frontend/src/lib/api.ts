@@ -336,12 +336,14 @@ export async function renameSessionFile(id: string, from: string, to: string): P
   if (!res.ok) throw new Error(await res.text())
 }
 
-export async function uploadSessionFile(id: string, path: string, data: string): Promise<void> {
+export async function uploadSessionFile(id: string, path: string, data: string): Promise<string> {
   const res = await api(`/api/sessions/${id}/upload`, {
     method: 'POST',
     body: JSON.stringify({ path, data }),
   })
   if (!res.ok) throw new Error(await res.text())
+  const body = await res.json() as { path: string }
+  return body.path
 }
 
 // Directory CRUD

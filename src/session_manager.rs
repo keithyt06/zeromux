@@ -1831,6 +1831,59 @@ struct PendingPrompt {
     ts_ms: i64,
 }
 
+/// Shared collect-queue state for all three fan-outs (was duplicated ~3×).
+/// Holds the pending appended prompts and the two debounce/hard-cap timers.
+/// Behavior is identical to the prior inline logic; this is an extraction only.
+struct PromptQueue {
+    pending: Vec<PendingPrompt>,
+    debounce: Option<std::pin::Pin<Box<tokio::time::Sleep>>>,
+    hard_cap: Option<std::pin::Pin<Box<tokio::time::Sleep>>>,
+}
+
+impl PromptQueue {
+    const DEBOUNCE_MS: u64 = 500;
+    const MAX_MS: u64 = 3000;
+
+    fn new() -> Self {
+        Self { pending: Vec::new(), debounce: None, hard_cap: None }
+    }
+
+    fn enqueue(&mut self, text: String) {
+        self.pending.push(PendingPrompt { text, ts_ms: now_millis() });
+    }
+
+    /// Reset the debounce timer (called on each new enqueue inside the window).
+    fn bump_debounce(&mut self) {
+        self.debounce = Some(Box::pin(tokio::time::sleep(
+            std::time::Duration::from_millis(Self::DEBOUNCE_MS))));
+    }
+
+    /// Arm both timers when a turn ends with items queued.
+    fn arm(&mut self) {
+        if !self.pending.is_empty() && self.debounce.is_none() {
+            self.bump_debounce();
+            self.hard_cap = Some(Box::pin(tokio::time::sleep(
+                std::time::Duration::from_millis(Self::MAX_MS))));
+        }
+    }
+
+    fn disarm(&mut self) {
+        self.debounce = None;
+        self.hard_cap = None;
+    }
+
+    fn clear(&mut self) {
+        self.pending.clear();
+        self.disarm();
+    }
+
+    fn drain_merged(&mut self) -> String {
+        let merged = merge_pending(&self.pending);
+        self.pending.clear();
+        merged
+    }
+}
+
 /// 向客户端广播一条 ephemeral `System{subtype:"queued"}` 事件,携带当前排队条数。
 /// 该事件在 ws_handler 侧被跳过 scrollback(E7),故重连回放不残留。三个 fanout 共用。
 fn emit_queued(event_tx: &broadcast::Sender<String>, count: usize) {
@@ -2662,6 +2715,18 @@ mod turn_state_tests {
         assert!(out.contains("重点 SQL 注入"));
         assert!(out.find("先看安全").unwrap() < out.find("重点 SQL 注入").unwrap());
         assert!(out.matches('[').count() >= 3); // header + 2 timestamps
+    }
+
+    #[test]
+    fn prompt_queue_enqueue_and_drain() {
+        let mut q = PromptQueue::new();
+        assert!(q.pending.is_empty());
+        q.enqueue("a".into());
+        q.enqueue("b".into());
+        assert_eq!(q.pending.len(), 2);
+        let merged = q.drain_merged();
+        assert!(q.pending.is_empty());
+        assert!(merged.contains("a") && merged.contains("b"));
     }
 
     #[test]

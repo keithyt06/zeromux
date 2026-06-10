@@ -614,6 +614,7 @@ async fn run_event_loop(
                                             let _ = event_tx
                                                 .send(AcpEvent::ContentBlock {
                                                     block_type: std::borrow::Cow::Borrowed("text"),
+                                                    turn_id: 0,
                                                     text: Some(text),
                                                     name: None,
                                                     input: None,
@@ -631,6 +632,7 @@ async fn run_event_loop(
                                             let _ = event_tx
                                                 .send(AcpEvent::ContentBlock {
                                                     block_type: std::borrow::Cow::Borrowed("thinking"),
+                                                    turn_id: 0,
                                                     text: Some(text),
                                                     name: None,
                                                     input: None,
@@ -650,6 +652,7 @@ async fn run_event_loop(
                                             let _ = event_tx
                                                 .send(AcpEvent::ContentBlock {
                                                     block_type: std::borrow::Cow::Borrowed("tool_use"),
+                                                    turn_id: 0,
                                                     text: None,
                                                     name: Some(name),
                                                     input: None,
@@ -662,6 +665,7 @@ async fn run_event_loop(
                                             let _ = event_tx
                                                 .send(AcpEvent::ContentBlock {
                                                     block_type: std::borrow::Cow::Borrowed("tool_result"),
+                                                    turn_id: 0,
                                                     text: Some(text),
                                                     name: Some(name),
                                                     input: None,
@@ -703,6 +707,7 @@ async fn run_event_loop(
                                     let _ = event_tx
                                         .send(AcpEvent::Result {
                                             text: content.unwrap_or_default(),
+                                            turn_id: 0,
                                             session_id: tid.unwrap_or_default(),
                                             cost_usd: None,
                                         })

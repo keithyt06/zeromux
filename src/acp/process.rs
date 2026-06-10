@@ -41,6 +41,9 @@ pub enum AcpEvent {
     /// - "tool_use"：工具调用，显示 `name · summary` + 图标，原始 `input` 折叠。
     ContentBlock {
         block_type: StaticOrOwnedStr,
+        /// 归属 turn。进程层不知道 turn_seq，构造时填 0；fan-out 的 emit 在广播前
+        /// 用 with_turn_id 盖上真实值（G3.2）。前端据此分组，见 UserPrompt 注释。
+        turn_id: u64,
         #[serde(skip_serializing_if = "Option::is_none")]
         text: Option<String>,
         #[serde(skip_serializing_if = "Option::is_none")]
@@ -62,9 +65,20 @@ pub enum AcpEvent {
     /// `text` 始终完整也保证 session_manager::log_result_event 的活动摘要可用。
     Result {
         text: String,
+        /// 归属 turn。同 ContentBlock：进程层填 0，fan-out 盖真实值（G3.2）。
+        turn_id: u64,
         session_id: String,
         #[serde(skip_serializing_if = "Option::is_none")]
         cost_usd: Option<f64>,
+    },
+    /// 用户 prompt 回显。每条用户 prompt 入队即 emit 一个（collect 合并成一个
+    /// turn 时仍 N 个事件，见 spec P1）。turn_id 标识它归属的 turn，前端据此分组，
+    /// 避免「边流边发」时新 prompt 插进上一个回答中间（spec T1）。
+    UserPrompt {
+        text: String,
+        turn_id: u64,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        client_id: Option<String>,
     },
     /// 错误信息，渲染为红框气泡，并标记当前助手消息为完成。
     Error {
@@ -303,6 +317,7 @@ fn translate_event(val: &serde_json::Value) -> Vec<AcpEvent> {
                     };
                     AcpEvent::ContentBlock {
                         block_type,
+                        turn_id: 0,
                         text,
                         name: b.get("name").and_then(|v| v.as_str()).map(String::from),
                         input: b.get("input").cloned(),
@@ -316,6 +331,7 @@ fn translate_event(val: &serde_json::Value) -> Vec<AcpEvent> {
         "result" => {
             vec![AcpEvent::Result {
                 text: val.get("result").and_then(|v| v.as_str()).unwrap_or("").to_string(),
+                turn_id: 0,
                 session_id: val.get("session_id").and_then(|v| v.as_str()).unwrap_or("").to_string(),
                 cost_usd: val.get("total_cost_usd").and_then(|v| v.as_f64()),
             }]
@@ -325,5 +341,24 @@ fn translate_event(val: &serde_json::Value) -> Vec<AcpEvent> {
             tracing::debug!("stream-json: unhandled event type: {other}");
             vec![]
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn user_prompt_serializes_with_turn_and_client_id() {
+        let evt = AcpEvent::UserPrompt { text: "hello".into(), turn_id: 7, client_id: Some("c1".into()) };
+        let j = serde_json::to_string(&evt).unwrap();
+        assert!(j.contains("\"type\":\"user_prompt\""));
+        assert!(j.contains("\"turn_id\":7"));
+        assert!(j.contains("\"client_id\":\"c1\""));
+    }
+    #[test]
+    fn user_prompt_omits_client_id_when_none() {
+        let evt = AcpEvent::UserPrompt { text: "x".into(), turn_id: 1, client_id: None };
+        let j = serde_json::to_string(&evt).unwrap();
+        assert!(!j.contains("client_id"));
     }
 }

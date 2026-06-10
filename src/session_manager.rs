@@ -129,7 +129,7 @@ pub enum SessionInput {
 pub enum TurnState { Idle, Running }
 
 /// 自动更新 idle-gate 用:区分交互 turn 与调度运行。见 auto_update.rs。
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct RunningSummary {
     /// 交互 agent 会话(无 source_task)当前 turn 为 Running 的数量。
     pub interactive: usize,
@@ -2742,22 +2742,24 @@ mod running_summary_tests {
         }
     }
 
-    fn mgr_with(sessions: Vec<Session>) -> Arc<SessionManager> {
+    fn mgr_with(sessions: Vec<Session>) -> (Arc<SessionManager>, tempfile::TempDir) {
+        let dir = tempfile::tempdir().unwrap();
+        let events = Arc::new(crate::events::EventStore::open(dir.path()).unwrap());
+        let store = Arc::new(crate::session_store::SessionStore::open(dir.path()).unwrap());
         let m = SessionManager::new(
-            crate::events::EventStore::open(std::path::Path::new("/tmp")).unwrap().into(),
-            crate::session_store::SessionStore::open(std::path::Path::new("/tmp")).unwrap().into(),
+            events, store,
             "claude".into(), "kiro-cli".into(), "codex".into(), "off".into(), "bash".into(),
         );
         {
             let mut map = m.sessions.lock().unwrap();
             for s in sessions { map.insert(s.id.clone(), s); }
         }
-        m
+        (m, dir)
     }
 
     #[test]
     fn counts_scheduled_and_interactive_skipping_tmux() {
-        let m = mgr_with(vec![
+        let (m, _tmp) = mgr_with(vec![
             running_session("a", SessionType::Claude, Some("task1".into()), TurnState::Idle),
             running_session("b", SessionType::Codex, None, TurnState::Running),
             running_session("c", SessionType::Claude, None, TurnState::Idle),
@@ -2770,7 +2772,7 @@ mod running_summary_tests {
 
     #[test]
     fn all_idle_when_no_running_agents() {
-        let m = mgr_with(vec![
+        let (m, _tmp) = mgr_with(vec![
             running_session("c", SessionType::Claude, None, TurnState::Idle),
             running_session("d", SessionType::Tmux, None, TurnState::Running),
         ]);

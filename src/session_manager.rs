@@ -143,7 +143,7 @@ pub enum QueueMode {
 }
 
 impl QueueMode {
-    fn from_str(s: &str) -> Self {
+    pub fn from_str(s: &str) -> Self {
         match s {
             "interrupt" => QueueMode::Interrupt,
             "passthrough" => QueueMode::Passthrough,
@@ -1660,6 +1660,9 @@ fn spawn_acp_fanout(
         // 入队只在 turn 进行中(Running)发生;flush 窗口只在 turn 结束(Idle)后 arm,
         // 因此合并 prompt 永不在一个进行中的 turn 里发出(否则会变成 mid-turn 强打断)。
         let mut queue = PromptQueue::new();
+        // 队列模式(G2b):collect(默认)/interrupt/passthrough,由 UI 切换。
+        const IS_ACP: bool = false; // Claude fan-out
+        let mut queue_mode = QueueMode::Collect;
         loop {
             tokio::select! {
                 event = process.event_rx.recv() => {
@@ -1783,31 +1786,71 @@ fn spawn_acp_fanout(
                                 if let Err(e) = process.send_prompt(&text).await {
                                     tracing::warn!("ACP send_prompt failed for {}: {}", sid, e);
                                 }
-                            } else if local_running {
-                                // turn 进行中:入队,不打断(collect 核心)。窗口在 turn 结束后才 arm。
-                                queue.enqueue(text);
-                                emit_queued(&event_tx, queue.pending.len());
-                            } else if queue.debounce.is_some() {
-                                // 收集窗口开着(已 Idle,等 flush):继续入队 + 重置防抖,硬上限保持。
-                                queue.enqueue(text);
-                                queue.bump_debounce();
-                                emit_queued(&event_tx, queue.pending.len());
                             } else {
-                                // 真正空闲:立即发送(原行为)
-                                // auto-titler:记录首条实质 prompt(P1:跳过 hi/ls/继续 等开场)
-                                if first_substantive_prompt.is_none() && is_substantive_prompt(&text) {
-                                    first_substantive_prompt = Some(text.clone());
-                                }
-                                active_run_id = None;
-                                turn_seq += 1;
-                                local_running = true;
-                                if let Some(m) = mgr.upgrade() {
-                                    m.mark_turn(&sid, TurnState::Running, turn_seq);
-                                }
-                                if let Err(e) = process.send_prompt(&text).await {
-                                    tracing::warn!("ACP send_prompt failed for {}: {}", sid, e);
+                                // 非调度 prompt:按当前队列模式分流(G2b)。
+                                match queue_mode {
+                                    QueueMode::Interrupt if local_running => {
+                                        // 打断当前 turn,丢弃任何待合并,立即发新 prompt。
+                                        if let Err(e) = process.interrupt().await {
+                                            tracing::warn!("interrupt (queue mode) failed for {}: {}", sid, e);
+                                        }
+                                        queue.clear();
+                                        active_run_id = None;
+                                        turn_seq += 1;
+                                        local_running = true;
+                                        if let Some(m) = mgr.upgrade() {
+                                            m.mark_turn(&sid, TurnState::Running, turn_seq);
+                                        }
+                                        if let Err(e) = process.send_prompt(&text).await {
+                                            tracing::warn!("ACP send_prompt failed for {}: {}", sid, e);
+                                        }
+                                    }
+                                    QueueMode::Passthrough => {
+                                        // 不打断,直接并发发出。
+                                        active_run_id = None;
+                                        turn_seq += 1;
+                                        local_running = true;
+                                        if let Some(m) = mgr.upgrade() {
+                                            m.mark_turn(&sid, TurnState::Running, turn_seq);
+                                        }
+                                        if let Err(e) = process.send_prompt(&text).await {
+                                            tracing::warn!("ACP send_prompt failed for {}: {}", sid, e);
+                                        }
+                                    }
+                                    // QueueMode::Collect(默认),以及 Interrupt 在 !local_running 时:
+                                    // 沿用原 collect 行为。
+                                    _ => {
+                                        if local_running {
+                                            // turn 进行中:入队,不打断(collect 核心)。窗口在 turn 结束后才 arm。
+                                            queue.enqueue(text);
+                                            emit_queued(&event_tx, queue.pending.len());
+                                        } else if queue.debounce.is_some() {
+                                            // 收集窗口开着(已 Idle,等 flush):继续入队 + 重置防抖,硬上限保持。
+                                            queue.enqueue(text);
+                                            queue.bump_debounce();
+                                            emit_queued(&event_tx, queue.pending.len());
+                                        } else {
+                                            // 真正空闲:立即发送(原行为)
+                                            // auto-titler:记录首条实质 prompt(P1:跳过 hi/ls/继续 等开场)
+                                            if first_substantive_prompt.is_none() && is_substantive_prompt(&text) {
+                                                first_substantive_prompt = Some(text.clone());
+                                            }
+                                            active_run_id = None;
+                                            turn_seq += 1;
+                                            local_running = true;
+                                            if let Some(m) = mgr.upgrade() {
+                                                m.mark_turn(&sid, TurnState::Running, turn_seq);
+                                            }
+                                            if let Err(e) = process.send_prompt(&text).await {
+                                                tracing::warn!("ACP send_prompt failed for {}: {}", sid, e);
+                                            }
+                                        }
+                                    }
                                 }
                             }
+                        }
+                        Some(SessionInput::SetQueueMode(m)) => {
+                            queue_mode = m.effective_for_acp(IS_ACP);
                         }
                         Some(SessionInput::Interrupt) => {
                             if local_running {
@@ -2099,6 +2142,9 @@ fn spawn_kiro_fanout(
         let mut boundary_count: u64 = 0;
         // ── collect 队列状态(镜像 spawn_acp_fanout;见那里的不变量注释) ──
         let mut queue = PromptQueue::new();
+        // 队列模式(G2b):Kiro 为 ACP 后端,passthrough 降级为 collect。
+        const IS_ACP: bool = true; // Kiro fan-out
+        let mut queue_mode = QueueMode::Collect;
         loop {
             tokio::select! {
                 event = process.event_rx.recv() => {
@@ -2180,23 +2226,58 @@ fn spawn_kiro_fanout(
                                 if let Err(e) = process.send_prompt(&text).await {
                                     tracing::warn!("Kiro send_prompt failed for {}: {}", sid, e);
                                 }
-                            } else if local_running {
-                                queue.enqueue(text);
-                                emit_queued(&event_tx, queue.pending.len());
-                            } else if queue.debounce.is_some() {
-                                queue.enqueue(text);
-                                queue.bump_debounce();
-                                emit_queued(&event_tx, queue.pending.len());
                             } else {
-                                turn_seq += 1;
-                                local_running = true;
-                                if let Some(m) = mgr.upgrade() {
-                                    m.mark_turn(&sid, TurnState::Running, turn_seq);
-                                }
-                                if let Err(e) = process.send_prompt(&text).await {
-                                    tracing::warn!("Kiro send_prompt failed for {}: {}", sid, e);
+                                // 非调度 prompt:按队列模式分流(G2b)。Kiro 为 ACP,
+                                // passthrough 已在 SetQueueMode 处降级为 collect。
+                                match queue_mode {
+                                    QueueMode::Interrupt if local_running => {
+                                        if let Err(e) = process.interrupt().await {
+                                            tracing::warn!("interrupt (queue mode) failed for {}: {}", sid, e);
+                                        }
+                                        queue.clear();
+                                        turn_seq += 1;
+                                        local_running = true;
+                                        if let Some(m) = mgr.upgrade() {
+                                            m.mark_turn(&sid, TurnState::Running, turn_seq);
+                                        }
+                                        if let Err(e) = process.send_prompt(&text).await {
+                                            tracing::warn!("Kiro send_prompt failed for {}: {}", sid, e);
+                                        }
+                                    }
+                                    QueueMode::Passthrough => {
+                                        turn_seq += 1;
+                                        local_running = true;
+                                        if let Some(m) = mgr.upgrade() {
+                                            m.mark_turn(&sid, TurnState::Running, turn_seq);
+                                        }
+                                        if let Err(e) = process.send_prompt(&text).await {
+                                            tracing::warn!("Kiro send_prompt failed for {}: {}", sid, e);
+                                        }
+                                    }
+                                    _ => {
+                                        if local_running {
+                                            queue.enqueue(text);
+                                            emit_queued(&event_tx, queue.pending.len());
+                                        } else if queue.debounce.is_some() {
+                                            queue.enqueue(text);
+                                            queue.bump_debounce();
+                                            emit_queued(&event_tx, queue.pending.len());
+                                        } else {
+                                            turn_seq += 1;
+                                            local_running = true;
+                                            if let Some(m) = mgr.upgrade() {
+                                                m.mark_turn(&sid, TurnState::Running, turn_seq);
+                                            }
+                                            if let Err(e) = process.send_prompt(&text).await {
+                                                tracing::warn!("Kiro send_prompt failed for {}: {}", sid, e);
+                                            }
+                                        }
+                                    }
                                 }
                             }
+                        }
+                        Some(SessionInput::SetQueueMode(m)) => {
+                            queue_mode = m.effective_for_acp(IS_ACP);
                         }
                         Some(SessionInput::Interrupt) => {
                             if local_running {
@@ -2263,6 +2344,9 @@ fn spawn_codex_fanout(
         let mut boundary_count: u64 = 0;
         // ── collect 队列状态(镜像 spawn_acp_fanout;见那里的不变量注释) ──
         let mut queue = PromptQueue::new();
+        // 队列模式(G2b):Codex 支持并发 turn,passthrough 不降级。
+        const IS_ACP: bool = false; // Codex fan-out
+        let mut queue_mode = QueueMode::Collect;
         loop {
             tokio::select! {
                 event = process.event_rx.recv() => {
@@ -2344,23 +2428,57 @@ fn spawn_codex_fanout(
                                 if let Err(e) = process.send_prompt(&text).await {
                                     tracing::warn!("Codex send_prompt failed for {}: {}", sid, e);
                                 }
-                            } else if local_running {
-                                queue.enqueue(text);
-                                emit_queued(&event_tx, queue.pending.len());
-                            } else if queue.debounce.is_some() {
-                                queue.enqueue(text);
-                                queue.bump_debounce();
-                                emit_queued(&event_tx, queue.pending.len());
                             } else {
-                                turn_seq += 1;
-                                local_running = true;
-                                if let Some(m) = mgr.upgrade() {
-                                    m.mark_turn(&sid, TurnState::Running, turn_seq);
-                                }
-                                if let Err(e) = process.send_prompt(&text).await {
-                                    tracing::warn!("Codex send_prompt failed for {}: {}", sid, e);
+                                // 非调度 prompt:按队列模式分流(G2b)。
+                                match queue_mode {
+                                    QueueMode::Interrupt if local_running => {
+                                        if let Err(e) = process.interrupt().await {
+                                            tracing::warn!("interrupt (queue mode) failed for {}: {}", sid, e);
+                                        }
+                                        queue.clear();
+                                        turn_seq += 1;
+                                        local_running = true;
+                                        if let Some(m) = mgr.upgrade() {
+                                            m.mark_turn(&sid, TurnState::Running, turn_seq);
+                                        }
+                                        if let Err(e) = process.send_prompt(&text).await {
+                                            tracing::warn!("Codex send_prompt failed for {}: {}", sid, e);
+                                        }
+                                    }
+                                    QueueMode::Passthrough => {
+                                        turn_seq += 1;
+                                        local_running = true;
+                                        if let Some(m) = mgr.upgrade() {
+                                            m.mark_turn(&sid, TurnState::Running, turn_seq);
+                                        }
+                                        if let Err(e) = process.send_prompt(&text).await {
+                                            tracing::warn!("Codex send_prompt failed for {}: {}", sid, e);
+                                        }
+                                    }
+                                    _ => {
+                                        if local_running {
+                                            queue.enqueue(text);
+                                            emit_queued(&event_tx, queue.pending.len());
+                                        } else if queue.debounce.is_some() {
+                                            queue.enqueue(text);
+                                            queue.bump_debounce();
+                                            emit_queued(&event_tx, queue.pending.len());
+                                        } else {
+                                            turn_seq += 1;
+                                            local_running = true;
+                                            if let Some(m) = mgr.upgrade() {
+                                                m.mark_turn(&sid, TurnState::Running, turn_seq);
+                                            }
+                                            if let Err(e) = process.send_prompt(&text).await {
+                                                tracing::warn!("Codex send_prompt failed for {}: {}", sid, e);
+                                            }
+                                        }
+                                    }
                                 }
                             }
+                        }
+                        Some(SessionInput::SetQueueMode(m)) => {
+                            queue_mode = m.effective_for_acp(IS_ACP);
                         }
                         Some(SessionInput::Interrupt) => {
                             if local_running {

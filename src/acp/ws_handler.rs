@@ -9,7 +9,7 @@ use futures::{SinkExt, StreamExt};
 use std::sync::Arc;
 use tokio::sync::broadcast;
 
-use crate::session_manager::SessionInput;
+use crate::session_manager::{QueueMode, SessionInput};
 use crate::{auth, AppState};
 
 #[derive(serde::Deserialize)]
@@ -26,6 +26,8 @@ enum ClientMsg {
     Cancel,
     #[serde(rename = "interrupt")]
     Interrupt,
+    #[serde(rename = "set_queue_mode")]
+    SetQueueMode { mode: String },
 }
 
 pub async fn ws_acp(
@@ -158,6 +160,9 @@ async fn handle_acp_ws(socket: WebSocket, session_id: String, state: Arc<AppStat
                                 }
                                 ClientMsg::Interrupt => {
                                     let _ = input_tx.send(SessionInput::Interrupt).await;
+                                }
+                                ClientMsg::SetQueueMode { mode } => {
+                                    let _ = input_tx.send(SessionInput::SetQueueMode(QueueMode::from_str(&mode))).await;
                                 }
                             }
                         }

@@ -43,23 +43,33 @@ pub fn spawn_titler(
     mgr: Weak<SessionManager>,
 ) {
     tokio::spawn(async move {
+        tracing::info!("titler[{}]: start, backend={:?}", sid, backend);
         let sandbox = match tempfile::Builder::new().prefix("zeromux-titler-").tempdir() {
             Ok(d) => d,
             Err(e) => {
-                tracing::debug!("titler tempdir failed: {}", e);
+                tracing::warn!("titler[{}]: tempdir failed: {}", sid, e);
                 return;
             }
         };
         let sandbox_path = sandbox.path().to_string_lossy().to_string();
         let prompt = titler_prompt(&first_prompt, &result_text);
 
-        let title = run_titler(backend, &cli_path, &sandbox_path, &prompt).await;
+        let title = run_titler(&sid, backend, &cli_path, &sandbox_path, &prompt).await;
 
-        let Some(raw) = title else { return };
-        let Some(clean) = sanitize_title(&raw) else { return };
+        let Some(raw) = title else {
+            tracing::info!("titler[{}]: no title produced, keeping default name", sid);
+            return;
+        };
+        let Some(clean) = sanitize_title(&raw) else {
+            tracing::info!("titler[{}]: raw title sanitized to empty, keeping default (raw={:?})", sid, raw);
+            return;
+        };
         if let Some(m) = mgr.upgrade() {
             if m.session_name_is_auto(&sid) {
-                m.set_auto_title(&sid, &clean);
+                let wrote = m.set_auto_title(&sid, &clean);
+                tracing::info!("titler[{}]: set_auto_title({:?}) wrote={}", sid, clean, wrote);
+            } else {
+                tracing::info!("titler[{}]: name no longer auto (user renamed?), skip write", sid);
             }
         }
         // sandbox drop → temp dir removed
@@ -69,6 +79,7 @@ pub fn spawn_titler(
 /// 拉起对应后端的无工具临时进程,发 prompt,在超时内等 `Result` 文本,结束后 kill。
 /// 仅 Claude 完整支持;Kiro/Codex 暂降为 None(见模块头注释)。
 async fn run_titler(
+    sid: &str,
     backend: TitlerBackend,
     cli_path: &str,
     sandbox_path: &str,
@@ -79,11 +90,12 @@ async fn run_titler(
             let mut proc = match AcpProcess::spawn_titler(cli_path, sandbox_path).await {
                 Ok(p) => p,
                 Err(e) => {
-                    tracing::debug!("titler claude spawn failed: {}", e);
+                    tracing::warn!("titler[{}]: claude spawn failed: {}", sid, e);
                     return None;
                 }
             };
             if proc.send_prompt(prompt).await.is_err() {
+                tracing::warn!("titler[{}]: send_prompt failed", sid);
                 proc.kill().await;
                 return None;
             }
@@ -101,14 +113,28 @@ async fn run_titler(
                     }
                 },
             )
-            .await
-            .ok()
-            .flatten();
+            .await;
             proc.kill().await;
-            text
+            match text {
+                Ok(Some(t)) => {
+                    tracing::info!("titler[{}]: got Result, {} chars", sid, t.chars().count());
+                    Some(t)
+                }
+                Ok(None) => {
+                    tracing::warn!("titler[{}]: stream ended with Error/Exit before Result", sid);
+                    None
+                }
+                Err(_) => {
+                    tracing::warn!("titler[{}]: timed out after {}s", sid, TITLER_TIMEOUT_SECS);
+                    None
+                }
+            }
         }
         // 无法安全保证无工具 → 按设计放弃,保留默认会话名。
-        TitlerBackend::Kiro | TitlerBackend::Codex => None,
+        TitlerBackend::Kiro | TitlerBackend::Codex => {
+            tracing::info!("titler[{}]: backend {:?} not supported (tool-less spawn unsafe), keeping default name by design", sid, backend);
+            None
+        }
     }
 }
 

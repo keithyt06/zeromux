@@ -13,6 +13,7 @@ interface Props {
   showGit: boolean
   showEvents: boolean
   onOpenSidebar?: () => void
+  onQueueMode?: (mode: string) => void
 }
 
 const STATUS_OPTIONS: { value: SessionMetaStatus; label: string; color: string }[] = [
@@ -27,8 +28,9 @@ export function StatusDot({ status }: { status: SessionMetaStatus }) {
   return <span className={`inline-block w-2 h-2 rounded-full ${opt?.color || 'bg-gray-400'} shrink-0`} />
 }
 
-export default function SessionInfoBar({ session, onUpdate, onToggleFiles, onToggleGit, onToggleEvents, showFiles, showGit, showEvents, onOpenSidebar }: Props) {
+export default function SessionInfoBar({ session, onUpdate, onToggleFiles, onToggleGit, onToggleEvents, showFiles, showGit, showEvents, onOpenSidebar, onQueueMode }: Props) {
   const [expanded, setExpanded] = useState(false)
+  const [queueMode, setQueueMode] = useState('collect')
   const [desc, setDesc] = useState(session.description)
   const [notes, setNotes] = useState<NoteEntry[]>([])
   const [noteInput, setNoteInput] = useState('')
@@ -187,6 +189,26 @@ export default function SessionInfoBar({ session, onUpdate, onToggleFiles, onTog
               ))}
             </div>
           </div>
+
+          {/* Queue mode (agent sessions only) */}
+          {onQueueMode && (
+            <div className="flex items-center gap-2">
+              <span className="text-[10px] text-[var(--text-muted)] uppercase w-12">Queue</span>
+              <select
+                value={queueMode}
+                onChange={e => {
+                  setQueueMode(e.target.value)
+                  onQueueMode(e.target.value)
+                }}
+                className="text-[10px] bg-[var(--bg-primary)] border border-[var(--border)] rounded px-1.5 py-0.5 text-[var(--text-primary)] outline-none focus:border-[var(--accent-blue)]"
+                title="多条消息同时在途时如何处理"
+              >
+                <option value="collect">Collect</option>
+                <option value="interrupt">Interrupt</option>
+                <option value="passthrough">Passthrough</option>
+              </select>
+            </div>
+          )}
 
           {/* Notes */}
           <div>

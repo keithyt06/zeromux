@@ -45,12 +45,15 @@ interface Props {
   sessionId: string
   active: boolean
   agentType?: 'claude' | 'kiro' | 'codex'
+  // Lets the parent (App→SessionInfoBar) drive WS-only controls that live in
+  // this component. Registered on mount, cleared on unmount. (G2b queue mode.)
+  onRegisterControls?: (sessionId: string, api: { setQueueMode: (mode: string) => void } | null) => void
 }
 
 // `active` is accepted (App passes it for all session views) but no longer used:
 // the Composer owns its own textarea and we intentionally don't auto-focus it,
 // so switching to a chat session doesn't pop the mobile keyboard.
-export default function AcpChatView({ sessionId, agentType = 'claude' }: Props) {
+export default function AcpChatView({ sessionId, agentType = 'claude', onRegisterControls }: Props) {
   // Raw wire-event log; the rendered transcript is DERIVED from it by grouping
   // on turn_id (T1). This is what fixes "send while streaming" misalignment:
   // a new prompt carries the NEXT turn_id, so it folds into its own group
@@ -298,6 +301,19 @@ export default function AcpChatView({ sessionId, agentType = 'claude' }: Props) 
     // Backend clears the pending collect queue on interrupt (E5); mirror locally.
     setQueuedCount(0)
   }, [])
+
+  const setQueueMode = useCallback((mode: string) => {
+    if (wsRef.current?.readyState === WebSocket.OPEN) {
+      wsRef.current.send(JSON.stringify({ type: 'set_queue_mode', mode }))
+    }
+  }, [])
+
+  // Register WS-only controls so SessionInfoBar (rendered by App, a sibling)
+  // can drive them for the active session. Clear on unmount.
+  useEffect(() => {
+    onRegisterControls?.(sessionId, { setQueueMode })
+    return () => onRegisterControls?.(sessionId, null)
+  }, [sessionId, setQueueMode, onRegisterControls])
 
   return (
     <div className="flex flex-col h-full">

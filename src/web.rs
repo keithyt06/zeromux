@@ -862,6 +862,24 @@ async fn rename_session_file(
 
 // ── File upload (base64) ──
 
+/// 在扩展名前插入 `-N` 后缀。前导点(dotfile)不视为扩展名。
+fn next_candidate(name: &str, n: usize) -> String {
+    match name.rfind('.').filter(|&i| i > 0) {
+        Some(i) => format!("{}-{}{}", &name[..i], n, &name[i..]),
+        None => format!("{}-{}", name, n),
+    }
+}
+
+/// 剥换行/控制字符(< 0x20 及 DEL 0x7f)与路径分隔符(/ \\)。
+/// 空或全非法 → "upload"。Unicode 正常字符保留。
+fn sanitize_filename(name: &str) -> String {
+    let cleaned: String = name
+        .chars()
+        .filter(|&c| c >= '\u{20}' && c != '\u{7f}' && c != '/' && c != '\\')
+        .collect();
+    if cleaned.is_empty() { "upload".to_string() } else { cleaned }
+}
+
 #[derive(serde::Deserialize)]
 struct UploadReq {
     path: String,
@@ -1454,4 +1472,44 @@ async fn scheduler_health(
     let now = chrono::Utc::now().timestamp_millis();
     let healthy = hb != 0 && now - hb < 180_000;
     Ok(Json(serde_json::json!({ "heartbeat_ms": hb, "healthy": healthy })))
+}
+
+#[cfg(test)]
+mod upload_helpers_tests {
+    use super::*;
+
+    #[test]
+    fn next_candidate_adds_suffix_before_ext() {
+        assert_eq!(next_candidate("a.png", 1), "a-1.png");
+        assert_eq!(next_candidate("a.png", 2), "a-2.png");
+    }
+
+    #[test]
+    fn next_candidate_no_extension() {
+        assert_eq!(next_candidate("log", 1), "log-1");
+    }
+
+    #[test]
+    fn next_candidate_dotfile_treated_as_no_ext() {
+        assert_eq!(next_candidate(".gitignore", 1), ".gitignore-1");
+    }
+
+    #[test]
+    fn sanitize_strips_control_and_separators() {
+        assert_eq!(sanitize_filename("a\nb.png"), "ab.png");
+        assert_eq!(sanitize_filename("x/y\\z.txt"), "xyz.txt");
+        assert_eq!(sanitize_filename("ok\u{7f}name"), "okname");
+    }
+
+    #[test]
+    fn sanitize_keeps_unicode_and_normal() {
+        assert_eq!(sanitize_filename("截图.png"), "截图.png");
+    }
+
+    #[test]
+    fn sanitize_empty_falls_back() {
+        assert_eq!(sanitize_filename(""), "upload");
+        assert_eq!(sanitize_filename("///"), "upload");
+        assert_eq!(sanitize_filename("\n\n"), "upload");
+    }
 }

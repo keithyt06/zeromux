@@ -1645,7 +1645,7 @@ fn spawn_acp_fanout(
                                 evt,
                                 AcpEvent::Result { .. } | AcpEvent::Error { .. } | AcpEvent::Exit { .. }
                             );
-                            emit(&mgr, &sid, &event_tx, &evt);
+                            emit(&mgr, &sid, &event_tx, turn_seq, &evt);
                             if is_boundary {
                                 // Each started turn emits exactly one boundary
                                 // (Result/Error/Exit), in FIFO order, so the
@@ -1905,8 +1905,20 @@ fn emit(
     mgr: &Weak<SessionManager>,
     sid: &str,
     event_tx: &broadcast::Sender<String>,
+    turn_id: u64,
     evt: &AcpEvent,
 ) {
+    // ContentBlock/Result arrive from the process layer with turn_id:0 (it
+    // doesn't track turn_seq). Stamp the live turn here before broadcast/persist
+    // so the frontend can group by turn (T1). Other events are passed through.
+    let stamped;
+    let evt = match evt {
+        AcpEvent::ContentBlock { .. } | AcpEvent::Result { .. } => {
+            stamped = with_turn_id(evt.clone(), turn_id);
+            &stamped
+        }
+        _ => evt,
+    };
     let json = match serde_json::to_string(evt) {
         Ok(j) => j,
         Err(_) => return,
@@ -1917,6 +1929,15 @@ fn emit(
         }
     }
     let _ = event_tx.send(json); // Err == zero subscribers; ignore (T2)
+}
+
+fn with_turn_id(mut evt: AcpEvent, tid: u64) -> AcpEvent {
+    match &mut evt {
+        AcpEvent::ContentBlock { turn_id, .. } => *turn_id = tid,
+        AcpEvent::Result { turn_id, .. } => *turn_id = tid,
+        _ => {}
+    }
+    evt
 }
 
 /// 把 Running 期间排队的追加 prompt 合并成一条带语义头的文本。
@@ -2031,7 +2052,7 @@ fn spawn_kiro_fanout(
                                 evt,
                                 AcpEvent::Result { .. } | AcpEvent::Error { .. } | AcpEvent::Exit { .. }
                             );
-                            emit(&mgr, &sid, &event_tx, &evt);
+                            emit(&mgr, &sid, &event_tx, turn_seq, &evt);
                             if is_boundary {
                                 // Each started turn emits exactly one boundary
                                 // (Result/Error/Exit), in FIFO order, so the
@@ -2180,7 +2201,7 @@ fn spawn_codex_fanout(
                                 evt,
                                 AcpEvent::Result { .. } | AcpEvent::Error { .. } | AcpEvent::Exit { .. }
                             );
-                            emit(&mgr, &sid, &event_tx, &evt);
+                            emit(&mgr, &sid, &event_tx, turn_seq, &evt);
                             if is_boundary {
                                 // Each started turn emits exactly one boundary
                                 // (Result/Error/Exit), in FIFO order, so the

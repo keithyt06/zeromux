@@ -128,6 +128,16 @@ pub enum SessionInput {
 #[derive(Clone, Copy, PartialEq, Debug)]
 pub enum TurnState { Idle, Running }
 
+/// 自动更新 idle-gate 用:区分交互 turn 与调度运行。见 auto_update.rs。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RunningSummary {
+    /// 交互 agent 会话(无 source_task)当前 turn 为 Running 的数量。
+    pub interactive: usize,
+    /// 调度运行会话(source_task_id 存在)且进程存活的数量(无论 turn 状态)。
+    /// 这是「run_id turn 在跑」的保守超集:绝不强制升级穿透它(评审 E1)。
+    pub scheduled: usize,
+}
+
 /// 一个会话的运行态：仅当进程存活时存在。fan-out 任务独占其中的进程句柄
 /// （通过 channel）。Drop 此结构 → channel 关闭 → fan-out 退出 → 进程死。
 struct RunningProcess {
@@ -765,6 +775,26 @@ impl SessionManager {
     /// True if a session with this id currently exists (process may be running).
     pub fn session_exists(&self, id: &str) -> bool {
         self.sessions.lock().unwrap().contains_key(id)
+    }
+
+    /// 统计正在运行的 agent 会话,按是否为调度运行分类(tmux 跳过)。
+    /// auto_update 的 idle-gate 据此决定能否升级(评审 E1:scheduled>0 → 永不强制穿透)。
+    pub fn running_summary(&self) -> RunningSummary {
+        let map = self.sessions.lock().unwrap();
+        let mut interactive = 0;
+        let mut scheduled = 0;
+        for s in map.values() {
+            if !matches!(s.session_type, SessionType::Claude | SessionType::Kiro | SessionType::Codex) {
+                continue; // tmux 无 turn 概念,不阻塞升级
+            }
+            let Some(rp) = s.running.as_ref() else { continue };
+            if s.source_task_id.is_some() {
+                scheduled += 1; // 调度运行,无论 turn 状态都阻塞(保守超集)
+            } else if rp.turn_state == TurnState::Running {
+                interactive += 1;
+            }
+        }
+        RunningSummary { interactive, scheduled }
     }
 
     /// Create a Claude session for a scheduled run, mark the run running, and
@@ -2665,5 +2695,87 @@ mod turn_state_tests {
         assert_eq!(v.get("count").and_then(|c| c.as_u64()), Some(3));
         // session_id is None → skipped, so reconnect/init parsing stays clean.
         assert!(v.get("session_id").is_none());
+    }
+}
+
+#[cfg(test)]
+mod running_summary_tests {
+    use super::*;
+
+    // 构造一个带 running 进程的会话,可指定类型/是否 source_task/turn_state。
+    fn running_session(
+        id: &str,
+        stype: SessionType,
+        source_task_id: Option<String>,
+        turn: TurnState,
+    ) -> Session {
+        let (event_tx, _) = broadcast::channel(BROADCAST_CAPACITY);
+        let (input_tx, _rx) = mpsc::channel::<SessionInput>(64);
+        Session {
+            id: id.into(),
+            name: "n".into(),
+            session_type: stype,
+            cols: 80,
+            rows: 24,
+            work_dir: "/tmp".into(),
+            owner_id: "o".into(),
+            description: String::new(),
+            name_is_auto: true,
+            status: SessionMeta::Idle,
+            resume_token: None,
+            worktree_path: None,
+            created_ms: 0,
+            source_task_id,
+            spawning: false,
+            last_activity_ms: 0,
+            turns_completed: 0,
+            running: Some(RunningProcess {
+                event_tx,
+                input_tx,
+                pty_pid: None,
+                turn_state: turn,
+                turn_started_ms: None,
+                turn_seq: 0,
+            }),
+            scrollback: VecDeque::new(),
+            scrollback_bytes: 0,
+        }
+    }
+
+    fn mgr_with(sessions: Vec<Session>) -> Arc<SessionManager> {
+        let m = SessionManager::new(
+            crate::events::EventStore::open(std::path::Path::new("/tmp")).unwrap().into(),
+            crate::session_store::SessionStore::open(std::path::Path::new("/tmp")).unwrap().into(),
+            "claude".into(), "kiro-cli".into(), "codex".into(), "off".into(), "bash".into(),
+        );
+        {
+            let mut map = m.sessions.lock().unwrap();
+            for s in sessions { map.insert(s.id.clone(), s); }
+        }
+        m
+    }
+
+    #[test]
+    fn counts_scheduled_and_interactive_skipping_tmux() {
+        let m = mgr_with(vec![
+            running_session("a", SessionType::Claude, Some("task1".into()), TurnState::Idle),
+            running_session("b", SessionType::Codex, None, TurnState::Running),
+            running_session("c", SessionType::Claude, None, TurnState::Idle),
+            running_session("d", SessionType::Tmux, None, TurnState::Running),
+        ]);
+        let s = m.running_summary();
+        assert_eq!(s.scheduled, 1, "source_task session counts as scheduled regardless of turn");
+        assert_eq!(s.interactive, 1, "only non-source running agent counts as interactive");
+    }
+
+    #[test]
+    fn all_idle_when_no_running_agents() {
+        let m = mgr_with(vec![
+            running_session("c", SessionType::Claude, None, TurnState::Idle),
+            running_session("d", SessionType::Tmux, None, TurnState::Running),
+        ]);
+        let s = m.running_summary();
+        assert_eq!(s.scheduled, 0);
+        assert_eq!(s.interactive, 0);
     }
 }

@@ -65,9 +65,14 @@ async fn handle_acp_ws(socket: WebSocket, session_id: String, state: Arc<AppStat
         tracing::error!("ensure_running failed for {}: {}", session_id, e);
         return;
     }
-    // Subscribe to broadcast (multi-client safe — no take/return)
-    let mut event_rx = match state.sessions.subscribe(&session_id) {
-        Some(rx) => rx,
+    // Atomically snapshot scrollback AND subscribe under one lock. This closes
+    // the reconnect double-delivery race: taking the history snapshot and the
+    // live receiver separately (as before) let an event emitted between the two
+    // land in BOTH the replay and the live stream (review 2026-06-11). See
+    // SessionManager::subscribe_with_history. The snapshot is taken here, before
+    // any `.await`, so nothing can interleave.
+    let (history, mut event_rx) = match state.sessions.subscribe_with_history(&session_id) {
+        Some(pair) => pair,
         None => {
             tracing::error!("ACP session {} not found", session_id);
             return;
@@ -86,8 +91,8 @@ async fn handle_acp_ws(socket: WebSocket, session_id: String, state: Arc<AppStat
         .send(Message::Text(init_msg.to_string().into()))
         .await;
 
-    // Replay event history for reconnecting clients
-    let history = state.sessions.get_scrollback(&session_id);
+    // Replay event history for reconnecting clients (snapshot taken above,
+    // atomically with the subscribe, so no event is both replayed and live).
     let has_history = !history.is_empty();
     for json in history {
         if ws_sink

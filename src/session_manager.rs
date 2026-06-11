@@ -151,10 +151,18 @@ impl QueueMode {
         }
     }
 
-    /// ACP backends (Kiro) lack independent concurrent-turn semantics, so
-    /// passthrough degrades to collect there (matches naozhi).
-    fn effective_for_acp(self, is_acp: bool) -> QueueMode {
-        if is_acp && self == QueueMode::Passthrough { QueueMode::Collect } else { self }
+    /// Passthrough cannot work under the current single-`turn_seq` /
+    /// `boundary_count` fan-out machinery on ANY backend:
+    /// - Codex (codex_process.rs): drops a prompt that arrives mid-turn, so the
+    ///   2nd prompt is lost AND `turn_seq` was already bumped → `boundary_count`
+    ///   can never catch up → the session wedges in Running ("thinking…") forever.
+    /// - Claude/Kiro: the single `turn_seq` stamps the still-streaming prior
+    ///   turn's trailing ContentBlocks with the new turn's id → mis-grouping.
+    /// So Passthrough degrades to Collect everywhere (review 2026-06-11). The UI
+    /// no longer offers it; this is the server-side backstop for a stale client
+    /// or a direct WS sending `passthrough`. `Interrupt` and `Collect` are sound.
+    fn effective(self) -> QueueMode {
+        if self == QueueMode::Passthrough { QueueMode::Collect } else { self }
     }
 }
 
@@ -1336,6 +1344,53 @@ impl SessionManager {
 
     // ── Broadcast API: subscribe to session events ──
 
+    /// Atomically snapshot the scrollback AND subscribe to the live broadcast
+    /// under a SINGLE lock, returning `(history, receiver)`. This closes the
+    /// reconnect double-delivery race (review 2026-06-11): the old path called
+    /// `subscribe()` then — after an `.await` — `get_scrollback()` as two
+    /// separate locks. Since G0 made `emit` write scrollback *before*
+    /// broadcasting (see `record_and_broadcast`), an event landing between the
+    /// two locks was BOTH replayed and delivered live → a duplicated streaming
+    /// chunk on reconnect-mid-stream. Taking the snapshot and the receiver in
+    /// one lock makes every event fall on exactly one side of the boundary:
+    /// either already in `history`, or delivered to `receiver`, never both.
+    /// Returns None if the session has no running process.
+    pub fn subscribe_with_history(
+        &self,
+        id: &str,
+    ) -> Option<(Vec<String>, broadcast::Receiver<String>)> {
+        let map = self.sessions.lock().unwrap();
+        let s = map.get(id)?;
+        let rx = s.running.as_ref()?.event_tx.subscribe();
+        let history = s.scrollback.iter().cloned().collect();
+        Some((history, rx))
+    }
+
+    /// Atomically push an event to scrollback AND broadcast it under a SINGLE
+    /// lock (review 2026-06-11). Pairs with `subscribe_with_history`: because
+    /// both the persist+broadcast here and the snapshot+subscribe there happen
+    /// under the same `sessions` mutex, a reconnecting client can never observe
+    /// an event in both its replay and its live stream. `broadcast::send` is
+    /// synchronous, so holding the std mutex across it does not block on I/O.
+    /// Returns the broadcast result (Err == zero live subscribers; persistence
+    /// still happened — that is the whole point, see T2).
+    fn record_and_broadcast(&self, id: &str, data: String) {
+        let mut map = self.sessions.lock().unwrap();
+        if let Some(s) = map.get_mut(id) {
+            let data_len = data.len();
+            s.scrollback.push_back(data.clone());
+            s.scrollback_bytes += data_len;
+            while s.scrollback_bytes > SCROLLBACK_MAX_BYTES && !s.scrollback.is_empty() {
+                if let Some(removed) = s.scrollback.pop_front() {
+                    s.scrollback_bytes -= removed.len();
+                }
+            }
+            if let Some(rp) = s.running.as_ref() {
+                let _ = rp.event_tx.send(data); // Err == zero subscribers; ignore (T2)
+            }
+        }
+    }
+
     /// Subscribe to a session's event broadcast. Returns None if session not found.
     pub fn subscribe(&self, id: &str) -> Option<broadcast::Receiver<String>> {
         self.sessions
@@ -1660,8 +1715,8 @@ fn spawn_acp_fanout(
         // 入队只在 turn 进行中(Running)发生;flush 窗口只在 turn 结束(Idle)后 arm,
         // 因此合并 prompt 永不在一个进行中的 turn 里发出(否则会变成 mid-turn 强打断)。
         let mut queue = PromptQueue::new();
-        // 队列模式(G2b):collect(默认)/interrupt/passthrough,由 UI 切换。
-        const IS_ACP: bool = false; // Claude fan-out
+        // 队列模式(G2b):collect(默认)/interrupt。passthrough 经 effective()
+        // 在所有后端降级为 collect(见 QueueMode::effective 注释,review 2026-06-11)。
         let mut queue_mode = QueueMode::Collect;
         loop {
             tokio::select! {
@@ -1850,7 +1905,7 @@ fn spawn_acp_fanout(
                             }
                         }
                         Some(SessionInput::SetQueueMode(m)) => {
-                            queue_mode = m.effective_for_acp(IS_ACP);
+                            queue_mode = m.effective();
                         }
                         Some(SessionInput::Interrupt) => {
                             if local_running {
@@ -2015,12 +2070,18 @@ fn emit(
         Ok(j) => j,
         Err(_) => return,
     };
-    if !is_ephemeral_event(evt) {
-        if let Some(m) = mgr.upgrade() {
-            m.push_scrollback(sid, json.clone());
-        }
+    if is_ephemeral_event(evt) {
+        // Ephemeral (queued hint): broadcast only, never persisted (E7).
+        let _ = event_tx.send(json); // Err == zero subscribers; ignore (T2)
+    } else if let Some(m) = mgr.upgrade() {
+        // Persist + broadcast atomically under one lock so a reconnecting
+        // client never sees this event in BOTH replay and live stream
+        // (review 2026-06-11; pairs with subscribe_with_history).
+        m.record_and_broadcast(sid, json);
+    } else {
+        // SessionManager gone (shutting down): best-effort live broadcast.
+        let _ = event_tx.send(json);
     }
-    let _ = event_tx.send(json); // Err == zero subscribers; ignore (T2)
 }
 
 /// Cap a user prompt before it enters scrollback (T3). A single huge paste
@@ -2142,8 +2203,7 @@ fn spawn_kiro_fanout(
         let mut boundary_count: u64 = 0;
         // ── collect 队列状态(镜像 spawn_acp_fanout;见那里的不变量注释) ──
         let mut queue = PromptQueue::new();
-        // 队列模式(G2b):Kiro 为 ACP 后端,passthrough 降级为 collect。
-        const IS_ACP: bool = true; // Kiro fan-out
+        // 队列模式(G2b):passthrough 经 effective() 降级为 collect(见 QueueMode::effective)。
         let mut queue_mode = QueueMode::Collect;
         loop {
             tokio::select! {
@@ -2277,7 +2337,7 @@ fn spawn_kiro_fanout(
                             }
                         }
                         Some(SessionInput::SetQueueMode(m)) => {
-                            queue_mode = m.effective_for_acp(IS_ACP);
+                            queue_mode = m.effective();
                         }
                         Some(SessionInput::Interrupt) => {
                             if local_running {
@@ -2344,8 +2404,9 @@ fn spawn_codex_fanout(
         let mut boundary_count: u64 = 0;
         // ── collect 队列状态(镜像 spawn_acp_fanout;见那里的不变量注释) ──
         let mut queue = PromptQueue::new();
-        // 队列模式(G2b):Codex 支持并发 turn,passthrough 不降级。
-        const IS_ACP: bool = false; // Codex fan-out
+        // 队列模式(G2b):Codex 的 mcp-server 事件循环在 turn 进行中会丢弃新 prompt
+        // (codex_process.rs),故无法真正并发;passthrough 经 effective() 降级为
+        // collect(见 QueueMode::effective,review 2026-06-11)。
         let mut queue_mode = QueueMode::Collect;
         loop {
             tokio::select! {
@@ -2478,7 +2539,7 @@ fn spawn_codex_fanout(
                             }
                         }
                         Some(SessionInput::SetQueueMode(m)) => {
-                            queue_mode = m.effective_for_acp(IS_ACP);
+                            queue_mode = m.effective();
                         }
                         Some(SessionInput::Interrupt) => {
                             if local_running {
@@ -2919,9 +2980,13 @@ mod turn_state_tests {
     }
 
     #[test]
-    fn passthrough_falls_back_to_collect_for_acp() {
-        assert_eq!(QueueMode::Passthrough.effective_for_acp(true), QueueMode::Collect);
-        assert_eq!(QueueMode::Passthrough.effective_for_acp(false), QueueMode::Passthrough);
+    fn passthrough_degrades_to_collect_on_every_backend() {
+        // Passthrough is unsound under the single-turn_seq machinery (Codex
+        // drops the mid-turn prompt → wedge; Claude/Kiro mis-stamp). effective()
+        // degrades it to Collect everywhere. Collect/Interrupt pass through.
+        assert_eq!(QueueMode::Passthrough.effective(), QueueMode::Collect);
+        assert_eq!(QueueMode::Collect.effective(), QueueMode::Collect);
+        assert_eq!(QueueMode::Interrupt.effective(), QueueMode::Interrupt);
     }
 
     #[test]
@@ -3106,5 +3171,41 @@ mod emit_tests {
         let out = truncate_prompt_for_scrollback(&big);
         assert!(out.len() < 70_000);
         assert!(out.contains("已截断"));
+    }
+
+    // Regression for the reconnect double-delivery race (review 2026-06-11).
+    // The fix makes "snapshot scrollback + subscribe" atomic against "push
+    // scrollback + broadcast". This test pins the boundary semantics directly
+    // on the broadcast/VecDeque primitives the two SessionManager methods use:
+    // an event recorded BEFORE the snapshot is in `history` and NOT in the
+    // receiver; an event recorded AFTER is in the receiver and NOT in `history`.
+    // No event is ever in both — which is exactly what prevents the duplicated
+    // streaming chunk a reconnecting client used to see.
+    #[test]
+    fn snapshot_and_subscribe_partition_events_no_overlap() {
+        use std::collections::VecDeque;
+        let (event_tx, _keep) = broadcast::channel::<String>(BROADCAST_CAPACITY);
+        let mut scrollback: VecDeque<String> = VecDeque::new();
+
+        // Event emitted BEFORE the client connects: persisted, broadcast to
+        // nobody (zero subscribers).
+        scrollback.push_back("before".to_string());
+        let _ = event_tx.send("before".to_string());
+
+        // Atomic (single conceptual lock) snapshot + subscribe, exactly as
+        // subscribe_with_history does: take history, THEN subscribe.
+        let history: Vec<String> = scrollback.iter().cloned().collect();
+        let mut rx = event_tx.subscribe();
+
+        // Event emitted AFTER: persisted AND delivered to the live receiver.
+        scrollback.push_back("after".to_string());
+        let _ = event_tx.send("after".to_string());
+
+        // Replay contains only the pre-connect event.
+        assert_eq!(history, vec!["before".to_string()]);
+        // Live receiver gets only the post-subscribe event — "before" is NOT
+        // redelivered (the bug was that it would be, via a non-atomic gap).
+        assert_eq!(rx.try_recv().unwrap(), "after");
+        assert!(rx.try_recv().is_err()); // nothing else queued
     }
 }

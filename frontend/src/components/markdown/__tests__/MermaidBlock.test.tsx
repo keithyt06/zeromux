@@ -1,6 +1,7 @@
 import { describe, it, expect, beforeEach, vi } from 'vitest'
 import { render, waitFor } from '@testing-library/react'
 import { mermaidCache } from '../cache'
+import { fnv1a } from '../hash'
 
 const renderMock = vi.fn()
 const parseMock = vi.fn()
@@ -34,17 +35,31 @@ describe('MermaidBlock', () => {
     })
     expect(parseMock).toHaveBeenCalledWith(code)
     expect(renderMock).toHaveBeenCalled()
-    expect(mermaidCache.get(code)).toBe('<svg id="ok"/>')
+    expect(mermaidCache.get(fnv1a(code))).toBe('<svg id="ok"/>')
   })
 
-  it('skips render when cache already has the svg', async () => {
-    mermaidCache.set('cached-code', '<svg id="cached"/>')
+  it('skips render when cache already has the svg (keyed by hash)', async () => {
+    mermaidCache.set(fnv1a('cached-code'), '<svg id="cached"/>')
     const { default: MermaidBlock } = await import('../MermaidBlock')
 
     const { container } = render(<MermaidBlock code="cached-code" />)
     expect(container.querySelector('.mermaid-rendered')).toBeInTheDocument()
     expect(renderMock).not.toHaveBeenCalled()
     expect(parseMock).not.toHaveBeenCalled()
+  })
+
+  it('does not cache on render error', async () => {
+    mermaidCache.clear()
+    parseMock.mockRejectedValue(new Error('boom'))
+    const { default: MermaidBlock } = await import('../MermaidBlock')
+    const code = '!!!invalid!!!'
+
+    const { container } = render(<MermaidBlock code={code} />)
+    await waitFor(() => {
+      expect(container.querySelector('.mermaid-err')).toBeInTheDocument()
+    })
+    expect(mermaidCache.has(fnv1a(code))).toBe(false)
+    expect(mermaidCache.size).toBe(0)
   })
 
   it('renders raw + error message when parse throws', async () => {

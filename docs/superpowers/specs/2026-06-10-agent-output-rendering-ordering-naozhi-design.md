@@ -271,6 +271,13 @@ sanitize 是**启发式**，只覆盖三类高频形态，不追求覆盖全部 
 - **P3 — naozhi `/stop` `/urgent` 抢占动词、群聊 @mention 门控、IM 网关**：naozhi 有但 zeromux 本次不做（YAGNI，已有 interrupt-resend）。
 - **P3 — UserPrompt redaction（密钥扫描）**：T3 只做大小上限，不做密钥脱敏（误报风险）。若日后开 `--log-dir` 落盘需重新评估。
 
+## 实现后评审 surfaced 的延迟事项（2026-06-10 subagent-driven 执行）
+
+- **P2 — `with_turn_id` 流式热路径每事件 clone**（G3 code review）：`emit` 为 stamp turn_id clone 整个 ContentBlock/Result。大 text 块每 token-batch 一次堆拷贝。可改 `emit` 接收 `AcpEvent` by value / `&mut` 原地 stamp，免 clone。非正确性问题。
+- **P2 — QueueMode 三 fan-out 分支重复**（G2b code review）：Interrupt/Passthrough 的 match 块在三个 fan-out 重复（仅 log label 不同）。可抽 `start_turn` + `dispatch_prompt` helper 进一步去重（延续 G2a 思路）。当前三份逐字相同，未漂移，collect 路径 byte-identical 无风险。
+- **P3 — QueueMode UI 与后端 desync**：SessionInfoBar 下拉每次切会话重挂载重置为 Collect，但后端 queue_mode 持久。控制是 write-only 无回读。修法：App 按 sid 持久化 UI 态，或后端连接时回显当前 mode。
+- **P3 — density 展开不可逆 + 全局**：concise→full 的「+N 展开」chip 翻转 view-wide `density`，无回到 concise 的路径，且 per-turn 按钮翻转全局态。可加 SessionInfoBar density 开关或改 per-group 展开。
+
 ## GSTACK REVIEW REPORT
 
 | Review | Trigger | Why | Runs | Status | Findings |

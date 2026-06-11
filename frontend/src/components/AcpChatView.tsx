@@ -1,4 +1,4 @@
-import { useState, useEffect, useRef, useCallback, memo, createElement } from 'react'
+import { useState, useEffect, useRef, useCallback, useMemo, memo, createElement } from 'react'
 import { wsUrl, uploadSessionFile } from '../lib/api'
 import { ChevronDown, Wrench, Brain, AlertCircle, FileText, Terminal, Search, Bot, Paperclip, X, type LucideIcon } from 'lucide-react'
 import MarkdownContent from './markdown/MarkdownContent'
@@ -6,34 +6,21 @@ import Composer from './Composer'
 import { buildPromptWithAttachments } from '../lib/attachments'
 import { MicButton } from './MicButton'
 import { useTranscribe } from '../lib/transcribe'
+import { foldTranscript, type WireEvent, type Block, type TurnGroup } from '../lib/transcript'
+import { partitionBlocks, type Density } from '../lib/density'
 
 // ── Message types ──
-
-interface BaseMsg { id: string }
-interface SystemMsg    extends BaseMsg { kind: 'system'; text: string }
-interface UserMsg      extends BaseMsg { kind: 'user'; text: string }
-interface AssistantMsg extends BaseMsg {
-  kind: 'assistant'
-  blocks: ContentBlock[]
-  cost?: number
-  complete: boolean
-}
-interface ErrorMsg     extends BaseMsg { kind: 'error'; text: string }
-
-type ChatMessage = SystemMsg | UserMsg | AssistantMsg | ErrorMsg
 
 const newId = () =>
   (typeof crypto !== 'undefined' && 'randomUUID' in crypto)
     ? crypto.randomUUID()
     : Math.random().toString(36).slice(2) + Date.now().toString(36)
 
-interface ContentBlock {
-  type: 'text' | 'thinking' | 'tool_use' | 'tool_result'
-  text?: string
-  name?: string
-  input?: any
-  summary?: string
-}
+// 系统/错误/退出提示:不属于 turn transcript(无 turn_id),单独按到达顺序保留
+// 渲染在 groups 之后。它们只驱动 busy 状态与可见诊断,不进 foldTranscript。
+interface Notice { id: string; kind: 'system' | 'error'; text: string }
+
+type ContentBlock = Block
 
 // ── Server events ──
 
@@ -51,19 +38,34 @@ interface ServerEvent {
   streaming?: boolean
   summary?: string
   count?: number
+  turn_id?: number
+  client_id?: string
 }
 
 interface Props {
   sessionId: string
   active: boolean
   agentType?: 'claude' | 'kiro' | 'codex'
+  // Lets the parent (App→SessionInfoBar) drive WS-only controls that live in
+  // this component. Registered on mount, cleared on unmount. (G2b queue mode.)
+  onRegisterControls?: (sessionId: string, api: { setQueueMode: (mode: string) => void } | null) => void
 }
 
 // `active` is accepted (App passes it for all session views) but no longer used:
 // the Composer owns its own textarea and we intentionally don't auto-focus it,
 // so switching to a chat session doesn't pop the mobile keyboard.
-export default function AcpChatView({ sessionId, agentType = 'claude' }: Props) {
-  const [messages, setMessages] = useState<ChatMessage[]>([])
+export default function AcpChatView({ sessionId, agentType = 'claude', onRegisterControls }: Props) {
+  // Raw wire-event log; the rendered transcript is DERIVED from it by grouping
+  // on turn_id (T1). This is what fixes "send while streaming" misalignment:
+  // a new prompt carries the NEXT turn_id, so it folds into its own group
+  // instead of splicing into the still-streaming prior turn's blocks.
+  const [events, setEvents] = useState<WireEvent[]>([])
+  // seenClientIds is NOT passed to foldTranscript (that would double-dedupe and
+  // hide the local optimistic bubble). It's used only by the WS handler to
+  // decide append-vs-replace for the server echo of a prompt we inserted.
+  const seenClientIds = useRef<Set<string>>(new Set())
+  const groups = useMemo(() => foldTranscript(events), [events])
+  const [notices, setNotices] = useState<Notice[]>([])
   const [input, setInput] = useState('')
   const [busy, setBusy] = useState(false)
   const [pending, setPending] = useState<string[]>([])   // 已上传待发的实际路径
@@ -75,9 +77,19 @@ export default function AcpChatView({ sessionId, agentType = 'claude' }: Props) 
   const [queuedCount, setQueuedCount] = useState(0)
   const [turnStartedMs, setTurnStartedMs] = useState<number | null>(null)
   const [nowMs, setNowMs] = useState(() => Date.now())
+  // 输出密度(G2b/P2):concise(默认)折叠思考+原始工具输入;full 全显。
+  const [density, setDensity] = useState<Density>('concise')
+  // 首次精简提示:一次性、可关。localStorage 跨会话只显示一次。
+  const [showDensityHint, setShowDensityHint] = useState(
+    () => typeof localStorage !== 'undefined' && localStorage.getItem('zeromux:density-hint') == null
+  )
+  const dismissDensityHint = useCallback(() => {
+    setShowDensityHint(false)
+    try { localStorage.setItem('zeromux:density-hint', '1') } catch { /* ignore */ }
+  }, [])
+  const expandDensity = useCallback(() => setDensity('full'), [])
   const wsRef = useRef<WebSocket | null>(null)
   const scrollRef = useRef<HTMLDivElement>(null)
-  const currentAssistant = useRef<AssistantMsg | null>(null)
 
   const transcribe = useTranscribe({
     language: 'zh-CN',
@@ -90,8 +102,13 @@ export default function AcpChatView({ sessionId, agentType = 'claude' }: Props) 
     })
   }, [])
 
-  const pushMessage = useCallback((msg: ChatMessage) => {
-    setMessages(prev => [...prev, msg])
+  const pushNotice = useCallback((notice: Notice) => {
+    setNotices(prev => [...prev, notice])
+    scrollBottom()
+  }, [scrollBottom])
+
+  const appendEvent = useCallback((evt: WireEvent) => {
+    setEvents(prev => [...prev, evt])
     scrollBottom()
   }, [scrollBottom])
 
@@ -109,8 +126,9 @@ export default function AcpChatView({ sessionId, agentType = 'claude' }: Props) 
         attempt = 0
         // The server replays full scrollback on (re)connect, so start clean to
         // avoid duplicating already-rendered messages. Matches page-reload behavior.
-        setMessages([])
-        currentAssistant.current = null
+        setEvents([])
+        seenClientIds.current.clear()
+        setNotices([])
         setBusy(false)
         setTurnStartedMs(null)
       }
@@ -124,13 +142,9 @@ export default function AcpChatView({ sessionId, agentType = 'claude' }: Props) 
 
       ws.onclose = () => {
         wsRef.current = null
-        const activeId = currentAssistant.current?.id
-        if (activeId) {
-          setMessages(prev => prev.map(m =>
-            m.kind === 'assistant' && m.id === activeId ? { ...m, complete: true } : m
-          ))
-        }
-        currentAssistant.current = null
+        // Transcript completeness is derived from `result` events in
+        // foldTranscript; a dropped socket simply ends the busy state. On
+        // reconnect the server replays full scrollback (incl. the result).
         setBusy(false)
         setTurnStartedMs(null)
         // Auto-reconnect: an idle-timeout proxy or transient drop must not leave
@@ -169,119 +183,61 @@ export default function AcpChatView({ sessionId, agentType = 'claude' }: Props) 
         }
         const label = labelMap[evt.subtype || ''] || evt.subtype || 'system'
         const sid = evt.session_id ? ` ${evt.session_id.substring(0, 8)}...` : ''
-        pushMessage({ id: newId(), kind: 'system', text: `${label}${sid}` })
+        pushNotice({ id: newId(), kind: 'system', text: `${label}${sid}` })
+        break
+      }
+
+      case 'user_prompt': {
+        // 服务器回显。若 client_id 已是本端乐观插入(seen),不重复 append;改为把
+        // 那条乐观事件的 turn_id 替换为权威值(乐观插入用 MAX_SAFE_INTEGER 让其
+        // 暂排在最后,真实 turn_id 到达后归位,与对应助手 turn 对齐)。
+        if (evt.client_id && seenClientIds.current.has(evt.client_id)) {
+          const cid = evt.client_id
+          const tid = evt.turn_id
+          setEvents(prev => prev.map(e =>
+            (e.type === 'user_prompt' && e.client_id === cid)
+              ? { ...e, turn_id: tid }
+              : e
+          ))
+          break
+        }
+        appendEvent(evt as unknown as WireEvent)
         break
       }
 
       case 'content_block': {
-        const delta = evt.text || ''
-        // Ensure there's an active assistant message
-        if (!currentAssistant.current) {
-          const msg: AssistantMsg = { id: newId(), kind: 'assistant', blocks: [], complete: false }
-          currentAssistant.current = msg
-          setMessages(prev => [...prev, msg])
-          // A brand-new assistant turn is starting. If a collect batch was queued,
-          // this is the merged turn beginning to produce output → clear the hint.
-          // (Mid-turn streaming keeps currentAssistant non-null, so this never
-          // erases the hint while the prior turn is still running.)
-          setQueuedCount(0)
-        }
-        const activeId = currentAssistant.current.id
-        setMessages(prev => prev.map(m => {
-          if (m.kind !== 'assistant' || m.id !== activeId) return m   // reference stable, memo skips
-          const blocks = [...m.blocks]
-          const mergeable = evt.block_type === 'text' || evt.block_type === 'thinking'
-          if (evt.streaming && mergeable && blocks.length > 0
-              && blocks[blocks.length - 1].type === evt.block_type) {
-            const last = blocks[blocks.length - 1]
-            blocks[blocks.length - 1] = { ...last, text: (last.text || '') + delta }
-          } else {
-            blocks.push({
-              type: (evt.block_type as ContentBlock['type']) || 'text',
-              text: evt.text,
-              name: evt.name,
-              input: evt.input,
-              summary: evt.summary,
-            })
-          }
-          // Mirror onto the ref so subsequent events still see the latest blocks.
-          const next = { ...m, blocks }
-          currentAssistant.current = next
-          return next
-        }))
+        appendEvent(evt as unknown as WireEvent)
+        // A brand-new assistant turn producing output clears any collect hint.
+        setQueuedCount(0)
         setBusy(true)
         // Stamp turn start if not already running (e.g. a turn observed from
         // another tab via replay, where this client didn't call sendPrompt).
         setTurnStartedMs(prev => prev ?? Date.now())
-        scrollBottom()
         break
       }
 
       case 'result': {
-        const activeId = currentAssistant.current?.id
-        if (activeId) {
-          const cost = evt.cost_usd
-          const finalText = (evt.text || '').trim()
-          setMessages(prev => prev.map(m => {
-            if (!(m.kind === 'assistant' && m.id === activeId)) return m
-            // 协议契约（见后端 AcpEvent::Result doc）：result.text 始终是
-            // 完整最终文本，但本轮若已通过流式 text ContentBlock 呈现过正文，
-            // 就不能再注入 result.text（否则重复渲染）。判据：blocks 里是否已
-            // 存在非空 text block。
-            // - Codex/Kiro 流式：已有 text block → 不注入。
-            // - Codex 非流式（Bedrock thinking 一次性返回）：无 text block → 注入。
-            // - Claude：assistant text block 已渲染 → 不注入。
-            const hasStreamedText = m.blocks.some(
-              b => b.type === 'text' && (b.text || '').length > 0,
-            )
-            const blocks = (finalText && !hasStreamedText)
-              ? [...m.blocks, { type: 'text', text: finalText } as ContentBlock]
-              : m.blocks
-            return { ...m, blocks, complete: true, ...(cost ? { cost } : {}) }
-          }))
-        }
-        currentAssistant.current = null
+        appendEvent(evt as unknown as WireEvent)
         setBusy(false)
         setTurnStartedMs(null)
         break
       }
 
       case 'error': {
-        const activeId = currentAssistant.current?.id
-        if (activeId) {
-          setMessages(prev => prev.map(m =>
-            m.kind === 'assistant' && m.id === activeId ? { ...m, complete: true } : m
-          ))
-        }
-        pushMessage({ id: newId(), kind: 'error', text: evt.message || 'Unknown error' })
-        currentAssistant.current = null
+        pushNotice({ id: newId(), kind: 'error', text: evt.message || 'Unknown error' })
         setBusy(false)
         setTurnStartedMs(null)
         break
       }
 
       case 'exit': {
-        const activeId = currentAssistant.current?.id
-        if (activeId) {
-          setMessages(prev => prev.map(m =>
-            m.kind === 'assistant' && m.id === activeId ? { ...m, complete: true } : m
-          ))
-        }
-        pushMessage({ id: newId(), kind: 'system', text: `Process exited (code: ${evt.code || 0})` })
-        currentAssistant.current = null
+        pushNotice({ id: newId(), kind: 'system', text: `Process exited (code: ${evt.code || 0})` })
         setBusy(false)
         setTurnStartedMs(null)
         break
       }
 
       case 'replay_done': {
-        const activeId = currentAssistant.current?.id
-        if (activeId) {
-          setMessages(prev => prev.map(m =>
-            m.kind === 'assistant' && m.id === activeId ? { ...m, complete: true } : m
-          ))
-        }
-        currentAssistant.current = null
         setBusy(false)
         setTurnStartedMs(null)
         // Reconnect replay finished — clear any stale queued hint (backend also
@@ -290,7 +246,7 @@ export default function AcpChatView({ sessionId, agentType = 'claude' }: Props) 
         break
       }
     }
-  }, [pushMessage, scrollBottom])
+  }, [pushNotice, appendEvent])
 
   // Composer 已 trim 且非空才回调；后端 fan-out 会在重发前自动打断在途轮次，
   // 前端只需发 prompt。
@@ -325,13 +281,18 @@ export default function AcpChatView({ sessionId, agentType = 'claude' }: Props) 
   const sendPrompt = useCallback((text: string) => {
     if (!wsRef.current || wsRef.current.readyState !== WebSocket.OPEN) return
     const full = buildPromptWithAttachments(text, pending)
-    pushMessage({ id: newId(), kind: 'user', text: full })
-    wsRef.current.send(JSON.stringify({ type: 'prompt', text: full }))
+    // Optimistic bubble: insert immediately with MAX_SAFE_INTEGER turn_id so it
+    // sorts last (newest) until the server echo arrives with the true turn_id,
+    // at which point we rewrite this entry's turn_id (deduped by client_id).
+    const cid = newId()
+    seenClientIds.current.add(cid)
+    appendEvent({ type: 'user_prompt', text: full, turn_id: Number.MAX_SAFE_INTEGER, client_id: cid })
+    wsRef.current.send(JSON.stringify({ type: 'prompt', text: full, client_id: cid }))
     setInput('')
     setPending([])
     setBusy(true)
     setTurnStartedMs(Date.now())
-  }, [pushMessage, pending])
+  }, [appendEvent, pending])
 
   // Stuck-turn timer: tick a 1s clock while busy so the elapsed display
   // updates. turnStartedMs is stamped in the event handlers (turn start) and
@@ -353,12 +314,41 @@ export default function AcpChatView({ sessionId, agentType = 'claude' }: Props) 
     setQueuedCount(0)
   }, [])
 
+  const setQueueMode = useCallback((mode: string) => {
+    if (wsRef.current?.readyState === WebSocket.OPEN) {
+      wsRef.current.send(JSON.stringify({ type: 'set_queue_mode', mode }))
+    }
+  }, [])
+
+  // Register WS-only controls so SessionInfoBar (rendered by App, a sibling)
+  // can drive them for the active session. Clear on unmount.
+  useEffect(() => {
+    onRegisterControls?.(sessionId, { setQueueMode })
+    return () => onRegisterControls?.(sessionId, null)
+  }, [sessionId, setQueueMode, onRegisterControls])
+
   return (
     <div className="flex flex-col h-full">
       <div ref={scrollRef} className="flex-1 overflow-y-auto px-5 py-4 space-y-4">
-        {messages.map(msg => (
-          <MessageBubble key={msg.id} msg={msg} agentName={agentType === 'kiro' ? 'Kiro' : agentType === 'codex' ? 'Codex' : 'Claude'} />
+        {showDensityHint && (
+          <div className="flex items-center gap-2 text-[11px] text-[var(--text-muted)] bg-[var(--bg-secondary)] border border-[var(--border)] rounded px-2 py-1">
+            <span className="flex-1">已为你精简显示，可切完整</span>
+            <button onClick={dismissDensityHint} aria-label="dismiss hint"
+              className="shrink-0 text-[var(--text-muted)] hover:text-[var(--text-primary)]">
+              <X size={12} />
+            </button>
+          </div>
+        )}
+        {groups.map(g => (
+          <TurnGroupView
+            key={g.turnId}
+            group={g}
+            agentName={agentType === 'kiro' ? 'Kiro' : agentType === 'codex' ? 'Codex' : 'Claude'}
+            density={density}
+            onExpand={expandDensity}
+          />
         ))}
+        {notices.map(n => <NoticeBubble key={n.id} notice={n} />)}
       </div>
 
       <div className="flex flex-col px-4 py-3 border-t border-[var(--border)] bg-[var(--bg-secondary)]">
@@ -448,46 +438,63 @@ export default function AcpChatView({ sessionId, agentType = 'claude' }: Props) 
 
 // ── Message rendering ──
 
-function MessageBubbleImpl({ msg, agentName = 'Claude' }: { msg: ChatMessage; agentName?: string }) {
-  switch (msg.kind) {
-    case 'system':
-      return <p className="text-[11px] text-[var(--text-muted)] italic">{msg.text}</p>
-
-    case 'user':
-      return (
-        <div>
+// A turn = its user prompt bubble(s) followed by the assistant's blocks. A
+// collect-merged turn has N userPrompts (P1) → N "You" bubbles, then one
+// assistant section. A turn with no blocks yet (prompt sent, nothing streamed)
+// renders just the user bubble(s).
+function TurnGroupViewImpl({ group, agentName = 'Claude', density = 'concise', onExpand }: {
+  group: TurnGroup; agentName?: string; density?: Density; onExpand?: () => void
+}) {
+  const { visible, collapsedCount } = partitionBlocks(group.blocks, density)
+  return (
+    <div className="space-y-4">
+      {group.userPrompts.map((p, i) => (
+        <div key={p.clientId ?? i}>
           <p className="text-[11px] font-semibold text-[var(--accent-blue)] mb-0.5">You</p>
-          <p className="text-sm text-[var(--text-primary)] whitespace-pre-wrap">{msg.text}</p>
+          <p className="text-sm text-[var(--text-primary)] whitespace-pre-wrap">{p.text}</p>
         </div>
-      )
-
-    case 'assistant':
-      return (
+      ))}
+      {group.blocks.length > 0 && (
         <div className="space-y-2">
           <p className="text-[11px] font-semibold text-[var(--accent-purple)] mb-0.5">{agentName}</p>
-          {msg.blocks.map((b, i) => <BlockView key={i} block={b} isComplete={msg.complete} />)}
-          {msg.cost != null && (
+          {visible.map((b, i) => <BlockView key={i} block={b} isComplete={group.complete} />)}
+          {collapsedCount > 0 && (
+            <button onClick={onExpand}
+              className="text-[11px] text-[var(--text-muted)] hover:text-[var(--accent-blue)] border border-[var(--border)] rounded px-2 py-0.5 transition-colors">
+              +{collapsedCount} 条思考/工具 · 展开
+            </button>
+          )}
+          {group.cost != null && (
             <p className="text-[10px] text-[var(--text-muted)] border-t border-[var(--border-light)] pt-1 mt-1">
-              cost: ${msg.cost.toFixed(4)}
+              cost: ${group.cost.toFixed(4)}
             </p>
           )}
         </div>
-      )
-
-    case 'error':
-      return (
-        <div className="flex items-start gap-1.5 text-[var(--accent-red)] text-xs">
-          <AlertCircle size={13} className="shrink-0 mt-0.5" />
-          <span>{msg.text}</span>
-        </div>
-      )
-  }
+      )}
+    </div>
+  )
 }
 
-const MessageBubble = memo(
-  MessageBubbleImpl,
-  (prev, next) => prev.msg === next.msg && prev.agentName === next.agentName
+const TurnGroupView = memo(
+  TurnGroupViewImpl,
+  (prev, next) =>
+    prev.group === next.group &&
+    prev.agentName === next.agentName &&
+    prev.density === next.density &&
+    prev.onExpand === next.onExpand
 )
+
+function NoticeBubble({ notice }: { notice: Notice }) {
+  if (notice.kind === 'system') {
+    return <p className="text-[11px] text-[var(--text-muted)] italic">{notice.text}</p>
+  }
+  return (
+    <div className="flex items-start gap-1.5 text-[var(--accent-red)] text-xs">
+      <AlertCircle size={13} className="shrink-0 mt-0.5" />
+      <span>{notice.text}</span>
+    </div>
+  )
+}
 
 // 工具名 → lucide 图标。未知/MCP 工具回落 Wrench。
 const TOOL_ICONS: Record<string, LucideIcon> = {

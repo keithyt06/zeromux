@@ -351,6 +351,7 @@ async fn dispatch_frame(
             let text = std::mem::take(pending_text);
             vec![AcpEvent::Result {
                 text,
+                turn_id: 0,
                 session_id: session_id.to_string(),
                 cost_usd: None,
             }]
@@ -400,6 +401,7 @@ fn parse_session_update(
                 pending_text.push_str(text);
                 vec![AcpEvent::ContentBlock {
                     block_type: std::borrow::Cow::Borrowed("text"),
+                    turn_id: 0,
                     text: Some(text.to_string()),
                     name: None,
                     input: None,
@@ -422,6 +424,7 @@ fn parse_session_update(
             if let Some(text) = text {
                 vec![AcpEvent::ContentBlock {
                     block_type: std::borrow::Cow::Borrowed("thinking"),
+                    turn_id: 0,
                     text: Some(text.to_string()),
                     name: None,
                     input: None,
@@ -440,6 +443,7 @@ fn parse_session_update(
                 .to_string();
             vec![AcpEvent::ContentBlock {
                 block_type: std::borrow::Cow::Borrowed("tool_use"),
+                turn_id: 0,
                 text: None,
                 name: Some(title),
                 input: None,

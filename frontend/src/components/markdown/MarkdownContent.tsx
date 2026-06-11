@@ -9,6 +9,7 @@ import 'highlight.js/styles/github-dark.css'
 import { markdownComponents } from '../markdownStyles'
 import { MarkdownContext } from './context'
 import CodeBlock from './CodeBlock'
+import { sanitizeStreamingMarkdown } from './sanitize'
 
 const HLJS_LANGS = [
   'bash', 'json', 'yaml',
@@ -33,7 +34,8 @@ type RehypePlugin = any
 
 export default function MarkdownContent({ text, isComplete, className }: Props) {
   const deferredText = useDeferredValue(text)
-  const needsKatex = useMemo(() => hasMathSyntax(deferredText), [deferredText])
+  const rendered = isComplete ? deferredText : sanitizeStreamingMarkdown(deferredText)
+  const needsKatex = useMemo(() => hasMathSyntax(rendered), [rendered])
   const [katexPlugin, setKatexPlugin] = useState<RehypePlugin | null>(null)
 
   useEffect(() => {
@@ -62,7 +64,7 @@ export default function MarkdownContent({ text, isComplete, className }: Props) 
           rehypePlugins={rehypePlugins}
           components={{ ...markdownComponents, code: CodeBlock }}
         >
-          {deferredText}
+          {rendered}
         </ReactMarkdown>
       </div>
     </MarkdownContext.Provider>

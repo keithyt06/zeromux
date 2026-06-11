@@ -24,6 +24,13 @@ export default function App() {
   // session id → turns_completed already seen (red-dot read baseline)
   const [readCounts, setReadCounts] = useState<Record<string, number>>({})
   const baselineInit = useRef(false)
+  // WS-only controls each AcpChatView registers, keyed by session id, so the
+  // sibling SessionInfoBar can drive them (G2b queue mode).
+  const sessionControls = useRef<Record<string, { setQueueMode: (mode: string) => void }>>({})
+  const registerControls = useCallback((sid: string, api: { setQueueMode: (mode: string) => void } | null) => {
+    if (api) sessionControls.current[sid] = api
+    else delete sessionControls.current[sid]
+  }, [])
   const themeCtx = useTheme()
   const isMobile = useMemo(() => window.innerWidth < 768, [])
   const [sidebarOpen, setSidebarOpen] = useState(!isMobile)
@@ -202,6 +209,9 @@ export default function App() {
             showGit={(overlay[activeSession.id] || 'none') === 'git'}
             showEvents={(overlay[activeSession.id] || 'none') === 'events'}
             onOpenSidebar={isMobile && !sidebarOpen ? () => setSidebarOpen(true) : undefined}
+            onQueueMode={activeSession.type !== 'tmux'
+              ? (mode) => sessionControls.current[activeSession.id]?.setQueueMode(mode)
+              : undefined}
           />
         )}
         {/* Mobile: show menu button when no active session */}
@@ -228,7 +238,7 @@ export default function App() {
                   {s.type === 'tmux' ? (
                     <TerminalView sessionId={s.id} active={isActive && view === 'none'} theme={themeCtx.theme} />
                   ) : (
-                    <AcpChatView sessionId={s.id} active={isActive && view === 'none'} agentType={s.type} />
+                    <AcpChatView sessionId={s.id} active={isActive && view === 'none'} agentType={s.type} onRegisterControls={registerControls} />
                   )}
                 </div>
                 {view === 'files' && <MarkdownViewer sessionId={s.id} sessionType={s.type} />}

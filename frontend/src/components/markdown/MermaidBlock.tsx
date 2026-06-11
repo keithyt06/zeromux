@@ -10,7 +10,8 @@ type State =
   | { kind: 'error'; msg: string }
 
 export default function MermaidBlock({ code }: Props) {
-  const cached = mermaidCache.get(code)
+  const key = fnv1a(code)
+  const cached = mermaidCache.get(key)
   const [state, setState] = useState<State>(
     cached ? { kind: 'svg', svg: cached } : { kind: 'pending' }
   )
@@ -23,10 +24,10 @@ export default function MermaidBlock({ code }: Props) {
         const m = (await import('mermaid')).default
         m.initialize({ startOnLoad: false, theme: 'dark', securityLevel: 'strict' })
         await m.parse(code)
-        const id = `mid-${fnv1a(code)}`
+        const id = `mid-${key}`
         const { svg } = await m.render(id, code)
         if (cancel) return
-        mermaidCache.set(code, svg)
+        mermaidCache.set(key, svg)
         setState({ kind: 'svg', svg })
       } catch (e) {
         if (cancel) return
@@ -34,7 +35,7 @@ export default function MermaidBlock({ code }: Props) {
       }
     })()
     return () => { cancel = true }
-  }, [code, state.kind])
+  }, [code, key, state.kind])
 
   if (state.kind === 'svg') {
     return (

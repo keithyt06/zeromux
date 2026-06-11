@@ -117,12 +117,45 @@ pub enum SessionInput {
     /// PTY: resize
     PtyResize(u16, u16),
     /// ACP/Kiro: prompt text + optional scheduled-run id for exactly-once
-    /// finalization (None for manual user prompts).
-    Prompt { text: String, run_id: Option<String> },
+    /// finalization (None for manual user prompts). `client_id` is the optional
+    /// browser-generated id used to dedupe the optimistic user bubble against the
+    /// server echo (G3, T1); None for scheduled runs.
+    Prompt { text: String, run_id: Option<String>, client_id: Option<String> },
     /// ACP/Kiro: cancel/kill
     Cancel,
     /// ACP/Kiro: turn-level interrupt (abort current turn, keep process alive)
     Interrupt,
+    /// ACP/Kiro/Codex: switch the per-session queue handling mode for
+    /// multiple in-flight prompts (collect / interrupt / passthrough).
+    SetQueueMode(QueueMode),
+}
+
+/// How a fan-out handles a new prompt that arrives while a turn is running.
+/// Per-session, switchable from the UI (G2b). Default Collect (debounce-merge).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum QueueMode {
+    /// Debounce-merge appended prompts into one follow-up turn (existing behavior).
+    Collect,
+    /// Interrupt the running turn and immediately send the new prompt.
+    Interrupt,
+    /// Send the new prompt immediately without interrupting (concurrent turns).
+    Passthrough,
+}
+
+impl QueueMode {
+    pub fn from_str(s: &str) -> Self {
+        match s {
+            "interrupt" => QueueMode::Interrupt,
+            "passthrough" => QueueMode::Passthrough,
+            _ => QueueMode::Collect,
+        }
+    }
+
+    /// ACP backends (Kiro) lack independent concurrent-turn semantics, so
+    /// passthrough degrades to collect there (matches naozhi).
+    fn effective_for_acp(self, is_acp: bool) -> QueueMode {
+        if is_acp && self == QueueMode::Passthrough { QueueMode::Collect } else { self }
+    }
 }
 
 #[derive(Clone, Copy, PartialEq, Debug)]
@@ -856,6 +889,7 @@ impl SessionManager {
                 .send(SessionInput::Prompt {
                     text: goal,
                     run_id: Some(run_id.to_string()),
+                    client_id: None,
                 })
                 .await
             {
@@ -1625,11 +1659,10 @@ fn spawn_acp_fanout(
         // 不变量:两个 deadline 仅在 `!local_running && !pending.is_empty()` 时为 Some。
         // 入队只在 turn 进行中(Running)发生;flush 窗口只在 turn 结束(Idle)后 arm,
         // 因此合并 prompt 永不在一个进行中的 turn 里发出(否则会变成 mid-turn 强打断)。
-        let mut pending: Vec<PendingPrompt> = Vec::new();
-        let mut collect_deadline: Option<std::pin::Pin<Box<tokio::time::Sleep>>> = None;
-        let mut collect_hard_deadline: Option<std::pin::Pin<Box<tokio::time::Sleep>>> = None;
-        const COLLECT_DEBOUNCE_MS: u64 = 500; // 防抖:窗口内新 prompt 重置
-        const COLLECT_MAX_MS: u64 = 3000;     // 硬上限:首条入队起最多等这么久必 flush(E3)
+        let mut queue = PromptQueue::new();
+        // 队列模式(G2b):collect(默认)/interrupt/passthrough,由 UI 切换。
+        const IS_ACP: bool = false; // Claude fan-out
+        let mut queue_mode = QueueMode::Collect;
         loop {
             tokio::select! {
                 event = process.event_rx.recv() => {
@@ -1649,11 +1682,7 @@ fn spawn_acp_fanout(
                                 evt,
                                 AcpEvent::Result { .. } | AcpEvent::Error { .. } | AcpEvent::Exit { .. }
                             );
-                            let json = match serde_json::to_string(&evt) {
-                                Ok(j) => j,
-                                Err(_) => continue,
-                            };
-                            let _ = event_tx.send(json);
+                            emit(&mgr, &sid, &event_tx, turn_seq, &evt);
                             if is_boundary {
                                 // Each started turn emits exactly one boundary
                                 // (Result/Error/Exit), in FIFO order, so the
@@ -1690,11 +1719,8 @@ fn spawn_acp_fanout(
                                 }
                                 // collect:turn 真正结束(已翻 Idle)且有排队的追加 →
                                 // arm 收集窗口。只在这里 arm,保证 flush 永不发生在进行中的 turn 里。
-                                if !local_running && !pending.is_empty() && collect_deadline.is_none() {
-                                    collect_deadline = Some(Box::pin(tokio::time::sleep(
-                                        std::time::Duration::from_millis(COLLECT_DEBOUNCE_MS))));
-                                    collect_hard_deadline = Some(Box::pin(tokio::time::sleep(
-                                        std::time::Duration::from_millis(COLLECT_MAX_MS))));
+                                if !local_running {
+                                    queue.arm();
                                 }
                                 // auto-titler:首条实质 prompt 的首个 Result 触发一次性命名。
                                 // first_substantive_prompt 仅在普通(非 run_id)turn 记录,故调度
@@ -1724,15 +1750,28 @@ fn spawn_acp_fanout(
                 }
                 input = input_rx.recv() => {
                     match input {
-                        Some(SessionInput::Prompt { text, run_id }) => {
+                        Some(SessionInput::Prompt { text, run_id, client_id }) => {
+                            // Echo each user prompt as its own UserPrompt event (P1):
+                            // N collect-merged messages still surface as N bubbles.
+                            // turn_id = the turn this prompt will belong to. In the
+                            // idle/run_id branches turn_seq is incremented below to
+                            // start the turn, so prompt_turn (turn_seq+1) matches. In
+                            // the collect path queued prompts each use turn_seq+1; since
+                            // turn_seq stays fixed while running/in-window until the
+                            // merged flush does turn_seq+=1, all share the same next-turn
+                            // id, matching the merged assistant turn (T1).
+                            let prompt_turn = turn_seq + 1;
+                            emit(&mgr, &sid, &event_tx, prompt_turn, &AcpEvent::UserPrompt {
+                                text: truncate_prompt_for_scrollback(&text),
+                                turn_id: prompt_turn,
+                                client_id: client_id.clone(),
+                            });
                             if run_id.is_some() {
                                 // C3:调度运行 prompt 绕过 collect,自成干净 turn。先丢弃任何
                                 // 待合并队列+窗口,保证调度 turn 不被用户闲聊追加污染,且收集
                                 // 窗口不会在调度 turn 进行中 flush(verdict 不会 finalize 在混入
                                 // 对话的合并 turn 上)。
-                                pending.clear();
-                                collect_deadline = None;
-                                collect_hard_deadline = None;
+                                queue.clear();
                                 active_run_id = run_id.clone();
                                 if local_running {
                                     if let Err(e) = process.interrupt().await {
@@ -1747,32 +1786,71 @@ fn spawn_acp_fanout(
                                 if let Err(e) = process.send_prompt(&text).await {
                                     tracing::warn!("ACP send_prompt failed for {}: {}", sid, e);
                                 }
-                            } else if local_running {
-                                // turn 进行中:入队,不打断(collect 核心)。窗口在 turn 结束后才 arm。
-                                pending.push(PendingPrompt { text, ts_ms: now_millis() });
-                                emit_queued(&event_tx, pending.len());
-                            } else if collect_deadline.is_some() {
-                                // 收集窗口开着(已 Idle,等 flush):继续入队 + 重置防抖,硬上限保持。
-                                pending.push(PendingPrompt { text, ts_ms: now_millis() });
-                                collect_deadline = Some(Box::pin(tokio::time::sleep(
-                                    std::time::Duration::from_millis(COLLECT_DEBOUNCE_MS))));
-                                emit_queued(&event_tx, pending.len());
                             } else {
-                                // 真正空闲:立即发送(原行为)
-                                // auto-titler:记录首条实质 prompt(P1:跳过 hi/ls/继续 等开场)
-                                if first_substantive_prompt.is_none() && is_substantive_prompt(&text) {
-                                    first_substantive_prompt = Some(text.clone());
-                                }
-                                active_run_id = None;
-                                turn_seq += 1;
-                                local_running = true;
-                                if let Some(m) = mgr.upgrade() {
-                                    m.mark_turn(&sid, TurnState::Running, turn_seq);
-                                }
-                                if let Err(e) = process.send_prompt(&text).await {
-                                    tracing::warn!("ACP send_prompt failed for {}: {}", sid, e);
+                                // 非调度 prompt:按当前队列模式分流(G2b)。
+                                match queue_mode {
+                                    QueueMode::Interrupt if local_running => {
+                                        // 打断当前 turn,丢弃任何待合并,立即发新 prompt。
+                                        if let Err(e) = process.interrupt().await {
+                                            tracing::warn!("interrupt (queue mode) failed for {}: {}", sid, e);
+                                        }
+                                        queue.clear();
+                                        active_run_id = None;
+                                        turn_seq += 1;
+                                        local_running = true;
+                                        if let Some(m) = mgr.upgrade() {
+                                            m.mark_turn(&sid, TurnState::Running, turn_seq);
+                                        }
+                                        if let Err(e) = process.send_prompt(&text).await {
+                                            tracing::warn!("ACP send_prompt failed for {}: {}", sid, e);
+                                        }
+                                    }
+                                    QueueMode::Passthrough => {
+                                        // 不打断,直接并发发出。
+                                        active_run_id = None;
+                                        turn_seq += 1;
+                                        local_running = true;
+                                        if let Some(m) = mgr.upgrade() {
+                                            m.mark_turn(&sid, TurnState::Running, turn_seq);
+                                        }
+                                        if let Err(e) = process.send_prompt(&text).await {
+                                            tracing::warn!("ACP send_prompt failed for {}: {}", sid, e);
+                                        }
+                                    }
+                                    // QueueMode::Collect(默认),以及 Interrupt 在 !local_running 时:
+                                    // 沿用原 collect 行为。
+                                    _ => {
+                                        if local_running {
+                                            // turn 进行中:入队,不打断(collect 核心)。窗口在 turn 结束后才 arm。
+                                            queue.enqueue(text);
+                                            emit_queued(&event_tx, queue.pending.len());
+                                        } else if queue.debounce.is_some() {
+                                            // 收集窗口开着(已 Idle,等 flush):继续入队 + 重置防抖,硬上限保持。
+                                            queue.enqueue(text);
+                                            queue.bump_debounce();
+                                            emit_queued(&event_tx, queue.pending.len());
+                                        } else {
+                                            // 真正空闲:立即发送(原行为)
+                                            // auto-titler:记录首条实质 prompt(P1:跳过 hi/ls/继续 等开场)
+                                            if first_substantive_prompt.is_none() && is_substantive_prompt(&text) {
+                                                first_substantive_prompt = Some(text.clone());
+                                            }
+                                            active_run_id = None;
+                                            turn_seq += 1;
+                                            local_running = true;
+                                            if let Some(m) = mgr.upgrade() {
+                                                m.mark_turn(&sid, TurnState::Running, turn_seq);
+                                            }
+                                            if let Err(e) = process.send_prompt(&text).await {
+                                                tracing::warn!("ACP send_prompt failed for {}: {}", sid, e);
+                                            }
+                                        }
+                                    }
                                 }
                             }
+                        }
+                        Some(SessionInput::SetQueueMode(m)) => {
+                            queue_mode = m.effective_for_acp(IS_ACP);
                         }
                         Some(SessionInput::Interrupt) => {
                             if local_running {
@@ -1783,9 +1861,7 @@ fn spawn_acp_fanout(
                             }
                             // E5:无条件清队列 + 取消窗口。用户中断意图含"别发那批排队的了",
                             // 即使 turn 已结束、窗口正等 flush(local_running==false)也要清。
-                            pending.clear();
-                            collect_deadline = None;
-                            collect_hard_deadline = None;
+                            queue.clear();
                         }
                         Some(SessionInput::Cancel) => {
                             process.kill().await;
@@ -1797,19 +1873,17 @@ fn spawn_acp_fanout(
                 // collect flush:收集窗口(防抖 OR 硬上限,取较早者)到期 → 合并发一条。
                 // 两个 deadline 在 turn 结束时一并 arm,故同 Some 同 None;只在 Idle 时触发。
                 _ = async {
-                    match (collect_deadline.as_mut(), collect_hard_deadline.as_mut()) {
+                    match (queue.debounce.as_mut(), queue.hard_cap.as_mut()) {
                         (Some(d), Some(h)) => { tokio::select! { _ = d.as_mut() => {}, _ = h.as_mut() => {} } }
                         (Some(d), None) => d.as_mut().await,
                         (None, Some(h)) => h.as_mut().await,
                         (None, None) => std::future::pending::<()>().await,
                     }
-                }, if collect_deadline.is_some() => {
-                    collect_deadline = None;
-                    collect_hard_deadline = None;
-                    if !pending.is_empty() {
-                        tracing::info!("collect[{}]: flushing {} queued prompt(s) as one merged turn", sid, pending.len());
-                        let merged = merge_pending(&pending);
-                        pending.clear();
+                }, if queue.debounce.is_some() => {
+                    queue.disarm();
+                    if !queue.pending.is_empty() {
+                        tracing::info!("collect[{}]: flushing {} queued prompt(s) as one merged turn", sid, queue.pending.len());
+                        let merged = queue.drain_merged();
                         active_run_id = None; // 合并 turn 永不携带 run_id(C3)
                         turn_seq += 1;
                         local_running = true;
@@ -1835,6 +1909,59 @@ struct PendingPrompt {
     ts_ms: i64,
 }
 
+/// Shared collect-queue state for all three fan-outs (was duplicated ~3×).
+/// Holds the pending appended prompts and the two debounce/hard-cap timers.
+/// Behavior is identical to the prior inline logic; this is an extraction only.
+struct PromptQueue {
+    pending: Vec<PendingPrompt>,
+    debounce: Option<std::pin::Pin<Box<tokio::time::Sleep>>>,
+    hard_cap: Option<std::pin::Pin<Box<tokio::time::Sleep>>>,
+}
+
+impl PromptQueue {
+    const DEBOUNCE_MS: u64 = 500;
+    const MAX_MS: u64 = 3000;
+
+    fn new() -> Self {
+        Self { pending: Vec::new(), debounce: None, hard_cap: None }
+    }
+
+    fn enqueue(&mut self, text: String) {
+        self.pending.push(PendingPrompt { text, ts_ms: now_millis() });
+    }
+
+    /// Reset the debounce timer (called on each new enqueue inside the window).
+    fn bump_debounce(&mut self) {
+        self.debounce = Some(Box::pin(tokio::time::sleep(
+            std::time::Duration::from_millis(Self::DEBOUNCE_MS))));
+    }
+
+    /// Arm both timers when a turn ends with items queued.
+    fn arm(&mut self) {
+        if !self.pending.is_empty() && self.debounce.is_none() {
+            self.bump_debounce();
+            self.hard_cap = Some(Box::pin(tokio::time::sleep(
+                std::time::Duration::from_millis(Self::MAX_MS))));
+        }
+    }
+
+    fn disarm(&mut self) {
+        self.debounce = None;
+        self.hard_cap = None;
+    }
+
+    fn clear(&mut self) {
+        self.pending.clear();
+        self.disarm();
+    }
+
+    fn drain_merged(&mut self) -> String {
+        let merged = merge_pending(&self.pending);
+        self.pending.clear();
+        merged
+    }
+}
+
 /// 向客户端广播一条 ephemeral `System{subtype:"queued"}` 事件,携带当前排队条数。
 /// 该事件在 ws_handler 侧被跳过 scrollback(E7),故重连回放不残留。三个 fanout 共用。
 fn emit_queued(event_tx: &broadcast::Sender<String>, count: usize) {
@@ -1846,6 +1973,80 @@ fn emit_queued(event_tx: &broadcast::Sender<String>, count: usize) {
     }) {
         let _ = event_tx.send(json);
     }
+}
+
+/// True for events that are forwarded live but NOT persisted to scrollback.
+/// Currently only `System{subtype:"queued"}` (the collect enqueue hint): a
+/// reconnect must not replay a phantom "已排队 N 条" for a batch already flushed.
+fn is_ephemeral_event(evt: &AcpEvent) -> bool {
+    matches!(
+        evt,
+        AcpEvent::System { subtype, .. } if subtype.as_ref() == "queued"
+    )
+}
+
+/// Single emit/persist chokepoint for all fan-out events.
+/// Invariant (T2): scrollback is written UNCONDITIONALLY, before and
+/// independent of `event_tx.send`. `broadcast::send` returns Err when there
+/// are zero subscribers (all clients disconnected) — gating persistence on
+/// send success would drop output produced while the phone is backgrounded.
+/// Invariant (D2): this is the ONLY scrollback write path for live events, so
+/// multiple connected clients can never double-record (the per-connection
+/// write in ws_handler is removed in Task G0.3).
+fn emit(
+    mgr: &Weak<SessionManager>,
+    sid: &str,
+    event_tx: &broadcast::Sender<String>,
+    turn_id: u64,
+    evt: &AcpEvent,
+) {
+    // ContentBlock/Result arrive from the process layer with turn_id:0 (it
+    // doesn't track turn_seq). Stamp the live turn here before broadcast/persist
+    // so the frontend can group by turn (T1). Other events are passed through.
+    let stamped;
+    let evt = match evt {
+        AcpEvent::ContentBlock { .. } | AcpEvent::Result { .. } => {
+            stamped = with_turn_id(evt.clone(), turn_id);
+            &stamped
+        }
+        _ => evt,
+    };
+    let json = match serde_json::to_string(evt) {
+        Ok(j) => j,
+        Err(_) => return,
+    };
+    if !is_ephemeral_event(evt) {
+        if let Some(m) = mgr.upgrade() {
+            m.push_scrollback(sid, json.clone());
+        }
+    }
+    let _ = event_tx.send(json); // Err == zero subscribers; ignore (T2)
+}
+
+/// Cap a user prompt before it enters scrollback (T3). A single huge paste
+/// must not blow the 2MB scrollback ring. NOT redaction — see spec P3 TODO.
+const USER_PROMPT_SCROLLBACK_CAP: usize = 64 * 1024;
+fn truncate_prompt_for_scrollback(text: &str) -> String {
+    if text.len() <= USER_PROMPT_SCROLLBACK_CAP {
+        return text.to_string();
+    }
+    let cut = text
+        .char_indices()
+        .take_while(|(i, _)| *i < USER_PROMPT_SCROLLBACK_CAP)
+        .last()
+        .map(|(i, c)| i + c.len_utf8())
+        .unwrap_or(0);
+    let dropped = text.len() - cut;
+    format!("{}\n[已截断 {} 字节]", &text[..cut], dropped)
+}
+
+fn with_turn_id(mut evt: AcpEvent, tid: u64) -> AcpEvent {
+    match &mut evt {
+        AcpEvent::ContentBlock { turn_id, .. } => *turn_id = tid,
+        AcpEvent::Result { turn_id, .. } => *turn_id = tid,
+        _ => {}
+    }
+    evt
 }
 
 /// 把 Running 期间排队的追加 prompt 合并成一条带语义头的文本。
@@ -1940,11 +2141,10 @@ fn spawn_kiro_fanout(
         let mut local_running = false;
         let mut boundary_count: u64 = 0;
         // ── collect 队列状态(镜像 spawn_acp_fanout;见那里的不变量注释) ──
-        let mut pending: Vec<PendingPrompt> = Vec::new();
-        let mut collect_deadline: Option<std::pin::Pin<Box<tokio::time::Sleep>>> = None;
-        let mut collect_hard_deadline: Option<std::pin::Pin<Box<tokio::time::Sleep>>> = None;
-        const COLLECT_DEBOUNCE_MS: u64 = 500;
-        const COLLECT_MAX_MS: u64 = 3000;
+        let mut queue = PromptQueue::new();
+        // 队列模式(G2b):Kiro 为 ACP 后端,passthrough 降级为 collect。
+        const IS_ACP: bool = true; // Kiro fan-out
+        let mut queue_mode = QueueMode::Collect;
         loop {
             tokio::select! {
                 event = process.event_rx.recv() => {
@@ -1964,11 +2164,7 @@ fn spawn_kiro_fanout(
                                 evt,
                                 AcpEvent::Result { .. } | AcpEvent::Error { .. } | AcpEvent::Exit { .. }
                             );
-                            let json = match serde_json::to_string(&evt) {
-                                Ok(j) => j,
-                                Err(_) => continue,
-                            };
-                            let _ = event_tx.send(json);
+                            emit(&mgr, &sid, &event_tx, turn_seq, &evt);
                             if is_boundary {
                                 // Each started turn emits exactly one boundary
                                 // (Result/Error/Exit), in FIFO order, so the
@@ -1988,11 +2184,8 @@ fn spawn_kiro_fanout(
                                     m.mark_turn(&sid, TurnState::Idle, boundary_count);
                                 }
                                 // collect:turn 结束(已 Idle)且有排队追加 → arm 收集窗口。
-                                if !local_running && !pending.is_empty() && collect_deadline.is_none() {
-                                    collect_deadline = Some(Box::pin(tokio::time::sleep(
-                                        std::time::Duration::from_millis(COLLECT_DEBOUNCE_MS))));
-                                    collect_hard_deadline = Some(Box::pin(tokio::time::sleep(
-                                        std::time::Duration::from_millis(COLLECT_MAX_MS))));
+                                if !local_running {
+                                    queue.arm();
                                 }
                             }
                         }
@@ -2001,12 +2194,25 @@ fn spawn_kiro_fanout(
                 }
                 input = input_rx.recv() => {
                     match input {
-                        Some(SessionInput::Prompt { text, run_id }) => {
+                        Some(SessionInput::Prompt { text, run_id, client_id }) => {
+                            // Echo each user prompt as its own UserPrompt event (P1):
+                            // N collect-merged messages still surface as N bubbles.
+                            // turn_id = the turn this prompt will belong to. In the
+                            // idle/run_id branches turn_seq is incremented below to
+                            // start the turn, so prompt_turn (turn_seq+1) matches. In
+                            // the collect path queued prompts each use turn_seq+1; since
+                            // turn_seq stays fixed while running/in-window until the
+                            // merged flush does turn_seq+=1, all share the same next-turn
+                            // id, matching the merged assistant turn (T1).
+                            let prompt_turn = turn_seq + 1;
+                            emit(&mgr, &sid, &event_tx, prompt_turn, &AcpEvent::UserPrompt {
+                                text: truncate_prompt_for_scrollback(&text),
+                                turn_id: prompt_turn,
+                                client_id: client_id.clone(),
+                            });
                             if run_id.is_some() {
                                 // C3:调度 prompt 绕过 collect(kiro 当前不跑调度,留此分支保持三 fanout 对称)
-                                pending.clear();
-                                collect_deadline = None;
-                                collect_hard_deadline = None;
+                                queue.clear();
                                 if local_running {
                                     if let Err(e) = process.interrupt().await {
                                         tracing::warn!("interrupt before resend failed for {}: {}", sid, e);
@@ -2020,24 +2226,58 @@ fn spawn_kiro_fanout(
                                 if let Err(e) = process.send_prompt(&text).await {
                                     tracing::warn!("Kiro send_prompt failed for {}: {}", sid, e);
                                 }
-                            } else if local_running {
-                                pending.push(PendingPrompt { text, ts_ms: now_millis() });
-                                emit_queued(&event_tx, pending.len());
-                            } else if collect_deadline.is_some() {
-                                pending.push(PendingPrompt { text, ts_ms: now_millis() });
-                                collect_deadline = Some(Box::pin(tokio::time::sleep(
-                                    std::time::Duration::from_millis(COLLECT_DEBOUNCE_MS))));
-                                emit_queued(&event_tx, pending.len());
                             } else {
-                                turn_seq += 1;
-                                local_running = true;
-                                if let Some(m) = mgr.upgrade() {
-                                    m.mark_turn(&sid, TurnState::Running, turn_seq);
-                                }
-                                if let Err(e) = process.send_prompt(&text).await {
-                                    tracing::warn!("Kiro send_prompt failed for {}: {}", sid, e);
+                                // 非调度 prompt:按队列模式分流(G2b)。Kiro 为 ACP,
+                                // passthrough 已在 SetQueueMode 处降级为 collect。
+                                match queue_mode {
+                                    QueueMode::Interrupt if local_running => {
+                                        if let Err(e) = process.interrupt().await {
+                                            tracing::warn!("interrupt (queue mode) failed for {}: {}", sid, e);
+                                        }
+                                        queue.clear();
+                                        turn_seq += 1;
+                                        local_running = true;
+                                        if let Some(m) = mgr.upgrade() {
+                                            m.mark_turn(&sid, TurnState::Running, turn_seq);
+                                        }
+                                        if let Err(e) = process.send_prompt(&text).await {
+                                            tracing::warn!("Kiro send_prompt failed for {}: {}", sid, e);
+                                        }
+                                    }
+                                    QueueMode::Passthrough => {
+                                        turn_seq += 1;
+                                        local_running = true;
+                                        if let Some(m) = mgr.upgrade() {
+                                            m.mark_turn(&sid, TurnState::Running, turn_seq);
+                                        }
+                                        if let Err(e) = process.send_prompt(&text).await {
+                                            tracing::warn!("Kiro send_prompt failed for {}: {}", sid, e);
+                                        }
+                                    }
+                                    _ => {
+                                        if local_running {
+                                            queue.enqueue(text);
+                                            emit_queued(&event_tx, queue.pending.len());
+                                        } else if queue.debounce.is_some() {
+                                            queue.enqueue(text);
+                                            queue.bump_debounce();
+                                            emit_queued(&event_tx, queue.pending.len());
+                                        } else {
+                                            turn_seq += 1;
+                                            local_running = true;
+                                            if let Some(m) = mgr.upgrade() {
+                                                m.mark_turn(&sid, TurnState::Running, turn_seq);
+                                            }
+                                            if let Err(e) = process.send_prompt(&text).await {
+                                                tracing::warn!("Kiro send_prompt failed for {}: {}", sid, e);
+                                            }
+                                        }
+                                    }
                                 }
                             }
+                        }
+                        Some(SessionInput::SetQueueMode(m)) => {
+                            queue_mode = m.effective_for_acp(IS_ACP);
                         }
                         Some(SessionInput::Interrupt) => {
                             if local_running {
@@ -2046,9 +2286,7 @@ fn spawn_kiro_fanout(
                                 }
                             }
                             // E5:无条件清队列 + 取消窗口
-                            pending.clear();
-                            collect_deadline = None;
-                            collect_hard_deadline = None;
+                            queue.clear();
                         }
                         Some(SessionInput::Cancel) => {
                             process.kill().await;
@@ -2061,18 +2299,16 @@ fn spawn_kiro_fanout(
                     }
                 }
                 _ = async {
-                    match (collect_deadline.as_mut(), collect_hard_deadline.as_mut()) {
+                    match (queue.debounce.as_mut(), queue.hard_cap.as_mut()) {
                         (Some(d), Some(h)) => { tokio::select! { _ = d.as_mut() => {}, _ = h.as_mut() => {} } }
                         (Some(d), None) => d.as_mut().await,
                         (None, Some(h)) => h.as_mut().await,
                         (None, None) => std::future::pending::<()>().await,
                     }
-                }, if collect_deadline.is_some() => {
-                    collect_deadline = None;
-                    collect_hard_deadline = None;
-                    if !pending.is_empty() {
-                        let merged = merge_pending(&pending);
-                        pending.clear();
+                }, if queue.debounce.is_some() => {
+                    queue.disarm();
+                    if !queue.pending.is_empty() {
+                        let merged = queue.drain_merged();
                         turn_seq += 1;
                         local_running = true;
                         if let Some(m) = mgr.upgrade() {
@@ -2107,11 +2343,10 @@ fn spawn_codex_fanout(
         let mut local_running = false;
         let mut boundary_count: u64 = 0;
         // ── collect 队列状态(镜像 spawn_acp_fanout;见那里的不变量注释) ──
-        let mut pending: Vec<PendingPrompt> = Vec::new();
-        let mut collect_deadline: Option<std::pin::Pin<Box<tokio::time::Sleep>>> = None;
-        let mut collect_hard_deadline: Option<std::pin::Pin<Box<tokio::time::Sleep>>> = None;
-        const COLLECT_DEBOUNCE_MS: u64 = 500;
-        const COLLECT_MAX_MS: u64 = 3000;
+        let mut queue = PromptQueue::new();
+        // 队列模式(G2b):Codex 支持并发 turn,passthrough 不降级。
+        const IS_ACP: bool = false; // Codex fan-out
+        let mut queue_mode = QueueMode::Collect;
         loop {
             tokio::select! {
                 event = process.event_rx.recv() => {
@@ -2131,11 +2366,7 @@ fn spawn_codex_fanout(
                                 evt,
                                 AcpEvent::Result { .. } | AcpEvent::Error { .. } | AcpEvent::Exit { .. }
                             );
-                            let json = match serde_json::to_string(&evt) {
-                                Ok(j) => j,
-                                Err(_) => continue,
-                            };
-                            let _ = event_tx.send(json);
+                            emit(&mgr, &sid, &event_tx, turn_seq, &evt);
                             if is_boundary {
                                 // Each started turn emits exactly one boundary
                                 // (Result/Error/Exit), in FIFO order, so the
@@ -2155,11 +2386,8 @@ fn spawn_codex_fanout(
                                     m.mark_turn(&sid, TurnState::Idle, boundary_count);
                                 }
                                 // collect:turn 结束(已 Idle)且有排队追加 → arm 收集窗口。
-                                if !local_running && !pending.is_empty() && collect_deadline.is_none() {
-                                    collect_deadline = Some(Box::pin(tokio::time::sleep(
-                                        std::time::Duration::from_millis(COLLECT_DEBOUNCE_MS))));
-                                    collect_hard_deadline = Some(Box::pin(tokio::time::sleep(
-                                        std::time::Duration::from_millis(COLLECT_MAX_MS))));
+                                if !local_running {
+                                    queue.arm();
                                 }
                             }
                         }
@@ -2168,12 +2396,25 @@ fn spawn_codex_fanout(
                 }
                 input = input_rx.recv() => {
                     match input {
-                        Some(SessionInput::Prompt { text, run_id }) => {
+                        Some(SessionInput::Prompt { text, run_id, client_id }) => {
+                            // Echo each user prompt as its own UserPrompt event (P1):
+                            // N collect-merged messages still surface as N bubbles.
+                            // turn_id = the turn this prompt will belong to. In the
+                            // idle/run_id branches turn_seq is incremented below to
+                            // start the turn, so prompt_turn (turn_seq+1) matches. In
+                            // the collect path queued prompts each use turn_seq+1; since
+                            // turn_seq stays fixed while running/in-window until the
+                            // merged flush does turn_seq+=1, all share the same next-turn
+                            // id, matching the merged assistant turn (T1).
+                            let prompt_turn = turn_seq + 1;
+                            emit(&mgr, &sid, &event_tx, prompt_turn, &AcpEvent::UserPrompt {
+                                text: truncate_prompt_for_scrollback(&text),
+                                turn_id: prompt_turn,
+                                client_id: client_id.clone(),
+                            });
                             if run_id.is_some() {
                                 // C3:调度 prompt 绕过 collect(codex 当前不跑调度,留此分支保持三 fanout 对称)
-                                pending.clear();
-                                collect_deadline = None;
-                                collect_hard_deadline = None;
+                                queue.clear();
                                 if local_running {
                                     if let Err(e) = process.interrupt().await {
                                         tracing::warn!("interrupt before resend failed for {}: {}", sid, e);
@@ -2187,24 +2428,57 @@ fn spawn_codex_fanout(
                                 if let Err(e) = process.send_prompt(&text).await {
                                     tracing::warn!("Codex send_prompt failed for {}: {}", sid, e);
                                 }
-                            } else if local_running {
-                                pending.push(PendingPrompt { text, ts_ms: now_millis() });
-                                emit_queued(&event_tx, pending.len());
-                            } else if collect_deadline.is_some() {
-                                pending.push(PendingPrompt { text, ts_ms: now_millis() });
-                                collect_deadline = Some(Box::pin(tokio::time::sleep(
-                                    std::time::Duration::from_millis(COLLECT_DEBOUNCE_MS))));
-                                emit_queued(&event_tx, pending.len());
                             } else {
-                                turn_seq += 1;
-                                local_running = true;
-                                if let Some(m) = mgr.upgrade() {
-                                    m.mark_turn(&sid, TurnState::Running, turn_seq);
-                                }
-                                if let Err(e) = process.send_prompt(&text).await {
-                                    tracing::warn!("Codex send_prompt failed for {}: {}", sid, e);
+                                // 非调度 prompt:按队列模式分流(G2b)。
+                                match queue_mode {
+                                    QueueMode::Interrupt if local_running => {
+                                        if let Err(e) = process.interrupt().await {
+                                            tracing::warn!("interrupt (queue mode) failed for {}: {}", sid, e);
+                                        }
+                                        queue.clear();
+                                        turn_seq += 1;
+                                        local_running = true;
+                                        if let Some(m) = mgr.upgrade() {
+                                            m.mark_turn(&sid, TurnState::Running, turn_seq);
+                                        }
+                                        if let Err(e) = process.send_prompt(&text).await {
+                                            tracing::warn!("Codex send_prompt failed for {}: {}", sid, e);
+                                        }
+                                    }
+                                    QueueMode::Passthrough => {
+                                        turn_seq += 1;
+                                        local_running = true;
+                                        if let Some(m) = mgr.upgrade() {
+                                            m.mark_turn(&sid, TurnState::Running, turn_seq);
+                                        }
+                                        if let Err(e) = process.send_prompt(&text).await {
+                                            tracing::warn!("Codex send_prompt failed for {}: {}", sid, e);
+                                        }
+                                    }
+                                    _ => {
+                                        if local_running {
+                                            queue.enqueue(text);
+                                            emit_queued(&event_tx, queue.pending.len());
+                                        } else if queue.debounce.is_some() {
+                                            queue.enqueue(text);
+                                            queue.bump_debounce();
+                                            emit_queued(&event_tx, queue.pending.len());
+                                        } else {
+                                            turn_seq += 1;
+                                            local_running = true;
+                                            if let Some(m) = mgr.upgrade() {
+                                                m.mark_turn(&sid, TurnState::Running, turn_seq);
+                                            }
+                                            if let Err(e) = process.send_prompt(&text).await {
+                                                tracing::warn!("Codex send_prompt failed for {}: {}", sid, e);
+                                            }
+                                        }
+                                    }
                                 }
                             }
+                        }
+                        Some(SessionInput::SetQueueMode(m)) => {
+                            queue_mode = m.effective_for_acp(IS_ACP);
                         }
                         Some(SessionInput::Interrupt) => {
                             if local_running {
@@ -2213,9 +2487,7 @@ fn spawn_codex_fanout(
                                 }
                             }
                             // E5:无条件清队列 + 取消窗口
-                            pending.clear();
-                            collect_deadline = None;
-                            collect_hard_deadline = None;
+                            queue.clear();
                         }
                         Some(SessionInput::Cancel) => {
                             process.kill().await;
@@ -2227,18 +2499,16 @@ fn spawn_codex_fanout(
                     }
                 }
                 _ = async {
-                    match (collect_deadline.as_mut(), collect_hard_deadline.as_mut()) {
+                    match (queue.debounce.as_mut(), queue.hard_cap.as_mut()) {
                         (Some(d), Some(h)) => { tokio::select! { _ = d.as_mut() => {}, _ = h.as_mut() => {} } }
                         (Some(d), None) => d.as_mut().await,
                         (None, Some(h)) => h.as_mut().await,
                         (None, None) => std::future::pending::<()>().await,
                     }
-                }, if collect_deadline.is_some() => {
-                    collect_deadline = None;
-                    collect_hard_deadline = None;
-                    if !pending.is_empty() {
-                        let merged = merge_pending(&pending);
-                        pending.clear();
+                }, if queue.debounce.is_some() => {
+                    queue.disarm();
+                    if !queue.pending.is_empty() {
+                        let merged = queue.drain_merged();
                         turn_seq += 1;
                         local_running = true;
                         if let Some(m) = mgr.upgrade() {
@@ -2641,6 +2911,32 @@ mod turn_state_tests {
     }
 
     #[test]
+    fn queue_mode_parses_and_defaults_collect() {
+        assert_eq!(QueueMode::from_str("collect"), QueueMode::Collect);
+        assert_eq!(QueueMode::from_str("interrupt"), QueueMode::Interrupt);
+        assert_eq!(QueueMode::from_str("passthrough"), QueueMode::Passthrough);
+        assert_eq!(QueueMode::from_str("garbage"), QueueMode::Collect);
+    }
+
+    #[test]
+    fn passthrough_falls_back_to_collect_for_acp() {
+        assert_eq!(QueueMode::Passthrough.effective_for_acp(true), QueueMode::Collect);
+        assert_eq!(QueueMode::Passthrough.effective_for_acp(false), QueueMode::Passthrough);
+    }
+
+    #[test]
+    fn prompt_queue_enqueue_and_drain() {
+        let mut q = PromptQueue::new();
+        assert!(q.pending.is_empty());
+        q.enqueue("a".into());
+        q.enqueue("b".into());
+        assert_eq!(q.pending.len(), 2);
+        let merged = q.drain_merged();
+        assert!(q.pending.is_empty());
+        assert!(merged.contains("a") && merged.contains("b"));
+    }
+
+    #[test]
     fn is_substantive_prompt_filters_trivial_openers() {
         for t in ["hi", "ls", "继续", "y", "q", "  ", "ok"] {
             assert!(!is_substantive_prompt(t), "expected non-substantive: {:?}", t);
@@ -2779,5 +3075,36 @@ mod running_summary_tests {
         let s = m.running_summary();
         assert_eq!(s.scheduled, 0);
         assert_eq!(s.interactive, 0);
+    }
+}
+
+#[cfg(test)]
+mod emit_tests {
+    use super::*;
+
+    #[test]
+    fn is_ephemeral_event_only_matches_queued() {
+        let queued = AcpEvent::System {
+            subtype: std::borrow::Cow::Borrowed("queued"),
+            session_id: None,
+            count: Some(3),
+        };
+        assert!(is_ephemeral_event(&queued));
+        let init = AcpEvent::System {
+            subtype: std::borrow::Cow::Borrowed("init"),
+            session_id: None,
+            count: None,
+        };
+        assert!(!is_ephemeral_event(&init));
+    }
+
+    #[test]
+    fn truncate_prompt_for_scrollback_caps_and_marks() {
+        let short = "hello";
+        assert_eq!(truncate_prompt_for_scrollback(short), "hello");
+        let big = "x".repeat(70_000);
+        let out = truncate_prompt_for_scrollback(&big);
+        assert!(out.len() < 70_000);
+        assert!(out.contains("已截断"));
     }
 }

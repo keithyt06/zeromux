@@ -9,7 +9,7 @@ import 'highlight.js/styles/github-dark.css'
 import { markdownComponents } from '../markdownStyles'
 import { MarkdownContext } from './context'
 import CodeBlock from './CodeBlock'
-import { sanitizeStreamingMarkdown } from './sanitize'
+import { sanitizeStreamingMarkdown, unwrapMarkdownFence } from './sanitize'
 
 const HLJS_LANGS = [
   'bash', 'json', 'yaml',
@@ -34,7 +34,12 @@ type RehypePlugin = any
 
 export default function MarkdownContent({ text, isComplete, className }: Props) {
   const deferredText = useDeferredValue(text)
-  const rendered = isComplete ? deferredText : sanitizeStreamingMarkdown(deferredText)
+  // Streaming: sanitize unclosed fences/tables/math. Complete: strip a whole-reply
+  // ```markdown wrapper (kiro habit — nested fences mis-render) then use raw text.
+  // Unwrap only on the completed text so we never act on a half-streamed wrapper.
+  const rendered = isComplete
+    ? unwrapMarkdownFence(deferredText)
+    : sanitizeStreamingMarkdown(deferredText)
   const needsKatex = useMemo(() => hasMathSyntax(rendered), [rendered])
   const [katexPlugin, setKatexPlugin] = useState<RehypePlugin | null>(null)
 

@@ -1334,6 +1334,8 @@ async fn create_scheduled(
         enabled: req.enabled,
         retention_n: req.retention_n,
         created_ms: chrono::Utc::now().timestamp_millis(),
+        side_effects: false,
+        max_runtime_min: None,
     };
     state
         .scheduled_tasks
@@ -1374,6 +1376,8 @@ async fn update_scheduled(
         enabled: req.enabled,
         retention_n: req.retention_n,
         created_ms: existing.created_ms,
+        side_effects: existing.side_effects,
+        max_runtime_min: existing.max_runtime_min,
     };
     state
         .scheduled_tasks
@@ -1437,6 +1441,9 @@ async fn run_scheduled_now(
         failure_kind: None,
         started_ms: Some(now),
         ended_ms: None,
+        input_snapshot: None,
+        confirm_status: None,
+        replay_of: None,
     };
     // Honor the atomic claim: if another caller (the scheduler, or a double-click)
     // already took this slot, INSERT OR IGNORE matches 0 rows. Spawning anyway

@@ -1,6 +1,6 @@
 import { useState, useEffect, useCallback, useMemo, useRef } from 'react'
 import type { SessionInfo, SessionType, UserInfo } from './lib/api'
-import { listSessions, createSession, deleteSession, checkAuth, legacyLogin, clearAuth, renameSession } from './lib/api'
+import { listSessions, createSession, deleteSession, checkAuth, legacyLogin, clearAuth, renameSession, listConfirmations } from './lib/api'
 import { useTheme } from './lib/theme'
 import Sidebar from './components/Sidebar'
 import TerminalView from './components/TerminalView'
@@ -34,6 +34,7 @@ export default function App() {
   const themeCtx = useTheme()
   const isMobile = useMemo(() => window.innerWidth < 768, [])
   const [sidebarOpen, setSidebarOpen] = useState(!isMobile)
+  const [confirmCount, setConfirmCount] = useState(0)
 
   const initAuth = useCallback(async () => {
     const me = await checkAuth()
@@ -75,6 +76,21 @@ export default function App() {
       } catch { /* ignore transient */ }
     }, 3000)
     return () => clearInterval(tick)
+  }, [authState])
+
+  // Poll the confirmation queue so the sidebar badge stays live (now + every 30s).
+  useEffect(() => {
+    if (authState !== 'active') return
+    let cancelled = false
+    const poll = async () => {
+      try {
+        const r = await listConfirmations()
+        if (!cancelled) setConfirmCount(r.count)
+      } catch { /* ignore transient */ }
+    }
+    poll()
+    const id = setInterval(poll, 30_000)
+    return () => { cancelled = true; clearInterval(id) }
   }, [authState])
 
   // First time we have a session list, treat all existing completions as read
@@ -194,6 +210,7 @@ export default function App() {
         open={sidebarOpen}
         onToggle={() => setSidebarOpen(v => !v)}
         mobile={isMobile}
+        confirmCount={confirmCount}
       />
       <main className="flex-1 min-w-0 flex flex-col">
         {/* Info bar for active session */}

@@ -9,6 +9,9 @@ import {
   deleteScheduledTask,
   runScheduledTaskNow,
   listTaskRuns,
+  listConfirmations,
+  confirmRunDone,
+  replayRun,
 } from '../lib/api'
 
 interface Props {
@@ -46,6 +49,15 @@ const STATE_COLORS: Record<TaskRun['state'], string> = {
   aborted: 'text-[var(--accent-yellow)]',
 }
 
+// eslint-disable-next-line react-refresh/only-export-components -- pure helper exported for unit tests
+export function runReason(r: TaskRun): { label: string; color: string } {
+  if (r.state === 'aborted') {
+    if (r.failure_kind === 'watchdog_timeout') return { label: '超时中止', color: 'text-[var(--accent-red)]' }
+    if (r.failure_kind === 'orphaned_restart') return { label: '重启中断', color: 'text-[var(--accent-red)]' }
+  }
+  return { label: STATE_LABELS[r.state], color: STATE_COLORS[r.state] }
+}
+
 export default function ScheduledTasksPanel({ onClose }: Props) {
   const [tasks, setTasks] = useState<ScheduledTask[]>([])
   const [loading, setLoading] = useState(true)
@@ -72,6 +84,8 @@ export default function ScheduledTasksPanel({ onClose }: Props) {
         prompt: t.prompt,
         enabled: !t.enabled,
         retention_n: t.retention_n,
+        side_effects: t.side_effects,
+        max_runtime_min: t.max_runtime_min,
       })
       load()
     } catch { /* ignore */ }
@@ -129,6 +143,7 @@ export default function ScheduledTasksPanel({ onClose }: Props) {
       <div className="flex-1 overflow-y-auto p-4 space-y-3">
         {view === 'list' && (
           <>
+            <ConfirmationQueue onResolved={load} />
             {note && (
               <div className="text-xs text-[var(--text-secondary)] bg-[var(--bg-secondary)] border border-[var(--border)] rounded px-3 py-2">
                 {note}
@@ -176,6 +191,89 @@ export default function ScheduledTasksPanel({ onClose }: Props) {
           <RunHistory task={historyTask} />
         )}
       </div>
+    </div>
+  )
+}
+
+function ConfirmationQueue({ onResolved }: { onResolved: () => void }) {
+  const [runs, setRuns] = useState<TaskRun[]>([])
+  const [busy, setBusy] = useState<string | null>(null)
+
+  const reload = useCallback(async () => {
+    try {
+      const r = await listConfirmations()
+      setRuns(r.runs)
+    } catch { /* ignore */ }
+  }, [])
+
+  useEffect(() => {
+    let cancelled = false
+    listConfirmations()
+      .then(r => { if (!cancelled) setRuns(r.runs) })
+      .catch(() => { /* ignore */ })
+    return () => { cancelled = true }
+  }, [])
+
+  const onDone = async (run: TaskRun) => {
+    setBusy(run.id)
+    try {
+      await confirmRunDone(run.id)
+      await reload()
+      onResolved()
+    } catch { /* ignore */ } finally { setBusy(null) }
+  }
+
+  const onReplay = async (run: TaskRun) => {
+    setBusy(run.id)
+    try {
+      await replayRun(run.id, true)
+      await reload()
+      onResolved()
+    } catch { /* ignore */ } finally { setBusy(null) }
+  }
+
+  if (runs.length === 0) return null
+
+  return (
+    <div className="space-y-1 mb-3">
+      <div className="flex items-center gap-2 text-[10px] font-semibold text-[var(--text-muted)] uppercase tracking-wider">
+        待确认
+        <span className="inline-flex items-center justify-center min-w-[16px] h-4 px-1 text-[10px] font-bold text-white bg-[var(--accent-red)] rounded-full">
+          {runs.length}
+        </span>
+      </div>
+      {runs.map(run => {
+        const reason = runReason(run)
+        return (
+          <div key={run.id} className="px-3 py-2 bg-[var(--bg-secondary)] rounded-lg border border-[var(--border)]">
+            <div className="flex items-center justify-between gap-2">
+              <span className={`text-xs font-medium ${reason.color}`}>{reason.label}</span>
+              {run.ended_ms != null && (
+                <span className="text-[10px] text-[var(--text-muted)]">{new Date(run.ended_ms).toLocaleString()}</span>
+              )}
+            </div>
+            {run.verdict && (
+              <div className="text-[10px] text-[var(--text-secondary)] mt-1 break-words">{run.verdict}</div>
+            )}
+            <div className="flex gap-2 mt-2">
+              <button
+                onClick={() => onDone(run)}
+                disabled={busy === run.id}
+                className="px-2 py-1 text-[11px] font-medium text-[var(--accent-green-text)] hover:bg-[var(--bg-tertiary)] rounded transition-colors disabled:opacity-50"
+              >
+                确认已完成
+              </button>
+              <button
+                onClick={() => onReplay(run)}
+                disabled={busy === run.id}
+                className="px-2 py-1 text-[11px] font-medium text-[var(--accent-blue)] hover:bg-[var(--bg-tertiary)] rounded transition-colors disabled:opacity-50"
+              >
+                确认未完成 → 重放
+              </button>
+            </div>
+          </div>
+        )
+      })}
     </div>
   )
 }
@@ -258,6 +356,8 @@ function TaskForm({ task, onCancel, onSaved }: {
   const [minute, setMinute] = useState(0)
   const [weekdays, setWeekdays] = useState<number[]>([1, 2, 3, 4, 5])
   const [cronExpr, setCronExpr] = useState(task?.trigger_spec ?? '')
+  const [sideEffects, setSideEffects] = useState(task?.side_effects ?? false)
+  const [maxRuntime, setMaxRuntime] = useState<number | null>(task?.max_runtime_min ?? null)
   const [pickingDir, setPickingDir] = useState(false)
   const [saving, setSaving] = useState(false)
   const [error, setError] = useState<string | null>(null)
@@ -286,6 +386,8 @@ function TaskForm({ task, onCancel, onSaved }: {
       work_dir: workDir.trim(),
       prompt: prompt.trim(),
       enabled,
+      side_effects: sideEffects,
+      max_runtime_min: maxRuntime,
     }
     setSaving(true)
     try {
@@ -394,6 +496,24 @@ function TaskForm({ task, onCancel, onSaved }: {
         <textarea value={prompt} onChange={e => setPrompt(e.target.value)} rows={4} className={`${inputCls} resize-y`} placeholder="要执行的任务..." />
       </div>
 
+      <div>
+        <label className={labelCls}>最长运行(分钟,留空=30)</label>
+        <input
+          type="number"
+          min={1}
+          max={1440}
+          value={maxRuntime ?? ''}
+          onChange={e => setMaxRuntime(e.target.value === '' ? null : Number(e.target.value))}
+          className={inputCls}
+          placeholder="30"
+        />
+      </div>
+
+      <label className="flex items-center gap-2 text-xs text-[var(--text-secondary)] cursor-pointer">
+        <input type="checkbox" checked={sideEffects} onChange={e => setSideEffects(e.target.checked)} className="accent-[var(--accent-blue)]" />
+        有外部副作用(提 PR / push / 改文件)
+      </label>
+
       <label className="flex items-center gap-2 text-xs text-[var(--text-secondary)] cursor-pointer">
         <input type="checkbox" checked={enabled} onChange={e => setEnabled(e.target.checked)} className="accent-[var(--accent-blue)]" />
         启用
@@ -421,6 +541,7 @@ function TaskForm({ task, onCancel, onSaved }: {
 function RunHistory({ task }: { task: ScheduledTask }) {
   const [runs, setRuns] = useState<TaskRun[]>([])
   const [loading, setLoading] = useState(true)
+  const [busy, setBusy] = useState<string | null>(null)
 
   useEffect(() => {
     let cancelled = false
@@ -434,21 +555,53 @@ function RunHistory({ task }: { task: ScheduledTask }) {
   if (loading) return <div className="text-sm text-[var(--text-muted)]">加载中...</div>
   if (runs.length === 0) return <div className="text-sm text-[var(--text-muted)]">还没有运行记录</div>
 
+  const onReplay = async (run: TaskRun) => {
+    setBusy(run.id)
+    try {
+      await replayRun(run.id, false)
+    } catch { /* ignore */ } finally { setBusy(null) }
+  }
+
   return (
     <div className="space-y-1">
-      {runs.map(r => (
-        <div key={r.id} className="px-3 py-2 bg-[var(--bg-secondary)] rounded-lg border border-[var(--border)]">
-          <div className="flex items-center justify-between gap-2">
-            <span className={`text-xs font-medium ${STATE_COLORS[r.state]}`}>{STATE_LABELS[r.state]}</span>
-            <span className="text-[10px] text-[var(--text-muted)]">{new Date(r.scheduled_for_ms).toLocaleString()}</span>
-          </div>
-          {(r.verdict || r.failure_kind) && (
-            <div className="text-[10px] text-[var(--text-secondary)] mt-1 break-words">
-              {r.verdict || r.failure_kind}
+      {runs.map(r => {
+        const reason = runReason(r)
+        const noSnapshot = r.input_snapshot === null
+        const sideEffectUnknown =
+          task.side_effects &&
+          r.state === 'aborted' &&
+          (r.failure_kind === 'watchdog_timeout' || r.failure_kind === 'orphaned_restart') &&
+          r.confirm_status === null
+        const disabled = noSnapshot || sideEffectUnknown
+        const title = noSnapshot
+          ? '无输入快照,无法重放'
+          : sideEffectUnknown
+            ? '请经待确认队列处理'
+            : undefined
+        return (
+          <div key={r.id} className="px-3 py-2 bg-[var(--bg-secondary)] rounded-lg border border-[var(--border)]">
+            <div className="flex items-center justify-between gap-2">
+              <span className={`text-xs font-medium ${reason.color}`}>{reason.label}</span>
+              <span className="text-[10px] text-[var(--text-muted)]">{new Date(r.scheduled_for_ms).toLocaleString()}</span>
             </div>
-          )}
-        </div>
-      ))}
+            {(r.verdict || r.failure_kind) && (
+              <div className="text-[10px] text-[var(--text-secondary)] mt-1 break-words">
+                {r.verdict || r.failure_kind}
+              </div>
+            )}
+            <div className="mt-2">
+              <button
+                onClick={() => onReplay(r)}
+                disabled={disabled || busy === r.id}
+                title={title}
+                className="px-2 py-1 text-[11px] font-medium text-[var(--accent-blue)] hover:bg-[var(--bg-tertiary)] rounded transition-colors disabled:opacity-40 disabled:cursor-not-allowed"
+              >
+                重放
+              </button>
+            </div>
+          </div>
+        )
+      })}
     </div>
   )
 }

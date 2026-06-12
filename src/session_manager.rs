@@ -2632,12 +2632,20 @@ fn spawn_codex_fanout(
     });
 }
 
+/// Serializes the few tests that read or mutate the process-global `HOME`
+/// env var. `cargo test` runs tests as threads in one process, so without
+/// this lock `append_run_event_writes_and_isolates` (which sets HOME to a
+/// tempdir) can race the work_dir tests that canonicalize the real HOME.
+#[cfg(test)]
+pub(crate) static HOME_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 #[cfg(test)]
 mod work_dir_confinement_tests {
-    use super::work_dir_under_home;
+    use super::{work_dir_under_home, HOME_ENV_LOCK};
 
     #[test]
     fn home_itself_and_subdir_pass() {
+        let _guard = HOME_ENV_LOCK.lock().unwrap();
         let home = std::env::var("HOME").unwrap();
         assert!(work_dir_under_home(&home).is_ok());
         // A subdir guaranteed to exist and canonicalize under HOME.
@@ -2662,6 +2670,7 @@ mod work_dir_confinement_tests {
 
     #[test]
     fn returns_canonical_path_not_raw_input() {
+        let _guard = HOME_ENV_LOCK.lock().unwrap();
         // The caller MUST spawn from the returned (canonical) path, not the raw
         // string — that is what closes the TOCTOU. So a path with a symlink or
         // a `.` component must come back fully resolved, with no `.`/symlink left.
@@ -2697,6 +2706,31 @@ mod resume_token_tests {
     #[test]
     fn from_unknown_kind_is_none() {
         assert!(ResumeToken::from_kind_value("bogus", "x").is_none());
+    }
+}
+
+#[cfg(test)]
+mod append_run_event_tests {
+    use super::*;
+
+    #[test]
+    fn append_run_event_writes_and_isolates() {
+        // HOME is process-global; lock against the work_dir tests that read it.
+        let _guard = HOME_ENV_LOCK.lock().unwrap();
+        let prev_home = std::env::var("HOME").ok();
+        let tmp = tempfile::tempdir().unwrap();
+        std::env::set_var("HOME", tmp.path());
+        append_run_event("run_abc", "{\"a\":1}");
+        append_run_event("run_abc", "{\"b\":2}");
+        let p = tmp.path().join(".zeromux/runs/run_abc/events.ndjson");
+        let content = std::fs::read_to_string(&p).unwrap();
+        // Restore HOME before the guard drops so no later test sees the tempdir.
+        match prev_home {
+            Some(h) => std::env::set_var("HOME", h),
+            None => std::env::remove_var("HOME"),
+        }
+        assert_eq!(content.lines().count(), 2);
+        assert!(content.contains("\"a\":1") && content.contains("\"b\":2"));
     }
 }
 

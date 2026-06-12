@@ -349,7 +349,7 @@ impl ScheduledStore {
         conn.execute(
             "UPDATE agent_task_runs SET state=?2, session_id=COALESCE(?3,session_id),
              verdict=COALESCE(?4,verdict), failure_kind=COALESCE(?5,failure_kind),
-             ended_ms=COALESCE(?6,ended_ms) WHERE id=?1",
+             ended_ms=COALESCE(?6,ended_ms) WHERE id=?1 AND state IN ('claimed','running')",
             params![run_id, state, session_id, verdict, failure_kind, ended_ms],
         ).map_err(|e| e.to_string())?;
         Ok(())
@@ -591,5 +591,23 @@ mod store_tests {
         assert_eq!(long.state, "running");   // 45min < 60min limit → survives
         assert_eq!(def.state, "aborted");    // 45min > 30min default → aborted
         assert_eq!(def.failure_kind.as_deref(), Some("watchdog_timeout"));
+    }
+
+    #[test]
+    fn set_run_state_does_not_overwrite_terminal() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = ScheduledStore::open(dir.path()).unwrap();
+        let run = TaskRun { id: "r1".into(), task_id: "t1".into(), scheduled_for_ms: 1, state: "claimed".into(),
+            session_id: None, verdict: None, failure_kind: None, started_ms: Some(1), ended_ms: None,
+            input_snapshot: None, confirm_status: None, replay_of: None };
+        s.claim_run(&run).unwrap();
+        s.set_run_state("r1", "running", Some("sess1"), None, None, None).unwrap();
+        s.set_run_state("r1", "aborted", None, None, Some("watchdog_timeout"), Some(50)).unwrap();
+        // late finalize tries to flip to succeeded — must be refused
+        s.set_run_state("r1", "succeeded", None, Some("done"), None, Some(99)).unwrap();
+        let r = s.runs_for_task("t1", 1).unwrap().into_iter().next().unwrap();
+        assert_eq!(r.state, "aborted");                           // not overwritten
+        assert_eq!(r.failure_kind.as_deref(), Some("watchdog_timeout"));
+        assert!(r.verdict.is_none());                             // late verdict not written either
     }
 }

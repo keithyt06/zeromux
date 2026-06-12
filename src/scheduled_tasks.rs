@@ -362,14 +362,19 @@ impl ScheduledStore {
         rows.collect::<Result<_,_>>().map_err(|e| e.to_string())
     }
 
-    /// Startup + watchdog: mark claimed/running as aborted. cutoff_ms=None at
-    /// startup (all orphans); Some(cutoff) for the timeout watchdog (only runs
-    /// whose started_ms is older than cutoff).
+    /// Startup + watchdog: mark claimed/running as aborted with a failure_kind.
+    /// cutoff_ms=None at startup (all orphans → `orphaned_restart`);
+    /// Some(cutoff) for the timeout watchdog (only runs whose started_ms is older
+    /// than cutoff → `watchdog_timeout`).
     pub fn reconcile_orphans(&self, cutoff_ms: Option<i64>) -> Result<usize, String> {
         let conn = self.conn.lock().unwrap();
         let n = match cutoff_ms {
-            None => conn.execute("UPDATE agent_task_runs SET state='aborted' WHERE state IN ('claimed','running')", params![]),
-            Some(c) => conn.execute("UPDATE agent_task_runs SET state='aborted' WHERE state IN ('claimed','running') AND started_ms < ?1", params![c]),
+            None => conn.execute(
+                "UPDATE agent_task_runs SET state='aborted', failure_kind='orphaned_restart' \
+                 WHERE state IN ('claimed','running')", params![]),
+            Some(c) => conn.execute(
+                "UPDATE agent_task_runs SET state='aborted', failure_kind='watchdog_timeout' \
+                 WHERE state IN ('claimed','running') AND started_ms < ?1", params![c]),
         }.map_err(|e| e.to_string())?;
         Ok(n)
     }
@@ -516,5 +521,31 @@ mod store_tests {
         assert_eq!(runs[0].session_id.as_deref(), Some("sess1"));
         assert_eq!(runs[0].verdict.as_deref(), Some("2 issues"));
         assert!(s.active_states_for_task("t1").unwrap().is_empty(), "succeeded is not active");
+    }
+
+    #[test]
+    fn reconcile_stamps_failure_kind() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = ScheduledStore::open(dir.path()).unwrap();
+        let mk = |id: &str, started: i64| TaskRun {
+            id: id.into(), task_id: "t1".into(), scheduled_for_ms: started, state: "claimed".into(),
+            session_id: None, verdict: None, failure_kind: None, started_ms: Some(started), ended_ms: None,
+            input_snapshot: None, confirm_status: None, replay_of: None };
+        s.claim_run(&mk("r_old", 1)).unwrap();
+        s.set_run_state("r_old", "running", None, None, None, None).unwrap();
+        s.claim_run(&mk("r_new", 1_000_000)).unwrap();
+        s.set_run_state("r_new", "running", None, None, None, None).unwrap();
+
+        s.reconcile_orphans(Some(100)).unwrap();   // watchdog cutoff=100: only r_old is older
+        let old = s.runs_for_task("t1", 10).unwrap().into_iter().find(|r| r.id == "r_old").unwrap();
+        let new = s.runs_for_task("t1", 10).unwrap().into_iter().find(|r| r.id == "r_new").unwrap();
+        assert_eq!(old.state, "aborted");
+        assert_eq!(old.failure_kind.as_deref(), Some("watchdog_timeout"));
+        assert_eq!(new.state, "running");
+
+        s.reconcile_orphans(None).unwrap();        // startup sweep: remaining running → orphaned_restart
+        let new2 = s.runs_for_task("t1", 10).unwrap().into_iter().find(|r| r.id == "r_new").unwrap();
+        assert_eq!(new2.state, "aborted");
+        assert_eq!(new2.failure_kind.as_deref(), Some("orphaned_restart"));
     }
 }

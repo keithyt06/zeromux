@@ -177,13 +177,15 @@ export default function AcpChatView({ sessionId, agentType = 'claude', onRegiste
           setQueuedCount(evt.count ?? 0)
           break
         }
+        // 生命周期噪音(session ready / task_started / task_progress /
+        // task_notification / task_completed 等,以及 agent 透传的其它状态行)
+        // 不进消息气泡。只有真正需要用户知道的 subtype 才弹 notice。
         const labelMap: Record<string, string> = {
-          init: 'session ready',
           resume_failed: '⚠ 上下文恢复失败，已重置为新会话',
         }
-        const label = labelMap[evt.subtype || ''] || evt.subtype || 'system'
-        const sid = evt.session_id ? ` ${evt.session_id.substring(0, 8)}...` : ''
-        pushNotice({ id: newId(), kind: 'system', text: `${label}${sid}` })
+        const label = labelMap[evt.subtype || '']
+        if (!label) break
+        pushNotice({ id: newId(), kind: 'system', text: label })
         break
       }
 

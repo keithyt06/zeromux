@@ -44,12 +44,32 @@ HEALTH="http://127.0.0.1:${PORT}/"
 # Everything that touches the service lives here so it can be run as one unit
 # inside a detached cgroup (see the dispatch below). Uses only sudo/systemctl/
 # cp/curl, so it is safe to run under a root scope. Takes $BUILT as $1.
+# Guard state for the EXIT trap below. NOT `local`: the EXIT trap fires at shell
+# exit, after do_swap has returned, so its locals would already be gone.
+SWAP_BACKUP=""
+SWAP_DONE=0
+# Last-resort guard: from the moment we stop the service until we exit cleanly,
+# ANY abnormal exit (cp fails, `systemctl start` errors, EPIPE, SIGTERM) must
+# still leave a RUNNING service — the script's whole promise. The health-check
+# rollback inside do_swap only covers "started but unhealthy"; this trap covers
+# the gaps where we'd otherwise die with the service stopped. SWAP_DONE=1
+# disarms it on success and on the handled-rollback path.
+_ensure_running() {
+  [ "$SWAP_DONE" = 1 ] && return
+  [ -n "$SWAP_BACKUP" ] || return
+  echo "!! Abnormal exit with service stopped — restoring from $SWAP_BACKUP" >&2
+  sudo cp "$SWAP_BACKUP" "$INSTALLED" 2>/dev/null || true
+  sudo systemctl start "$SERVICE" 2>/dev/null || true
+}
+
 do_swap() {
   local built="$1"
-  local backup
-  backup="${INSTALLED}.bak-$(date +%Y%m%d-%H%M%S)"
+  SWAP_BACKUP="${INSTALLED}.bak-$(date +%Y%m%d-%H%M%S)"
+  local backup="$SWAP_BACKUP"
   echo ">> Backing up current binary -> $backup"
   sudo cp "$INSTALLED" "$backup"
+
+  trap _ensure_running EXIT
 
   echo ">> Stopping $SERVICE..."
   sudo systemctl stop "$SERVICE"
@@ -62,7 +82,7 @@ do_swap() {
   local code
   for _ in $(seq 1 10); do
     code="$(curl -s -o /dev/null -w '%{http_code}' "$HEALTH" || true)"
-    [ "$code" = "200" ] && { echo ">> OK: HTTP 200, deploy complete."; return 0; }
+    [ "$code" = "200" ] && { SWAP_DONE=1; echo ">> OK: HTTP 200, deploy complete."; return 0; }
     sleep 1
   done
 
@@ -70,6 +90,7 @@ do_swap() {
   sudo systemctl stop "$SERVICE"
   sudo cp "$backup" "$INSTALLED"
   sudo systemctl start "$SERVICE"
+  SWAP_DONE=1
   echo "!! Rolled back. Service restarted with previous binary. Check: journalctl -u $SERVICE -n 30"
   return 1
 }
@@ -103,13 +124,29 @@ echo ">> Smoke-testing new binary..."
 # NOTE: it must be a service (`systemd-run`), NOT `systemd-run --scope`. A scope
 # stays attached to the launching session's cgroup and dies with it (verified
 # empirically). `--wait` blocks until the swap finishes and propagates its exit
-# code; `--pipe` streams the swap's output to this terminal live. The build above
-# already ran as the normal user; only the root-safe swap is detached.
+# code. The build above already ran as the normal user; only the root-safe swap
+# is detached.
+#
+# DO NOT add `--pipe` here. `--pipe` connects the swap service's stdout back to
+# THIS systemd-run client — and this client, reached via `exec` from a zeromux
+# PTY, is still inside the zeromux.service cgroup (exec does not change cgroup).
+# The instant the swap reaches `systemctl stop zeromux`, KillMode=control-group
+# kills this client, breaking the pipe; the swap's next `echo` then dies on
+# EPIPE under `set -e` — AFTER stop, BEFORE cp+start. That leaves the service
+# dead and 502-ing (the exact failure this script exists to prevent, observed
+# twice: 2026-06-11 23:40 and 2026-06-12 03:49). Without `--pipe`, the swap's
+# output goes to the journal instead of a fd tethered to the doomed cgroup, so
+# the swap always runs stop->cp->start->verify to completion. Follow it with:
+#   journalctl -u zeromux-deploy-<pid> -f   (pid printed below)
+# When launched from a zeromux PTY, THIS terminal also drops at `stop` — that is
+# expected; reconnect and the service is already back up.
 SCRIPT_PATH="$(cd "$(dirname "$0")" && pwd)/$(basename "$0")"
 CURRENT_CGROUP="$(head -1 /proc/self/cgroup 2>/dev/null || true)"
 if printf '%s' "$CURRENT_CGROUP" | grep -q "${SERVICE}.service"; then
-  echo ">> Inside ${SERVICE}.service cgroup — running swap as a detached systemd service so 'systemctl stop' can't kill it..."
-  exec sudo systemd-run --wait --pipe --collect --quiet --unit="zeromux-deploy-$$" \
+  UNIT="zeromux-deploy-$$"
+  echo ">> Inside ${SERVICE}.service cgroup — running swap as a detached systemd service so 'systemctl stop' can't kill it."
+  echo ">> This terminal may drop when the service stops; the swap completes independently. Follow it with: journalctl -u ${UNIT} -f"
+  exec sudo systemd-run --wait --collect --quiet --unit="${UNIT}" \
     bash "$SCRIPT_PATH" __swap__
 fi
 

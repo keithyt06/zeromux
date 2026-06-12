@@ -379,6 +379,22 @@ impl ScheduledStore {
         Ok(n)
     }
 
+    /// Watchdog: abort runs that exceeded their task's max_runtime_min
+    /// (default 30 if NULL). Single set-based UPDATE joining config — no
+    /// per-task loop (avoid an N+1 query every tick).
+    pub fn reconcile_timeouts_per_task(&self, now_ms: i64) -> Result<usize, String> {
+        let conn = self.conn.lock().unwrap();
+        let n = conn.execute(
+            "UPDATE agent_task_runs SET state='aborted', failure_kind='watchdog_timeout', ended_ms=?1 \
+             WHERE state IN ('claimed','running') \
+               AND started_ms < ?1 - (COALESCE( \
+                     (SELECT max_runtime_min FROM agent_runs_config WHERE id = agent_task_runs.task_id), \
+                     30) * 60000)",
+            params![now_ms],
+        ).map_err(|e| e.to_string())?;
+        Ok(n)
+    }
+
     pub fn runs_for_task(&self, task_id: &str, limit: i64) -> Result<Vec<TaskRun>, String> {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare("SELECT id,task_id,scheduled_for_ms,state,session_id,verdict,failure_kind,started_ms,ended_ms,input_snapshot,confirm_status,replay_of FROM agent_task_runs WHERE task_id=?1 ORDER BY scheduled_for_ms DESC LIMIT ?2").map_err(|e| e.to_string())?;
@@ -415,9 +431,8 @@ pub fn spawn_scheduler(
                     tick.tick().await;
                     let now = chrono::Utc::now();
                     hb.store(now.timestamp_millis(), Ordering::Relaxed);
-                    // runtime watchdog: abort runs running longer than 30 min
-                    let cutoff = now.timestamp_millis() - 30 * 60 * 1000;
-                    let _ = s.reconcile_orphans(Some(cutoff));
+                    // runtime watchdog: abort runs past their per-task max_runtime_min (default 30)
+                    let _ = s.reconcile_timeouts_per_task(now.timestamp_millis());
                     let tasks = match s.list_enabled() { Ok(t) => t, Err(_) => { continue; } };
                     for task in tasks {
                         let fires = match due_fire_points(&task.trigger_spec, last_seen, now) {
@@ -547,5 +562,34 @@ mod store_tests {
         let new2 = s.runs_for_task("t1", 10).unwrap().into_iter().find(|r| r.id == "r_new").unwrap();
         assert_eq!(new2.state, "aborted");
         assert_eq!(new2.failure_kind.as_deref(), Some("orphaned_restart"));
+    }
+
+    #[test]
+    fn per_task_timeout_respects_max_runtime_min() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = ScheduledStore::open(dir.path()).unwrap();
+        let mk_cfg = |id: &str, max: Option<i64>| TaskConfig {
+            id: id.into(), owner_id: "u".into(), name: "n".into(), trigger_type: "cron".into(),
+            trigger_spec: "0 0 * * * *".into(), tz: "Asia/Shanghai".into(), agent_type: "claude".into(),
+            work_dir: ".".into(), prompt: "p".into(), enabled: true, retention_n: 20, created_ms: 1,
+            side_effects: false, max_runtime_min: max };
+        s.upsert_config(&mk_cfg("t_long", Some(60))).unwrap();
+        s.upsert_config(&mk_cfg("t_def", None)).unwrap();
+        let now = 100_000_000i64;
+        let mk_run = |id: &str, task: &str, started: i64| TaskRun {
+            id: id.into(), task_id: task.into(), scheduled_for_ms: started, state: "running".into(),
+            session_id: None, verdict: None, failure_kind: None, started_ms: Some(started), ended_ms: None,
+            input_snapshot: None, confirm_status: None, replay_of: None };
+        s.claim_run(&mk_run("r_long", "t_long", now - 45*60*1000)).unwrap();
+        s.set_run_state("r_long", "running", None, None, None, None).unwrap();
+        s.claim_run(&mk_run("r_def", "t_def", now - 45*60*1000)).unwrap();
+        s.set_run_state("r_def", "running", None, None, None, None).unwrap();
+
+        s.reconcile_timeouts_per_task(now).unwrap();
+        let long = s.runs_for_task("t_long", 10).unwrap().into_iter().find(|r| r.id=="r_long").unwrap();
+        let def = s.runs_for_task("t_def", 10).unwrap().into_iter().find(|r| r.id=="r_def").unwrap();
+        assert_eq!(long.state, "running");   // 45min < 60min limit → survives
+        assert_eq!(def.state, "aborted");    // 45min > 30min default → aborted
+        assert_eq!(def.failure_kind.as_deref(), Some("watchdog_timeout"));
     }
 }

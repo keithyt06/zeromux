@@ -214,6 +214,66 @@ mod tests {
     }
 
     #[test]
+    fn prune_does_not_exempt_non_side_effecting_unknown() {
+        // A read-only task's aborted/unknown runs never enter the confirmation
+        // queue, so they must stay prunable — not accumulate forever.
+        let dir = tempfile::tempdir().unwrap();
+        let s = ScheduledStore::open(dir.path()).unwrap();
+        let cfg = TaskConfig { id: "t".into(), owner_id: "u".into(), name: "n".into(), trigger_type: "cron".into(),
+            trigger_spec: "0 0 * * * *".into(), tz: "Asia/Shanghai".into(), agent_type: "claude".into(),
+            work_dir: ".".into(), prompt: "p".into(), enabled: true, retention_n: 1, created_ms: 1,
+            side_effects: false, max_runtime_min: None };   // NOT side-effecting
+        s.upsert_config(&cfg).unwrap();
+        let mk = |id: &str, sched: i64, kind: Option<&str>, state: &str| {
+            let run = TaskRun { id: id.into(), task_id: "t".into(), scheduled_for_ms: sched, state: "claimed".into(),
+                session_id: None, verdict: None, failure_kind: None, started_ms: Some(sched), ended_ms: None,
+                input_snapshot: None, confirm_status: None, replay_of: None };
+            s.claim_run(&run).unwrap();
+            s.set_run_state(id, state, None, None, kind, Some(sched)).unwrap();
+        };
+        mk("r_old_aborted", 1, Some("watchdog_timeout"), "aborted");   // unknown, but read-only task
+        mk("r_new", 200, None, "succeeded");
+        s.prune_runs("t", 1).unwrap();
+        let ids: Vec<String> = s.runs_for_task("t", 50).unwrap().into_iter().map(|r| r.id).collect();
+        assert!(!ids.contains(&"r_old_aborted".to_string()), "read-only aborted/unknown run must be prunable");
+        assert!(ids.contains(&"r_new".to_string()), "newest run kept");
+    }
+
+    #[test]
+    fn set_confirm_status_only_stamps_queue_runs() {
+        // Guards against stamping confirm_status on a run that isn't in the
+        // queue (succeeded, or non-side-effecting) — which would otherwise be a
+        // silent no-op-but-true, or worse pre-empt a future timeout.
+        let dir = tempfile::tempdir().unwrap();
+        let s = ScheduledStore::open(dir.path()).unwrap();
+        let mk_cfg = |id: &str, se: bool| TaskConfig {
+            id: id.into(), owner_id: "u".into(), name: id.into(), trigger_type: "cron".into(),
+            trigger_spec: "0 0 * * * *".into(), tz: "Asia/Shanghai".into(), agent_type: "claude".into(),
+            work_dir: ".".into(), prompt: "p".into(), enabled: true, retention_n: 20, created_ms: 1,
+            side_effects: se, max_runtime_min: None };
+        s.upsert_config(&mk_cfg("t_se", true)).unwrap();
+        s.upsert_config(&mk_cfg("t_ro", false)).unwrap();
+        // distinct scheduled_for_ms per run — UNIQUE(task_id, scheduled_for_ms)
+        // would otherwise make a same-task second claim a silent no-op.
+        let mk_run = |id: &str, task: &str, sched: i64| TaskRun { id: id.into(), task_id: task.into(),
+            scheduled_for_ms: sched, state: "claimed".into(), session_id: None, verdict: None, failure_kind: None,
+            started_ms: Some(sched), ended_ms: None, input_snapshot: None, confirm_status: None, replay_of: None };
+        // succeeded side-effecting run — NOT in queue
+        s.claim_run(&mk_run("r_ok", "t_se", 1)).unwrap();
+        s.set_run_state("r_ok", "succeeded", None, None, None, Some(2)).unwrap();
+        assert!(!s.set_confirm_status("r_ok", "confirmed_done").unwrap(), "succeeded run is not in queue");
+        // aborted/unknown but read-only — NOT in queue
+        s.claim_run(&mk_run("r_ro", "t_ro", 2)).unwrap();
+        s.set_run_state("r_ro", "aborted", None, None, Some("watchdog_timeout"), Some(2)).unwrap();
+        assert!(!s.set_confirm_status("r_ro", "confirmed_done").unwrap(), "read-only aborted run is not in queue");
+        // genuine queue run — accepts the stamp once
+        s.claim_run(&mk_run("r_q", "t_se", 3)).unwrap();
+        s.set_run_state("r_q", "aborted", None, None, Some("orphaned_restart"), Some(2)).unwrap();
+        assert!(s.set_confirm_status("r_q", "confirmed_done").unwrap(), "queue run accepts stamp");
+        assert!(!s.set_confirm_status("r_q", "replayed").unwrap(), "second stamp refused");
+    }
+
+    #[test]
     fn add_columns_is_idempotent() {
         let dir = tempfile::tempdir().unwrap();
         // open twice: second open must NOT panic on "duplicate column"
@@ -353,6 +413,21 @@ impl ScheduledStore {
     }
     pub fn delete_config(&self, id: &str) -> Result<(), String> {
         let conn = self.conn.lock().unwrap();
+        // Remove on-disk run records before dropping the rows, else the
+        // ~/.zeromux/runs/<id>/ dirs leak with no DB row left to find them by.
+        let run_ids: Vec<String> = {
+            let mut stmt = conn.prepare("SELECT id FROM agent_task_runs WHERE task_id=?1")
+                .map_err(|e| e.to_string())?;
+            let rows = stmt.query_map(params![id], |r| r.get::<_, String>(0))
+                .map_err(|e| e.to_string())?;
+            rows.collect::<Result<_,_>>().map_err(|e| e.to_string())?
+        };
+        for rid in &run_ids {
+            let _ = std::fs::remove_dir_all(run_dir(rid));
+        }
+        // No FK cascade on this schema — drop the run rows explicitly, else they
+        // outlive the deleted task as orphans.
+        conn.execute("DELETE FROM agent_task_runs WHERE task_id=?1", params![id]).map_err(|e| e.to_string())?;
         conn.execute("DELETE FROM agent_runs_config WHERE id=?1", params![id]).map_err(|e| e.to_string())?;
         Ok(())
     }
@@ -470,12 +545,18 @@ impl ScheduledStore {
 
     /// Set confirm_status. Bypasses set_run_state's terminal guard on purpose:
     /// mutates an already-aborted row's confirm_status, not its state.
-    /// First-writer-wins via WHERE confirm_status IS NULL. Returns true iff this
-    /// call set it (1 row changed).
+    /// First-writer-wins via WHERE confirm_status IS NULL. The WHERE also pins
+    /// the full confirmation-queue predicate (side-effecting + unknown terminal),
+    /// so a stray call can't stamp a succeeded/active run and pre-empt a future
+    /// timeout from ever entering the queue. Returns true iff this call set it.
     pub fn set_confirm_status(&self, run_id: &str, status: &str) -> Result<bool, String> {
         let conn = self.conn.lock().unwrap();
         let n = conn.execute(
-            "UPDATE agent_task_runs SET confirm_status=?2 WHERE id=?1 AND confirm_status IS NULL",
+            "UPDATE agent_task_runs SET confirm_status=?2 \
+             WHERE id=?1 AND confirm_status IS NULL AND state='aborted' \
+               AND failure_kind IN ('watchdog_timeout','orphaned_restart') \
+               AND EXISTS (SELECT 1 FROM agent_runs_config c \
+                           WHERE c.id = agent_task_runs.task_id AND c.side_effects=1)",
             params![run_id, status]).map_err(|e| e.to_string())?;
         Ok(n == 1)
     }
@@ -520,14 +601,19 @@ impl ScheduledStore {
     /// Keep the newest `keep` runs per task; delete older rows AND their
     /// ~/.zeromux/runs/<id>/ dir. Runs awaiting confirmation (side-effecting,
     /// unknown terminal, confirm_status IS NULL) are EXEMPT — never dropped
-    /// while a human still needs to decide.
+    /// while a human still needs to decide. The exemption is gated on the task
+    /// actually being side-effecting (EXISTS on config): a non-side-effecting
+    /// task's aborted/unknown runs never enter the queue, so they must remain
+    /// prunable rather than accumulate forever.
     pub fn prune_runs(&self, task_id: &str, keep: i64) -> Result<(), String> {
         let conn = self.conn.lock().unwrap();
         let ids: Vec<String> = {
             let mut stmt = conn.prepare(
                 "SELECT r.id FROM agent_task_runs r \
                  WHERE r.task_id=?1 \
-                   AND NOT (r.state='aborted' AND r.failure_kind IN ('watchdog_timeout','orphaned_restart') AND r.confirm_status IS NULL) \
+                   AND NOT (r.state='aborted' AND r.failure_kind IN ('watchdog_timeout','orphaned_restart') \
+                            AND r.confirm_status IS NULL \
+                            AND EXISTS (SELECT 1 FROM agent_runs_config c WHERE c.id=r.task_id AND c.side_effects=1)) \
                    AND r.id NOT IN ( \
                      SELECT id FROM agent_task_runs WHERE task_id=?1 ORDER BY scheduled_for_ms DESC LIMIT ?2 )",
                 ).map_err(|e| e.to_string())?;
@@ -535,13 +621,19 @@ impl ScheduledStore {
                 .map_err(|e| e.to_string())?;
             rows.collect::<Result<_,_>>().map_err(|e| e.to_string())?
         };
-        let home = std::env::var("HOME").unwrap_or_else(|_| "/home/ubuntu".to_string());
         for id in &ids {
-            let _ = std::fs::remove_dir_all(std::path::Path::new(&home).join(".zeromux").join("runs").join(id));
+            let _ = std::fs::remove_dir_all(run_dir(id));
             let _ = conn.execute("DELETE FROM agent_task_runs WHERE id=?1", params![id]);
         }
         Ok(())
     }
+}
+
+/// Path to a run's on-disk record dir (~/.zeromux/runs/<run_id>/). Mirrors
+/// append_run_event in session_manager.rs — both resolve HOME the same way.
+fn run_dir(run_id: &str) -> std::path::PathBuf {
+    let home = std::env::var("HOME").unwrap_or_else(|_| "/home/ubuntu".to_string());
+    std::path::Path::new(&home).join(".zeromux").join("runs").join(run_id)
 }
 
 use std::sync::atomic::{AtomicI64, Ordering};
@@ -571,6 +663,12 @@ pub fn spawn_scheduler(
                     // runtime watchdog: abort runs past their per-task max_runtime_min (default 30)
                     let _ = s.reconcile_timeouts_per_task(now.timestamp_millis());
                     let tasks = match s.list_enabled() { Ok(t) => t, Err(_) => { continue; } };
+                    // retention: bound run history (rows + on-disk run dirs) per task.
+                    // prune_runs exempts pending-confirmation runs, so this never
+                    // drops anything still awaiting a human decision.
+                    for task in &tasks {
+                        let _ = s.prune_runs(&task.id, task.retention_n);
+                    }
                     for task in tasks {
                         let fires = match due_fire_points(&task.trigger_spec, last_seen, now) {
                             Ok(f) => f,
@@ -823,5 +921,25 @@ mod store_tests {
         assert_eq!(s.task_id_of_run("r_orig").unwrap().as_deref(), Some("t"));
         assert!(s.task_id_of_run("nope").unwrap().is_none());
         assert!(s.is_unconfirmed_side_effect_unknown("r_orig").unwrap()); // side-effecting + watchdog_timeout + confirm NULL
+    }
+
+    #[test]
+    fn delete_config_removes_run_rows() {
+        // delete_config must not orphan run rows (no FK cascade on this schema).
+        let (s, _dir) = store();
+        let cfg = TaskConfig { id: "t".into(), owner_id: "u".into(), name: "n".into(), trigger_type: "cron".into(),
+            trigger_spec: "0 0 * * * *".into(), tz: "Asia/Shanghai".into(), agent_type: "claude".into(),
+            work_dir: ".".into(), prompt: "p".into(), enabled: true, retention_n: 20, created_ms: 1,
+            side_effects: false, max_runtime_min: None };
+        s.upsert_config(&cfg).unwrap();
+        let run = TaskRun { id: "r1".into(), task_id: "t".into(), scheduled_for_ms: 1, state: "claimed".into(),
+            session_id: None, verdict: None, failure_kind: None, started_ms: Some(1), ended_ms: None,
+            input_snapshot: None, confirm_status: None, replay_of: None };
+        s.claim_run(&run).unwrap();
+        s.set_run_state("r1", "succeeded", None, None, None, Some(2)).unwrap();
+        assert_eq!(s.runs_for_task("t", 10).unwrap().len(), 1);
+        s.delete_config("t").unwrap();
+        assert!(s.get_config("t").unwrap().is_none());
+        assert_eq!(s.runs_for_task("t", 10).unwrap().len(), 0, "run rows must not outlive the deleted task");
     }
 }

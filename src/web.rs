@@ -1563,20 +1563,17 @@ async fn replay_run_handler(
             return Err((StatusCode::CONFLICT, "must confirm via queue before replay".to_string()));
         }
     }
-    // overlap guard — must run BEFORE consuming the confirmation, else an
-    // overlap-skip would mark the queue item "replayed" without spawning,
-    // silently vanishing it from the queue.
+    // overlap guard — skip if the task already has an active run.
     let active = state.scheduled_tasks.active_states_for_task(&cfg.id)
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
     let refs: Vec<&str> = active.iter().map(|s| s.as_str()).collect();
     if crate::scheduled_tasks::should_skip_overlap(&refs) {
         return Ok(Json(serde_json::json!({ "skipped": true, "reason": "overlap" })));
     }
-    // committed to spawning now: queue path consumes the confirmation.
-    if q.from_queue {
-        let _ = state.scheduled_tasks.set_confirm_status(&run_id, "replayed")
-            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
-    }
+    // Claim + spawn FIRST; consume the confirmation only once the replay is
+    // actually live. If the snapshot is missing (claim_replay errors) or the
+    // spawn fails, the queue item stays put — a side-effecting unknown run is
+    // NEVER silently dropped from the queue without a replay (spec §4.5).
     let (new_id, snap) = state.scheduled_tasks.claim_replay(&run_id)
         .map_err(|e| (StatusCode::BAD_REQUEST, e))?;
     let name = format!("{} · replay", cfg.name);
@@ -1588,6 +1585,13 @@ async fn replay_run_handler(
             &new_id, "failed", None, None, Some("spawn_failed"), Some(now),
         );
         return Err((StatusCode::INTERNAL_SERVER_ERROR, e));
+    }
+    // Replay is live — now consume the confirmation (queue path only). Gated by
+    // the queue predicate inside set_confirm_status, so it's a safe no-op if the
+    // original run wasn't actually a queue item.
+    if q.from_queue {
+        let _ = state.scheduled_tasks.set_confirm_status(&run_id, "replayed")
+            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
     }
     Ok(Json(serde_json::json!({ "run_id": new_id, "replay_of": run_id })))
 }

@@ -480,6 +480,43 @@ impl ScheduledStore {
         Ok(n == 1)
     }
 
+    /// Create a new claimed run linked to the original via replay_of, carrying
+    /// the ORIGINAL input_snapshot (reproduce that run's input, not current
+    /// config). Returns (new_run_id, snapshot_json). Errors if no snapshot.
+    pub fn claim_replay(&self, orig_run_id: &str) -> Result<(String, String), String> {
+        let conn = self.conn.lock().unwrap();
+        let (task_id, snap): (String, Option<String>) = conn.query_row(
+            "SELECT task_id, input_snapshot FROM agent_task_runs WHERE id=?1",
+            params![orig_run_id], |r| Ok((r.get(0)?, r.get(1)?))).map_err(|e| e.to_string())?;
+        let snap = snap.ok_or_else(|| "no input snapshot — cannot replay".to_string())?;
+        let new_id = uuid::Uuid::new_v4().to_string();
+        let now = chrono::Utc::now().timestamp_millis();
+        conn.execute(
+            "INSERT INTO agent_task_runs (id,task_id,scheduled_for_ms,state,started_ms,input_snapshot,replay_of) \
+             VALUES (?1,?2,?3,'claimed',?3,?4,?5)",
+            params![new_id, task_id, now, snap, orig_run_id]).map_err(|e| e.to_string())?;
+        Ok((new_id, snap))
+    }
+
+    pub fn task_id_of_run(&self, run_id: &str) -> Result<Option<String>, String> {
+        let conn = self.conn.lock().unwrap();
+        match conn.query_row("SELECT task_id FROM agent_task_runs WHERE id=?1", params![run_id], |r| r.get(0)) {
+            Ok(s) => Ok(Some(s)),
+            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+            Err(e) => Err(e.to_string()),
+        }
+    }
+
+    /// True iff run is side-effecting + unknown terminal + confirm_status NULL.
+    pub fn is_unconfirmed_side_effect_unknown(&self, run_id: &str) -> Result<bool, String> {
+        let conn = self.conn.lock().unwrap();
+        conn.query_row(
+            "SELECT COUNT(*) FROM agent_task_runs r JOIN agent_runs_config c ON c.id=r.task_id \
+             WHERE r.id=?1 AND c.side_effects=1 AND r.state='aborted' \
+               AND r.failure_kind IN ('watchdog_timeout','orphaned_restart') AND r.confirm_status IS NULL",
+            params![run_id], |row| row.get::<_,i64>(0)).map(|n| n > 0).map_err(|e| e.to_string())
+    }
+
     /// Keep the newest `keep` runs per task; delete older rows AND their
     /// ~/.zeromux/runs/<id>/ dir. Runs awaiting confirmation (side-effecting,
     /// unknown terminal, confirm_status IS NULL) are EXEMPT — never dropped
@@ -756,5 +793,35 @@ mod store_tests {
         assert_eq!(r.state, "aborted");                          // confirm didn't change state
         assert_eq!(r.confirm_status.as_deref(), Some("confirmed_done"));
         assert!(!s.set_confirm_status("r_se", "replayed").unwrap()); // already set → false (idempotent guard)
+    }
+
+    #[test]
+    fn replay_creates_linked_row_from_snapshot() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = ScheduledStore::open(dir.path()).unwrap();
+        let cfg = TaskConfig { id: "t".into(), owner_id: "u".into(), name: "n".into(), trigger_type: "cron".into(),
+            trigger_spec: "0 0 * * * *".into(), tz: "Asia/Shanghai".into(), agent_type: "claude".into(),
+            work_dir: ".".into(), prompt: "NEW prompt".into(), enabled: true, retention_n: 20, created_ms: 1,
+            side_effects: true, max_runtime_min: None };
+        s.upsert_config(&cfg).unwrap();
+        let run = TaskRun { id: "r_orig".into(), task_id: "t".into(), scheduled_for_ms: 1, state: "claimed".into(),
+            session_id: None, verdict: None, failure_kind: None, started_ms: Some(1), ended_ms: None,
+            input_snapshot: None, confirm_status: None, replay_of: None };
+        s.claim_run(&run).unwrap();
+        s.set_input_snapshot("r_orig", r#"{"prompt":"OLD prompt","work_dir":".","agent_type":"claude","secrets":[]}"#).unwrap();
+        s.set_run_state("r_orig", "aborted", None, None, Some("watchdog_timeout"), Some(2)).unwrap();
+
+        let (new_id, snap) = s.claim_replay("r_orig").unwrap();
+        let new = s.runs_for_task("t", 10).unwrap().into_iter().find(|r| r.id == new_id).unwrap();
+        assert_eq!(new.replay_of.as_deref(), Some("r_orig"));
+        assert_eq!(new.state, "claimed");
+        assert!(snap.contains("OLD prompt"));
+        let orig = s.runs_for_task("t", 10).unwrap().into_iter().find(|r| r.id == "r_orig").unwrap();
+        assert_eq!(orig.state, "aborted");
+
+        // helpers
+        assert_eq!(s.task_id_of_run("r_orig").unwrap().as_deref(), Some("t"));
+        assert!(s.task_id_of_run("nope").unwrap().is_none());
+        assert!(s.is_unconfirmed_side_effect_unknown("r_orig").unwrap()); // side-effecting + watchdog_timeout + confirm NULL
     }
 }

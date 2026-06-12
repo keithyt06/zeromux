@@ -944,6 +944,18 @@ impl SessionManager {
         Ok(sid)
     }
 
+    /// Replay: spawn a run from a snapshot's prompt/work_dir. Reuses trigger_run's
+    /// spawn path (incl. the work_dir_under_home TOCTOU gate). new_run_id was
+    /// already claimed by claim_replay.
+    pub async fn replay_run(&self, new_run_id: &str, task_id: &str, owner_id: &str,
+                            name: String, snapshot_json: &str) -> Result<String, String> {
+        let v: serde_json::Value = serde_json::from_str(snapshot_json)
+            .map_err(|e| format!("bad snapshot: {e}"))?;
+        let prompt = v["prompt"].as_str().unwrap_or("").to_string();
+        let work_dir = v["work_dir"].as_str().unwrap_or(".").to_string();
+        self.trigger_run(new_run_id, name, &work_dir, owner_id, task_id, prompt).await
+    }
+
     /// Spawn a Kiro process for `id` at `work_dir`, start its fan-out, return the
     /// live handle. `resume: Some(sid)` issues `session/load` to restore context.
     async fn spawn_kiro(

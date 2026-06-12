@@ -419,6 +419,8 @@ export interface ScheduledTask {
   enabled: boolean
   retention_n: number
   created_ms: number
+  side_effects: boolean
+  max_runtime_min: number | null
 }
 
 export interface TaskRun {
@@ -431,6 +433,9 @@ export interface TaskRun {
   failure_kind: string | null
   started_ms: number | null
   ended_ms: number | null
+  input_snapshot: string | null
+  confirm_status: 'confirmed_done' | 'replayed' | null
+  replay_of: string | null
 }
 
 export interface ScheduledTaskReq {
@@ -440,6 +445,8 @@ export interface ScheduledTaskReq {
   prompt: string
   enabled?: boolean
   retention_n?: number
+  side_effects?: boolean
+  max_runtime_min?: number | null
 }
 
 export async function listScheduledTasks(): Promise<ScheduledTask[]> {
@@ -475,6 +482,23 @@ export async function listTaskRuns(id: string): Promise<TaskRun[]> {
   const res = await api(`/api/scheduled-tasks/${id}/runs`)
   if (!res.ok) throw new Error(await res.text())
   return (await res.json()).runs
+}
+
+export async function listConfirmations(): Promise<{ runs: TaskRun[]; count: number }> {
+  const res = await api('/api/scheduled-tasks/confirmations')
+  if (!res.ok) throw new Error(await res.text())
+  return res.json()
+}
+
+export async function confirmRunDone(runId: string): Promise<void> {
+  const res = await api(`/api/scheduled-tasks/runs/${runId}/confirm-done`, { method: 'POST' })
+  if (!res.ok) throw new Error(await res.text())
+}
+
+export async function replayRun(runId: string, fromQueue = false): Promise<{ run_id?: string; skipped?: boolean; reason?: string }> {
+  const res = await api(`/api/scheduled-tasks/runs/${runId}/replay${fromQueue ? '?from_queue=1' : ''}`, { method: 'POST' })
+  if (!res.ok) throw new Error(await res.text())
+  return res.json()
 }
 
 export async function getSchedulerHealth(): Promise<{ heartbeat_ms: number; healthy: boolean }> {

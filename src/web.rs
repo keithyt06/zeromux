@@ -42,6 +42,9 @@ pub fn build_router(state: Arc<AppState>) -> Router {
         .route("/api/events", get(list_events))
         .route("/api/events/{id}", delete(delete_event))
         .route("/api/scheduled-tasks", get(list_scheduled).post(create_scheduled))
+        .route("/api/scheduled-tasks/confirmations", get(list_confirmations))
+        .route("/api/scheduled-tasks/runs/{run_id}/confirm-done", post(confirm_run_done))
+        .route("/api/scheduled-tasks/runs/{run_id}/replay", post(replay_run_handler))
         .route("/api/scheduled-tasks/{id}", put(update_scheduled).delete(delete_scheduled))
         .route("/api/scheduled-tasks/{id}/run", post(run_scheduled_now))
         .route("/api/scheduled-tasks/{id}/runs", get(list_scheduled_runs))
@@ -1290,6 +1293,10 @@ struct ScheduledTaskReq {
     enabled: bool,
     #[serde(default = "default_retention")]
     retention_n: i64,
+    #[serde(default)]
+    side_effects: bool,
+    #[serde(default)]
+    max_runtime_min: Option<i64>,
 }
 fn default_true() -> bool {
     true
@@ -1334,8 +1341,8 @@ async fn create_scheduled(
         enabled: req.enabled,
         retention_n: req.retention_n,
         created_ms: chrono::Utc::now().timestamp_millis(),
-        side_effects: false,
-        max_runtime_min: None,
+        side_effects: req.side_effects,
+        max_runtime_min: req.max_runtime_min.map(|m| m.clamp(1, 1440)),
     };
     state
         .scheduled_tasks
@@ -1376,8 +1383,8 @@ async fn update_scheduled(
         enabled: req.enabled,
         retention_n: req.retention_n,
         created_ms: existing.created_ms,
-        side_effects: existing.side_effects,
-        max_runtime_min: existing.max_runtime_min,
+        side_effects: req.side_effects,
+        max_runtime_min: req.max_runtime_min.map(|m| m.clamp(1, 1440)),
     };
     state
         .scheduled_tasks
@@ -1500,6 +1507,79 @@ async fn list_scheduled_runs(
         .runs_for_task(&id, 50)
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
     Ok(Json(serde_json::json!({ "runs": runs })))
+}
+
+/// GET /api/scheduled-tasks/confirmations — caller's pending-confirmation runs.
+async fn list_confirmations(
+    State(state): State<Arc<AppState>>,
+    user: axum::Extension<CurrentUser>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    let runs = state.scheduled_tasks.confirmation_queue(&user.id)
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
+    let count = runs.len();
+    Ok(Json(serde_json::json!({ "runs": runs, "count": count })))
+}
+
+/// load run's task config + enforce ownership.
+async fn owned_run_cfg(state: &AppState, user_id: &str, run_id: &str)
+    -> Result<crate::scheduled_tasks::TaskConfig, (StatusCode, String)> {
+    let task_id = state.scheduled_tasks.task_id_of_run(run_id)
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?
+        .ok_or((StatusCode::NOT_FOUND, "Run not found".to_string()))?;
+    let cfg = state.scheduled_tasks.get_config(&task_id)
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?
+        .ok_or((StatusCode::NOT_FOUND, "Task not found".to_string()))?;
+    if cfg.owner_id != user_id { return Err((StatusCode::FORBIDDEN, "Forbidden".to_string())); }
+    Ok(cfg)
+}
+
+/// POST /api/scheduled-tasks/runs/{run_id}/confirm-done
+async fn confirm_run_done(
+    State(state): State<Arc<AppState>>,
+    user: axum::Extension<CurrentUser>,
+    axum::extract::Path(run_id): axum::extract::Path<String>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    owned_run_cfg(&state, &user.id, &run_id).await?;
+    let ok = state.scheduled_tasks.set_confirm_status(&run_id, "confirmed_done")
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
+    Ok(Json(serde_json::json!({ "ok": ok })))
+}
+
+#[derive(serde::Deserialize)]
+struct ReplayQuery { #[serde(default)] from_queue: bool }
+
+/// POST /api/scheduled-tasks/runs/{run_id}/replay?from_queue=<bool>
+async fn replay_run_handler(
+    State(state): State<Arc<AppState>>,
+    user: axum::Extension<CurrentUser>,
+    axum::extract::Path(run_id): axum::extract::Path<String>,
+    axum::extract::Query(q): axum::extract::Query<ReplayQuery>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    let cfg = owned_run_cfg(&state, &user.id, &run_id).await?;
+    if q.from_queue {
+        // queue path: mark replayed first (consumes the confirmation), then proceed.
+        let _ = state.scheduled_tasks.set_confirm_status(&run_id, "replayed")
+            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
+    } else {
+        // plain run-history replay: refuse an unconfirmed side-effecting unknown run.
+        if state.scheduled_tasks.is_unconfirmed_side_effect_unknown(&run_id)
+            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))? {
+            return Err((StatusCode::CONFLICT, "must confirm via queue before replay".to_string()));
+        }
+    }
+    // overlap guard
+    let active = state.scheduled_tasks.active_states_for_task(&cfg.id)
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
+    let refs: Vec<&str> = active.iter().map(|s| s.as_str()).collect();
+    if crate::scheduled_tasks::should_skip_overlap(&refs) {
+        return Ok(Json(serde_json::json!({ "skipped": true, "reason": "overlap" })));
+    }
+    let (new_id, snap) = state.scheduled_tasks.claim_replay(&run_id)
+        .map_err(|e| (StatusCode::BAD_REQUEST, e))?;
+    let name = format!("{} · replay", cfg.name);
+    state.sessions.replay_run(&new_id, &cfg.id, &cfg.owner_id, name, &snap).await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
+    Ok(Json(serde_json::json!({ "run_id": new_id, "replay_of": run_id })))
 }
 
 /// GET /api/scheduler/health — scheduler heartbeat freshness.

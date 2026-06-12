@@ -412,6 +412,46 @@ impl ScheduledStore {
         })).map_err(|e| e.to_string())?;
         rows.collect::<Result<_,_>>().map_err(|e| e.to_string())
     }
+
+    /// Side-effecting runs that ended in an unknown terminal state and haven't
+    /// been confirmed yet — the human confirmation queue. Owner-scoped via JOIN.
+    pub fn confirmation_queue(&self, owner_id: &str) -> Result<Vec<TaskRun>, String> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT r.id,r.task_id,r.scheduled_for_ms,r.state,r.session_id,r.verdict,r.failure_kind,r.started_ms,r.ended_ms,r.input_snapshot,r.confirm_status,r.replay_of \
+             FROM agent_task_runs r JOIN agent_runs_config c ON c.id = r.task_id \
+             WHERE c.owner_id=?1 AND c.side_effects=1 AND r.state='aborted' \
+               AND r.failure_kind IN ('watchdog_timeout','orphaned_restart') \
+               AND r.confirm_status IS NULL \
+             ORDER BY r.ended_ms DESC").map_err(|e| e.to_string())?;
+        let rows = stmt.query_map(params![owner_id], |r| Ok(TaskRun {
+            id: r.get(0)?, task_id: r.get(1)?, scheduled_for_ms: r.get(2)?, state: r.get(3)?,
+            session_id: r.get(4)?, verdict: r.get(5)?, failure_kind: r.get(6)?, started_ms: r.get(7)?, ended_ms: r.get(8)?,
+            input_snapshot: r.get(9)?, confirm_status: r.get(10)?, replay_of: r.get(11)?,
+        })).map_err(|e| e.to_string())?;
+        rows.collect::<Result<_,_>>().map_err(|e| e.to_string())
+    }
+
+    pub fn confirmation_count(&self, owner_id: &str) -> Result<i64, String> {
+        let conn = self.conn.lock().unwrap();
+        conn.query_row(
+            "SELECT COUNT(*) FROM agent_task_runs r JOIN agent_runs_config c ON c.id = r.task_id \
+             WHERE c.owner_id=?1 AND c.side_effects=1 AND r.state='aborted' \
+               AND r.failure_kind IN ('watchdog_timeout','orphaned_restart') AND r.confirm_status IS NULL",
+            params![owner_id], |row| row.get(0)).map_err(|e| e.to_string())
+    }
+
+    /// Set confirm_status. Bypasses set_run_state's terminal guard on purpose:
+    /// mutates an already-aborted row's confirm_status, not its state.
+    /// First-writer-wins via WHERE confirm_status IS NULL. Returns true iff this
+    /// call set it (1 row changed).
+    pub fn set_confirm_status(&self, run_id: &str, status: &str) -> Result<bool, String> {
+        let conn = self.conn.lock().unwrap();
+        let n = conn.execute(
+            "UPDATE agent_task_runs SET confirm_status=?2 WHERE id=?1 AND confirm_status IS NULL",
+            params![run_id, status]).map_err(|e| e.to_string())?;
+        Ok(n == 1)
+    }
 }
 
 use std::sync::atomic::{AtomicI64, Ordering};
@@ -630,5 +670,38 @@ mod store_tests {
         s.set_input_snapshot("r1", snap).unwrap();
         let r = s.runs_for_task("t1", 1).unwrap().into_iter().next().unwrap();
         assert_eq!(r.input_snapshot.as_deref(), Some(snap));
+    }
+
+    #[test]
+    fn confirmation_queue_predicate() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = ScheduledStore::open(dir.path()).unwrap();
+        let mk_cfg = |id: &str, se: bool| TaskConfig {
+            id: id.into(), owner_id: "u".into(), name: id.into(), trigger_type: "cron".into(),
+            trigger_spec: "0 0 * * * *".into(), tz: "Asia/Shanghai".into(), agent_type: "claude".into(),
+            work_dir: ".".into(), prompt: "p".into(), enabled: true, retention_n: 20, created_ms: 1,
+            side_effects: se, max_runtime_min: None };
+        s.upsert_config(&mk_cfg("t_se", true)).unwrap();
+        s.upsert_config(&mk_cfg("t_ro", false)).unwrap();
+        let mk_run = |id: &str, task: &str| TaskRun { id: id.into(), task_id: task.into(), scheduled_for_ms: 1,
+            state: "claimed".into(), session_id: None, verdict: None, failure_kind: None, started_ms: Some(1),
+            ended_ms: None, input_snapshot: None, confirm_status: None, replay_of: None };
+        s.claim_run(&mk_run("r_se", "t_se")).unwrap();
+        s.set_run_state("r_se", "aborted", None, None, Some("watchdog_timeout"), Some(2)).unwrap();
+        s.claim_run(&mk_run("r_ro", "t_ro")).unwrap();
+        s.set_run_state("r_ro", "aborted", None, None, Some("watchdog_timeout"), Some(2)).unwrap();
+
+        let q = s.confirmation_queue("u").unwrap();
+        assert_eq!(q.len(), 1);
+        assert_eq!(q[0].id, "r_se");
+        assert_eq!(s.confirmation_count("u").unwrap(), 1);
+
+        assert!(s.set_confirm_status("r_se", "confirmed_done").unwrap());  // first writer wins → true
+        assert_eq!(s.confirmation_queue("u").unwrap().len(), 0);
+        assert_eq!(s.confirmation_count("u").unwrap(), 0);
+        let r = s.runs_for_task("t_se", 1).unwrap().into_iter().next().unwrap();
+        assert_eq!(r.state, "aborted");                          // confirm didn't change state
+        assert_eq!(r.confirm_status.as_deref(), Some("confirmed_done"));
+        assert!(!s.set_confirm_status("r_se", "replayed").unwrap()); // already set → false (idempotent guard)
     }
 }

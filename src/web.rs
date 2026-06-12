@@ -1556,29 +1556,39 @@ async fn replay_run_handler(
     axum::extract::Query(q): axum::extract::Query<ReplayQuery>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
     let cfg = owned_run_cfg(&state, &user.id, &run_id).await?;
-    if q.from_queue {
-        // queue path: mark replayed first (consumes the confirmation), then proceed.
-        let _ = state.scheduled_tasks.set_confirm_status(&run_id, "replayed")
-            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
-    } else {
+    if !q.from_queue {
         // plain run-history replay: refuse an unconfirmed side-effecting unknown run.
         if state.scheduled_tasks.is_unconfirmed_side_effect_unknown(&run_id)
             .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))? {
             return Err((StatusCode::CONFLICT, "must confirm via queue before replay".to_string()));
         }
     }
-    // overlap guard
+    // overlap guard — must run BEFORE consuming the confirmation, else an
+    // overlap-skip would mark the queue item "replayed" without spawning,
+    // silently vanishing it from the queue.
     let active = state.scheduled_tasks.active_states_for_task(&cfg.id)
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
     let refs: Vec<&str> = active.iter().map(|s| s.as_str()).collect();
     if crate::scheduled_tasks::should_skip_overlap(&refs) {
         return Ok(Json(serde_json::json!({ "skipped": true, "reason": "overlap" })));
     }
+    // committed to spawning now: queue path consumes the confirmation.
+    if q.from_queue {
+        let _ = state.scheduled_tasks.set_confirm_status(&run_id, "replayed")
+            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
+    }
     let (new_id, snap) = state.scheduled_tasks.claim_replay(&run_id)
         .map_err(|e| (StatusCode::BAD_REQUEST, e))?;
     let name = format!("{} · replay", cfg.name);
-    state.sessions.replay_run(&new_id, &cfg.id, &cfg.owner_id, name, &snap).await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
+    if let Err(e) = state.sessions.replay_run(&new_id, &cfg.id, &cfg.owner_id, name, &snap).await {
+        // Finalize the claimed run, else it sits in 'claimed' forever and the
+        // overlap guard wedges every future fire of the task (mirrors run_scheduled_now).
+        let now = chrono::Utc::now().timestamp_millis();
+        let _ = state.scheduled_tasks.set_run_state(
+            &new_id, "failed", None, None, Some("spawn_failed"), Some(now),
+        );
+        return Err((StatusCode::INTERNAL_SERVER_ERROR, e));
+    }
     Ok(Json(serde_json::json!({ "run_id": new_id, "replay_of": run_id })))
 }
 

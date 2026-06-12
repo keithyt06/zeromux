@@ -187,6 +187,33 @@ mod tests {
     }
 
     #[test]
+    fn prune_exempts_pending_confirmation() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = ScheduledStore::open(dir.path()).unwrap();
+        let cfg = TaskConfig { id: "t".into(), owner_id: "u".into(), name: "n".into(), trigger_type: "cron".into(),
+            trigger_spec: "0 0 * * * *".into(), tz: "Asia/Shanghai".into(), agent_type: "claude".into(),
+            work_dir: ".".into(), prompt: "p".into(), enabled: true, retention_n: 1, created_ms: 1,
+            side_effects: true, max_runtime_min: None };
+        s.upsert_config(&cfg).unwrap();
+        let mk = |id: &str, sched: i64, kind: Option<&str>, state: &str| {
+            let run = TaskRun { id: id.into(), task_id: "t".into(), scheduled_for_ms: sched, state: "claimed".into(),
+                session_id: None, verdict: None, failure_kind: None, started_ms: Some(sched), ended_ms: None,
+                input_snapshot: None, confirm_status: None, replay_of: None };
+            s.claim_run(&run).unwrap();
+            s.set_run_state(id, state, None, None, kind, Some(sched)).unwrap();
+        };
+        // old pending-confirmation run (side-effecting unknown) + two newer succeeded runs. keep=1.
+        mk("r_pending", 1, Some("watchdog_timeout"), "aborted");
+        mk("r_new1", 100, None, "succeeded");
+        mk("r_new2", 200, None, "succeeded");
+        s.prune_runs("t", 1).unwrap();
+        let ids: Vec<String> = s.runs_for_task("t", 50).unwrap().into_iter().map(|r| r.id).collect();
+        assert!(ids.contains(&"r_pending".to_string()), "pending-confirmation run must survive prune");
+        assert!(ids.contains(&"r_new2".to_string()), "newest run kept");
+        assert!(!ids.contains(&"r_new1".to_string()), "older non-pending run pruned");
+    }
+
+    #[test]
     fn add_columns_is_idempotent() {
         let dir = tempfile::tempdir().unwrap();
         // open twice: second open must NOT panic on "duplicate column"
@@ -451,6 +478,32 @@ impl ScheduledStore {
             "UPDATE agent_task_runs SET confirm_status=?2 WHERE id=?1 AND confirm_status IS NULL",
             params![run_id, status]).map_err(|e| e.to_string())?;
         Ok(n == 1)
+    }
+
+    /// Keep the newest `keep` runs per task; delete older rows AND their
+    /// ~/.zeromux/runs/<id>/ dir. Runs awaiting confirmation (side-effecting,
+    /// unknown terminal, confirm_status IS NULL) are EXEMPT — never dropped
+    /// while a human still needs to decide.
+    pub fn prune_runs(&self, task_id: &str, keep: i64) -> Result<(), String> {
+        let conn = self.conn.lock().unwrap();
+        let ids: Vec<String> = {
+            let mut stmt = conn.prepare(
+                "SELECT r.id FROM agent_task_runs r \
+                 WHERE r.task_id=?1 \
+                   AND NOT (r.state='aborted' AND r.failure_kind IN ('watchdog_timeout','orphaned_restart') AND r.confirm_status IS NULL) \
+                   AND r.id NOT IN ( \
+                     SELECT id FROM agent_task_runs WHERE task_id=?1 ORDER BY scheduled_for_ms DESC LIMIT ?2 )",
+                ).map_err(|e| e.to_string())?;
+            let rows = stmt.query_map(params![task_id, keep], |r| r.get::<_, String>(0))
+                .map_err(|e| e.to_string())?;
+            rows.collect::<Result<_,_>>().map_err(|e| e.to_string())?
+        };
+        let home = std::env::var("HOME").unwrap_or_else(|_| "/home/ubuntu".to_string());
+        for id in &ids {
+            let _ = std::fs::remove_dir_all(std::path::Path::new(&home).join(".zeromux").join("runs").join(id));
+            let _ = conn.execute("DELETE FROM agent_task_runs WHERE id=?1", params![id]);
+        }
+        Ok(())
     }
 }
 

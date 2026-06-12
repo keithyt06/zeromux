@@ -496,7 +496,7 @@ export async function confirmRunDone(runId: string): Promise<void> {
 }
 
 export async function replayRun(runId: string, fromQueue = false): Promise<{ run_id?: string; skipped?: boolean; reason?: string }> {
-  const res = await api(`/api/scheduled-tasks/runs/${runId}/replay${fromQueue ? '?from_queue=1' : ''}`, { method: 'POST' })
+  const res = await api(`/api/scheduled-tasks/runs/${runId}/replay${fromQueue ? '?from_queue=true' : ''}`, { method: 'POST' })
   if (!res.ok) throw new Error(await res.text())
   return res.json()
 }

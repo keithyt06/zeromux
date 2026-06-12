@@ -102,9 +102,18 @@ naozhi 三态映射:
 
 ### 3.3 每任务 `max_runtime_min`
 
-- `agent_runs_config` 新增 nullable `max_runtime_min INT`;HTTP create/update 时钳到 **1–120**;NULL → 沿用 30min。
-- watchdog(`scheduled_tasks.rs:363`)今天算一个全局 `cutoff`;改为**遍历任务时按该任务的 `max_runtime_min` 算 per-task cutoff**(NULL 落 30)。watchdog 本就在迭代任务,改动最小。
-- 实现注意:`reconcile_orphans(Some(cutoff))` 当前是"一个 cutoff 扫全表"。需改为支持 per-task cutoff——可在 watchdog 循环内对每个 task 用其 cutoff 调一次按 task_id 限定的 reconcile,或下推一张 (task_id, cutoff) 列表。**实现计划阶段定具体 SQL 形态**(此为已知实现细节,非阻塞设计)。
+- `agent_runs_config` 新增 nullable `max_runtime_min INT`;HTTP create/update 时钳到 **1–1440(24h)**;NULL → 沿用 30min。
+  - **为何不抄 naozhi 的 ≤60min**:naozhi 那个上限是 AgentCore **云端流式连接** 60min 平台天花板(其 RFC §4.3),zeromux 跑**本机进程**无此约束。1440 只是个防手滑的合理上界(防 `99999` 这类 typo 让卡死任务永不回收),不人为掐死合法长任务(跑全测试套件 + 提 PR 可能 >2h)。
+- watchdog(`scheduled_tasks.rs:363`)今天算一个全局 `cutoff`;改为按每任务的 `max_runtime_min` 判超时(NULL 落 30)。
+- **SQL 形态已锁(Eng review Issue 2)——单条集合式 UPDATE,JOIN config,不要 per-task 循环**。今天 `reconcile_orphans` 是一条全表 UPDATE;天真的 per-task 做法会变成每 60s tick 对每个 enabled 任务发一条 UPDATE(latent N+1)。改为一条:
+  ```sql
+  UPDATE agent_task_runs SET state='aborted', failure_kind='watchdog_timeout', ended_ms=?now
+  WHERE state IN ('claimed','running')
+    AND started_ms < ?now - (COALESCE(
+          (SELECT max_runtime_min FROM agent_runs_config WHERE id=agent_task_runs.task_id),
+          30) * 60000)
+  ```
+  一条查询、无循环、无 N+1。启动清理路径(`orphaned_restart`)仍是无 cutoff 的全表 UPDATE(所有 `claimed/running` → `aborted`+`orphaned_restart`),与本条正交。
 
 ---
 
@@ -145,6 +154,15 @@ GET /api/scheduled-tasks/confirmations   ← dashboard 轮询(复用现有 cron 
 
 `ScheduledTasksPanel.tsx` 内一个可折叠"待确认"区 + **attention 徽标**显示计数。每张卡片:任务名、变未知的时刻、原因(`watchdog_timeout`="超过 N 分钟上限" / `orphaned_restart`="服务器运行中重启")、捕获的 `verdict`(若有)、部分输出预览(从该 run 的 `events.ndjson` 取尾部若干事件)。两个按钮:**「确认已完成」**(不重放)/ **「确认未完成 → 重放」**。
 
+### 4.4-bis 通知触达(CEO review Finding 1)
+
+**问题**:本功能的全部价值是在用户**没盯着**时浮出未知失败,但若只有 dashboard 面板内的徽标,用户得主动打开面板才看得到——手机优先的产品里这是弱保证。
+
+**v1 取触达最强、零新基建的那层**:
+- 待确认计数**同时浮到主会话列表**(用户每次打开 zeromux 必经的界面),不止藏在 scheduled-tasks 面板里。`/api/scheduled-tasks/confirmations` 已返回该计数,前端在 `App.tsx`(拥有会话列表)消费即可,无新端点。
+- **明确写入"延后"段(§后续工作)的依赖**:真正的"无人值守 → 推到手机"需未来的 PWA + web-push 通道(见 [[zeromux-mobile-terminal-composer]] PM 建议)。本 spec **不**引入推送基建(那是独立 feature 独立 spec),但**点名这个 gap**,不假装徽标已解决无人值守通知。
+- 诚实定性:**本功能是保险,不是日用驱动**。队列仅在 `side_effects=true` 且命中 `watchdog_timeout`/`orphaned_restart` 时才填充——在个人/少用户场景属罕见但严重(静默重复提 PR、夜跑任务无下文)。便宜的保险值得做,但别过度打磨。
+
 ### 4.5 关键安全性质
 
 `failed_transport` 上**无任何自动动作**。运行就在队列里无限等待,直到人工处理。这是整份 spec 的论点——未知的副作用结果**绝不**被静默重试或静默丢弃。(非副作用的未知运行只是作为 `aborted` 躺在历史里,永不进队列、不需要人。)
@@ -172,6 +190,8 @@ GET /api/scheduled-tasks/confirmations   ← dashboard 轮询(复用现有 cron 
 要点:此运行之后被编辑的任务(新 prompt、移动 work_dir)**不改变**对**此运行**的 replay 行为——可复现性冻结在 trigger 时刻。**secrets 红线**:即便 v1 不注入 secrets,该字段也只存**引用名,绝不存原值**——现在就立下不变量,防日后有人往里写 token。
 
 **② 输出流——`~/.zeromux/runs/<run_id>/events.ndjson`**(决策 C:大/append → 磁盘,镜像 B-1"文件为事实源")。fanout 本就为 scrollback 序列化每个 `AcpEvent`;对携带 `run_id` 的运行,把同一份序列化事件 tee 到 append writer。`failed_transport` 时,cutoff 前流出的已落盘——正是队列卡片用来帮人判断"PR 到底提没提"的依据。
+
+> **tee 作用域(Eng review Issue 1)**:调度会话是**长生命周期**,而 `run_id` 是**单 turn** 的(`session_manager.rs:1762` 在终态事件 `active_run_id.take()` 清空)。tee **必须严格绑定 `active_run_id == Some` 的窗口**:prompt 注入(`active_run_id` 置位)开始,finalize 边界(`active_run_id.take()`)停止。events.ndjson 只含该 run 那一个 turn 的事件。**绝不**按"整个 session 生命周期"tee——否则一个被手工复用的调度会话会把无关事件追加进该 run 的记录,污染可复现性。
 
 ### 5.2 replay 机制(决策 A)
 
@@ -202,6 +222,7 @@ POST /api/scheduled-tasks/runs/{run_id}/replay
 - **replay overlap 竞态**:两人/两标签页点同一卡片。`claim_run` 本就是原子卡点(`INSERT ... ON CONFLICT` 认领);第二次 claim 失败 → 409。`confirm_status` 转移用 `WHERE confirm_status IS NULL` 守卫,只第一次写生效。无双重 replay。
 - **watchdog abort 之后运行才 finalize**(真正的"断流≠死":agent 活着、第 31 分钟才完成、watchdog 第 30 分钟已切行):迟到的 `Result`/`Exit` 到达一个已 `aborted` 的运行。令 `finalize_run` **拒绝覆盖终态**(`UPDATE ... WHERE state IN ('claimed','running')`)。行保持 `aborted`+未知——正确,因为此时 worktree/进程可能处于不确定态。这正是 naozhi §6.2 教训:流变安静不证明已死,人仍需确认。*(今天 `set_run_state` 用 `COALESCE` 会覆盖;此处加终态守卫。)*
 - **zeromux 重启遇在途运行**:启动 `reconcile_orphans(None)` 打 `orphaned_restart` → 副作用的进队列(naozhi §6.5 orphan reconcile,zeromux 已半做——已 abort,只补 kind)。
+  - **假设(Eng review Issue 3,需写明)**:`orphaned_restart` = "进程已死、状态未知" 这个语义,**依赖 zeromux 重启会带走所有 agent 子进程**(子进程随父进程 Drop / systemd cgroup `KillMode=control-group` 终止,见 [[zeromux-deploy]] cgroup self-kill 分析)。本机模型下成立——重启即子进程全灭。**若该假设被破坏**(如某个 detached 进程存活),`finalize_run` 的终态守卫(`WHERE state IN ('claimed','running')`)是兜底:迟到的 finalize 无法覆盖已 `aborted` 的行,不会双写。即:假设让我们能保守判 `orphaned_restart`,守卫保证即使判错也安全。
 
 ### 6.2 必须保持的不变量
 
@@ -225,7 +246,8 @@ POST /api/scheduled-tasks/runs/{run_id}/replay
 | `scheduled_tasks.rs` | 5 新列;`reconcile_orphans` 打 kind;per-task cutoff;队列 `SELECT`;`confirm_status`/`replay_of` 写;`set_run_state` 终态守卫 | 所有 run/task 持久化本就在此 |
 | `session_manager.rs` | 为 `run_id` 运行 tee `AcpEvent`→`events.ndjson`;trigger 时写 `input_snapshot`;`finalize_run` 终态守卫;`replay_run()` helper | fanout 本就拥有输出;replay 复用 `trigger_run` |
 | `web.rs` | 3 端点:`GET /confirmations`、`POST /confirmations/{id}/{done\|replay}`、`POST /runs/{id}/replay`;create/update 加 `max_runtime_min`/`side_effects` | 镜像现有 scheduled-task handler + auth |
-| `ScheduledTasksPanel.tsx` + `api.ts` | 任务编辑器字段;"待确认"区 + attention 徽标;run-history 重放按钮 + `replay_of` 链 | 既有面板;CSS-visibility 约定 |
+| `ScheduledTasksPanel.tsx` + `api.ts` | 任务编辑器字段(`side_effects`/`max_runtime_min`);"待确认"区 + attention 徽标;run-history 重放按钮 + `replay_of` 链 | 既有面板;CSS-visibility 约定 |
+| `App.tsx`(Finding 1) | 主会话列表消费 `/confirmations` 计数,把待确认数浮到必经界面 | 拥有会话列表;复用现有端点,无新端点 |
 
 ---
 
@@ -234,16 +256,18 @@ POST /api/scheduled-tasks/runs/{run_id}/replay
 ### 8.1 Rust(`#[cfg(test)]`,仓库约定)
 
 1. `reconcile_orphans(Some)` → `aborted`+`watchdog_timeout`;`reconcile_orphans(None)` → `aborted`+`orphaned_restart`。
-2. per-task `max_runtime_min`:60min 限的任务 35min 不被 abort;NULL 仍走 30min 默认;写入钳 1–120。
+2. per-task `max_runtime_min`:60min 限的任务 35min 不被 abort;NULL 仍走 30min 默认;写入钳 1–1440(`0`/负→1,`99999`→1440)。
 3. **终态守卫(最重要)**:对已 `aborted` 运行 `finalize_run("succeeded")` 是 **no-op**(迟到完成竞态)。
 4. 队列谓词:副作用未知 + `confirm_status IS NULL` 出现;非副作用未知**不**出现;`confirmed_done` 移出。
 5. replay:新行带 `replay_of`,原行除 `confirm_status` 外不变;有在途运行时 overlap 守卫 → 不 replay;**服务端拒绝对"副作用未知 + `confirm_status IS NULL`"运行的普通 replay**(门控)。
 6. `input_snapshot` 往返;replay 注入快照非当前配置(两次间编辑任务 prompt → replay 用旧 prompt)。
 7. retention 剪枝删 run 目录;**队列待处理运行豁免剪枝**。
+8. **events.ndjson tee(Eng review Issue 4——新 I/O 必须测)**:run prompt 注入后事件追加到 `runs/<id>/events.ndjson`;终态边界后 tee **停止**(后续事件不再追加,验证 §5.1 tee 作用域绑定 `active_run_id`);写失败(目录不可写)时**运行不中断、降级为部分输出**(验证 §6.1 best-effort)。
 
 ### 8.2 前端(vitest)
 
 - 队列仅渲染合格运行;attention 徽标计数;重放按钮按终态的禁用态 + tooltip;`replay_of` 链渲染。
+- 待确认计数浮到主会话列表(Finding 1):计数 >0 时会话列表显示标识,=0 时不显示。
 
 ### 8.3 手动冒烟(文档化,不自动化)
 
@@ -258,8 +282,20 @@ POST /api/scheduled-tasks/runs/{run_id}/replay
 ## 9. 决策清单(已锁)
 
 1. **范围**:A+B+C(副作用队列 + 终态精化 + run-record/replay);keepalive(D)延后。
-2. **终态**:`failed_transport` ≡ `aborted`+未知 kind(无迁移);per-task `max_runtime_min`(1–120,默认 30)。
+2. **终态**:`failed_transport` ≡ `aborted`+未知 kind(无迁移);per-task `max_runtime_min`(**1–1440,默认 30**;CEO review Finding 2 — 不抄 naozhi 云端 60min 上限)。
 3. **replay 门控**:副作用范围化——只读自由重放;副作用未知经队列硬停(服务端强制)。
 4. **存储**:输入快照入 SQLite,输出 `events.ndjson` 落盘。
 5. **replay 模型**:新 `replay_of` 链接行,注入快照,复用 `claim_run`+overlap+TOCTOU 门;历史不可变。
 6. **队列**:派生视图(一个 `confirm_status` 列,无新表);永不自动动作;待处理运行豁免剪枝。
+7. **通知触达**(CEO review Finding 1):v1 = dashboard 徽标 + 计数浮到主会话列表;真正的无人值守推送依赖未来 PWA+web-push(见 §10 后续工作)。
+
+**Eng review 加固(4 项,已并入正文)**:① events.ndjson tee 严格绑定 `active_run_id` 窗口(§5.1);② watchdog 用单条集合式 UPDATE+JOIN config,杜绝 per-task N+1(§3.3);③ `orphaned_restart` 的"进程已死"假设写明 + 终态守卫兜底(§6.1);④ 补 events-tee 的写入/停止/降级测试(§8.1 #8)。
+
+---
+
+## 10. 后续工作(明确延后,不在 v1)
+
+- **PWA + web-push 推送通道**:本功能"无人值守失败浮出"的价值要真正兑现,需把待确认事件推到手机锁屏。这是独立 feature 独立 spec(见 [[zeromux-mobile-terminal-composer]] PM 已建议)。v1 只点名依赖,不实现。
+- **keepalive 心跳(原 #D)**:让"静默但活着" vs "卡死"可区分,需改三个 ACP 后端;现有保守行为下不紧急。做了之后可把默认 watchdog 从 30min 收紧。
+- **content-hash 去重快照**:v1 快照极小不值得;快照变大时复用 markdown hash-cache 模式([[zeromux-rendering-ordering-naozhi-shipped]])。
+- **AgentCore / 云端 placement 轴**:本体缓议,走多租户 SaaS 那天再说。

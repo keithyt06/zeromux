@@ -395,6 +395,13 @@ impl ScheduledStore {
         Ok(n)
     }
 
+    pub fn set_input_snapshot(&self, run_id: &str, snapshot: &str) -> Result<(), String> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute("UPDATE agent_task_runs SET input_snapshot=?2 WHERE id=?1",
+            params![run_id, snapshot]).map_err(|e| e.to_string())?;
+        Ok(())
+    }
+
     pub fn runs_for_task(&self, task_id: &str, limit: i64) -> Result<Vec<TaskRun>, String> {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare("SELECT id,task_id,scheduled_for_ms,state,session_id,verdict,failure_kind,started_ms,ended_ms,input_snapshot,confirm_status,replay_of FROM agent_task_runs WHERE task_id=?1 ORDER BY scheduled_for_ms DESC LIMIT ?2").map_err(|e| e.to_string())?;
@@ -609,5 +616,19 @@ mod store_tests {
         assert_eq!(r.state, "aborted");                           // not overwritten
         assert_eq!(r.failure_kind.as_deref(), Some("watchdog_timeout"));
         assert!(r.verdict.is_none());                             // late verdict not written either
+    }
+
+    #[test]
+    fn input_snapshot_roundtrips() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = ScheduledStore::open(dir.path()).unwrap();
+        let run = TaskRun { id: "r1".into(), task_id: "t1".into(), scheduled_for_ms: 1, state: "claimed".into(),
+            session_id: None, verdict: None, failure_kind: None, started_ms: Some(1), ended_ms: None,
+            input_snapshot: None, confirm_status: None, replay_of: None };
+        s.claim_run(&run).unwrap();
+        let snap = r#"{"prompt":"do x","work_dir":"/home/u/p","agent_type":"claude","secrets":[]}"#;
+        s.set_input_snapshot("r1", snap).unwrap();
+        let r = s.runs_for_task("t1", 1).unwrap().into_iter().next().unwrap();
+        assert_eq!(r.input_snapshot.as_deref(), Some(snap));
     }
 }

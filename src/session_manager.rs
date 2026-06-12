@@ -888,6 +888,18 @@ impl SessionManager {
         if let Some(store) = self.scheduled.lock().unwrap().clone() {
             let _ = store.set_run_state(run_id, "running", Some(&sid), None, None, None);
         }
+        // run-record: snapshot the exact input at trigger time so a later config
+        // edit doesn't change what a replay of THIS run does. secrets: reference
+        // names only, never raw values.
+        if let Some(store) = self.scheduled.lock().unwrap().clone() {
+            let snap = serde_json::json!({
+                "prompt": prompt,
+                "work_dir": canonical_str.as_ref(),
+                "agent_type": "claude",
+                "secrets": [],
+            }).to_string();
+            let _ = store.set_input_snapshot(run_id, &snap);
+        }
         let goal = format!(
             "{}\n\n完成后，最后单独输出一行：\n<<<VERDICT>>>一句话结论<<<END>>>",
             prompt
@@ -1738,6 +1750,14 @@ fn spawn_acp_fanout(
                                 AcpEvent::Result { .. } | AcpEvent::Error { .. } | AcpEvent::Exit { .. }
                             );
                             emit(&mgr, &sid, &event_tx, turn_seq, &evt);
+                            // Tee to events.ndjson for the active scheduled run's turn.
+                            // Scoped to active_run_id window: fires for every event from
+                            // prompt-injection until active_run_id.take() at the boundary.
+                            if let Some(rid) = &active_run_id {
+                                if let Ok(line) = serde_json::to_string(&evt) {
+                                    append_run_event(rid, &line);
+                                }
+                            }
                             if is_boundary {
                                 // Each started turn emits exactly one boundary
                                 // (Result/Error/Exit), in FIFO order, so the
@@ -2081,6 +2101,19 @@ fn emit(
     } else {
         // SessionManager gone (shutting down): best-effort live broadcast.
         let _ = event_tx.send(json);
+    }
+}
+
+/// Append one serialized AcpEvent line to a run's events.ndjson. Best-effort:
+/// a write failure is dropped (never blocks the run). Scoped by the caller to
+/// the active_run_id window only.
+fn append_run_event(run_id: &str, serialized: &str) {
+    let home = std::env::var("HOME").unwrap_or_else(|_| "/home/ubuntu".to_string());
+    let dir = std::path::Path::new(&home).join(".zeromux").join("runs").join(run_id);
+    if std::fs::create_dir_all(&dir).is_err() { return; }
+    use std::io::Write;
+    if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(dir.join("events.ndjson")) {
+        let _ = writeln!(f, "{}", serialized);
     }
 }
 

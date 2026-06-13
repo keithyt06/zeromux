@@ -470,13 +470,18 @@ impl ScheduledStore {
     /// than cutoff → `watchdog_timeout`).
     pub fn reconcile_orphans(&self, cutoff_ms: Option<i64>) -> Result<usize, String> {
         let conn = self.conn.lock().unwrap();
+        // Stamp ended_ms too: the confirmation queue orders by it and the card
+        // renders it, so an orphaned/aborted run with NULL ended_ms sorts last
+        // and shows no timestamp. (reconcile_timeouts_per_task already does this;
+        // both abort paths must agree.)
+        let now = chrono::Utc::now().timestamp_millis();
         let n = match cutoff_ms {
             None => conn.execute(
-                "UPDATE agent_task_runs SET state='aborted', failure_kind='orphaned_restart' \
-                 WHERE state IN ('claimed','running')", params![]),
+                "UPDATE agent_task_runs SET state='aborted', failure_kind='orphaned_restart', ended_ms=?1 \
+                 WHERE state IN ('claimed','running')", params![now]),
             Some(c) => conn.execute(
-                "UPDATE agent_task_runs SET state='aborted', failure_kind='watchdog_timeout' \
-                 WHERE state IN ('claimed','running') AND started_ms < ?1", params![c]),
+                "UPDATE agent_task_runs SET state='aborted', failure_kind='watchdog_timeout', ended_ms=?2 \
+                 WHERE state IN ('claimed','running') AND started_ms < ?1", params![c, now]),
         }.map_err(|e| e.to_string())?;
         Ok(n)
     }
@@ -517,20 +522,22 @@ impl ScheduledStore {
 
     /// Side-effecting runs that ended in an unknown terminal state and haven't
     /// been confirmed yet — the human confirmation queue. Owner-scoped via JOIN.
-    pub fn confirmation_queue(&self, owner_id: &str) -> Result<Vec<TaskRun>, String> {
+    /// Each entry pairs the run with its task name (the card needs to show WHICH
+    /// task is pending; TaskRun itself only carries task_id).
+    pub fn confirmation_queue(&self, owner_id: &str) -> Result<Vec<(TaskRun, String)>, String> {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(
-            "SELECT r.id,r.task_id,r.scheduled_for_ms,r.state,r.session_id,r.verdict,r.failure_kind,r.started_ms,r.ended_ms,r.input_snapshot,r.confirm_status,r.replay_of \
+            "SELECT r.id,r.task_id,r.scheduled_for_ms,r.state,r.session_id,r.verdict,r.failure_kind,r.started_ms,r.ended_ms,r.input_snapshot,r.confirm_status,r.replay_of,c.name \
              FROM agent_task_runs r JOIN agent_runs_config c ON c.id = r.task_id \
              WHERE c.owner_id=?1 AND c.side_effects=1 AND r.state='aborted' \
                AND r.failure_kind IN ('watchdog_timeout','orphaned_restart') \
                AND r.confirm_status IS NULL \
              ORDER BY r.ended_ms DESC").map_err(|e| e.to_string())?;
-        let rows = stmt.query_map(params![owner_id], |r| Ok(TaskRun {
+        let rows = stmt.query_map(params![owner_id], |r| Ok((TaskRun {
             id: r.get(0)?, task_id: r.get(1)?, scheduled_for_ms: r.get(2)?, state: r.get(3)?,
             session_id: r.get(4)?, verdict: r.get(5)?, failure_kind: r.get(6)?, started_ms: r.get(7)?, ended_ms: r.get(8)?,
             input_snapshot: r.get(9)?, confirm_status: r.get(10)?, replay_of: r.get(11)?,
-        })).map_err(|e| e.to_string())?;
+        }, r.get::<_, String>(12)?))).map_err(|e| e.to_string())?;
         rows.collect::<Result<_,_>>().map_err(|e| e.to_string())
     }
 
@@ -634,6 +641,33 @@ impl ScheduledStore {
 fn run_dir(run_id: &str) -> std::path::PathBuf {
     let home = std::env::var("HOME").unwrap_or_else(|_| "/home/ubuntu".to_string());
     std::path::Path::new(&home).join(".zeromux").join("runs").join(run_id)
+}
+
+/// Last `max_lines` human-readable text snippets from a run's events.ndjson —
+/// the partial output a person uses to judge whether a side effect (PR/push)
+/// actually landed before the run was aborted (spec §4.4/§5.1). Pulls prose out
+/// of content_block/result/error/system events; raw tool-call JSON is skipped to
+/// keep the preview readable. Best-effort: a missing/unreadable file yields an
+/// empty Vec, never an error (output capture is best-effort, spec §6.1).
+pub fn run_output_tail(run_id: &str, max_lines: usize) -> Vec<String> {
+    let path = run_dir(run_id).join("events.ndjson");
+    let Ok(content) = std::fs::read_to_string(&path) else { return Vec::new() };
+    let mut out: Vec<String> = Vec::new();
+    for line in content.lines() {
+        let Ok(v) = serde_json::from_str::<serde_json::Value>(line) else { continue };
+        let snippet = match v.get("type").and_then(|t| t.as_str()) {
+            Some("content_block") => v.get("text").and_then(|t| t.as_str()).map(|s| s.to_string()),
+            Some("result") => v.get("text").and_then(|t| t.as_str()).map(|s| s.to_string()),
+            Some("error") => v.get("message").and_then(|m| m.as_str()).map(|s| format!("[error] {s}")),
+            Some("exit") => v.get("code").and_then(|c| c.as_i64()).map(|c| format!("[exit {c}]")),
+            _ => None,
+        };
+        if let Some(s) = snippet {
+            let s = s.trim();
+            if !s.is_empty() { out.push(s.to_string()); }
+        }
+    }
+    if out.len() > max_lines { out.split_off(out.len() - max_lines) } else { out }
 }
 
 use std::sync::atomic::{AtomicI64, Ordering};
@@ -791,12 +825,14 @@ mod store_tests {
         let new = s.runs_for_task("t1", 10).unwrap().into_iter().find(|r| r.id == "r_new").unwrap();
         assert_eq!(old.state, "aborted");
         assert_eq!(old.failure_kind.as_deref(), Some("watchdog_timeout"));
+        assert!(old.ended_ms.is_some(), "aborted run must carry ended_ms for queue ordering/display");
         assert_eq!(new.state, "running");
 
         s.reconcile_orphans(None).unwrap();        // startup sweep: remaining running → orphaned_restart
         let new2 = s.runs_for_task("t1", 10).unwrap().into_iter().find(|r| r.id == "r_new").unwrap();
         assert_eq!(new2.state, "aborted");
         assert_eq!(new2.failure_kind.as_deref(), Some("orphaned_restart"));
+        assert!(new2.ended_ms.is_some(), "orphaned_restart run must carry ended_ms (Finding A)");
     }
 
     #[test]
@@ -881,7 +917,8 @@ mod store_tests {
 
         let q = s.confirmation_queue("u").unwrap();
         assert_eq!(q.len(), 1);
-        assert_eq!(q[0].id, "r_se");
+        assert_eq!(q[0].0.id, "r_se");
+        assert_eq!(q[0].1, "t_se", "queue entry carries its task name (Finding B)");
         assert_eq!(s.confirmation_count("u").unwrap(), 1);
 
         assert!(s.set_confirm_status("r_se", "confirmed_done").unwrap());  // first writer wins → true
@@ -941,5 +978,28 @@ mod store_tests {
         s.delete_config("t").unwrap();
         assert!(s.get_config("t").unwrap().is_none());
         assert_eq!(s.runs_for_task("t", 10).unwrap().len(), 0, "run rows must not outlive the deleted task");
+    }
+
+    #[test]
+    fn run_output_tail_extracts_readable_text() {
+        // HOME is process-global; serialize against the other HOME-mutating tests.
+        let _guard = crate::session_manager::HOME_ENV_LOCK.lock().unwrap();
+        let prev = std::env::var("HOME").ok();
+        let tmp = tempfile::tempdir().unwrap();
+        std::env::set_var("HOME", tmp.path());
+        let dir = tmp.path().join(".zeromux/runs/r_tail");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("events.ndjson"),
+            "{\"type\":\"system\",\"subtype\":\"task_updated\"}\n\
+             {\"type\":\"content_block\",\"block_type\":\"text\",\"text\":\"opening a PR\"}\n\
+             {\"type\":\"content_block\",\"block_type\":\"tool_use\",\"name\":\"bash\"}\n\
+             {\"type\":\"result\",\"text\":\"PR #42 opened\",\"turn_id\":0,\"session_id\":\"s\"}\n").unwrap();
+        let tail = super::run_output_tail("r_tail", 10);
+        // restore HOME before assertions so a panic can't leak the tempdir
+        match prev { Some(h) => std::env::set_var("HOME", h), None => std::env::remove_var("HOME") }
+        assert_eq!(tail, vec!["opening a PR".to_string(), "PR #42 opened".to_string()],
+            "tail pulls prose from content_block/result, skips tool_use + system");
+        // missing file → empty, never an error (best-effort, spec §6.1)
+        assert!(super::run_output_tail("nope_missing", 10).is_empty());
     }
 }

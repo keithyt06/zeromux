@@ -436,6 +436,10 @@ export interface TaskRun {
   input_snapshot: string | null
   confirm_status: 'confirmed_done' | 'replayed' | null
   replay_of: string | null
+  // Only populated by the confirmation-queue endpoint (joins task name + tails
+  // the captured output so the card can show which task + what it managed to do).
+  task_name?: string
+  output_tail?: string[]
 }
 
 export interface ScheduledTaskReq {

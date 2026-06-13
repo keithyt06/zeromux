@@ -247,13 +247,21 @@ function ConfirmationQueue({ onResolved }: { onResolved: () => void }) {
         return (
           <div key={run.id} className="px-3 py-2 bg-[var(--bg-secondary)] rounded-lg border border-[var(--border)]">
             <div className="flex items-center justify-between gap-2">
-              <span className={`text-xs font-medium ${reason.color}`}>{reason.label}</span>
+              <span className="text-xs font-medium text-[var(--text-primary)] truncate" title={run.task_name}>
+                {run.task_name ?? run.task_id}
+              </span>
               {run.ended_ms != null && (
-                <span className="text-[10px] text-[var(--text-muted)]">{new Date(run.ended_ms).toLocaleString()}</span>
+                <span className="text-[10px] text-[var(--text-muted)] shrink-0">{new Date(run.ended_ms).toLocaleString()}</span>
               )}
             </div>
+            <div className={`text-[10px] font-medium mt-0.5 ${reason.color}`}>{reason.label}</div>
             {run.verdict && (
               <div className="text-[10px] text-[var(--text-secondary)] mt-1 break-words">{run.verdict}</div>
+            )}
+            {run.output_tail && run.output_tail.length > 0 && (
+              <div className="mt-1.5 max-h-24 overflow-y-auto bg-[var(--bg-tertiary)] rounded px-2 py-1 text-[10px] font-mono text-[var(--text-secondary)] whitespace-pre-wrap break-words">
+                {run.output_tail.join('\n')}
+              </div>
             )}
             <div className="flex gap-2 mt-2">
               <button

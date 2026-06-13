@@ -1510,13 +1510,26 @@ async fn list_scheduled_runs(
 }
 
 /// GET /api/scheduled-tasks/confirmations — caller's pending-confirmation runs.
+/// Each run carries its task name (so the card shows WHICH task is pending) and a
+/// short tail of captured output (the evidence a person uses to judge whether the
+/// side effect landed — spec §4.4). verdict is ~always NULL on a timeout/orphan,
+/// so the tail is the only signal the human has.
 async fn list_confirmations(
     State(state): State<Arc<AppState>>,
     user: axum::Extension<CurrentUser>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
-    let runs = state.scheduled_tasks.confirmation_queue(&user.id)
+    let pairs = state.scheduled_tasks.confirmation_queue(&user.id)
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
-    let count = runs.len();
+    let count = pairs.len();
+    let runs: Vec<serde_json::Value> = pairs.into_iter().map(|(run, task_name)| {
+        let tail = crate::scheduled_tasks::run_output_tail(&run.id, 6);
+        let mut v = serde_json::to_value(&run).unwrap_or_else(|_| serde_json::json!({}));
+        if let Some(obj) = v.as_object_mut() {
+            obj.insert("task_name".into(), serde_json::Value::String(task_name));
+            obj.insert("output_tail".into(), serde_json::json!(tail));
+        }
+        v
+    }).collect();
     Ok(Json(serde_json::json!({ "runs": runs, "count": count })))
 }
 
@@ -1576,6 +1589,27 @@ async fn replay_run_handler(
     // NEVER silently dropped from the queue without a replay (spec §4.5).
     let (new_id, snap) = state.scheduled_tasks.claim_replay(&run_id)
         .map_err(|e| (StatusCode::BAD_REQUEST, e))?;
+    // TOCTOU close: the overlap check above and claim_replay's INSERT aren't one
+    // transaction (claim_replay uses a fresh uuid+now, so it never collides on
+    // the UNIQUE(task_id, scheduled_for_ms) slot the scheduler relies on). Two
+    // replay clicks a few ms apart could both pass the pre-check and both claim,
+    // double-spawning a side-effecting task (double PR/push). After our own claim,
+    // re-read active runs: if anything other than our row is active, a rival won —
+    // finalize ours and skip rather than double-fire.
+    {
+        let active = state.scheduled_tasks.active_states_for_task(&cfg.id)
+            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
+        if active.len() > 1 {
+            // Finalize the loser as 'skipped', NOT aborted+unknown — it never
+            // spawned, so it produced no side effect and must NOT enter the
+            // confirmation queue (whose predicate is aborted + watchdog/orphaned).
+            let now = chrono::Utc::now().timestamp_millis();
+            let _ = state.scheduled_tasks.set_run_state(
+                &new_id, "skipped", None, None, Some("overlap"), Some(now),
+            );
+            return Ok(Json(serde_json::json!({ "skipped": true, "reason": "overlap" })));
+        }
+    }
     let name = format!("{} · replay", cfg.name);
     if let Err(e) = state.sessions.replay_run(&new_id, &cfg.id, &cfg.owner_id, name, &snap).await {
         // Finalize the claimed run, else it sits in 'claimed' forever and the

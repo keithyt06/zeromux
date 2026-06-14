@@ -301,6 +301,7 @@ struct CreateSessionReq {
     session_type: crate::session_manager::SessionType,
     work_dir: Option<String>,
     tmux_target: Option<String>,
+    initial_prompt: Option<String>,   // 仅 agent 会话有意义；tmux 忽略
 }
 
 fn default_session_type() -> crate::session_manager::SessionType {
@@ -377,6 +378,17 @@ async fn create_session(
                 .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?
         }
     };
+
+    // 启动 Prompt：仅 agent 会话、且 prompt 非空白时，作为第一条用户消息透传。
+    // tmux 跳过：PTY fan-out 会静默丢弃 Prompt，显式跳过免得 F3 的成功日志说谎。
+    if req.session_type != crate::session_manager::SessionType::Tmux {
+        if let Some(prompt) = req.initial_prompt.as_deref() {
+            let prompt = prompt.trim();
+            if !prompt.is_empty() {
+                state.sessions.send_initial_prompt(&id, prompt).await;
+            }
+        }
+    }
 
     Ok(Json(serde_json::json!({
         "id": id,
@@ -1712,5 +1724,25 @@ mod upload_helpers_tests {
         assert_eq!(take("a/../../etc/x"), "x");
         assert_eq!(take(".."), "upload");        // file_name() 对 ".." 返回 None
         assert_eq!(take("/abs/path/file.png"), "file.png");
+    }
+}
+
+#[cfg(test)]
+mod create_session_req_tests {
+    use super::CreateSessionReq;
+
+    #[test]
+    fn initial_prompt_defaults_to_none_when_absent() {
+        // 老前端不发 initial_prompt 字段 → 必须反序列化为 None（向后兼容）。
+        let json = r#"{"type":"claude"}"#;
+        let req: CreateSessionReq = serde_json::from_str(json).unwrap();
+        assert!(req.initial_prompt.is_none());
+    }
+
+    #[test]
+    fn initial_prompt_parses_when_present() {
+        let json = r#"{"type":"claude","initial_prompt":"hello"}"#;
+        let req: CreateSessionReq = serde_json::from_str(json).unwrap();
+        assert_eq!(req.initial_prompt.as_deref(), Some("hello"));
     }
 }

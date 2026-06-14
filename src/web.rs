@@ -308,6 +308,23 @@ fn default_session_type() -> crate::session_manager::SessionType {
     crate::session_manager::SessionType::Tmux
 }
 
+/// 启动 Prompt 的 gating 决策（纯函数，便于测试）：
+/// 返回 Some(trimmed) 表示应发送该文本；None 表示不发（tmux / 缺省 / 空白）。
+fn should_send_initial_prompt(
+    session_type: crate::session_manager::SessionType,
+    prompt: Option<&str>,
+) -> Option<String> {
+    if session_type == crate::session_manager::SessionType::Tmux {
+        return None;
+    }
+    let trimmed = prompt?.trim();
+    if trimmed.is_empty() {
+        None
+    } else {
+        Some(trimmed.to_string())
+    }
+}
+
 /// Security: a client-supplied work_dir must resolve to a path under HOME.
 /// Without this an authenticated user could spawn a shell/agent (and write a
 /// git worktree) anywhere on the host the server process can reach (e.g. /etc,
@@ -379,15 +396,9 @@ async fn create_session(
         }
     };
 
-    // 启动 Prompt：仅 agent 会话、且 prompt 非空白时，作为第一条用户消息透传。
-    // tmux 跳过：PTY fan-out 会静默丢弃 Prompt，显式跳过免得 F3 的成功日志说谎。
-    if req.session_type != crate::session_manager::SessionType::Tmux {
-        if let Some(prompt) = req.initial_prompt.as_deref() {
-            let prompt = prompt.trim();
-            if !prompt.is_empty() {
-                state.sessions.send_initial_prompt(&id, prompt).await;
-            }
-        }
+    // 启动 Prompt：gating 决策抽到 should_send_initial_prompt（已单测）。
+    if let Some(prompt) = should_send_initial_prompt(req.session_type, req.initial_prompt.as_deref()) {
+        state.sessions.send_initial_prompt(&id, &prompt).await;
     }
 
     Ok(Json(serde_json::json!({
@@ -1730,6 +1741,27 @@ mod upload_helpers_tests {
 #[cfg(test)]
 mod create_session_req_tests {
     use super::CreateSessionReq;
+    use super::should_send_initial_prompt;
+    use crate::session_manager::SessionType;
+
+    #[test]
+    fn gating_sends_only_for_nonblank_agent_prompt() {
+        // 非空 agent prompt → 发（trim 后）
+        assert_eq!(
+            should_send_initial_prompt(SessionType::Claude, Some("hi")),
+            Some("hi".to_string())
+        );
+        assert_eq!(
+            should_send_initial_prompt(SessionType::Kiro, Some("  x  ")),
+            Some("x".to_string()),
+            "应 trim 后发送"
+        );
+        // 空白 / None → 不发
+        assert_eq!(should_send_initial_prompt(SessionType::Claude, Some("   ")), None);
+        assert_eq!(should_send_initial_prompt(SessionType::Codex, None), None);
+        // tmux → 永不发（即使有 prompt）
+        assert_eq!(should_send_initial_prompt(SessionType::Tmux, Some("hi")), None);
+    }
 
     #[test]
     fn initial_prompt_defaults_to_none_when_absent() {

@@ -956,6 +956,36 @@ impl SessionManager {
         self.trigger_run(new_run_id, name, &work_dir, owner_id, task_id, prompt).await
     }
 
+    /// 交互式启动 prompt：把 `prompt` 作为第一条用户消息透传给 agent 会话。
+    ///
+    /// F1: 发 `run_id: None` —— 走 fan-out 的普通用户 prompt 路径（若会话空闲则
+    /// 立即发送；若忙则进 fan-out 队列按 QueueMode 处理），**不是** trigger_run
+    /// 的 `run_id: Some` 调度分支。切勿带 run_id，否则会把交互会话误判成调度运行
+    /// （污染 active_run_id / 触发 verdict finalize）。
+    ///
+    /// best-effort：发送失败只记日志（session 已建好可用，用户可手动重发）。
+    /// 调用方（web handler）负责 tmux 跳过与空白 prompt 过滤。
+    pub async fn send_initial_prompt(&self, id: &str, prompt: &str) {
+        if let Some(tx) = self.input_tx(id) {
+            if let Err(e) = tx
+                .send(SessionInput::Prompt {
+                    text: prompt.to_string(),
+                    run_id: None,
+                    client_id: None,
+                })
+                .await
+            {
+                tracing::warn!("initial_prompt send failed for {}: {}", id, e);
+            } else {
+                // F3: 成功也留痕，否则线上排查"agent 没自动开跑"时，
+                // "发了但 agent 没动" 与 "压根没进这段逻辑" 在日志里无法区分。
+                tracing::info!("initial_prompt sent for {}", id);
+            }
+        } else {
+            tracing::warn!("initial_prompt: no input channel for {}", id);
+        }
+    }
+
     /// Spawn a Kiro process for `id` at `work_dir`, start its fan-out, return the
     /// live handle. `resume: Some(sid)` issues `session/load` to restore context.
     async fn spawn_kiro(
@@ -3219,6 +3249,36 @@ mod running_summary_tests {
         let s = m.running_summary();
         assert_eq!(s.scheduled, 0);
         assert_eq!(s.interactive, 0);
+    }
+
+    /// 像 running_session，但返回接收端供断言"发了什么"。
+    /// 复用 running_session 的字段构造，避免 Session 字段增改时两处漂移。
+    fn running_session_observable(
+        id: &str,
+        stype: SessionType,
+    ) -> (Session, mpsc::Receiver<SessionInput>) {
+        let (input_tx, rx) = mpsc::channel::<SessionInput>(64);
+        let mut s = running_session(id, stype, None, TurnState::Idle);
+        s.running.as_mut().unwrap().input_tx = input_tx;
+        (s, rx)
+    }
+
+    #[tokio::test]
+    async fn send_initial_prompt_passthrough_run_id_none() {
+        let (s, mut rx) = running_session_observable("sid", SessionType::Claude);
+        let (m, _tmp) = mgr_with(vec![s]);
+
+        m.send_initial_prompt("sid", "查一下登录 bug").await;
+
+        let got = rx.recv().await.expect("a prompt should have been sent");
+        match got {
+            SessionInput::Prompt { text, run_id, client_id } => {
+                assert_eq!(text, "查一下登录 bug", "文本必须原样透传，无 verdict 追加");
+                assert!(run_id.is_none(), "F1: 交互式启动 prompt 的 run_id 必须为 None");
+                assert!(client_id.is_none());
+            }
+            _other => panic!("expected SessionInput::Prompt variant"),
+        }
     }
 }
 

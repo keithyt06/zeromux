@@ -114,10 +114,10 @@ export async function listSessions(): Promise<SessionInfo[]> {
   return data.sessions || []
 }
 
-export async function createSession(type: SessionType, name?: string, workDir?: string, tmuxTarget?: string): Promise<SessionInfo> {
+export async function createSession(type: SessionType, name?: string, workDir?: string, tmuxTarget?: string, initialPrompt?: string): Promise<SessionInfo> {
   const res = await api('/api/sessions', {
     method: 'POST',
-    body: JSON.stringify({ type, name: name || null, work_dir: workDir || null, tmux_target: tmuxTarget || null }),
+    body: JSON.stringify({ type, name: name || null, work_dir: workDir || null, tmux_target: tmuxTarget || null, initial_prompt: initialPrompt || null }),
   })
   if (!res.ok) throw new Error(await res.text())
   return res.json()

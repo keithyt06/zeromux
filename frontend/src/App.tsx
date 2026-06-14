@@ -137,8 +137,8 @@ export default function App() {
     }
   }, [])
 
-  const handleCreate = useCallback(async (type: SessionType, workDir?: string, tmuxTarget?: string) => {
-    const s = await createSession(type, undefined, workDir, tmuxTarget)
+  const handleCreate = useCallback(async (type: SessionType, workDir?: string, tmuxTarget?: string, initialPrompt?: string) => {
+    const s = await createSession(type, undefined, workDir, tmuxTarget, initialPrompt)
     setSessions(prev => [...prev, s])
     setActiveId(s.id)
   }, [])

@@ -11,7 +11,7 @@ interface Props {
   sessions: SessionInfo[]
   activeId: string | null
   onSelect: (id: string) => void
-  onCreate: (type: SessionType, workDir?: string, tmuxTarget?: string) => void
+  onCreate: (type: SessionType, workDir?: string, tmuxTarget?: string, initialPrompt?: string) => void
   onDelete: (id: string) => void
   onRename: (id: string, name: string) => void
   hasUnread: (s: SessionInfo) => boolean
@@ -45,7 +45,7 @@ function TurnDot({ s }: { s: SessionInfo }) {
   return <span className={`w-2 h-2 rounded-full shrink-0 ${cls}`} />
 }
 
-type NewSessionStep = 'closed' | 'pick-type' | 'pick-terminal-mode' | 'pick-dir' | 'pick-tmux'
+type NewSessionStep = 'closed' | 'pick-type' | 'pick-terminal-mode' | 'pick-dir' | 'pick-tmux' | 'pick-prompt'
 
 /** Per-agent-type icon used in session list rows. Kept in one place so the
  *  sidebar's two render sites (active row, condensed row) stay in sync as
@@ -63,6 +63,8 @@ function SessionTypeIcon({ type, size = 14, className }: { type: SessionType; si
 export default function Sidebar({ sessions, activeId, onSelect, onCreate, onDelete, onRename, hasUnread, onLogout, theme, onToggleTheme, user, open, onToggle, mobile, confirmCount = 0 }: Props) {
   const [step, setStep] = useState<NewSessionStep>('closed')
   const [pendingType, setPendingType] = useState<SessionType | null>(null)
+  const [promptDraft, setPromptDraft] = useState('')
+  const [pendingDir, setPendingDir] = useState<string | null>(null)
   const [showAdmin, setShowAdmin] = useState(false)
   const [showScheduled, setShowScheduled] = useState(false)
   const [schedulerHealthy, setSchedulerHealthy] = useState(true)
@@ -166,15 +168,38 @@ export default function Sidebar({ sessions, activeId, onSelect, onCreate, onDele
   }
 
   const selectDir = (path: string) => {
-    if (pendingType) {
-      onCreate(pendingType, path)
+    if (!pendingType) { setStep('closed'); return }
+    if (pendingType === 'tmux') {
+      onCreate('tmux', path)
+      setStep('closed')
+    } else {
+      setPendingDir(path)
+      setPromptDraft('')
+      setStep('pick-prompt')
     }
-    setStep('closed')
   }
 
   const close = () => {
     setStep('closed')
     setPendingType(null)
+    setPromptDraft('')
+    setPendingDir(null)
+  }
+
+  const submitWithPrompt = () => {
+    if (!pendingType || !pendingDir) { setStep('closed'); return }
+    const trimmed = promptDraft.trim()
+    onCreate(pendingType, pendingDir, undefined, trimmed ? promptDraft : undefined)
+    setPromptDraft('')
+    setPendingDir(null)
+    setStep('closed')
+  }
+  const submitSkip = () => {
+    if (!pendingType || !pendingDir) { setStep('closed'); return }
+    onCreate(pendingType, pendingDir)
+    setPromptDraft('')
+    setPendingDir(null)
+    setStep('closed')
   }
 
   const handleSelect = (id: string) => {
@@ -590,6 +615,59 @@ export default function Sidebar({ sessions, activeId, onSelect, onCreate, onDele
                         </button>
                       ))
                     )}
+                  </div>
+                </>
+              )}
+
+              {step === 'pick-prompt' && (
+                <>
+                  <div className="flex items-center gap-1 px-2 py-1.5 border-b border-[var(--border)]">
+                    <button
+                      onClick={() => setStep('pick-dir')}
+                      className="p-0.5 text-[var(--text-secondary)] hover:text-[var(--text-primary)] rounded transition-colors"
+                      title="Back"
+                    >
+                      <ChevronLeft size={14} />
+                    </button>
+                    <span className="text-[10px] font-semibold text-[var(--text-muted)] uppercase tracking-wider">Initial prompt (optional)</span>
+                  </div>
+                  <div className="p-2 flex flex-col gap-2">
+                    <textarea
+                      autoFocus
+                      value={promptDraft}
+                      onChange={e => setPromptDraft(e.target.value)}
+                      onKeyDown={e => {
+                        if (e.key === 'Enter' && (e.metaKey || e.ctrlKey)) { e.preventDefault(); submitWithPrompt() }
+                        else if (e.key === 'Escape') { e.preventDefault(); close() }
+                      }}
+                      placeholder="给 agent 的第一条指令，留空则只创建会话"
+                      className="w-full h-24 resize-none rounded bg-[var(--bg-secondary)] border border-[var(--border)] p-2 text-xs text-[var(--text-primary)] focus:outline-none focus:border-[var(--accent-blue)]"
+                    />
+                    <div className="flex justify-end gap-2">
+                      {promptDraft.trim() ? (
+                        <>
+                          <button
+                            onClick={submitSkip}
+                            className="px-2 py-1 text-[10px] font-semibold text-[var(--text-secondary)] hover:text-[var(--text-primary)] transition-colors"
+                          >
+                            Skip &amp; create
+                          </button>
+                          <button
+                            onClick={submitWithPrompt}
+                            className="px-3 py-1 text-[10px] font-semibold bg-[var(--accent-blue)] hover:bg-[var(--accent-blue-hover)] text-white rounded transition-colors"
+                          >
+                            Create &amp; send
+                          </button>
+                        </>
+                      ) : (
+                        <button
+                          onClick={submitSkip}
+                          className="px-3 py-1 text-[10px] font-semibold bg-[var(--accent-blue)] hover:bg-[var(--accent-blue-hover)] text-white rounded transition-colors"
+                        >
+                          Create
+                        </button>
+                      )}
+                    </div>
                   </div>
                 </>
               )}

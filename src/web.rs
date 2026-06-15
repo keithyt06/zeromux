@@ -1320,6 +1320,8 @@ struct ScheduledTaskReq {
     side_effects: bool,
     #[serde(default)]
     max_runtime_min: Option<i64>,
+    #[serde(default)]
+    idle_timeout_min: Option<i64>,
 }
 fn default_true() -> bool {
     true
@@ -1366,7 +1368,7 @@ async fn create_scheduled(
         created_ms: chrono::Utc::now().timestamp_millis(),
         side_effects: req.side_effects,
         max_runtime_min: req.max_runtime_min.map(|m| m.clamp(1, 1440)),
-        idle_timeout_min: None,
+        idle_timeout_min: req.idle_timeout_min.map(|m| m.clamp(1, 1440)),
     };
     state
         .scheduled_tasks
@@ -1409,7 +1411,7 @@ async fn update_scheduled(
         created_ms: existing.created_ms,
         side_effects: req.side_effects,
         max_runtime_min: req.max_runtime_min.map(|m| m.clamp(1, 1440)),
-        idle_timeout_min: None,
+        idle_timeout_min: req.idle_timeout_min.map(|m| m.clamp(1, 1440)),
     };
     state
         .scheduled_tasks

@@ -9,7 +9,10 @@ describe('runReason', () => {
     started_ms: 1, ended_ms: 2, input_snapshot: null, confirm_status: null, replay_of: null,
   } as const
   it('labels watchdog_timeout aborts', () => {
-    expect(runReason({ ...base, state: 'aborted', failure_kind: 'watchdog_timeout' } as TaskRun).label).toBe('超时中止')
+    expect(runReason({ ...base, state: 'aborted', failure_kind: 'watchdog_timeout' } as TaskRun).label).toBe('超过最长运行时长')
+  })
+  it('labels idle_timeout aborts', () => {
+    expect(runReason({ ...base, state: 'aborted', failure_kind: 'idle_timeout' } as TaskRun).label).toBe('静默超时(无输出)')
   })
   it('labels orphaned_restart aborts', () => {
     expect(runReason({ ...base, state: 'aborted', failure_kind: 'orphaned_restart' } as TaskRun).label).toBe('重启中断')

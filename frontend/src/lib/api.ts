@@ -421,6 +421,7 @@ export interface ScheduledTask {
   created_ms: number
   side_effects: boolean
   max_runtime_min: number | null
+  idle_timeout_min: number | null
 }
 
 export interface TaskRun {
@@ -451,6 +452,7 @@ export interface ScheduledTaskReq {
   retention_n?: number
   side_effects?: boolean
   max_runtime_min?: number | null
+  idle_timeout_min?: number | null
 }
 
 export async function listScheduledTasks(): Promise<ScheduledTask[]> {

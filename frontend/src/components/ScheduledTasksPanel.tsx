@@ -52,7 +52,8 @@ const STATE_COLORS: Record<TaskRun['state'], string> = {
 // eslint-disable-next-line react-refresh/only-export-components -- pure helper exported for unit tests
 export function runReason(r: TaskRun): { label: string; color: string } {
   if (r.state === 'aborted') {
-    if (r.failure_kind === 'watchdog_timeout') return { label: '超时中止', color: 'text-[var(--accent-red)]' }
+    if (r.failure_kind === 'idle_timeout') return { label: '静默超时(无输出)', color: 'text-[var(--accent-red)]' }
+    if (r.failure_kind === 'watchdog_timeout') return { label: '超过最长运行时长', color: 'text-[var(--accent-red)]' }
     if (r.failure_kind === 'orphaned_restart') return { label: '重启中断', color: 'text-[var(--accent-red)]' }
   }
   return { label: STATE_LABELS[r.state], color: STATE_COLORS[r.state] }
@@ -366,6 +367,7 @@ function TaskForm({ task, onCancel, onSaved }: {
   const [cronExpr, setCronExpr] = useState(task?.trigger_spec ?? '')
   const [sideEffects, setSideEffects] = useState(task?.side_effects ?? false)
   const [maxRuntime, setMaxRuntime] = useState<number | null>(task?.max_runtime_min ?? null)
+  const [idleTimeout, setIdleTimeout] = useState<number | null>(task?.idle_timeout_min ?? null)
   const [pickingDir, setPickingDir] = useState(false)
   const [saving, setSaving] = useState(false)
   const [error, setError] = useState<string | null>(null)
@@ -396,6 +398,7 @@ function TaskForm({ task, onCancel, onSaved }: {
       enabled,
       side_effects: sideEffects,
       max_runtime_min: maxRuntime,
+      idle_timeout_min: idleTimeout,
     }
     setSaving(true)
     try {
@@ -505,7 +508,7 @@ function TaskForm({ task, onCancel, onSaved }: {
       </div>
 
       <div>
-        <label className={labelCls}>最长运行(分钟,留空=30)</label>
+        <label className={labelCls}>最长运行(分钟,留空=300)</label>
         <input
           type="number"
           min={1}
@@ -513,7 +516,22 @@ function TaskForm({ task, onCancel, onSaved }: {
           value={maxRuntime ?? ''}
           onChange={e => setMaxRuntime(e.target.value === '' ? null : Number(e.target.value))}
           className={inputCls}
-          placeholder="30"
+          placeholder="300"
+        />
+      </div>
+
+      <div>
+        <label className={labelCls} title="若任务会运行长时间无输出的命令(全量测试/CI/大型 build),请把空闲超时设得高于该命令的预期时长,否则会被误判为卡死">
+          空闲超时(分钟,留空=60)
+        </label>
+        <input
+          type="number"
+          min={1}
+          max={1440}
+          value={idleTimeout ?? ''}
+          onChange={e => setIdleTimeout(e.target.value === '' ? null : Number(e.target.value))}
+          className={inputCls}
+          placeholder="60"
         />
       </div>
 
@@ -578,7 +596,7 @@ function RunHistory({ task }: { task: ScheduledTask }) {
         const sideEffectUnknown =
           task.side_effects &&
           r.state === 'aborted' &&
-          (r.failure_kind === 'watchdog_timeout' || r.failure_kind === 'orphaned_restart') &&
+          (r.failure_kind === 'watchdog_timeout' || r.failure_kind === 'orphaned_restart' || r.failure_kind === 'idle_timeout') &&
           r.confirm_status === null
         const disabled = noSnapshot || sideEffectUnknown
         const title = noSnapshot

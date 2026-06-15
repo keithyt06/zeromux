@@ -193,7 +193,7 @@ mod tests {
         let cfg = TaskConfig { id: "t".into(), owner_id: "u".into(), name: "n".into(), trigger_type: "cron".into(),
             trigger_spec: "0 0 * * * *".into(), tz: "Asia/Shanghai".into(), agent_type: "claude".into(),
             work_dir: ".".into(), prompt: "p".into(), enabled: true, retention_n: 1, created_ms: 1,
-            side_effects: true, max_runtime_min: None };
+            side_effects: true, max_runtime_min: None, idle_timeout_min: None };
         s.upsert_config(&cfg).unwrap();
         let mk = |id: &str, sched: i64, kind: Option<&str>, state: &str| {
             let run = TaskRun { id: id.into(), task_id: "t".into(), scheduled_for_ms: sched, state: "claimed".into(),
@@ -222,7 +222,7 @@ mod tests {
         let cfg = TaskConfig { id: "t".into(), owner_id: "u".into(), name: "n".into(), trigger_type: "cron".into(),
             trigger_spec: "0 0 * * * *".into(), tz: "Asia/Shanghai".into(), agent_type: "claude".into(),
             work_dir: ".".into(), prompt: "p".into(), enabled: true, retention_n: 1, created_ms: 1,
-            side_effects: false, max_runtime_min: None };   // NOT side-effecting
+            side_effects: false, max_runtime_min: None, idle_timeout_min: None };   // NOT side-effecting
         s.upsert_config(&cfg).unwrap();
         let mk = |id: &str, sched: i64, kind: Option<&str>, state: &str| {
             let run = TaskRun { id: id.into(), task_id: "t".into(), scheduled_for_ms: sched, state: "claimed".into(),
@@ -250,7 +250,7 @@ mod tests {
             id: id.into(), owner_id: "u".into(), name: id.into(), trigger_type: "cron".into(),
             trigger_spec: "0 0 * * * *".into(), tz: "Asia/Shanghai".into(), agent_type: "claude".into(),
             work_dir: ".".into(), prompt: "p".into(), enabled: true, retention_n: 20, created_ms: 1,
-            side_effects: se, max_runtime_min: None };
+            side_effects: se, max_runtime_min: None, idle_timeout_min: None };
         s.upsert_config(&mk_cfg("t_se", true)).unwrap();
         s.upsert_config(&mk_cfg("t_ro", false)).unwrap();
         // distinct scheduled_for_ms per run — UNIQUE(task_id, scheduled_for_ms)
@@ -285,6 +285,7 @@ mod tests {
             tz: "Asia/Shanghai".into(), agent_type: "claude".into(),
             work_dir: ".".into(), prompt: "p".into(), enabled: true,
             retention_n: 20, created_ms: 1, side_effects: true, max_runtime_min: Some(60),
+            idle_timeout_min: None,
         };
         s.upsert_config(&c).unwrap();
         let got = s.get_config("t1").unwrap().unwrap();
@@ -353,6 +354,8 @@ pub struct TaskConfig {
     pub side_effects: bool,
     #[serde(default)]
     pub max_runtime_min: Option<i64>,
+    #[serde(default)]
+    pub idle_timeout_min: Option<i64>,
 }
 
 #[derive(Debug, Clone, serde::Serialize)]
@@ -403,6 +406,7 @@ impl ScheduledStore {
         for stmt in [
             "ALTER TABLE agent_runs_config ADD COLUMN side_effects INTEGER NOT NULL DEFAULT 0",
             "ALTER TABLE agent_runs_config ADD COLUMN max_runtime_min INTEGER",
+            "ALTER TABLE agent_runs_config ADD COLUMN idle_timeout_min INTEGER",
             "ALTER TABLE agent_task_runs ADD COLUMN input_snapshot TEXT",
             "ALTER TABLE agent_task_runs ADD COLUMN confirm_status TEXT",
             "ALTER TABLE agent_task_runs ADD COLUMN replay_of TEXT",
@@ -421,12 +425,12 @@ impl ScheduledStore {
         let conn = self.conn.lock().unwrap();
         conn.execute(
             "INSERT INTO agent_runs_config
-             (id,owner_id,name,trigger_type,trigger_spec,tz,agent_type,work_dir,prompt,enabled,retention_n,created_ms,side_effects,max_runtime_min)
-             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14)
-             ON CONFLICT(id) DO UPDATE SET name=?3,trigger_spec=?5,work_dir=?8,prompt=?9,enabled=?10,retention_n=?11,side_effects=?13,max_runtime_min=?14",
+             (id,owner_id,name,trigger_type,trigger_spec,tz,agent_type,work_dir,prompt,enabled,retention_n,created_ms,side_effects,max_runtime_min,idle_timeout_min)
+             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15)
+             ON CONFLICT(id) DO UPDATE SET name=?3,trigger_spec=?5,work_dir=?8,prompt=?9,enabled=?10,retention_n=?11,side_effects=?13,max_runtime_min=?14,idle_timeout_min=?15",
             params![c.id,c.owner_id,c.name,c.trigger_type,c.trigger_spec,c.tz,c.agent_type,
                     c.work_dir,c.prompt,c.enabled as i64,c.retention_n,c.created_ms,
-                    c.side_effects as i64, c.max_runtime_min],
+                    c.side_effects as i64, c.max_runtime_min, c.idle_timeout_min],
         ).map_err(|e| e.to_string())?;
         Ok(())
     }
@@ -439,13 +443,13 @@ impl ScheduledStore {
     }
     fn query_configs(&self, where_clause: &str, p: impl rusqlite::Params) -> Result<Vec<TaskConfig>, String> {
         let conn = self.conn.lock().unwrap();
-        let sql = format!("SELECT id,owner_id,name,trigger_type,trigger_spec,tz,agent_type,work_dir,prompt,enabled,retention_n,created_ms,side_effects,max_runtime_min FROM agent_runs_config {}", where_clause);
+        let sql = format!("SELECT id,owner_id,name,trigger_type,trigger_spec,tz,agent_type,work_dir,prompt,enabled,retention_n,created_ms,side_effects,max_runtime_min,idle_timeout_min FROM agent_runs_config {}", where_clause);
         let mut stmt = conn.prepare(&sql).map_err(|e| e.to_string())?;
         let rows = stmt.query_map(p, |r| Ok(TaskConfig {
             id: r.get(0)?, owner_id: r.get(1)?, name: r.get(2)?, trigger_type: r.get(3)?,
             trigger_spec: r.get(4)?, tz: r.get(5)?, agent_type: r.get(6)?, work_dir: r.get(7)?,
             prompt: r.get(8)?, enabled: r.get::<_, i64>(9)? != 0, retention_n: r.get(10)?, created_ms: r.get(11)?,
-            side_effects: r.get::<_, i64>(12)? != 0, max_runtime_min: r.get(13)?,
+            side_effects: r.get::<_, i64>(12)? != 0, max_runtime_min: r.get(13)?, idle_timeout_min: r.get(14)?,
         })).map_err(|e| e.to_string())?;
         rows.collect::<Result<_,_>>().map_err(|e| e.to_string())
     }
@@ -846,7 +850,7 @@ mod store_tests {
         let c = TaskConfig { id:"t1".into(), owner_id:"alice".into(), name:"daily".into(),
             trigger_type:"cron".into(), trigger_spec:"0 0 9 * * *".into(), tz:"Asia/Shanghai".into(),
             agent_type:"claude".into(), work_dir:"/tmp".into(), prompt:"review".into(),
-            enabled:true, retention_n:20, created_ms:123, side_effects:false, max_runtime_min:None };
+            enabled:true, retention_n:20, created_ms:123, side_effects:false, max_runtime_min:None, idle_timeout_min:None };
         s.upsert_config(&c).unwrap();
         assert_eq!(s.list_for_owner("alice").unwrap().len(), 1);
         assert_eq!(s.list_for_owner("bob").unwrap().len(), 0);
@@ -905,7 +909,7 @@ mod store_tests {
             id: id.into(), owner_id: "u".into(), name: "n".into(), trigger_type: "cron".into(),
             trigger_spec: "0 0 * * * *".into(), tz: "Asia/Shanghai".into(), agent_type: "claude".into(),
             work_dir: ".".into(), prompt: "p".into(), enabled: true, retention_n: 20, created_ms: 1,
-            side_effects: false, max_runtime_min: max };
+            side_effects: false, max_runtime_min: max, idle_timeout_min: None };
         s.upsert_config(&mk_cfg("t_long", Some(60))).unwrap();
         s.upsert_config(&mk_cfg("t_def", None)).unwrap();
         let now = 100_000_000i64;
@@ -966,7 +970,7 @@ mod store_tests {
             id: id.into(), owner_id: "u".into(), name: id.into(), trigger_type: "cron".into(),
             trigger_spec: "0 0 * * * *".into(), tz: "Asia/Shanghai".into(), agent_type: "claude".into(),
             work_dir: ".".into(), prompt: "p".into(), enabled: true, retention_n: 20, created_ms: 1,
-            side_effects: se, max_runtime_min: None };
+            side_effects: se, max_runtime_min: None, idle_timeout_min: None };
         s.upsert_config(&mk_cfg("t_se", true)).unwrap();
         s.upsert_config(&mk_cfg("t_ro", false)).unwrap();
         let mk_run = |id: &str, task: &str| TaskRun { id: id.into(), task_id: task.into(), scheduled_for_ms: 1,
@@ -999,7 +1003,7 @@ mod store_tests {
         let cfg = TaskConfig { id: "t".into(), owner_id: "u".into(), name: "n".into(), trigger_type: "cron".into(),
             trigger_spec: "0 0 * * * *".into(), tz: "Asia/Shanghai".into(), agent_type: "claude".into(),
             work_dir: ".".into(), prompt: "NEW prompt".into(), enabled: true, retention_n: 20, created_ms: 1,
-            side_effects: true, max_runtime_min: None };
+            side_effects: true, max_runtime_min: None, idle_timeout_min: None };
         s.upsert_config(&cfg).unwrap();
         let run = TaskRun { id: "r_orig".into(), task_id: "t".into(), scheduled_for_ms: 1, state: "claimed".into(),
             session_id: None, verdict: None, failure_kind: None, started_ms: Some(1), ended_ms: None,
@@ -1029,7 +1033,7 @@ mod store_tests {
         let cfg = TaskConfig { id: "t".into(), owner_id: "u".into(), name: "n".into(), trigger_type: "cron".into(),
             trigger_spec: "0 0 * * * *".into(), tz: "Asia/Shanghai".into(), agent_type: "claude".into(),
             work_dir: ".".into(), prompt: "p".into(), enabled: true, retention_n: 20, created_ms: 1,
-            side_effects: false, max_runtime_min: None };
+            side_effects: false, max_runtime_min: None, idle_timeout_min: None };
         s.upsert_config(&cfg).unwrap();
         let run = TaskRun { id: "r1".into(), task_id: "t".into(), scheduled_for_ms: 1, state: "claimed".into(),
             session_id: None, verdict: None, failure_kind: None, started_ms: Some(1), ended_ms: None,

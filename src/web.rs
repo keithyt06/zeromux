@@ -1366,6 +1366,7 @@ async fn create_scheduled(
         created_ms: chrono::Utc::now().timestamp_millis(),
         side_effects: req.side_effects,
         max_runtime_min: req.max_runtime_min.map(|m| m.clamp(1, 1440)),
+        idle_timeout_min: None,
     };
     state
         .scheduled_tasks
@@ -1408,6 +1409,7 @@ async fn update_scheduled(
         created_ms: existing.created_ms,
         side_effects: req.side_effects,
         max_runtime_min: req.max_runtime_min.map(|m| m.clamp(1, 1440)),
+        idle_timeout_min: None,
     };
     state
         .scheduled_tasks

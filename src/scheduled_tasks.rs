@@ -291,6 +291,48 @@ mod tests {
         assert!(got.side_effects);
         assert_eq!(got.max_runtime_min, Some(60));
     }
+
+    #[test]
+    fn stale_verdict_idle_triggers() {
+        let now = 100_000_000i64;
+        let v = super::stale_verdict(now, now - 90*60_000, Some(now - 90*60_000), 60, 300);
+        assert_eq!(v, Some("idle_timeout"));
+    }
+
+    #[test]
+    fn stale_verdict_recent_activity_survives() {
+        let now = 100_000_000i64;
+        let v = super::stale_verdict(now, now - 45*60_000, Some(now - 1*60_000), 60, 300);
+        assert_eq!(v, None, "健康慢任务:有近期活动,过去会被 30min 默认误杀,现在活下来");
+    }
+
+    #[test]
+    fn stale_verdict_total_hard_cap() {
+        let now = 100_000_000i64;
+        let v = super::stale_verdict(now, now - 310*60_000, Some(now - 1*60_000), 60, 300);
+        assert_eq!(v, Some("watchdog_timeout"));
+    }
+
+    #[test]
+    fn stale_verdict_idle_wins_when_both_exceed() {
+        let now = 100_000_000i64;
+        let v = super::stale_verdict(now, now - 200*60_000, Some(now - 90*60_000), 60, 300);
+        assert_eq!(v, Some("idle_timeout"), "先判空闲");
+    }
+
+    #[test]
+    fn stale_verdict_none_mtime_falls_back_to_started() {
+        let now = 100_000_000i64;
+        assert_eq!(super::stale_verdict(now, now - 90*60_000, None, 60, 300), Some("idle_timeout"));
+        assert_eq!(super::stale_verdict(now, now - 5*60_000, None, 60, 300), None);
+    }
+
+    #[test]
+    fn stale_verdict_zero_idle_kills_immediately() {
+        let now = 100_000_000i64;
+        let v = super::stale_verdict(now, now, Some(now), 0, 300);
+        assert_eq!(v, Some("idle_timeout"), "idle=0 → now-last(0) > 0 恒真 → 全员秒杀");
+    }
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -641,6 +683,26 @@ impl ScheduledStore {
 fn run_dir(run_id: &str) -> std::path::PathBuf {
     let home = std::env::var("HOME").unwrap_or_else(|_| "/home/ubuntu".to_string());
     std::path::Path::new(&home).join(".zeromux").join("runs").join(run_id)
+}
+
+/// 看门狗判定(纯函数,便于单测):返回 Some(failure_kind) 表示应 abort。
+/// last_activity_ms: events.ndjson 的 mtime(epoch ms);无文件传 None → 退化按 started_ms。
+/// 先判空闲(更常见、更需早发现),再判总时长硬上限。
+fn stale_verdict(
+    now_ms: i64,
+    started_ms: i64,
+    last_activity_ms: Option<i64>,
+    idle_timeout_min: i64,
+    max_runtime_min: i64,
+) -> Option<&'static str> {
+    let last = last_activity_ms.unwrap_or(started_ms);
+    if now_ms - last >= idle_timeout_min * 60_000 {
+        return Some("idle_timeout");
+    }
+    if now_ms - started_ms > max_runtime_min * 60_000 {
+        return Some("watchdog_timeout");
+    }
+    None
 }
 
 /// Last `max_lines` human-readable text snippets from a run's events.ndjson —

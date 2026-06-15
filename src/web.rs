@@ -39,6 +39,8 @@ pub fn build_router(state: Arc<AppState>) -> Router {
         .route("/api/sessions/{id}/notes", get(list_notes))
         .route("/api/sessions/{id}/notes", post(create_note))
         .route("/api/sessions/{id}/notes/{note_id}", delete(delete_note))
+        .route("/api/prompts", get(list_prompts).post(create_prompt))
+        .route("/api/prompts/{id}", put(update_prompt).delete(delete_prompt))
         .route("/api/events", get(list_events))
         .route("/api/events/{id}", delete(delete_event))
         .route("/api/scheduled-tasks", get(list_scheduled).post(create_scheduled))
@@ -566,6 +568,18 @@ struct CreateNoteReq {
     tags: Vec<String>,
 }
 
+#[derive(serde::Deserialize)]
+struct CreatePromptReq {
+    title: String,
+    body: String,
+}
+
+#[derive(serde::Deserialize)]
+struct UpdatePromptReq {
+    title: Option<String>,
+    body: Option<String>,
+}
+
 async fn list_notes(
     State(state): State<Arc<AppState>>,
     axum::extract::Path(id): axum::extract::Path<String>,
@@ -610,6 +624,55 @@ async fn delete_note(
     axum::extract::Path((_session_id, note_id)): axum::extract::Path<(String, String)>,
 ) -> StatusCode {
     match state.notes.delete_note(&note_id) {
+        Ok(true) => StatusCode::OK,
+        Ok(false) => StatusCode::NOT_FOUND,
+        Err(_) => StatusCode::INTERNAL_SERVER_ERROR,
+    }
+}
+
+// ── Prompt presets (global, not session-scoped) ──
+
+async fn list_prompts(
+    State(state): State<Arc<AppState>>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    let presets = state
+        .prompts
+        .list()
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
+    Ok(Json(serde_json::json!({ "presets": presets })))
+}
+
+async fn create_prompt(
+    State(state): State<Arc<AppState>>,
+    Json(req): Json<CreatePromptReq>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    match state.prompts.create(&req.title, &req.body) {
+        Ok(p) => Ok(Json(serde_json::json!(p))),
+        // "empty"/"too long" are user-input validation -> 400 (not notes' 500).
+        Err(e) => Err((StatusCode::BAD_REQUEST, e)),
+    }
+}
+
+async fn update_prompt(
+    State(state): State<Arc<AppState>>,
+    axum::extract::Path(id): axum::extract::Path<String>,
+    Json(req): Json<UpdatePromptReq>,
+) -> StatusCode {
+    match state
+        .prompts
+        .update(&id, req.title.as_deref(), req.body.as_deref())
+    {
+        Ok(true) => StatusCode::OK,
+        Ok(false) => StatusCode::NOT_FOUND, // missing id OR empty PUT
+        Err(_) => StatusCode::BAD_REQUEST,  // blank/over-cap field
+    }
+}
+
+async fn delete_prompt(
+    State(state): State<Arc<AppState>>,
+    axum::extract::Path(id): axum::extract::Path<String>,
+) -> StatusCode {
+    match state.prompts.delete(&id) {
         Ok(true) => StatusCode::OK,
         Ok(false) => StatusCode::NOT_FOUND,
         Err(_) => StatusCode::INTERNAL_SERVER_ERROR,

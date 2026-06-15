@@ -332,7 +332,7 @@ mod tests {
     fn stale_verdict_zero_idle_kills_immediately() {
         let now = 100_000_000i64;
         let v = super::stale_verdict(now, now, Some(now), 0, 300);
-        assert_eq!(v, Some("idle_timeout"), "idle=0 → now-last(0) > 0 恒真 → 全员秒杀");
+        assert_eq!(v, Some("idle_timeout"), "idle=0 → now-last(0) >= 0 恒真 → 全员秒杀");
     }
 }
 
@@ -532,19 +532,40 @@ impl ScheduledStore {
         Ok(n)
     }
 
-    /// Watchdog: abort runs that exceeded their task's max_runtime_min
-    /// (default 30 if NULL). Single set-based UPDATE joining config — no
-    /// per-task loop (avoid an N+1 query every tick).
+    /// Watchdog: abort runs whose events.ndjson has been silent longer than the
+    /// task's idle_timeout_min (default 60), OR which exceeded max_runtime_min
+    /// (default 300) total. Idle wins → failure_kind='idle_timeout'; total cap →
+    /// 'watchdog_timeout'. Not a set-based UPDATE: SQLite can't stat files, so we
+    /// query active runs, stat each events.ndjson mtime, judge via stale_verdict.
+    /// Active scheduled runs are few + this ticks every 60s, so the loop is cheap.
     pub fn reconcile_timeouts_per_task(&self, now_ms: i64) -> Result<usize, String> {
-        let conn = self.conn.lock().unwrap();
-        let n = conn.execute(
-            "UPDATE agent_task_runs SET state='aborted', failure_kind='watchdog_timeout', ended_ms=?1 \
-             WHERE state IN ('claimed','running') \
-               AND started_ms < ?1 - (COALESCE( \
-                     (SELECT max_runtime_min FROM agent_runs_config WHERE id = agent_task_runs.task_id), \
-                     30) * 60000)",
-            params![now_ms],
-        ).map_err(|e| e.to_string())?;
+        let candidates: Vec<(String, i64, Option<i64>, Option<i64>)> = {
+            let conn = self.conn.lock().unwrap();
+            let mut stmt = conn.prepare(
+                "SELECT r.id, r.started_ms, c.idle_timeout_min, c.max_runtime_min \
+                 FROM agent_task_runs r JOIN agent_runs_config c ON c.id = r.task_id \
+                 WHERE r.state IN ('claimed','running')").map_err(|e| e.to_string())?;
+            let rows = stmt.query_map(params![], |r| Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, Option<i64>>(1)?.unwrap_or(now_ms),
+                r.get::<_, Option<i64>>(2)?,
+                r.get::<_, Option<i64>>(3)?,
+            ))).map_err(|e| e.to_string())?;
+            rows.collect::<Result<_,_>>().map_err(|e| e.to_string())?
+        };
+        let mut n = 0usize;
+        for (id, started_ms, idle_cfg, max_cfg) in candidates {
+            let last = events_mtime_ms(&id);
+            if let Some(kind) = stale_verdict(
+                now_ms, started_ms, last,
+                idle_cfg.unwrap_or(60), max_cfg.unwrap_or(300),
+            ) {
+                // set_run_state 的 state IN ('claimed','running') 终态守卫保证
+                // 与 fanout 正常 finalize 不双写(spec §11 竞态:先到者赢)。
+                self.set_run_state(&id, "aborted", None, None, Some(kind), Some(now_ms))?;
+                n += 1;
+            }
+        }
         Ok(n)
     }
 
@@ -914,31 +935,38 @@ mod store_tests {
 
     #[test]
     fn per_task_timeout_respects_max_runtime_min() {
+        let _guard = crate::session_manager::HOME_ENV_LOCK.lock().unwrap();
+        let prev = std::env::var("HOME").ok();
+        let home_tmp = tempfile::tempdir().unwrap();
+        std::env::set_var("HOME", home_tmp.path());
         let dir = tempfile::tempdir().unwrap();
         let s = ScheduledStore::open(dir.path()).unwrap();
-        let mk_cfg = |id: &str, max: Option<i64>| TaskConfig {
+        // 无 events.ndjson 文件 → mtime=None → 退化按 started_ms 判 idle。
+        let mk_cfg = |id: &str, idle: Option<i64>, max: Option<i64>| TaskConfig {
             id: id.into(), owner_id: "u".into(), name: "n".into(), trigger_type: "cron".into(),
             trigger_spec: "0 0 * * * *".into(), tz: "Asia/Shanghai".into(), agent_type: "claude".into(),
             work_dir: ".".into(), prompt: "p".into(), enabled: true, retention_n: 20, created_ms: 1,
-            side_effects: false, max_runtime_min: max, idle_timeout_min: None };
-        s.upsert_config(&mk_cfg("t_long", Some(60))).unwrap();
-        s.upsert_config(&mk_cfg("t_def", None)).unwrap();
+            side_effects: false, max_runtime_min: max, idle_timeout_min: idle };
+        // t_patient: idle=120min → 90min 静默不杀;t_def: idle=None(默认60) → 90min 静默杀
+        s.upsert_config(&mk_cfg("t_patient", Some(120), Some(300))).unwrap();
+        s.upsert_config(&mk_cfg("t_def", None, None)).unwrap();
         let now = 100_000_000i64;
         let mk_run = |id: &str, task: &str, started: i64| TaskRun {
             id: id.into(), task_id: task.into(), scheduled_for_ms: started, state: "running".into(),
             session_id: None, verdict: None, failure_kind: None, started_ms: Some(started), ended_ms: None,
             input_snapshot: None, confirm_status: None, replay_of: None };
-        s.claim_run(&mk_run("r_long", "t_long", now - 45*60*1000)).unwrap();
-        s.set_run_state("r_long", "running", None, None, None, None).unwrap();
-        s.claim_run(&mk_run("r_def", "t_def", now - 45*60*1000)).unwrap();
+        s.claim_run(&mk_run("r_patient", "t_patient", now - 90*60*1000)).unwrap();
+        s.set_run_state("r_patient", "running", None, None, None, None).unwrap();
+        s.claim_run(&mk_run("r_def", "t_def", now - 90*60*1000)).unwrap();
         s.set_run_state("r_def", "running", None, None, None, None).unwrap();
 
         s.reconcile_timeouts_per_task(now).unwrap();
-        let long = s.runs_for_task("t_long", 10).unwrap().into_iter().find(|r| r.id=="r_long").unwrap();
+        match prev { Some(h) => std::env::set_var("HOME", h), None => std::env::remove_var("HOME") }
+        let patient = s.runs_for_task("t_patient", 10).unwrap().into_iter().find(|r| r.id=="r_patient").unwrap();
         let def = s.runs_for_task("t_def", 10).unwrap().into_iter().find(|r| r.id=="r_def").unwrap();
-        assert_eq!(long.state, "running");   // 45min < 60min limit → survives
-        assert_eq!(def.state, "aborted");    // 45min > 30min default → aborted
-        assert_eq!(def.failure_kind.as_deref(), Some("watchdog_timeout"));
+        assert_eq!(patient.state, "running", "90min 静默 < idle 120min → 存活");
+        assert_eq!(def.state, "aborted", "90min 静默 > idle 默认 60min → 中止");
+        assert_eq!(def.failure_kind.as_deref(), Some("idle_timeout"));
     }
 
     #[test]

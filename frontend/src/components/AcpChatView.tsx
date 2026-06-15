@@ -1,8 +1,10 @@
 import { useState, useEffect, useRef, useCallback, useMemo, memo, createElement } from 'react'
 import { wsUrl, uploadSessionFile } from '../lib/api'
-import { ChevronDown, Wrench, Brain, AlertCircle, FileText, Terminal, Search, Bot, Paperclip, X, type LucideIcon } from 'lucide-react'
+import { ChevronDown, Wrench, Brain, AlertCircle, FileText, Terminal, Search, Bot, Paperclip, ListPlus, X, type LucideIcon } from 'lucide-react'
 import MarkdownContent from './markdown/MarkdownContent'
 import Composer from './Composer'
+import PromptManager from './PromptManager'
+import { usePromptPresets } from '../lib/usePromptPresets'
 import { buildPromptWithAttachments } from '../lib/attachments'
 import { MicButton } from './MicButton'
 import { useTranscribe } from '../lib/transcribe'
@@ -67,6 +69,9 @@ export default function AcpChatView({ sessionId, agentType = 'claude', onRegiste
   const groups = useMemo(() => foldTranscript(events), [events])
   const [notices, setNotices] = useState<Notice[]>([])
   const [input, setInput] = useState('')
+  const presetStore = usePromptPresets()
+  const [presetOpen, setPresetOpen] = useState(false)
+  const [presetManaging, setPresetManaging] = useState(false)
   const [busy, setBusy] = useState(false)
   const [pending, setPending] = useState<string[]>([])   // 已上传待发的实际路径
   const [uploading, setUploading] = useState(0)           // 上传中计数
@@ -353,7 +358,7 @@ export default function AcpChatView({ sessionId, agentType = 'claude', onRegiste
         {notices.map(n => <NoticeBubble key={n.id} notice={n} />)}
       </div>
 
-      <div className="flex flex-col px-4 py-3 border-t border-[var(--border)] bg-[var(--bg-secondary)]">
+      <div className="relative flex flex-col px-4 py-3 border-t border-[var(--border)] bg-[var(--bg-secondary)]">
         {(transcribe.partial || transcribe.error) && (
           <div className="px-2 pb-1 text-xs italic text-[var(--text-muted)]">
             {transcribe.error
@@ -408,6 +413,52 @@ export default function AcpChatView({ sessionId, agentType = 'claude', onRegiste
           onChange={e => { handleFiles(e.target.files); e.target.value = '' }} />
         <input ref={fileInputRef} type="file" accept="*/*" multiple className="hidden"
           onChange={e => { handleFiles(e.target.files); e.target.value = '' }} />
+        {presetOpen && (
+          <div className="absolute bottom-full left-0 right-0 mb-2 mx-2 rounded-lg border border-[var(--border)] bg-[var(--bg-primary)] shadow-lg z-20">
+            {presetManaging ? (
+              <PromptManager
+                presets={presetStore.presets}
+                error={presetStore.error}
+                onAdd={presetStore.add}
+                onEdit={presetStore.edit}
+                onRemove={presetStore.remove}
+                onClose={() => setPresetManaging(false)}
+              />
+            ) : (
+              <div className="p-2 flex flex-col gap-2">
+                <div className="flex flex-wrap gap-1">
+                  {presetStore.presets.length === 0 && (
+                    <span className="text-[10px] text-[var(--text-muted)] px-1 py-1">还没有常用 prompt</span>
+                  )}
+                  {presetStore.presets.map(p => (
+                    <button
+                      key={p.id}
+                      onClick={() => { setInput(p.body); setPresetOpen(false) }}
+                      title={p.body}
+                      className="px-2 py-0.5 text-[10px] rounded-full bg-[var(--bg-secondary)] border border-[var(--border)] text-[var(--text-secondary)] hover:text-[var(--text-primary)] hover:border-[var(--accent-blue)] transition-colors truncate max-w-[160px]"
+                    >
+                      {p.title}
+                    </button>
+                  ))}
+                </div>
+                <div className="flex justify-between">
+                  <button
+                    onClick={() => setPresetManaging(true)}
+                    className="flex items-center gap-1 px-2 py-1 text-[10px] font-semibold text-[var(--accent-blue)] hover:opacity-80"
+                  >
+                    ✎ 管理
+                  </button>
+                  <button
+                    onClick={() => setPresetOpen(false)}
+                    className="px-2 py-1 text-[10px] text-[var(--text-muted)] hover:text-[var(--text-primary)]"
+                  >
+                    关闭
+                  </button>
+                </div>
+              </div>
+            )}
+          </div>
+        )}
         <Composer
           value={input}
           onChange={setInput}
@@ -416,6 +467,17 @@ export default function AcpChatView({ sessionId, agentType = 'claude', onRegiste
           placeholder={`Send a message to ${agentType === 'kiro' ? 'Kiro' : agentType === 'codex' ? 'Codex' : 'Claude'}...`}
           rightSlot={
             <div className="flex items-end gap-1">
+              <button
+                onClick={() => {
+                  setPresetManaging(false)
+                  setPresetOpen(o => { if (!o) presetStore.reload(); return !o })
+                }}
+                aria-label="prompt presets"
+                className="self-end p-2 text-[var(--text-muted)] hover:text-[var(--text-primary)] rounded-lg transition-colors"
+                title="常用 prompt"
+              >
+                <ListPlus size={16} />
+              </button>
               <button onClick={() => imageInputRef.current?.click()} aria-label="attach image"
                 className="self-end p-2 text-[var(--text-muted)] hover:text-[var(--text-primary)] rounded-lg transition-colors" title="图片">
                 <Paperclip size={16} />

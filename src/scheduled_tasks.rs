@@ -689,6 +689,17 @@ fn run_dir(run_id: &str) -> std::path::PathBuf {
     std::path::Path::new(&home).join(".zeromux").join("runs").join(run_id)
 }
 
+/// events.ndjson 的 mtime(epoch ms)作为 run 的"最后活动时刻"。
+/// append_run_event 每事件 append 该文件,故 mtime 天然随活动刷新。
+/// 文件缺失/不可读 → None(看门狗退化按 started_ms 判)。Best-effort,不返回错误。
+fn events_mtime_ms(run_id: &str) -> Option<i64> {
+    let path = run_dir(run_id).join("events.ndjson");
+    let meta = std::fs::metadata(&path).ok()?;
+    let mtime = meta.modified().ok()?;
+    let dur = mtime.duration_since(std::time::UNIX_EPOCH).ok()?;
+    Some(dur.as_millis() as i64)
+}
+
 /// 看门狗判定(纯函数,便于单测):返回 Some(failure_kind) 表示应 abort。
 /// last_activity_ms: events.ndjson 的 mtime(epoch ms);无文件传 None → 退化按 started_ms。
 /// 先判空闲(更常见、更需早发现),再判总时长硬上限。
@@ -1044,6 +1055,25 @@ mod store_tests {
         s.delete_config("t").unwrap();
         assert!(s.get_config("t").unwrap().is_none());
         assert_eq!(s.runs_for_task("t", 10).unwrap().len(), 0, "run rows must not outlive the deleted task");
+    }
+
+    #[test]
+    fn events_mtime_reads_existing_and_missing() {
+        let _guard = crate::session_manager::HOME_ENV_LOCK.lock().unwrap();
+        let prev = std::env::var("HOME").ok();
+        let tmp = tempfile::tempdir().unwrap();
+        std::env::set_var("HOME", tmp.path());
+        let dir = tmp.path().join(".zeromux/runs/r_mt");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("events.ndjson"), "x\n").unwrap();
+
+        let got = super::events_mtime_ms("r_mt");
+        let missing = super::events_mtime_ms("nope_missing");
+
+        match prev { Some(h) => std::env::set_var("HOME", h), None => std::env::remove_var("HOME") }
+        assert!(got.is_some(), "existing file → Some(mtime)");
+        assert!(got.unwrap() > 0);
+        assert_eq!(missing, None, "missing file → None");
     }
 
     #[test]

@@ -7,6 +7,7 @@ import AdminPanel from './AdminPanel'
 import ScheduledTasksPanel from './ScheduledTasksPanel'
 import PromptManager from './PromptManager'
 import { usePromptPresets } from '../lib/usePromptPresets'
+import { applyPreset } from '../lib/applyPreset'
 import { ClaudeCodeIcon, KiroIcon, CodexIcon } from './BrandIcons'
 
 interface Props {
@@ -641,7 +642,7 @@ export default function Sidebar({ sessions, activeId, onSelect, onCreate, onDele
                       {presetStore.presets.map(p => (
                         <button
                           key={p.id}
-                          onClick={() => setPromptDraft(p.body)}
+                          onClick={() => setPromptDraft(applyPreset(p.body, promptDraft))}
                           title={p.body}
                           className="px-2 py-0.5 text-[10px] rounded-full bg-[var(--bg-secondary)] border border-[var(--border)] text-[var(--text-secondary)] hover:text-[var(--text-primary)] hover:border-[var(--accent-blue)] transition-colors truncate max-w-[120px]"
                         >

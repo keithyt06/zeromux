@@ -5,6 +5,7 @@ import MarkdownContent from './markdown/MarkdownContent'
 import Composer from './Composer'
 import PromptManager from './PromptManager'
 import { usePromptPresets } from '../lib/usePromptPresets'
+import { applyPreset } from '../lib/applyPreset'
 import { buildPromptWithAttachments } from '../lib/attachments'
 import { MicButton } from './MicButton'
 import { useTranscribe } from '../lib/transcribe'
@@ -72,6 +73,7 @@ export default function AcpChatView({ sessionId, agentType = 'claude', onRegiste
   const presetStore = usePromptPresets()
   const [presetOpen, setPresetOpen] = useState(false)
   const [presetManaging, setPresetManaging] = useState(false)
+  const closePreset = useCallback(() => { setPresetOpen(false); setPresetManaging(false) }, [])
   const [busy, setBusy] = useState(false)
   const [pending, setPending] = useState<string[]>([])   // 已上传待发的实际路径
   const [uploading, setUploading] = useState(0)           // 上传中计数
@@ -334,6 +336,14 @@ export default function AcpChatView({ sessionId, agentType = 'claude', onRegiste
     return () => onRegisterControls?.(sessionId, null)
   }, [sessionId, setQueueMode, onRegisterControls])
 
+  // Esc closes the preset popover (parity with the Sidebar pick-prompt step).
+  useEffect(() => {
+    if (!presetOpen) return
+    const onKey = (e: KeyboardEvent) => { if (e.key === 'Escape') closePreset() }
+    window.addEventListener('keydown', onKey)
+    return () => window.removeEventListener('keydown', onKey)
+  }, [presetOpen, closePreset])
+
   return (
     <div className="flex flex-col h-full">
       <div ref={scrollRef} className="flex-1 overflow-y-auto px-5 py-4 space-y-4">
@@ -414,6 +424,10 @@ export default function AcpChatView({ sessionId, agentType = 'claude', onRegiste
         <input ref={fileInputRef} type="file" accept="*/*" multiple className="hidden"
           onChange={e => { handleFiles(e.target.files); e.target.value = '' }} />
         {presetOpen && (
+          // Tap-outside-to-close: transparent full-screen catcher behind the popover.
+          <div className="fixed inset-0 z-10" onClick={closePreset} aria-hidden="true" />
+        )}
+        {presetOpen && (
           <div className="absolute bottom-full left-0 right-0 mb-2 mx-2 rounded-lg border border-[var(--border)] bg-[var(--bg-primary)] shadow-lg z-20">
             {presetManaging ? (
               <PromptManager
@@ -433,7 +447,7 @@ export default function AcpChatView({ sessionId, agentType = 'claude', onRegiste
                   {presetStore.presets.map(p => (
                     <button
                       key={p.id}
-                      onClick={() => { setInput(p.body); setPresetOpen(false) }}
+                      onClick={() => { setInput(applyPreset(p.body, input)); setPresetOpen(false) }}
                       title={p.body}
                       className="px-2 py-0.5 text-[10px] rounded-full bg-[var(--bg-secondary)] border border-[var(--border)] text-[var(--text-secondary)] hover:text-[var(--text-primary)] hover:border-[var(--accent-blue)] transition-colors truncate max-w-[160px]"
                     >
@@ -449,7 +463,7 @@ export default function AcpChatView({ sessionId, agentType = 'claude', onRegiste
                     ✎ 管理
                   </button>
                   <button
-                    onClick={() => setPresetOpen(false)}
+                    onClick={closePreset}
                     className="px-2 py-1 text-[10px] text-[var(--text-muted)] hover:text-[var(--text-primary)]"
                   >
                     关闭

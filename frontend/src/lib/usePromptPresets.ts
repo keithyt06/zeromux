@@ -29,21 +29,29 @@ export function usePromptPresets() {
     setLoading(false)
   }, [])
 
-  const add = useCallback(async (title: string, body: string) => {
+  // add/edit return whether the write succeeded, so callers (PromptManager) can
+  // keep the edit form open on failure instead of discarding the user's draft.
+  const add = useCallback(async (title: string, body: string): Promise<boolean> => {
     try {
       await createPrompt(title, body)
       await reload()
+      return true
     } catch (e) {
       setError(e instanceof Error ? e.message : 'Failed to create preset')
+      return false
     }
   }, [reload])
 
-  const edit = useCallback(async (id: string, fields: { title?: string; body?: string }) => {
+  const edit = useCallback(async (id: string, fields: { title?: string; body?: string }): Promise<boolean> => {
     try {
       await updatePrompt(id, fields)
       await reload()
+      return true
     } catch (e) {
       setError(e instanceof Error ? e.message : 'Failed to update preset')
+      // A concurrently-deleted row 404s here; re-list so it self-corrects (spec: last-writer-wins).
+      reload()
+      return false
     }
   }, [reload])
 
@@ -53,6 +61,8 @@ export function usePromptPresets() {
       await reload()
     } catch (e) {
       setError(e instanceof Error ? e.message : 'Failed to delete preset')
+      // Already-deleted elsewhere → 404; re-list so the stale row disappears.
+      reload()
     }
   }, [reload])
 

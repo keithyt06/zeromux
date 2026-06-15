@@ -792,7 +792,8 @@ pub fn spawn_scheduler(
                     tick.tick().await;
                     let now = chrono::Utc::now();
                     hb.store(now.timestamp_millis(), Ordering::Relaxed);
-                    // runtime watchdog: abort runs past their per-task max_runtime_min (default 30)
+                    // watchdog: abort runs idle past idle_timeout_min (default 60) or
+                    // exceeding max_runtime_min total (default 300)
                     let _ = s.reconcile_timeouts_per_task(now.timestamp_millis());
                     let tasks = match s.list_enabled() { Ok(t) => t, Err(_) => { continue; } };
                     // retention: bound run history (rows + on-disk run dirs) per task.

@@ -597,7 +597,7 @@ impl ScheduledStore {
             "SELECT r.id,r.task_id,r.scheduled_for_ms,r.state,r.session_id,r.verdict,r.failure_kind,r.started_ms,r.ended_ms,r.input_snapshot,r.confirm_status,r.replay_of,c.name \
              FROM agent_task_runs r JOIN agent_runs_config c ON c.id = r.task_id \
              WHERE c.owner_id=?1 AND c.side_effects=1 AND r.state='aborted' \
-               AND r.failure_kind IN ('watchdog_timeout','orphaned_restart') \
+               AND r.failure_kind IN ('watchdog_timeout','orphaned_restart','idle_timeout') \
                AND r.confirm_status IS NULL \
              ORDER BY r.ended_ms DESC").map_err(|e| e.to_string())?;
         let rows = stmt.query_map(params![owner_id], |r| Ok((TaskRun {
@@ -613,7 +613,7 @@ impl ScheduledStore {
         conn.query_row(
             "SELECT COUNT(*) FROM agent_task_runs r JOIN agent_runs_config c ON c.id = r.task_id \
              WHERE c.owner_id=?1 AND c.side_effects=1 AND r.state='aborted' \
-               AND r.failure_kind IN ('watchdog_timeout','orphaned_restart') AND r.confirm_status IS NULL",
+               AND r.failure_kind IN ('watchdog_timeout','orphaned_restart','idle_timeout') AND r.confirm_status IS NULL",
             params![owner_id], |row| row.get(0)).map_err(|e| e.to_string())
     }
 
@@ -628,7 +628,7 @@ impl ScheduledStore {
         let n = conn.execute(
             "UPDATE agent_task_runs SET confirm_status=?2 \
              WHERE id=?1 AND confirm_status IS NULL AND state='aborted' \
-               AND failure_kind IN ('watchdog_timeout','orphaned_restart') \
+               AND failure_kind IN ('watchdog_timeout','orphaned_restart','idle_timeout') \
                AND EXISTS (SELECT 1 FROM agent_runs_config c \
                            WHERE c.id = agent_task_runs.task_id AND c.side_effects=1)",
             params![run_id, status]).map_err(|e| e.to_string())?;
@@ -668,7 +668,7 @@ impl ScheduledStore {
         conn.query_row(
             "SELECT COUNT(*) FROM agent_task_runs r JOIN agent_runs_config c ON c.id=r.task_id \
              WHERE r.id=?1 AND c.side_effects=1 AND r.state='aborted' \
-               AND r.failure_kind IN ('watchdog_timeout','orphaned_restart') AND r.confirm_status IS NULL",
+               AND r.failure_kind IN ('watchdog_timeout','orphaned_restart','idle_timeout') AND r.confirm_status IS NULL",
             params![run_id], |row| row.get::<_,i64>(0)).map(|n| n > 0).map_err(|e| e.to_string())
     }
 
@@ -685,7 +685,7 @@ impl ScheduledStore {
             let mut stmt = conn.prepare(
                 "SELECT r.id FROM agent_task_runs r \
                  WHERE r.task_id=?1 \
-                   AND NOT (r.state='aborted' AND r.failure_kind IN ('watchdog_timeout','orphaned_restart') \
+                   AND NOT (r.state='aborted' AND r.failure_kind IN ('watchdog_timeout','orphaned_restart','idle_timeout') \
                             AND r.confirm_status IS NULL \
                             AND EXISTS (SELECT 1 FROM agent_runs_config c WHERE c.id=r.task_id AND c.side_effects=1)) \
                    AND r.id NOT IN ( \
@@ -1033,6 +1033,29 @@ mod store_tests {
         assert_eq!(r.state, "aborted");                          // confirm didn't change state
         assert_eq!(r.confirm_status.as_deref(), Some("confirmed_done"));
         assert!(!s.set_confirm_status("r_se", "replayed").unwrap()); // already set → false (idempotent guard)
+    }
+
+    #[test]
+    fn idle_timeout_side_effect_enters_confirm_queue() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = ScheduledStore::open(dir.path()).unwrap();
+        let cfg = TaskConfig {
+            id: "t_se".into(), owner_id: "u".into(), name: "t_se".into(), trigger_type: "cron".into(),
+            trigger_spec: "0 0 * * * *".into(), tz: "Asia/Shanghai".into(), agent_type: "claude".into(),
+            work_dir: ".".into(), prompt: "p".into(), enabled: true, retention_n: 20, created_ms: 1,
+            side_effects: true, max_runtime_min: None, idle_timeout_min: None };
+        s.upsert_config(&cfg).unwrap();
+        let run = TaskRun { id: "r_idle".into(), task_id: "t_se".into(), scheduled_for_ms: 1,
+            state: "claimed".into(), session_id: None, verdict: None, failure_kind: None, started_ms: Some(1),
+            ended_ms: None, input_snapshot: None, confirm_status: None, replay_of: None };
+        s.claim_run(&run).unwrap();
+        // 模拟被空闲超时 abort
+        s.set_run_state("r_idle", "aborted", None, None, Some("idle_timeout"), Some(2)).unwrap();
+
+        let q = s.confirmation_queue("u").unwrap();
+        assert_eq!(q.len(), 1, "idle_timeout 的副作用任务必须进确认队列");
+        assert_eq!(q[0].0.failure_kind.as_deref(), Some("idle_timeout"));
+        assert_eq!(s.confirmation_count("u").unwrap(), 1);
     }
 
     #[test]

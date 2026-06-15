@@ -5,6 +5,8 @@ import type { Theme } from '../lib/theme'
 import { Terminal, Plus, X, PanelLeftClose, PanelLeft, Sun, Moon, Folder, FolderGit2, ChevronLeft, Home, LogOut, Users, MonitorUp, Link, Clock } from 'lucide-react'
 import AdminPanel from './AdminPanel'
 import ScheduledTasksPanel from './ScheduledTasksPanel'
+import PromptManager from './PromptManager'
+import { usePromptPresets } from '../lib/usePromptPresets'
 import { ClaudeCodeIcon, KiroIcon, CodexIcon } from './BrandIcons'
 
 interface Props {
@@ -45,7 +47,7 @@ function TurnDot({ s }: { s: SessionInfo }) {
   return <span className={`w-2 h-2 rounded-full shrink-0 ${cls}`} />
 }
 
-type NewSessionStep = 'closed' | 'pick-type' | 'pick-terminal-mode' | 'pick-dir' | 'pick-tmux' | 'pick-prompt'
+type NewSessionStep = 'closed' | 'pick-type' | 'pick-terminal-mode' | 'pick-dir' | 'pick-tmux' | 'pick-prompt' | 'manage-prompts'
 
 /** Per-agent-type icon used in session list rows. Kept in one place so the
  *  sidebar's two render sites (active row, condensed row) stay in sync as
@@ -65,6 +67,7 @@ export default function Sidebar({ sessions, activeId, onSelect, onCreate, onDele
   const [pendingType, setPendingType] = useState<SessionType | null>(null)
   const [promptDraft, setPromptDraft] = useState('')
   const [pendingDir, setPendingDir] = useState<string | null>(null)
+  const presetStore = usePromptPresets()
   const [showAdmin, setShowAdmin] = useState(false)
   const [showScheduled, setShowScheduled] = useState(false)
   const [schedulerHealthy, setSchedulerHealthy] = useState(true)
@@ -175,6 +178,7 @@ export default function Sidebar({ sessions, activeId, onSelect, onCreate, onDele
     } else {
       setPendingDir(path)
       setPromptDraft('')
+      presetStore.reload()
       setStep('pick-prompt')
     }
   }
@@ -632,6 +636,25 @@ export default function Sidebar({ sessions, activeId, onSelect, onCreate, onDele
                     <span className="text-[10px] font-semibold text-[var(--text-muted)] uppercase tracking-wider">Initial prompt (optional)</span>
                   </div>
                   <div className="p-2 flex flex-col gap-2">
+                    {/* Always render the row so "✎ 管理" is reachable even with 0 presets / load failure. */}
+                    <div className="flex flex-wrap items-center gap-1">
+                      {presetStore.presets.map(p => (
+                        <button
+                          key={p.id}
+                          onClick={() => setPromptDraft(p.body)}
+                          title={p.body}
+                          className="px-2 py-0.5 text-[10px] rounded-full bg-[var(--bg-secondary)] border border-[var(--border)] text-[var(--text-secondary)] hover:text-[var(--text-primary)] hover:border-[var(--accent-blue)] transition-colors truncate max-w-[120px]"
+                        >
+                          {p.title}
+                        </button>
+                      ))}
+                      <button
+                        onClick={() => setStep('manage-prompts')}
+                        className="px-2 py-0.5 text-[10px] rounded-full text-[var(--accent-blue)] hover:opacity-80"
+                      >
+                        ✎ 管理
+                      </button>
+                    </div>
                     <textarea
                       autoFocus
                       value={promptDraft}
@@ -669,6 +692,29 @@ export default function Sidebar({ sessions, activeId, onSelect, onCreate, onDele
                       )}
                     </div>
                   </div>
+                </>
+              )}
+
+              {step === 'manage-prompts' && (
+                <>
+                  <div className="flex items-center gap-1 px-2 py-1.5 border-b border-[var(--border)]">
+                    <button
+                      onClick={() => setStep('pick-prompt')}
+                      className="p-0.5 text-[var(--text-secondary)] hover:text-[var(--text-primary)] rounded transition-colors"
+                      title="Back"
+                    >
+                      <ChevronLeft size={14} />
+                    </button>
+                    <span className="text-[10px] font-semibold text-[var(--text-muted)] uppercase tracking-wider">管理常用 prompt</span>
+                  </div>
+                  <PromptManager
+                    presets={presetStore.presets}
+                    error={presetStore.error}
+                    onAdd={presetStore.add}
+                    onEdit={presetStore.edit}
+                    onRemove={presetStore.remove}
+                    onClose={() => setStep('pick-prompt')}
+                  />
                 </>
               )}
             </div>

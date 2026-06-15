@@ -10,6 +10,7 @@ mod events;
 mod logger;
 mod notes;
 mod oauth;
+mod prompts;
 mod pty_bridge;
 mod scheduled_tasks;
 mod session_manager;

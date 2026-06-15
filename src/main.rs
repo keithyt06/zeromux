@@ -128,6 +128,7 @@ pub struct AppState {
     pub logger: Option<logger::Logger>,
     pub db: Option<db::Database>,
     pub notes: notes::NotesStore,
+    pub prompts: prompts::PromptPresetStore,
     pub events: Arc<events::EventStore>,
     pub scheduled_tasks: Arc<scheduled_tasks::ScheduledStore>,
     pub sched_heartbeat: Arc<std::sync::atomic::AtomicI64>,
@@ -224,6 +225,9 @@ async fn main() {
     let notes_store = notes::NotesStore::open(std::path::Path::new(&data_dir_str))
         .expect("Failed to initialize notes store");
 
+    let prompts_store = prompts::PromptPresetStore::open(std::path::Path::new(&data_dir_str))
+        .expect("Failed to open prompts store");
+
     let event_store = Arc::new(
         events::EventStore::open(std::path::Path::new(&data_dir_str))
             .expect("Failed to initialize event store"),
@@ -267,6 +271,7 @@ async fn main() {
         logger,
         db: database,
         notes: notes_store,
+        prompts: prompts_store,
         events: event_store,
         scheduled_tasks: scheduled_store.clone(),
         sched_heartbeat: Arc::new(std::sync::atomic::AtomicI64::new(0)),

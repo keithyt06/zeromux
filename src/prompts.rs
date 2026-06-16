@@ -174,6 +174,59 @@ impl PromptPresetStore {
             .map_err(|e| format!("Delete error: {}", e))?;
         Ok(rows > 0)
     }
+
+    /// First-run seeding of the version-controlled starter presets. Idempotent
+    /// and user-respecting: it runs at most once per database, gated by
+    /// `PRAGMA user_version` (NOT "table is empty" — the live DB persists across
+    /// deploys, so emptiness would resurrect presets the user deliberately deleted).
+    ///
+    /// - `user_version >= 1` → already seeded, never touched again (returns 0).
+    /// - otherwise: insert the presets ONLY if the table is empty (don't stack
+    ///   onto a hand-populated library), then mark `user_version = 1` regardless.
+    ///
+    /// The inserts and the `user_version = 1` marker are written in ONE
+    /// transaction (SQLite stores `user_version` in the db header and the write
+    /// is transactional), so the seed and its marker land atomically — both or
+    /// neither. A crash mid-seed rolls back cleanly and the next boot re-seeds
+    /// from scratch; there is no reachable "rows present but unmarked" state to
+    /// resurrect deleted presets from. The empty-table check still guards against
+    /// stacking onto a hand-populated library. Returns the number inserted.
+    ///
+    /// SQL is inlined under the single held lock — calling `self.create()` would
+    /// re-lock the non-reentrant Mutex and deadlock.
+    pub fn seed_if_unseeded(&self, presets: &[(&str, &str)]) -> Result<usize, String> {
+        let mut conn = self.conn.lock().unwrap();
+        let version: i64 = conn
+            .query_row("PRAGMA user_version", [], |row| row.get(0))
+            .map_err(|e| format!("Pragma read error: {}", e))?;
+        if version >= 1 {
+            return Ok(0);
+        }
+        let count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM prompt_presets", [], |row| row.get(0))
+            .map_err(|e| format!("Count error: {}", e))?;
+        let now = now_iso();
+        let tx = conn.transaction().map_err(|e| format!("Tx error: {}", e))?;
+        let mut inserted = 0usize;
+        // Insert ONLY into a fresh empty library; never stack onto user content.
+        if count == 0 {
+            for (i, (title, body)) in presets.iter().enumerate() {
+                tx.execute(
+                    "INSERT INTO prompt_presets (id, title, body, created_at, updated_at, sort_order)
+                     VALUES (?1, ?2, ?3, ?4, ?4, ?5)",
+                    params![short_uuid(), title.trim(), body.trim(), now, (i as i64) + 1],
+                )
+                .map_err(|e| format!("Seed insert error: {}", e))?;
+                inserted += 1;
+            }
+        }
+        // Mark seeded in the same tx — atomic with the inserts (and set even when
+        // we skipped a prepopulated library, so it's never reconsidered).
+        tx.execute_batch("PRAGMA user_version = 1")
+            .map_err(|e| format!("Pragma write error: {}", e))?;
+        tx.commit().map_err(|e| format!("Seed commit error: {}", e))?;
+        Ok(inserted)
+    }
 }
 
 // Private to notes.rs — duplicated here (two tiny fns, not worth a shared util).
@@ -274,5 +327,87 @@ mod tests {
         assert_eq!(s.delete(&p.id).unwrap(), true);
         assert_eq!(s.list().unwrap().len(), 0);
         assert_eq!(s.delete(&p.id).unwrap(), false);
+    }
+
+    // ── seed_if_unseeded ──
+    use crate::prompts_seed::SEED_PRESETS;
+
+    #[test]
+    fn seed_inserts_eight_on_fresh_db() {
+        let (s, _d) = tmp_store();
+        let n = s.seed_if_unseeded(SEED_PRESETS).unwrap();
+        assert_eq!(n, SEED_PRESETS.len());
+        let all = s.list().unwrap();
+        assert_eq!(all.len(), SEED_PRESETS.len());
+        // order + content match the embedded array (sort_order = index)
+        for (row, (title, body)) in all.iter().zip(SEED_PRESETS.iter()) {
+            assert_eq!(&row.title, title);
+            assert_eq!(&row.body, body);
+        }
+    }
+
+    #[test]
+    fn seed_is_idempotent() {
+        let (s, _d) = tmp_store();
+        assert_eq!(s.seed_if_unseeded(SEED_PRESETS).unwrap(), SEED_PRESETS.len());
+        // second call is a no-op: marker already set
+        assert_eq!(s.seed_if_unseeded(SEED_PRESETS).unwrap(), 0);
+        assert_eq!(s.list().unwrap().len(), SEED_PRESETS.len());
+    }
+
+    #[test]
+    fn seed_does_not_resurrect_after_delete_all() {
+        let (s, _d) = tmp_store();
+        s.seed_if_unseeded(SEED_PRESETS).unwrap();
+        for p in s.list().unwrap() {
+            s.delete(&p.id).unwrap();
+        }
+        assert_eq!(s.list().unwrap().len(), 0);
+        // already seeded once → never refill, even though table is empty now
+        assert_eq!(s.seed_if_unseeded(SEED_PRESETS).unwrap(), 0);
+        assert_eq!(s.list().unwrap().len(), 0);
+    }
+
+    #[test]
+    fn seed_skips_when_prepopulated() {
+        let (s, _d) = tmp_store();
+        // a library that already has user content (e.g. hand-POSTed on a live DB)
+        s.create("mine", "body").unwrap();
+        assert_eq!(s.seed_if_unseeded(SEED_PRESETS).unwrap(), 0); // no stacking
+        let all = s.list().unwrap();
+        assert_eq!(all.len(), 1);
+        assert_eq!(all[0].title, "mine");
+        // and still no-op afterwards
+        assert_eq!(s.seed_if_unseeded(SEED_PRESETS).unwrap(), 0);
+        assert_eq!(s.list().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn seed_marker_persists_across_reopen() {
+        // The marker must be durable on disk (not just in-memory), or every
+        // restart/deploy would re-seed. Reopen the SAME db file and confirm the
+        // second seed is a no-op. This pins the user_version write as persistent.
+        let dir = tempfile::tempdir().unwrap();
+        {
+            let s = PromptPresetStore::open(dir.path()).unwrap();
+            assert_eq!(s.seed_if_unseeded(SEED_PRESETS).unwrap(), SEED_PRESETS.len());
+        } // drop closes the connection / flushes
+        {
+            let s = PromptPresetStore::open(dir.path()).unwrap();
+            assert_eq!(s.seed_if_unseeded(SEED_PRESETS).unwrap(), 0);
+            assert_eq!(s.list().unwrap().len(), SEED_PRESETS.len());
+        }
+    }
+
+    #[test]
+    fn seed_content_within_caps() {
+        for (title, body) in SEED_PRESETS {
+            let t = title.trim();
+            let b = body.trim();
+            assert!(!t.is_empty(), "seed title empty");
+            assert!(!b.is_empty(), "seed body empty: {}", t);
+            assert!(t.chars().count() <= TITLE_MAX, "seed title too long: {}", t);
+            assert!(b.chars().count() <= BODY_MAX, "seed body too long: {}", t);
+        }
     }
 }

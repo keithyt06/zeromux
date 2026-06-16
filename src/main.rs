@@ -11,6 +11,7 @@ mod logger;
 mod notes;
 mod oauth;
 mod prompts;
+mod prompts_seed;
 mod pty_bridge;
 mod scheduled_tasks;
 mod session_manager;
@@ -227,6 +228,15 @@ async fn main() {
 
     let prompts_store = prompts::PromptPresetStore::open(std::path::Path::new(&data_dir_str))
         .expect("Failed to open prompts store");
+    // First-run only: populate the version-controlled starter presets. Idempotent
+    // and user-respecting (see seed_if_unseeded). Content correctness is guarded by
+    // the seed_content_within_caps test; a runtime error here can only be DB/IO, so
+    // log and continue — a seeding hiccup must not take down the server.
+    match prompts_store.seed_if_unseeded(prompts_seed::SEED_PRESETS) {
+        Ok(0) => {}
+        Ok(n) => eprintln!("Seeded {} starter prompt presets", n),
+        Err(e) => eprintln!("Prompt preset seeding skipped: {}", e),
+    }
 
     let event_store = Arc::new(
         events::EventStore::open(std::path::Path::new(&data_dir_str))

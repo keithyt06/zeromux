@@ -8,10 +8,12 @@
  *
  * Uses a function replacer so regex-special sequences in `current` (`$&`, `$1`, …)
  * are inserted literally rather than interpreted as replacement-string specials.
+ *
+ * The regex is a fresh literal each call (not a shared module-level `/g` object):
+ * `.replace` with no match already returns `body` unchanged, so a separate
+ * `.test()` guard is unnecessary — and a shared global regex would carry mutable
+ * `lastIndex` between calls, which is a footgun worth not having at all.
  */
-const INPUT_TOKEN = /\{\{\s*input\s*\}\}/g
-
 export function applyPreset(body: string, current: string): string {
-  if (!INPUT_TOKEN.test(body)) return body
-  return body.replace(INPUT_TOKEN, () => current)
+  return body.replace(/\{\{\s*input\s*\}\}/g, () => current)
 }

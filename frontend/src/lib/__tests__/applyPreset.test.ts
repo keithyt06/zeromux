@@ -31,4 +31,15 @@ describe('applyPreset', () => {
     // $& / $1 are replacement-string specials — must not be interpreted.
     expect(applyPreset('wrap: {{input}}', '$& and $1 and \\n')).toBe('wrap: $& and $1 and \\n')
   })
+
+  it('repeated calls are independent (no shared global-regex lastIndex state)', () => {
+    // Guards against reintroducing a module-level /g regex whose mutable lastIndex
+    // could leak between clicks and leave {{input}} unsubstituted. Mix token /
+    // no-token / end-anchored bodies so a stale lastIndex would surface.
+    const bodies = ['a {{input}} b', 'no token', '{{input}}', 'x {{ input }}']
+    for (let i = 0; i < 100; i++) {
+      const out = applyPreset(bodies[i % bodies.length], `v${i}`)
+      expect(out).not.toContain('{{')
+    }
+  })
 })

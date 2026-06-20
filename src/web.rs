@@ -821,12 +821,14 @@ async fn get_session_file(
 ) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
     let base = resolve_base_dir(&state, &id, query.base_dir.as_deref())?;
 
-    // Security: resolve and check path is under base
-    let file_path = base.join(&query.path).canonicalize()
-        .map_err(|e| (StatusCode::BAD_REQUEST, format!("Invalid path: {}", e)))?;
+    // Security: resolve + verify the real path is under base (follows symlinks).
+    let file_path = resolve_and_verify(&base, &query.path)?;
 
-    if !file_path.starts_with(&base) {
-        return Err((StatusCode::FORBIDDEN, "Path traversal denied".to_string()));
+    // Refuse credential / sensitive files by name.
+    if let Some(name) = file_path.file_name().and_then(|s| s.to_str()) {
+        if is_credential_path(name) {
+            return Err((StatusCode::FORBIDDEN, "Credential file access denied".to_string()));
+        }
     }
 
     // Size check (1MB max)
@@ -908,15 +910,13 @@ fn resolve_session_path(
     Ok((base, joined))
 }
 
-// ── Unified path-safety helpers (B-Task 1; wired into endpoints in B-Task 2) ──
+// ── Unified path-safety helpers ──
 //
-// These are the single source of truth for file-endpoint safety. They are not yet
-// called by the existing handlers (that rewiring is B-Task 2), so they carry a
-// narrow #[allow(dead_code)] until then.
+// These are the single source of truth for file-endpoint safety, wired into the
+// read/write/upload handlers below.
 
 /// Credential / sensitive filenames: never enumerated by `list`, refused by `download`.
 /// Operates on the file NAME only (no directory components), case-insensitive.
-#[allow(dead_code)]
 fn is_credential_path(name: &str) -> bool {
     let n = name.to_ascii_lowercase();
     n.starts_with(".env")
@@ -928,7 +928,6 @@ fn is_credential_path(name: &str) -> bool {
 
 /// Write-blocked control dirs: if any component of the canonical real path matches,
 /// writes are denied (defends against a symlinked parent dir bypassing the check).
-#[allow(dead_code)]
 fn is_write_blocked(canonical: &std::path::Path) -> bool {
     canonical.components().any(|c| {
         matches!(c, std::path::Component::Normal(s)
@@ -946,7 +945,6 @@ fn is_write_blocked(canonical: &std::path::Path) -> bool {
 /// the window to near-zero (for reads it is sufficient: the file already exists and
 /// canonicalize yields its real path). The residual canonicalize→open TOCTOU window is
 /// low-risk in the single-user work_dir scenario; openat2 hardening is a deferred seam.
-#[allow(dead_code)]
 fn resolve_and_verify(
     base_canonical: &std::path::Path,
     rel: &str,
@@ -990,13 +988,24 @@ async fn write_session_file(
     axum::extract::Path(id): axum::extract::Path<String>,
     Json(req): Json<WriteFileReq>,
 ) -> Result<StatusCode, (StatusCode, String)> {
-    let (_base, file_path) = resolve_session_path(&state, &id, &req.path)?;
+    let base = resolve_base_dir(&state, &id, None)?;
 
-    // Ensure parent directory exists
-    if let Some(parent) = file_path.parent() {
-        std::fs::create_dir_all(parent)
-            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("Cannot create dir: {}", e)))?;
+    // The parent directory must already exist (we do not implicitly create
+    // client-named directory trees). Resolve + verify the real parent is under base,
+    // then write the leaf file inside it.
+    let rel = std::path::Path::new(&req.path);
+    let file_name = rel
+        .file_name()
+        .and_then(|s| s.to_str())
+        .ok_or((StatusCode::BAD_REQUEST, "Invalid file path".to_string()))?;
+    let parent_rel = rel.parent().map(|p| p.to_string_lossy().into_owned()).unwrap_or_default();
+    let real_parent = resolve_and_verify(&base, &parent_rel)?;
+
+    if is_write_blocked(&real_parent) {
+        return Err((StatusCode::FORBIDDEN, "Writes to control directories denied".to_string()));
     }
+
+    let file_path = real_parent.join(file_name);
 
     std::fs::write(&file_path, &req.content)
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("Write failed: {}", e)))?;
@@ -1109,6 +1118,19 @@ fn dedupe_and_create(dir: &std::path::Path, name: &str) -> std::io::Result<(std:
     Err(std::io::Error::new(std::io::ErrorKind::AlreadyExists, "too many name collisions"))
 }
 
+/// Split an upload relative path into (target directory, safe file name). Preserves the
+/// directory part (fixes the bug where only file_name() was taken, so uploads always
+/// landed in work_dir root regardless of the browsed subdir).
+fn split_upload_target(base: &std::path::Path, rel: &str) -> (std::path::PathBuf, String) {
+    let p = std::path::Path::new(rel);
+    let name = sanitize_filename(p.file_name().and_then(|s| s.to_str()).unwrap_or("upload"));
+    let dir = match p.parent() {
+        Some(par) if !par.as_os_str().is_empty() => base.join(par),
+        _ => base.to_path_buf(),
+    };
+    (dir, name)
+}
+
 #[derive(serde::Deserialize)]
 struct UploadReq {
     path: String,
@@ -1127,13 +1149,22 @@ async fn upload_session_file(
     axum::extract::Path(id): axum::extract::Path<String>,
     Json(req): Json<UploadReq>,
 ) -> Result<Json<UploadResp>, (StatusCode, String)> {
-    let safe_name = sanitize_filename(
-        std::path::Path::new(&req.path)
-            .file_name()
-            .and_then(|s| s.to_str())
-            .unwrap_or("upload"),
-    );
-    let (base, _joined) = resolve_session_path(&state, &id, &safe_name)?;
+    let base = resolve_base_dir(&state, &id, None)?;
+
+    // Honor the directory part of the upload path (e.g. "sub/dir/pic.png" → base/sub/dir).
+    let (target_dir, safe_name) = split_upload_target(&base, &req.path);
+
+    // Verify the target directory's real path is under base. Its relative part is the
+    // upload path with the leaf name stripped; the directory must already exist.
+    let parent_rel = target_dir
+        .strip_prefix(&base)
+        .map(|p| p.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    let real_target = resolve_and_verify(&base, &parent_rel)?;
+
+    if is_write_blocked(&real_target) {
+        return Err((StatusCode::FORBIDDEN, "Writes to control directories denied".to_string()));
+    }
 
     let bytes = base64::Engine::decode(&base64::engine::general_purpose::STANDARD, &req.data)
         .map_err(|e| (StatusCode::BAD_REQUEST, format!("Invalid base64: {}", e)))?;
@@ -1142,10 +1173,7 @@ async fn upload_session_file(
         return Err((StatusCode::BAD_REQUEST, "File too large (max 20MB)".to_string()));
     }
 
-    std::fs::create_dir_all(&base)
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("Cannot create dir: {}", e)))?;
-
-    let (mut file, actual_name) = dedupe_and_create(&base, &safe_name)
+    let (mut file, actual_name) = dedupe_and_create(&real_target, &safe_name)
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("Create failed: {}", e)))?;
     use std::io::Write;
     file.write_all(&bytes)
@@ -1947,6 +1975,19 @@ mod upload_helpers_tests {
         assert_eq!(n3, "a-2.png");
 
         assert_eq!(std::fs::read(d.join("a.png")).unwrap(), b"one");
+    }
+
+    #[test]
+    fn upload_targets_subdir_not_root() {
+        // Pure helper behavior: base + "sub/dir/pic.png" → dir base/sub/dir, name pic.png.
+        let base = std::path::Path::new("/home/u/work");
+        let (dir, name) = split_upload_target(base, "sub/dir/pic.png");
+        assert_eq!(dir, std::path::Path::new("/home/u/work/sub/dir"));
+        assert_eq!(name, "pic.png");
+        // Bare filename → lands in base.
+        let (dir2, name2) = split_upload_target(base, "pic.png");
+        assert_eq!(dir2, base);
+        assert_eq!(name2, "pic.png");
     }
 
     #[test]

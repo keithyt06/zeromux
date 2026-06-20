@@ -750,9 +750,11 @@ struct FilesQuery {
 
 async fn list_session_files(
     State(state): State<Arc<AppState>>,
+    user: axum::Extension<CurrentUser>,
     axum::extract::Path(id): axum::extract::Path<String>,
     Query(query): Query<FilesQuery>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    require_session_access(&state, &user, &id)?;
     let base = resolve_base_dir(&state, &id, query.base_dir.as_deref())?;
 
     let pattern = query.pattern.as_deref().unwrap_or("*.md");
@@ -827,15 +829,21 @@ struct FileQuery {
 
 async fn get_session_file(
     State(state): State<Arc<AppState>>,
+    user: axum::Extension<CurrentUser>,
     axum::extract::Path(id): axum::extract::Path<String>,
     Query(query): Query<FileQuery>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    require_session_access(&state, &user, &id)?;
     let base = resolve_base_dir(&state, &id, query.base_dir.as_deref())?;
 
     // Security: resolve + verify the real path is under base (follows symlinks).
     let file_path = resolve_and_verify(&base, &query.path)?;
 
-    // Refuse credential / sensitive files by name.
+    // Refuse credential / sensitive files by name, or any path descending into a
+    // sensitive directory (.ssh/.aws/.gnupg/.git) even if the leaf looks innocuous.
+    if descends_into_sensitive_dir(&base, &file_path) {
+        return Err((StatusCode::FORBIDDEN, "Access to sensitive directory denied".to_string()));
+    }
     if let Some(name) = file_path.file_name().and_then(|s| s.to_str()) {
         if is_credential_path(name) {
             return Err((StatusCode::FORBIDDEN, "Credential file access denied".to_string()));
@@ -866,11 +874,16 @@ fn build_raw_headers(filename: &str) -> (&'static str, &'static str, String) {
 
 async fn get_file_raw(
     State(state): State<Arc<AppState>>,
+    user: axum::Extension<CurrentUser>,
     axum::extract::Path(id): axum::extract::Path<String>,
     Query(query): Query<FileQuery>,
 ) -> Result<Response, (StatusCode, String)> {
+    require_session_access(&state, &user, &id)?;
     let base = resolve_base_dir(&state, &id, query.base_dir.as_deref())?;
     let real = resolve_and_verify(&base, &query.path)?;
+    if descends_into_sensitive_dir(&base, &real) {
+        return Err((StatusCode::FORBIDDEN, "Forbidden".into()));
+    }
     let fname = real.file_name().and_then(|s| s.to_str()).unwrap_or("download");
     if is_credential_path(fname) {
         return Err((StatusCode::FORBIDDEN, "Forbidden".into()));
@@ -884,6 +897,21 @@ async fn get_file_raw(
         .header("Content-Disposition", disp)
         .body(axum::body::Body::from(bytes))
         .unwrap())
+}
+
+/// Owner gate for the file/dir endpoints: an authenticated non-admin user may only
+/// touch sessions they own. Mirrors the check used by session delete/patch. Legacy
+/// password mode runs as a synthetic admin, so this is a no-op there.
+fn require_session_access(
+    state: &AppState,
+    user: &CurrentUser,
+    session_id: &str,
+) -> Result<(), (StatusCode, String)> {
+    if user.is_admin() || state.sessions.is_owner(session_id, &user.id) {
+        Ok(())
+    } else {
+        Err((StatusCode::FORBIDDEN, "Not your session".to_string()))
+    }
 }
 
 /// Resolve the effective base directory: use base_dir_override if provided, otherwise session work_dir.
@@ -965,10 +993,35 @@ fn is_credential_path(name: &str) -> bool {
         || n.ends_with("credentials")
 }
 
-/// Write-blocked control dirs: if any component of the canonical real path matches,
-/// writes are denied (defends against a symlinked parent dir bypassing the check).
-fn is_write_blocked(canonical: &std::path::Path) -> bool {
-    canonical.components().any(|c| {
+/// Sensitive directories that must never be traversed by read endpoints (a path
+/// that descends *into* one of these, e.g. `.ssh/config` or `.aws/credentials`,
+/// is refused even though the leaf name itself isn't credential-shaped). Checked
+/// against the components below the workspace base.
+fn descends_into_sensitive_dir(base: &std::path::Path, canonical: &std::path::Path) -> bool {
+    let rel = match canonical.strip_prefix(base) {
+        Ok(r) => r,
+        Err(_) => return true,
+    };
+    rel.components().any(|c| {
+        matches!(c, std::path::Component::Normal(s)
+            if matches!(s.to_str(),
+                Some(".ssh") | Some(".aws") | Some(".gnupg") | Some(".git")))
+    })
+}
+
+/// Write-blocked control dirs: deny writes that descend into a control directory
+/// (.git/.zeromux/.zeromux-worktrees/.ssh) *below the workspace base*.
+///
+/// Only components below `base` are inspected. Agent sessions run with a base of
+/// `<repo>/.zeromux-worktrees/<id>/`, so checking the full canonical path would (and
+/// did) match `.zeromux-worktrees` in the base prefix and 403 *every* write in an
+/// agent workspace. A path that isn't under `base` is refused defensively.
+fn is_write_blocked(base: &std::path::Path, canonical: &std::path::Path) -> bool {
+    let rel = match canonical.strip_prefix(base) {
+        Ok(r) => r,
+        Err(_) => return true,
+    };
+    rel.components().any(|c| {
         matches!(c, std::path::Component::Normal(s)
             if matches!(s.to_str(), Some(".git") | Some(".zeromux") | Some(".zeromux-worktrees") | Some(".ssh")))
     })
@@ -1035,6 +1088,9 @@ fn list_dir_entries(
     } else {
         resolve_and_verify(base_canonical, rel)?
     };
+    if descends_into_sensitive_dir(base_canonical, &dir) {
+        return Err((StatusCode::FORBIDDEN, "Access to sensitive directory denied".into()));
+    }
     if !dir.is_dir() {
         return Err((StatusCode::BAD_REQUEST, "Not a directory".into()));
     }
@@ -1063,7 +1119,7 @@ fn list_dir_entries(
                 .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
                 .map(|d| d.as_secs())
                 .unwrap_or(0),
-            writable: !is_write_blocked(&dir.join(&name)),
+            writable: !is_write_blocked(base_canonical, &dir.join(&name)),
             name,
         });
     }
@@ -1074,9 +1130,11 @@ fn list_dir_entries(
 
 async fn list_dir(
     State(state): State<Arc<AppState>>,
+    user: axum::Extension<CurrentUser>,
     axum::extract::Path(id): axum::extract::Path<String>,
     Query(query): Query<DirQuery>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    require_session_access(&state, &user, &id)?;
     let base = resolve_base_dir(&state, &id, None)?;
     let (entries, truncated) = list_dir_entries(&base, query.path.as_deref().unwrap_or(""))?;
     let arr: Vec<_> = entries
@@ -1100,9 +1158,11 @@ struct WriteFileReq {
 
 async fn write_session_file(
     State(state): State<Arc<AppState>>,
+    user: axum::Extension<CurrentUser>,
     axum::extract::Path(id): axum::extract::Path<String>,
     Json(req): Json<WriteFileReq>,
 ) -> Result<StatusCode, (StatusCode, String)> {
+    require_session_access(&state, &user, &id)?;
     let base = resolve_base_dir(&state, &id, None)?;
 
     // The parent directory must already exist (we do not implicitly create
@@ -1116,11 +1176,20 @@ async fn write_session_file(
     let parent_rel = rel.parent().map(|p| p.to_string_lossy().into_owned()).unwrap_or_default();
     let real_parent = resolve_and_verify(&base, &parent_rel)?;
 
-    if is_write_blocked(&real_parent) {
+    if is_write_blocked(&base, &real_parent) {
         return Err((StatusCode::FORBIDDEN, "Writes to control directories denied".to_string()));
     }
 
     let file_path = real_parent.join(file_name);
+
+    // Refuse to follow an existing symlink leaf out of the workspace (the parent is
+    // verified under base, but the leaf name itself could be a symlink). Reads use
+    // canonicalize; writes create the file, so guard the leaf explicitly here.
+    if let Ok(meta) = std::fs::symlink_metadata(&file_path) {
+        if meta.file_type().is_symlink() {
+            return Err((StatusCode::FORBIDDEN, "Refusing to write through a symlink".to_string()));
+        }
+    }
 
     std::fs::write(&file_path, &req.content)
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("Write failed: {}", e)))?;
@@ -1132,9 +1201,11 @@ async fn write_session_file(
 
 async fn delete_session_file(
     State(state): State<Arc<AppState>>,
+    user: axum::Extension<CurrentUser>,
     axum::extract::Path(id): axum::extract::Path<String>,
     Query(query): Query<FileQuery>,
 ) -> Result<StatusCode, (StatusCode, String)> {
+    require_session_access(&state, &user, &id)?;
     let (base, _) = resolve_session_path(&state, &id, &query.path)?;
 
     let file_path = base.join(&query.path).canonicalize()
@@ -1164,9 +1235,11 @@ struct RenameReq {
 
 async fn rename_session_file(
     State(state): State<Arc<AppState>>,
+    user: axum::Extension<CurrentUser>,
     axum::extract::Path(id): axum::extract::Path<String>,
     Json(req): Json<RenameReq>,
 ) -> Result<StatusCode, (StatusCode, String)> {
+    require_session_access(&state, &user, &id)?;
     let (base, _) = resolve_session_path(&state, &id, &req.from)?;
     let (_, to_path) = resolve_session_path(&state, &id, &req.to)?;
 
@@ -1261,9 +1334,11 @@ struct UploadResp {
 
 async fn upload_session_file(
     State(state): State<Arc<AppState>>,
+    user: axum::Extension<CurrentUser>,
     axum::extract::Path(id): axum::extract::Path<String>,
     Json(req): Json<UploadReq>,
 ) -> Result<Json<UploadResp>, (StatusCode, String)> {
+    require_session_access(&state, &user, &id)?;
     let base = resolve_base_dir(&state, &id, None)?;
 
     // Honor the directory part of the upload path (e.g. "sub/dir/pic.png" → base/sub/dir).
@@ -1277,7 +1352,7 @@ async fn upload_session_file(
         .unwrap_or_default();
     let real_target = resolve_and_verify(&base, &parent_rel)?;
 
-    if is_write_blocked(&real_target) {
+    if is_write_blocked(&base, &real_target) {
         return Err((StatusCode::FORBIDDEN, "Writes to control directories denied".to_string()));
     }
 
@@ -1306,9 +1381,11 @@ struct DirOpReq {
 
 async fn create_session_dir(
     State(state): State<Arc<AppState>>,
+    user: axum::Extension<CurrentUser>,
     axum::extract::Path(id): axum::extract::Path<String>,
     Json(req): Json<DirOpReq>,
 ) -> Result<StatusCode, (StatusCode, String)> {
+    require_session_access(&state, &user, &id)?;
     let (_base, dir_path) = resolve_session_path(&state, &id, &req.path)?;
 
     std::fs::create_dir_all(&dir_path)
@@ -1319,9 +1396,11 @@ async fn create_session_dir(
 
 async fn delete_session_dir(
     State(state): State<Arc<AppState>>,
+    user: axum::Extension<CurrentUser>,
     axum::extract::Path(id): axum::extract::Path<String>,
     Query(query): Query<DirOpReq>,
 ) -> Result<StatusCode, (StatusCode, String)> {
+    require_session_access(&state, &user, &id)?;
     let (base, _) = resolve_session_path(&state, &id, &query.path)?;
 
     let dir_path = base.join(&query.path).canonicalize()
@@ -1348,9 +1427,11 @@ async fn delete_session_dir(
 
 async fn rename_session_dir(
     State(state): State<Arc<AppState>>,
+    user: axum::Extension<CurrentUser>,
     axum::extract::Path(id): axum::extract::Path<String>,
     Json(req): Json<RenameReq>,
 ) -> Result<StatusCode, (StatusCode, String)> {
+    require_session_access(&state, &user, &id)?;
     let (base, _) = resolve_session_path(&state, &id, &req.from)?;
     let (_, to_path) = resolve_session_path(&state, &id, &req.to)?;
 
@@ -2034,11 +2115,43 @@ mod path_safety_tests {
     }
 
     #[test]
+    fn sensitive_dir_descent_blocked() {
+        let base = std::path::Path::new("/home/u/work");
+        // Descending into a sensitive dir is blocked even if the leaf looks innocuous.
+        assert!(descends_into_sensitive_dir(base, std::path::Path::new("/home/u/work/.ssh/config")));
+        assert!(descends_into_sensitive_dir(base, std::path::Path::new("/home/u/work/.aws/credentials")));
+        assert!(descends_into_sensitive_dir(base, std::path::Path::new("/home/u/work/.git/config")));
+        assert!(descends_into_sensitive_dir(base, std::path::Path::new("/home/u/work/sub/.gnupg/x")));
+        // Normal paths pass.
+        assert!(!descends_into_sensitive_dir(base, std::path::Path::new("/home/u/work/src/main.rs")));
+        assert!(!descends_into_sensitive_dir(base, std::path::Path::new("/home/u/work/README.md")));
+        // Anything outside base is refused defensively.
+        assert!(descends_into_sensitive_dir(base, std::path::Path::new("/etc/passwd")));
+    }
+
+    #[test]
     fn write_blocked_for_control_dirs() {
-        let p = std::path::Path::new("/home/u/work/.git/config");
-        assert!(is_write_blocked(p));
-        let p2 = std::path::Path::new("/home/u/work/src/main.rs");
-        assert!(!is_write_blocked(p2));
+        let base = std::path::Path::new("/home/u/work");
+        // A control dir *below* base is blocked.
+        assert!(is_write_blocked(base, std::path::Path::new("/home/u/work/.git/config")));
+        // A normal file below base is allowed.
+        assert!(!is_write_blocked(base, std::path::Path::new("/home/u/work/src/main.rs")));
+    }
+
+    #[test]
+    fn write_not_blocked_for_agent_worktree_base() {
+        // Regression: agent sessions run with base = <repo>/.zeromux-worktrees/<id>/.
+        // The base prefix contains ".zeromux-worktrees", which previously tripped the
+        // full-path check and 403'd EVERY write in an agent workspace.
+        let base = std::path::Path::new("/home/u/repo/.zeromux-worktrees/abc123");
+        // Normal file directly under the worktree base → writable.
+        assert!(!is_write_blocked(base, std::path::Path::new("/home/u/repo/.zeromux-worktrees/abc123/notes.md")));
+        // Subdir under the worktree base → writable.
+        assert!(!is_write_blocked(base, std::path::Path::new("/home/u/repo/.zeromux-worktrees/abc123/docs/a.md")));
+        // But a real .git INSIDE the worktree is still blocked.
+        assert!(is_write_blocked(base, std::path::Path::new("/home/u/repo/.zeromux-worktrees/abc123/.git/config")));
+        // A path outside base is refused defensively.
+        assert!(is_write_blocked(base, std::path::Path::new("/home/u/other/x.md")));
     }
 
     #[test]

@@ -225,7 +225,9 @@ mod tests {
 
     #[tokio::test]
     async fn writer_appends_ndjson_line() {
-        // 用临时 HOME 隔离
+        // 用临时 HOME 隔离 —— 必须持锁并恢复，否则会泄漏给其它线程上的测试
+        let _guard = crate::session_manager::HOME_ENV_LOCK.lock().unwrap();
+        let prev = std::env::var("HOME").ok();
         let tmp = std::env::temp_dir().join(format!("zmtest-{}", std::process::id()));
         std::fs::create_dir_all(&tmp).unwrap();
         std::env::set_var("HOME", &tmp);
@@ -240,11 +242,21 @@ mod tests {
         };
         tx.send(m).await.unwrap();
         // 给 worker 落盘时间
+        let mut written = false;
         for _ in 0..50 {
             let p = metrics_dir().join("sessA.ndjson");
-            if p.exists() && std::fs::read_to_string(&p).unwrap().contains("\"r1\"") { return; }
+            if p.exists() && std::fs::read_to_string(&p).unwrap().contains("\"r1\"") {
+                written = true;
+                break;
+            }
             tokio::time::sleep(std::time::Duration::from_millis(10)).await;
         }
-        panic!("ndjson line not written");
+
+        // 恢复 HOME，无论成功失败都执行
+        match prev {
+            Some(h) => std::env::set_var("HOME", h),
+            None => std::env::remove_var("HOME"),
+        }
+        assert!(written, "ndjson line not written");
     }
 }

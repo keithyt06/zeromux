@@ -29,6 +29,7 @@ pub fn build_router(state: Arc<AppState>) -> Router {
         .route("/api/sessions/{id}/file", post(write_session_file))
         .route("/api/sessions/{id}/file", delete(delete_session_file))
         .route("/api/sessions/{id}/file/rename", post(rename_session_file))
+        .route("/api/sessions/{id}/dir/list", get(list_dir))
         .route("/api/sessions/{id}/upload", post(upload_session_file)
             .layer(DefaultBodyLimit::max(28_311_552)))
         .route("/api/sessions/{id}/dir", post(create_session_dir))
@@ -975,6 +976,82 @@ fn resolve_and_verify(
     Ok(real)
 }
 
+// ── Single-level directory listing (dir/list) ──
+
+struct DirEntryOut {
+    name: String,
+    kind: &'static str,
+    size: u64,
+    mtime: u64,
+    writable: bool,
+}
+
+/// List one directory level (non-recursive). Credential files are never enumerated.
+/// Caps at 2000 entries and sets `truncated`. Dirs sort before files, then by name.
+fn list_dir_entries(
+    base_canonical: &std::path::Path,
+    rel: &str,
+) -> Result<(Vec<DirEntryOut>, bool), (StatusCode, String)> {
+    let dir = if rel.is_empty() {
+        base_canonical.to_path_buf()
+    } else {
+        resolve_and_verify(base_canonical, rel)?
+    };
+    if !dir.is_dir() {
+        return Err((StatusCode::BAD_REQUEST, "Not a directory".into()));
+    }
+    let rd = std::fs::read_dir(&dir)
+        .map_err(|e| (StatusCode::BAD_REQUEST, format!("Cannot read dir: {e}")))?;
+    let mut out = Vec::new();
+    let mut truncated = false;
+    for entry in rd.flatten() {
+        if out.len() >= 2000 {
+            truncated = true;
+            break;
+        }
+        let name = entry.file_name().to_string_lossy().to_string();
+        if is_credential_path(&name) {
+            continue; // never enumerate credentials
+        }
+        let ft = entry.file_type().ok();
+        let is_dir = ft.map(|t| t.is_dir()).unwrap_or(false);
+        let meta = entry.metadata().ok();
+        out.push(DirEntryOut {
+            kind: if is_dir { "dir" } else { "file" },
+            size: meta.as_ref().map(|m| m.len()).unwrap_or(0),
+            mtime: meta
+                .as_ref()
+                .and_then(|m| m.modified().ok())
+                .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                .map(|d| d.as_secs())
+                .unwrap_or(0),
+            writable: !is_write_blocked(&dir.join(&name)),
+            name,
+        });
+    }
+    // dirs first ("dir" > "file" reverse-sorted via b.kind), then case-insensitive name
+    out.sort_by(|a, b| (b.kind, a.name.to_lowercase()).cmp(&(a.kind, b.name.to_lowercase())));
+    Ok((out, truncated))
+}
+
+async fn list_dir(
+    State(state): State<Arc<AppState>>,
+    axum::extract::Path(id): axum::extract::Path<String>,
+    Query(query): Query<DirQuery>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    let base = resolve_base_dir(&state, &id, None)?;
+    let (entries, truncated) = list_dir_entries(&base, query.path.as_deref().unwrap_or(""))?;
+    let arr: Vec<_> = entries
+        .iter()
+        .map(|e| {
+            serde_json::json!({
+                "name": e.name, "type": e.kind, "size": e.size, "mtime": e.mtime, "writable": e.writable,
+            })
+        })
+        .collect();
+    Ok(Json(serde_json::json!({ "entries": arr, "truncated": truncated })))
+}
+
 // ── File write (create/edit) ──
 
 #[derive(serde::Deserialize)]
@@ -1916,6 +1993,22 @@ mod path_safety_tests {
         assert!(is_write_blocked(p));
         let p2 = std::path::Path::new("/home/u/work/src/main.rs");
         assert!(!is_write_blocked(p2));
+    }
+
+    #[test]
+    fn list_dir_filters_credentials_and_marks_types() {
+        let tmp = std::env::temp_dir().join(format!("zmld-{}", std::process::id()));
+        std::fs::create_dir_all(tmp.join("sub")).unwrap();
+        std::fs::write(tmp.join("a.txt"), "x").unwrap();
+        std::fs::write(tmp.join(".env"), "SECRET=1").unwrap();
+        let base = tmp.canonicalize().unwrap();
+        let (entries, _trunc) = list_dir_entries(&base, "").unwrap();
+        let names: Vec<&str> = entries.iter().map(|e| e.name.as_str()).collect();
+        assert!(names.contains(&"a.txt"));
+        assert!(names.contains(&"sub"));
+        assert!(!names.contains(&".env")); // credential 不枚举
+        let sub = entries.iter().find(|e| e.name == "sub").unwrap();
+        assert_eq!(sub.kind, "dir");
     }
 }
 

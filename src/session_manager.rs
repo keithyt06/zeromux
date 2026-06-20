@@ -585,6 +585,56 @@ impl SessionManager {
         let _ = self.run_metrics_tx.try_send(m);
     }
 
+    /// Owner-scoped read of a session's run history. Returns `None` if the
+    /// session is missing OR the caller is not the owner (don't leak existence).
+    /// Stats are computed over the FULL history; `before_ms`/`limit` only shape
+    /// the returned page (newest-first).
+    pub fn runs_for_session(
+        &self,
+        sid: &str,
+        owner_id: &str,
+        limit: Option<usize>,
+        before_ms: Option<i64>,
+    ) -> Option<(Vec<crate::run_metrics::RunMetric>, crate::run_metrics::SessionRunStats)> {
+        let map = self.sessions.lock().unwrap();
+        let s = map.get(sid)?;
+        if s.owner_id != owner_id {
+            return None;
+        }
+        let stats = crate::run_metrics::compute_stats(&s.run_metrics);
+        let mut runs: Vec<_> = s
+            .run_metrics
+            .iter()
+            .filter(|r| before_ms.map(|b| r.ended_ms < b).unwrap_or(true))
+            .cloned()
+            .collect();
+        runs.reverse(); // newest first
+        if let Some(n) = limit {
+            runs.truncate(n);
+        }
+        Some((runs, stats))
+    }
+
+    /// Owner-scoped set of a human 👍/👎 verdict on one run. Returns `false` if
+    /// the session is missing, owner mismatches, or the run_id is not found.
+    /// Note: only the in-memory VecDeque is updated; rewriting the persisted
+    /// ndjson history is a documented future seam (MVP does not touch disk).
+    pub fn set_human_verdict(&self, sid: &str, owner_id: &str, run_id: &str, verdict: &str) -> bool {
+        let mut map = self.sessions.lock().unwrap();
+        let Some(s) = map.get_mut(sid) else {
+            return false;
+        };
+        if s.owner_id != owner_id {
+            return false;
+        }
+        if let Some(r) = s.run_metrics.iter_mut().find(|r| r.run_id == run_id) {
+            r.verdict = Some(verdict.to_string());
+            r.verdict_source = crate::run_metrics::VerdictSource::Human;
+            return true;
+        }
+        false
+    }
+
     /// Watchdog: find *interactive* sessions (no `source_task_id`) that are
     /// Running and have been silent for at least `idle_ms` (by `last_activity_ms`).
     /// Scheduled runs (`source_task_id.is_some()`) are excluded — they have their
@@ -3207,6 +3257,47 @@ mod turn_state_tests {
         assert_eq!(rp.turn_state, TurnState::Running);
         assert!(rp.turn_started_ms.is_some());
         assert_eq!(rp.turn_seq, 1);
+    }
+
+    #[test]
+    fn runs_for_session_enforces_owner_and_limit() {
+        let (mgr, _dir) = {
+            let dir = tempfile::tempdir().unwrap();
+            let events = Arc::new(crate::events::EventStore::open(dir.path()).unwrap());
+            let store = Arc::new(crate::session_store::SessionStore::open(dir.path()).unwrap());
+            let mgr = SessionManager::new(
+                events, store,
+                "claude".into(), "kiro".into(), "codex".into(), "off".into(), "bash".into(),
+            );
+            (mgr, dir)
+        };
+
+        // Session owned by "u1" with 3 run metrics.
+        let mut s = running_session("sid");
+        s.owner_id = "u1".into();
+        let mk = |id: &str| crate::run_metrics::RunMetric {
+            run_id: id.into(), session_id: "sid".into(), work_dir: "/w".into(),
+            agent_type: "claude".into(), turn_seq: 1, started_ms: 0, ended_ms: 100,
+            duration_ms: 100, outcome: crate::run_metrics::RunOutcome::Completed,
+            failure_kind: None, verdict: None,
+            verdict_source: crate::run_metrics::VerdictSource::None,
+            cost_usd: None, tokens_in: None, tokens_out: None, input_snapshot_ref: None,
+        };
+        s.run_metrics.push_back(mk("r1"));
+        s.run_metrics.push_back(mk("r2"));
+        s.run_metrics.push_back(mk("r3"));
+        mgr.sessions.lock().unwrap().insert("sid".into(), s);
+
+        // Cross-owner → None (don't leak existence).
+        assert!(mgr.runs_for_session("sid", "u2", None, None).is_none());
+
+        // Owner match, limit=2 → 2 runs in the page, but stats over full history (count==3).
+        let (runs, stats) = mgr.runs_for_session("sid", "u1", Some(2), None).unwrap();
+        assert_eq!(runs.len(), 2);
+        assert_eq!(stats.count, 3);
+        // Newest-first ordering.
+        assert_eq!(runs[0].run_id, "r3");
+        assert_eq!(runs[1].run_id, "r2");
     }
 
     #[test]

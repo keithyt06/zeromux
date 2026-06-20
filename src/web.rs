@@ -36,6 +36,8 @@ pub fn build_router(state: Arc<AppState>) -> Router {
         .route("/api/sessions/{id}/dir/rename", post(rename_session_dir))
         .route("/api/sessions/{id}/git/log", get(git_log))
         .route("/api/sessions/{id}/git/show", get(git_show))
+        .route("/api/sessions/{id}/runs", get(get_session_runs))
+        .route("/api/sessions/{id}/runs/{run_id}/verdict", post(post_run_verdict))
         .route("/api/sessions/{id}/notes", get(list_notes))
         .route("/api/sessions/{id}/notes", post(create_note))
         .route("/api/sessions/{id}/notes/{note_id}", delete(delete_note))
@@ -627,6 +629,54 @@ async fn delete_note(
         Ok(true) => StatusCode::OK,
         Ok(false) => StatusCode::NOT_FOUND,
         Err(_) => StatusCode::INTERNAL_SERVER_ERROR,
+    }
+}
+
+// ── Per-run metrics (owner-scoped) ──
+
+#[derive(serde::Deserialize)]
+struct RunsQuery {
+    limit: Option<usize>,
+    before: Option<i64>,
+}
+
+/// GET /api/sessions/{id}/runs?limit=&before= — owner-scoped run history + stats.
+/// 404 when the session is missing OR not owned by the caller (don't leak existence).
+async fn get_session_runs(
+    State(state): State<Arc<AppState>>,
+    user: axum::Extension<CurrentUser>,
+    axum::extract::Path(id): axum::extract::Path<String>,
+    Query(query): Query<RunsQuery>,
+) -> Result<Json<serde_json::Value>, StatusCode> {
+    let (runs, stats) = state
+        .sessions
+        .runs_for_session(&id, &user.id, query.limit, query.before)
+        .ok_or(StatusCode::NOT_FOUND)?;
+    Ok(Json(serde_json::json!({ "runs": runs, "stats": stats })))
+}
+
+#[derive(serde::Deserialize)]
+struct VerdictReq {
+    verdict: String,
+    #[allow(dead_code)] // `note` is accepted but not yet persisted (future seam).
+    note: Option<String>,
+}
+
+/// POST /api/sessions/{id}/runs/{run_id}/verdict — set a human 👍/👎 verdict.
+/// 404 when the session is missing, not owned, or the run_id is unknown.
+async fn post_run_verdict(
+    State(state): State<Arc<AppState>>,
+    user: axum::Extension<CurrentUser>,
+    axum::extract::Path((id, run_id)): axum::extract::Path<(String, String)>,
+    Json(req): Json<VerdictReq>,
+) -> Result<Json<serde_json::Value>, StatusCode> {
+    if state
+        .sessions
+        .set_human_verdict(&id, &user.id, &run_id, &req.verdict)
+    {
+        Ok(Json(serde_json::json!({ "ok": true })))
+    } else {
+        Err(StatusCode::NOT_FOUND)
     }
 }
 

@@ -1,0 +1,8 @@
+<svg width="256" height="256" viewBox="0 0 256 256" xmlns="http://www.w3.org/2000/svg">
+  <title>ZeroMux — Z modern</title>
+  <!-- squircle tile -->
+  <rect x="16" y="16" width="224" height="224" rx="56" fill="#11161d"/>
+  <!-- bold geometric Z in brand yellow, lobehub-style chunky glyph -->
+  <path d="M78 78 H178 V108 L116 148 H178 V178 H78 V148 L140 108 H78 Z"
+        fill="#f7b500" stroke="#f7b500" stroke-width="2" stroke-linejoin="round"/>
+</svg>

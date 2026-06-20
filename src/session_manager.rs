@@ -585,6 +585,35 @@ impl SessionManager {
         let _ = self.run_metrics_tx.try_send(m);
     }
 
+    /// Watchdog: find *interactive* sessions (no `source_task_id`) that are
+    /// Running and have been silent for at least `idle_ms` (by `last_activity_ms`).
+    /// Scheduled runs (`source_task_id.is_some()`) are excluded — they have their
+    /// own reconcile path in scheduled_tasks.rs and must not be double-handled.
+    /// Pure filter over the in-memory map; the caller sends TimeoutKill.
+    pub fn running_idle_too_long(&self, now_ms: i64, idle_ms: i64) -> Vec<String> {
+        let map = self.sessions.lock().unwrap();
+        map.values()
+            .filter(|s| s.source_task_id.is_none())
+            .filter(|s| s.running.as_ref().map(|rp| rp.turn_state == TurnState::Running).unwrap_or(false))
+            .filter(|s| now_ms - s.last_activity_ms >= idle_ms)
+            .map(|s| s.id.clone())
+            .collect()
+    }
+
+    /// Send a `TimeoutKill` to a session's fan-out so a silent/wedged run is
+    /// terminated through the single fan-out exit (→ recorded as a Timeout metric,
+    /// consistent with normal finalize). Clone the `input_tx` under the lock, then
+    /// `.send()` outside it — never hold the sessions lock across an await.
+    pub async fn send_timeout_kill(&self, sid: &str, run_id: Option<String>) {
+        let tx = {
+            let map = self.sessions.lock().unwrap();
+            map.get(sid).and_then(|s| s.running.as_ref().map(|rp| rp.input_tx.clone()))
+        };
+        if let Some(tx) = tx {
+            let _ = tx.send(SessionInput::TimeoutKill { run_id }).await;
+        }
+    }
+
     /// Persist a session's metadata to the store (insert or update).
     fn persist_meta(&self, s: &Session) {
         let pj = PersistedSession {
@@ -3452,6 +3481,60 @@ mod running_summary_tests {
         let mut s = running_session(id, stype, None, TurnState::Idle);
         s.running.as_mut().unwrap().input_tx = input_tx;
         (s, rx)
+    }
+
+    // Build a running_session with an explicit last_activity_ms so the idle
+    // filter can be exercised deterministically (running_session sets it to 0).
+    fn aged_session(
+        id: &str,
+        source_task_id: Option<String>,
+        turn: TurnState,
+        last_activity_ms: i64,
+    ) -> Session {
+        let mut s = running_session(id, SessionType::Claude, source_task_id, turn);
+        s.last_activity_ms = last_activity_ms;
+        s
+    }
+
+    #[test]
+    fn running_idle_too_long_targets_only_interactive_running_stale() {
+        let now = 1_000_000i64;
+        let idle = 30 * 60_000i64; // 30 min
+        let stale_ts = now - idle - 1; // older than threshold
+        let fresh_ts = now - 1; // within threshold
+        let (m, _tmp) = mgr_with(vec![
+            // interactive + Running + stale  → SHOULD be killed
+            aged_session("kill_me", None, TurnState::Running, stale_ts),
+            // interactive + Running + fresh  → too recent, skip
+            aged_session("fresh", None, TurnState::Running, fresh_ts),
+            // interactive + Idle + stale     → not in a turn, skip
+            aged_session("idle_interactive", None, TurnState::Idle, stale_ts),
+            // scheduled + Running + stale     → has its own reconcile path, skip
+            aged_session("scheduled", Some("task1".into()), TurnState::Running, stale_ts),
+            // exactly at threshold (>=)        → SHOULD be killed (boundary)
+            aged_session("boundary", None, TurnState::Running, now - idle),
+        ]);
+
+        let mut got = m.running_idle_too_long(now, idle);
+        got.sort();
+        assert_eq!(got, vec!["boundary".to_string(), "kill_me".to_string()],
+            "only interactive + Running + silent>=idle sessions; scheduled/idle/fresh excluded");
+    }
+
+    #[tokio::test]
+    async fn send_timeout_kill_emits_timeout_kill_run_id_none() {
+        let (s, mut rx) = running_session_observable("sid", SessionType::Claude);
+        let (m, _tmp) = mgr_with(vec![s]);
+
+        m.send_timeout_kill("sid", None).await;
+
+        let got = rx.recv().await.expect("a TimeoutKill should have been sent");
+        match got {
+            SessionInput::TimeoutKill { run_id } => {
+                assert!(run_id.is_none(), "watchdog kills interactive sessions with run_id=None");
+            }
+            _other => panic!("expected SessionInput::TimeoutKill variant"),
+        }
     }
 
     #[tokio::test]

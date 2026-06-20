@@ -5,6 +5,14 @@ use std::path::Path;
 use std::str::FromStr;
 use std::sync::Mutex;
 
+/// Idle threshold after which a silent *interactive* (non-scheduled) agent
+/// session is assumed wedged and gets a TimeoutKill. Scheduled runs use their
+/// own per-task `idle_timeout_min`; this is a conservative fixed value for
+/// interactive sessions, which today have no kill/timeout detection at all.
+/// Constant for now — per-session/self-tuning thresholds are a documented future
+/// seam (spec §8).
+const INTERACTIVE_IDLE_MS: i64 = 30 * 60_000; // 30 minutes
+
 /// Return scheduled fire points in the half-open interval (last_seen, now],
 /// evaluated in Asia/Shanghai, oldest -> newest. The scheduler caller uses
 /// `.last()` to fire only the most recent due point (no backfill of older ones).
@@ -795,6 +803,15 @@ pub fn spawn_scheduler(
                     // watchdog: abort runs idle past idle_timeout_min (default 60) or
                     // exceeding max_runtime_min total (default 300)
                     let _ = s.reconcile_timeouts_per_task(now.timestamp_millis());
+                    // interactive (non-scheduled) wedge protection (review high-leverage
+                    // point): sessions silent past INTERACTIVE_IDLE_MS get a TimeoutKill,
+                    // so run_metrics records a Timeout instead of the session hanging
+                    // forever. Scheduled runs are excluded — reconcile_timeouts_per_task
+                    // above already handles them.
+                    let stale = m.running_idle_too_long(now.timestamp_millis(), INTERACTIVE_IDLE_MS);
+                    for sid in stale {
+                        m.send_timeout_kill(&sid, None).await;
+                    }
                     let tasks = match s.list_enabled() { Ok(t) => t, Err(_) => { continue; } };
                     // retention: bound run history (rows + on-disk run dirs) per task.
                     // prune_runs exempts pending-confirmation runs, so this never

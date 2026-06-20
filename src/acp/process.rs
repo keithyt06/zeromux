@@ -70,6 +70,10 @@ pub enum AcpEvent {
         session_id: String,
         #[serde(skip_serializing_if = "Option::is_none")]
         cost_usd: Option<f64>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        tokens_in: Option<u64>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        tokens_out: Option<u64>,
     },
     /// 用户 prompt 回显。每条用户 prompt 入队即 emit 一个（collect 合并成一个
     /// turn 时仍 N 个事件，见 spec P1）。turn_id 标识它归属的 turn，前端据此分组，
@@ -329,11 +333,14 @@ fn translate_event(val: &serde_json::Value) -> Vec<AcpEvent> {
         }
 
         "result" => {
+            let usage = val.get("usage");
             vec![AcpEvent::Result {
                 text: val.get("result").and_then(|v| v.as_str()).unwrap_or("").to_string(),
                 turn_id: 0,
                 session_id: val.get("session_id").and_then(|v| v.as_str()).unwrap_or("").to_string(),
                 cost_usd: val.get("total_cost_usd").and_then(|v| v.as_f64()),
+                tokens_in: usage.and_then(|u| u.get("input_tokens")).and_then(|v| v.as_u64()),
+                tokens_out: usage.and_then(|u| u.get("output_tokens")).and_then(|v| v.as_u64()),
             }]
         }
 
@@ -360,5 +367,22 @@ mod tests {
         let evt = AcpEvent::UserPrompt { text: "x".into(), turn_id: 1, client_id: None };
         let j = serde_json::to_string(&evt).unwrap();
         assert!(!j.contains("client_id"));
+    }
+    #[test]
+    fn result_parses_usage_tokens() {
+        let raw = serde_json::json!({
+            "type": "result", "result": "done", "session_id": "s1",
+            "total_cost_usd": 0.02,
+            "usage": { "input_tokens": 123, "output_tokens": 45 }
+        });
+        let evts = translate_event(&raw);
+        match &evts[0] {
+            AcpEvent::Result { tokens_in, tokens_out, cost_usd, .. } => {
+                assert_eq!(*tokens_in, Some(123));
+                assert_eq!(*tokens_out, Some(45));
+                assert_eq!(*cost_usd, Some(0.02));
+            }
+            _ => panic!("expected Result"),
+        }
     }
 }

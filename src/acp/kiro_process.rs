@@ -354,6 +354,8 @@ async fn dispatch_frame(
                 turn_id: 0,
                 session_id: session_id.to_string(),
                 cost_usd: None,
+                tokens_in: None,
+                tokens_out: None,
             }]
         }
 

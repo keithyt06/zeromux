@@ -710,6 +710,8 @@ async fn run_event_loop(
                                             turn_id: 0,
                                             session_id: tid.unwrap_or_default(),
                                             cost_usd: None,
+                                            tokens_in: None,
+                                            tokens_out: None,
                                         })
                                         .await;
                                 }

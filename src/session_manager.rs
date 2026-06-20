@@ -128,6 +128,9 @@ pub enum SessionInput {
     /// ACP/Kiro/Codex: switch the per-session queue handling mode for
     /// multiple in-flight prompts (collect / interrupt / passthrough).
     SetQueueMode(QueueMode),
+    /// Watchdog→fan-out: 超时终结当前 run。让超时和完成/错/取消一样从 fan-out
+    /// 单一出口走,run_metrics 与 finalize_run 天然一致(评审 P0)。
+    TimeoutKill { run_id: Option<String> },
 }
 
 /// How a fan-out handles a new prompt that arrives while a turn is running.
@@ -224,6 +227,8 @@ pub struct Session {
     spawning: bool,
     last_activity_ms: i64,
     turns_completed: u32,
+    /// 本会话最近的 per-run 度量历史(cap 50, GC 30d)。进程死后仍保留供重连查看。
+    run_metrics: std::collections::VecDeque<crate::run_metrics::RunMetric>,
     /// 运行态；None = 未运行（可按 resume_token 重生）。
     running: Option<RunningProcess>,
     /// Output history for replay on reconnect (base64 for PTY, JSON for ACP/Kiro)
@@ -697,6 +702,7 @@ impl SessionManager {
             spawning: false,
             last_activity_ms: now_millis(),
             turns_completed: 0,
+            run_metrics: VecDeque::new(),
             running: Some(running),
             scrollback: VecDeque::new(),
             scrollback_bytes: 0,
@@ -803,6 +809,7 @@ impl SessionManager {
             spawning: false,
             last_activity_ms: now_millis(),
             turns_completed: 0,
+            run_metrics: VecDeque::new(),
             running: Some(running),
             scrollback: VecDeque::new(),
             scrollback_bytes: 0,
@@ -1065,6 +1072,7 @@ impl SessionManager {
             spawning: false,
             last_activity_ms: now_millis(),
             turns_completed: 0,
+            run_metrics: VecDeque::new(),
             running: Some(running),
             scrollback: VecDeque::new(),
             scrollback_bytes: 0,
@@ -1167,6 +1175,7 @@ impl SessionManager {
             spawning: false,
             last_activity_ms: now_millis(),
             turns_completed: 0,
+            run_metrics: VecDeque::new(),
             running: Some(running),
             scrollback: VecDeque::new(),
             scrollback_bytes: 0,
@@ -1619,6 +1628,7 @@ impl SessionManager {
                     spawning: false,
                     last_activity_ms: now_millis(),
                     turns_completed: 0,
+                    run_metrics: VecDeque::new(),
                     running: None,
                     scrollback: VecDeque::new(),
                     scrollback_bytes: 0,
@@ -2789,6 +2799,7 @@ mod decide_spawn_tests {
             spawning: false,
             last_activity_ms: 0,
             turns_completed: 0,
+            run_metrics: VecDeque::new(),
             running: None,
             scrollback: VecDeque::new(),
             scrollback_bytes: 0,
@@ -2970,6 +2981,7 @@ mod turn_state_tests {
             spawning: false,
             last_activity_ms: 0,
             turns_completed: 0,
+            run_metrics: VecDeque::new(),
             running: Some(RunningProcess {
                 event_tx, input_tx, pty_pid: None,
                 turn_state: TurnState::Idle,
@@ -3199,6 +3211,7 @@ mod running_summary_tests {
             spawning: false,
             last_activity_ms: 0,
             turns_completed: 0,
+            run_metrics: VecDeque::new(),
             running: Some(RunningProcess {
                 event_tx,
                 input_tx,

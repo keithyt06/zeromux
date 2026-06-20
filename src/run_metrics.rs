@@ -125,6 +125,20 @@ pub fn gc_retain(runs: &mut VecDeque<RunMetric>, now_ms: i64, keep_count: usize,
     }
 }
 
+/// 16-hex run id for a per-run metric. Process-local monotonic counter mixed
+/// with the pid, so it is unique within and across the process's lifetime
+/// without depending on wall-clock or a CSPRNG draw on the hot path. Distinct
+/// from scheduled-task run ids (those are full UUIDs); these label interactive
+/// per-turn metrics only.
+pub fn new_run_id() -> String {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+    let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+    let pid = std::process::id() as u64;
+    // pid in the high 32 bits, counter in the low 32 bits → 16 hex chars.
+    format!("{:08x}{:08x}", pid & 0xffff_ffff, n & 0xffff_ffff)
+}
+
 pub fn metrics_dir() -> std::path::PathBuf {
     let home = std::env::var("HOME").unwrap_or_else(|_| "/home/ubuntu".to_string());
     std::path::Path::new(&home).join(".zeromux").join("run-metrics")
@@ -134,21 +148,27 @@ pub fn metrics_dir() -> std::path::PathBuf {
 /// fsync 永不落在对话延迟路径。队列满时 try_send 端 best-effort 丢弃(见 Task 5)。
 pub fn spawn_writer() -> tokio::sync::mpsc::Sender<RunMetric> {
     let (tx, mut rx) = tokio::sync::mpsc::channel::<RunMetric>(256);
-    tokio::spawn(async move {
-        while let Some(m) = rx.recv().await {
-            let _ = tokio::task::spawn_blocking(move || {
-                use std::io::Write;
-                let dir = metrics_dir();
-                if std::fs::create_dir_all(&dir).is_err() { return; }
-                let path = dir.join(format!("{}.ndjson", sanitize(&m.session_id)));
-                if let Ok(line) = serde_json::to_string(&m) {
-                    if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(&path) {
-                        let _ = writeln!(f, "{}", line);
+    // Spawn the drain task only when a Tokio runtime is present. In production
+    // `SessionManager::new` runs inside the server runtime, so the writer always
+    // starts. Sync unit tests construct a manager with no reactor — there we skip
+    // the spawn (the channel still works; `try_send` is best-effort and drops).
+    if tokio::runtime::Handle::try_current().is_ok() {
+        tokio::spawn(async move {
+            while let Some(m) = rx.recv().await {
+                let _ = tokio::task::spawn_blocking(move || {
+                    use std::io::Write;
+                    let dir = metrics_dir();
+                    if std::fs::create_dir_all(&dir).is_err() { return; }
+                    let path = dir.join(format!("{}.ndjson", sanitize(&m.session_id)));
+                    if let Ok(line) = serde_json::to_string(&m) {
+                        if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(&path) {
+                            let _ = writeln!(f, "{}", line);
+                        }
                     }
-                }
-            }).await;
-        }
-    });
+                }).await;
+            }
+        });
+    }
     tx
 }
 

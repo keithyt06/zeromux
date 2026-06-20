@@ -257,6 +257,10 @@ pub struct SessionManager {
     /// Scheduled-tasks store, set at startup after construction. Fan-out tasks
     /// use it to finalize scheduled runs. None when no scheduler is wired.
     scheduled: Mutex<Option<Arc<crate::scheduled_tasks::ScheduledStore>>>,
+    /// Per-run metrics writer channel. `record_run_metric` pushes into the
+    /// session's in-memory VecDeque (under lock) and then `try_send`s here
+    /// (outside the lock) so the async writer fsyncs off the conversation path.
+    run_metrics_tx: tokio::sync::mpsc::Sender<crate::run_metrics::RunMetric>,
 }
 
 #[derive(serde::Serialize)]
@@ -538,6 +542,7 @@ impl SessionManager {
             codex_reasoning,
             shell,
             scheduled: Mutex::new(None),
+            run_metrics_tx: crate::run_metrics::spawn_writer(),
         });
         *mgr.self_weak.lock().unwrap() = Arc::downgrade(&mgr);
         mgr
@@ -561,6 +566,23 @@ impl SessionManager {
                 tracing::warn!("finalize_run {} failed: {}", run_id, e);
             }
         }
+    }
+
+    /// Record one per-run metric: push into the session's bounded in-memory ring
+    /// (cap 50) under the sessions lock, then — outside the lock — `try_send` to
+    /// the async writer. No I/O is done while the lock is held; a full writer
+    /// queue is best-effort dropped (metrics are advisory, not load-bearing).
+    pub fn record_run_metric(&self, sid: &str, m: crate::run_metrics::RunMetric) {
+        {
+            let mut map = self.sessions.lock().unwrap();
+            if let Some(s) = map.get_mut(sid) {
+                s.run_metrics.push_back(m.clone());
+                while s.run_metrics.len() > 50 {
+                    s.run_metrics.pop_front();
+                }
+            }
+        } // lock released before any send
+        let _ = self.run_metrics_tx.try_send(m);
     }
 
     /// Persist a session's metadata to the store (insert or update).
@@ -1753,6 +1775,26 @@ fn codex_thread_id(evt: &AcpEvent) -> Option<String> {
     }
 }
 
+/// Build a `RunMetric` from per-turn fields. Pure helper (no I/O, no clock) so
+/// it is unit-testable; the fan-out passes the boundary's resolved outcome and
+/// token/cost figures. `duration_ms` is derived (clamps clock regressions).
+#[allow(clippy::too_many_arguments)]
+fn build_run_metric(
+    run_id: &str, session_id: &str, work_dir: &str, agent_type: &str, turn_seq: u64,
+    started_ms: i64, ended_ms: i64,
+    outcome: crate::run_metrics::RunOutcome, failure_kind: Option<String>,
+    cost_usd: Option<f64>, tokens_in: Option<u64>, tokens_out: Option<u64>,
+) -> crate::run_metrics::RunMetric {
+    crate::run_metrics::RunMetric {
+        run_id: run_id.to_string(), session_id: session_id.to_string(),
+        work_dir: work_dir.to_string(), agent_type: agent_type.to_string(), turn_seq,
+        started_ms, ended_ms, duration_ms: crate::run_metrics::duration_ms(started_ms, ended_ms),
+        outcome, failure_kind,
+        verdict: None, verdict_source: crate::run_metrics::VerdictSource::None,
+        cost_usd, tokens_in, tokens_out, input_snapshot_ref: None,
+    }
+}
+
 fn spawn_acp_fanout(
     sid: String,
     mut process: AcpProcess,
@@ -1782,6 +1824,13 @@ fn spawn_acp_fanout(
         // 队列模式(G2b):collect(默认)/interrupt。passthrough 经 effective()
         // 在所有后端降级为 collect(见 QueueMode::effective 注释,review 2026-06-11)。
         let mut queue_mode = QueueMode::Collect;
+        // ── per-run metrics state ──
+        // `run_started_ms` is stamped at every turn-start site and consumed
+        // (`.take()`) at the boundary; `pending_outcome` carries INTENT
+        // (Cancel/Interrupt→Cancelled, TimeoutKill→Timeout) set on the input
+        // branch and overrides the terminal-event inference (classify_outcome).
+        let mut pending_outcome: Option<crate::run_metrics::RunOutcome> = None;
+        let mut run_started_ms: Option<i64> = None;
         loop {
             tokio::select! {
                 event = process.event_rx.recv() => {
@@ -1842,6 +1891,35 @@ fn spawn_acp_fanout(
                                             AcpEvent::Exit { .. } => m.finalize_run(&rid, "failed", None, Some("cli_exited")),
                                             _ => { active_run_id = Some(rid); } // not terminal, keep waiting
                                         }
+                                    }
+                                }
+                                // per-run metrics: every boundary (completed/error/cancel/timeout)
+                                // records exactly one metric from this single exit. Intent
+                                // (pending_outcome) overrides the event-type inference; the
+                                // late boundaries of an interrupt-resend still each record a run
+                                // (they represent a real run that ended). Skipped only if this
+                                // boundary has no matching turn-start stamp (run_started_ms None).
+                                let term = match &evt {
+                                    AcpEvent::Result { .. } => crate::run_metrics::TerminalEvt::Result,
+                                    AcpEvent::Error { .. } => crate::run_metrics::TerminalEvt::Error,
+                                    _ => crate::run_metrics::TerminalEvt::Exit,
+                                };
+                                let outcome = crate::run_metrics::classify_outcome(term, pending_outcome.take());
+                                let (mc, mt_in, mt_out) = match &evt {
+                                    AcpEvent::Result { cost_usd, tokens_in, tokens_out, .. } => (*cost_usd, *tokens_in, *tokens_out),
+                                    _ => (None, None, None),
+                                };
+                                let fk = match outcome {
+                                    crate::run_metrics::RunOutcome::Errored => Some(
+                                        if matches!(evt, AcpEvent::Exit { .. }) { "cli_exited" } else { "cli_error" }.to_string()),
+                                    _ => None,
+                                };
+                                if let Some(started) = run_started_ms.take() {
+                                    if let Some(m) = mgr.upgrade() {
+                                        let rid = crate::run_metrics::new_run_id();
+                                        let metric = build_run_metric(&rid, &sid, &work_dir, agent_label, turn_seq,
+                                            started, now_millis(), outcome, fk, mc, mt_in, mt_out);
+                                        m.record_run_metric(&sid, metric);
                                     }
                                 }
                                 // collect:turn 真正结束(已翻 Idle)且有排队的追加 →
@@ -1907,6 +1985,7 @@ fn spawn_acp_fanout(
                                 }
                                 turn_seq += 1;
                                 local_running = true;
+                                run_started_ms = Some(now_millis());
                                 if let Some(m) = mgr.upgrade() {
                                     m.mark_turn(&sid, TurnState::Running, turn_seq);
                                 }
@@ -1925,6 +2004,7 @@ fn spawn_acp_fanout(
                                         active_run_id = None;
                                         turn_seq += 1;
                                         local_running = true;
+                                        run_started_ms = Some(now_millis());
                                         if let Some(m) = mgr.upgrade() {
                                             m.mark_turn(&sid, TurnState::Running, turn_seq);
                                         }
@@ -1937,6 +2017,7 @@ fn spawn_acp_fanout(
                                         active_run_id = None;
                                         turn_seq += 1;
                                         local_running = true;
+                                        run_started_ms = Some(now_millis());
                                         if let Some(m) = mgr.upgrade() {
                                             m.mark_turn(&sid, TurnState::Running, turn_seq);
                                         }
@@ -1965,6 +2046,7 @@ fn spawn_acp_fanout(
                                             active_run_id = None;
                                             turn_seq += 1;
                                             local_running = true;
+                                            run_started_ms = Some(now_millis());
                                             if let Some(m) = mgr.upgrade() {
                                                 m.mark_turn(&sid, TurnState::Running, turn_seq);
                                             }
@@ -1981,6 +2063,8 @@ fn spawn_acp_fanout(
                         }
                         Some(SessionInput::Interrupt) => {
                             if local_running {
+                                // Intent: the interrupted turn is not a completion.
+                                pending_outcome = Some(crate::run_metrics::RunOutcome::Cancelled);
                                 if let Err(e) = process.interrupt().await {
                                     tracing::warn!("interrupt failed for {}: {}", sid, e);
                                 }
@@ -1991,6 +2075,13 @@ fn spawn_acp_fanout(
                             queue.clear();
                         }
                         Some(SessionInput::Cancel) => {
+                            // Intent before kill: the ensuing Exit must classify as Cancelled.
+                            pending_outcome = Some(crate::run_metrics::RunOutcome::Cancelled);
+                            process.kill().await;
+                        }
+                        Some(SessionInput::TimeoutKill { .. }) => {
+                            // Intent before kill: the ensuing Exit must classify as Timeout.
+                            pending_outcome = Some(crate::run_metrics::RunOutcome::Timeout);
                             process.kill().await;
                         }
                         None => break, // all input senders dropped (session removed)
@@ -2014,6 +2105,7 @@ fn spawn_acp_fanout(
                         active_run_id = None; // 合并 turn 永不携带 run_id(C3)
                         turn_seq += 1;
                         local_running = true;
+                        run_started_ms = Some(now_millis());
                         if let Some(m) = mgr.upgrade() {
                             m.mark_turn(&sid, TurnState::Running, turn_seq);
                         }
@@ -2290,6 +2382,9 @@ fn spawn_kiro_fanout(
         let mut queue = PromptQueue::new();
         // 队列模式(G2b):passthrough 经 effective() 降级为 collect(见 QueueMode::effective)。
         let mut queue_mode = QueueMode::Collect;
+        // ── per-run metrics state (mirrors spawn_acp_fanout) ──
+        let mut pending_outcome: Option<crate::run_metrics::RunOutcome> = None;
+        let mut run_started_ms: Option<i64> = None;
         loop {
             tokio::select! {
                 event = process.event_rx.recv() => {
@@ -2328,6 +2423,32 @@ fn spawn_kiro_fanout(
                                 if let Some(m) = mgr.upgrade() {
                                     m.mark_turn(&sid, TurnState::Idle, boundary_count);
                                 }
+                                // per-run metrics: one metric per boundary, intent overrides
+                                // event type (mirrors spawn_acp_fanout). Skipped when this
+                                // boundary has no matching turn-start stamp.
+                                let term = match &evt {
+                                    AcpEvent::Result { .. } => crate::run_metrics::TerminalEvt::Result,
+                                    AcpEvent::Error { .. } => crate::run_metrics::TerminalEvt::Error,
+                                    _ => crate::run_metrics::TerminalEvt::Exit,
+                                };
+                                let outcome = crate::run_metrics::classify_outcome(term, pending_outcome.take());
+                                let (mc, mt_in, mt_out) = match &evt {
+                                    AcpEvent::Result { cost_usd, tokens_in, tokens_out, .. } => (*cost_usd, *tokens_in, *tokens_out),
+                                    _ => (None, None, None),
+                                };
+                                let fk = match outcome {
+                                    crate::run_metrics::RunOutcome::Errored => Some(
+                                        if matches!(evt, AcpEvent::Exit { .. }) { "cli_exited" } else { "cli_error" }.to_string()),
+                                    _ => None,
+                                };
+                                if let Some(started) = run_started_ms.take() {
+                                    if let Some(m) = mgr.upgrade() {
+                                        let rid = crate::run_metrics::new_run_id();
+                                        let metric = build_run_metric(&rid, &sid, &work_dir, agent_label, turn_seq,
+                                            started, now_millis(), outcome, fk, mc, mt_in, mt_out);
+                                        m.record_run_metric(&sid, metric);
+                                    }
+                                }
                                 // collect:turn 结束(已 Idle)且有排队追加 → arm 收集窗口。
                                 if !local_running {
                                     queue.arm();
@@ -2365,6 +2486,7 @@ fn spawn_kiro_fanout(
                                 }
                                 turn_seq += 1;
                                 local_running = true;
+                                run_started_ms = Some(now_millis());
                                 if let Some(m) = mgr.upgrade() {
                                     m.mark_turn(&sid, TurnState::Running, turn_seq);
                                 }
@@ -2382,6 +2504,7 @@ fn spawn_kiro_fanout(
                                         queue.clear();
                                         turn_seq += 1;
                                         local_running = true;
+                                        run_started_ms = Some(now_millis());
                                         if let Some(m) = mgr.upgrade() {
                                             m.mark_turn(&sid, TurnState::Running, turn_seq);
                                         }
@@ -2392,6 +2515,7 @@ fn spawn_kiro_fanout(
                                     QueueMode::Passthrough => {
                                         turn_seq += 1;
                                         local_running = true;
+                                        run_started_ms = Some(now_millis());
                                         if let Some(m) = mgr.upgrade() {
                                             m.mark_turn(&sid, TurnState::Running, turn_seq);
                                         }
@@ -2410,6 +2534,7 @@ fn spawn_kiro_fanout(
                                         } else {
                                             turn_seq += 1;
                                             local_running = true;
+                                            run_started_ms = Some(now_millis());
                                             if let Some(m) = mgr.upgrade() {
                                                 m.mark_turn(&sid, TurnState::Running, turn_seq);
                                             }
@@ -2426,6 +2551,8 @@ fn spawn_kiro_fanout(
                         }
                         Some(SessionInput::Interrupt) => {
                             if local_running {
+                                // Intent: the interrupted turn is not a completion.
+                                pending_outcome = Some(crate::run_metrics::RunOutcome::Cancelled);
                                 if let Err(e) = process.interrupt().await {
                                     tracing::warn!("interrupt failed for {}: {}", sid, e);
                                 }
@@ -2434,6 +2561,13 @@ fn spawn_kiro_fanout(
                             queue.clear();
                         }
                         Some(SessionInput::Cancel) => {
+                            // Intent before kill: the ensuing Exit must classify as Cancelled.
+                            pending_outcome = Some(crate::run_metrics::RunOutcome::Cancelled);
+                            process.kill().await;
+                        }
+                        Some(SessionInput::TimeoutKill { .. }) => {
+                            // Intent before kill: the ensuing Exit must classify as Timeout.
+                            pending_outcome = Some(crate::run_metrics::RunOutcome::Timeout);
                             process.kill().await;
                         }
                         None => break,
@@ -2456,6 +2590,7 @@ fn spawn_kiro_fanout(
                         let merged = queue.drain_merged();
                         turn_seq += 1;
                         local_running = true;
+                        run_started_ms = Some(now_millis());
                         if let Some(m) = mgr.upgrade() {
                             m.mark_turn(&sid, TurnState::Running, turn_seq);
                         }
@@ -2493,6 +2628,9 @@ fn spawn_codex_fanout(
         // (codex_process.rs),故无法真正并发;passthrough 经 effective() 降级为
         // collect(见 QueueMode::effective,review 2026-06-11)。
         let mut queue_mode = QueueMode::Collect;
+        // ── per-run metrics state (mirrors spawn_acp_fanout) ──
+        let mut pending_outcome: Option<crate::run_metrics::RunOutcome> = None;
+        let mut run_started_ms: Option<i64> = None;
         loop {
             tokio::select! {
                 event = process.event_rx.recv() => {
@@ -2531,6 +2669,32 @@ fn spawn_codex_fanout(
                                 if let Some(m) = mgr.upgrade() {
                                     m.mark_turn(&sid, TurnState::Idle, boundary_count);
                                 }
+                                // per-run metrics: one metric per boundary, intent overrides
+                                // event type (mirrors spawn_acp_fanout). Skipped when this
+                                // boundary has no matching turn-start stamp.
+                                let term = match &evt {
+                                    AcpEvent::Result { .. } => crate::run_metrics::TerminalEvt::Result,
+                                    AcpEvent::Error { .. } => crate::run_metrics::TerminalEvt::Error,
+                                    _ => crate::run_metrics::TerminalEvt::Exit,
+                                };
+                                let outcome = crate::run_metrics::classify_outcome(term, pending_outcome.take());
+                                let (mc, mt_in, mt_out) = match &evt {
+                                    AcpEvent::Result { cost_usd, tokens_in, tokens_out, .. } => (*cost_usd, *tokens_in, *tokens_out),
+                                    _ => (None, None, None),
+                                };
+                                let fk = match outcome {
+                                    crate::run_metrics::RunOutcome::Errored => Some(
+                                        if matches!(evt, AcpEvent::Exit { .. }) { "cli_exited" } else { "cli_error" }.to_string()),
+                                    _ => None,
+                                };
+                                if let Some(started) = run_started_ms.take() {
+                                    if let Some(m) = mgr.upgrade() {
+                                        let rid = crate::run_metrics::new_run_id();
+                                        let metric = build_run_metric(&rid, &sid, &work_dir, agent_label, turn_seq,
+                                            started, now_millis(), outcome, fk, mc, mt_in, mt_out);
+                                        m.record_run_metric(&sid, metric);
+                                    }
+                                }
                                 // collect:turn 结束(已 Idle)且有排队追加 → arm 收集窗口。
                                 if !local_running {
                                     queue.arm();
@@ -2568,6 +2732,7 @@ fn spawn_codex_fanout(
                                 }
                                 turn_seq += 1;
                                 local_running = true;
+                                run_started_ms = Some(now_millis());
                                 if let Some(m) = mgr.upgrade() {
                                     m.mark_turn(&sid, TurnState::Running, turn_seq);
                                 }
@@ -2584,6 +2749,7 @@ fn spawn_codex_fanout(
                                         queue.clear();
                                         turn_seq += 1;
                                         local_running = true;
+                                        run_started_ms = Some(now_millis());
                                         if let Some(m) = mgr.upgrade() {
                                             m.mark_turn(&sid, TurnState::Running, turn_seq);
                                         }
@@ -2594,6 +2760,7 @@ fn spawn_codex_fanout(
                                     QueueMode::Passthrough => {
                                         turn_seq += 1;
                                         local_running = true;
+                                        run_started_ms = Some(now_millis());
                                         if let Some(m) = mgr.upgrade() {
                                             m.mark_turn(&sid, TurnState::Running, turn_seq);
                                         }
@@ -2612,6 +2779,7 @@ fn spawn_codex_fanout(
                                         } else {
                                             turn_seq += 1;
                                             local_running = true;
+                                            run_started_ms = Some(now_millis());
                                             if let Some(m) = mgr.upgrade() {
                                                 m.mark_turn(&sid, TurnState::Running, turn_seq);
                                             }
@@ -2628,6 +2796,8 @@ fn spawn_codex_fanout(
                         }
                         Some(SessionInput::Interrupt) => {
                             if local_running {
+                                // Intent: the interrupted turn is not a completion.
+                                pending_outcome = Some(crate::run_metrics::RunOutcome::Cancelled);
                                 if let Err(e) = process.interrupt().await {
                                     tracing::warn!("interrupt failed for {}: {}", sid, e);
                                 }
@@ -2636,6 +2806,13 @@ fn spawn_codex_fanout(
                             queue.clear();
                         }
                         Some(SessionInput::Cancel) => {
+                            // Intent before kill: the ensuing Exit must classify as Cancelled.
+                            pending_outcome = Some(crate::run_metrics::RunOutcome::Cancelled);
+                            process.kill().await;
+                        }
+                        Some(SessionInput::TimeoutKill { .. }) => {
+                            // Intent before kill: the ensuing Exit must classify as Timeout.
+                            pending_outcome = Some(crate::run_metrics::RunOutcome::Timeout);
                             process.kill().await;
                         }
                         None => break,
@@ -2657,6 +2834,7 @@ fn spawn_codex_fanout(
                         let merged = queue.drain_merged();
                         turn_seq += 1;
                         local_running = true;
+                        run_started_ms = Some(now_millis());
                         if let Some(m) = mgr.upgrade() {
                             m.mark_turn(&sid, TurnState::Running, turn_seq);
                         }
@@ -3359,5 +3537,24 @@ mod emit_tests {
         // redelivered (the bug was that it would be, via a non-atomic gap).
         assert_eq!(rx.try_recv().unwrap(), "after");
         assert!(rx.try_recv().is_err()); // nothing else queued
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn build_run_metric_maps_fields() {
+        let m = build_run_metric(
+            "rid", "sess", "/w", "claude", 3,
+            1000, 1700, // started, ended → duration 700
+            crate::run_metrics::RunOutcome::Completed, None,
+            Some(0.05), Some(10), Some(20),
+        );
+        assert_eq!(m.duration_ms, 700);
+        assert_eq!(m.outcome, crate::run_metrics::RunOutcome::Completed);
+        assert_eq!(m.cost_usd, Some(0.05));
+        assert_eq!(m.turn_seq, 3);
     }
 }

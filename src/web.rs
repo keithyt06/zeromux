@@ -198,6 +198,14 @@ fn try_serve_embedded(path: &str) -> Option<Response> {
         Response::builder()
             .header("Content-Type", mime.as_ref())
             .header("Cache-Control", "public, max-age=3600")
+            // Global CSP backstop (defense-in-depth): even if a raw endpoint were
+            // misconfigured, agent-generated content can't execute in the app origin.
+            .header(
+                "Content-Security-Policy",
+                "default-src 'self'; img-src 'self' data:; style-src 'self' 'unsafe-inline'; \
+                 script-src 'self'; connect-src 'self' ws: wss:; frame-src 'self'; \
+                 object-src 'none'; base-uri 'self'",
+            )
             .body(axum::body::Body::from(file.data.to_vec()))
             .unwrap()
     })
@@ -1199,7 +1207,7 @@ fn next_candidate(name: &str, n: usize) -> String {
 fn sanitize_filename(name: &str) -> String {
     let cleaned: String = name
         .chars()
-        .filter(|&c| c >= '\u{20}' && c != '\u{7f}' && c != '/' && c != '\\')
+        .filter(|&c| c >= '\u{20}' && c != '\u{7f}' && c != '/' && c != '\\' && c != '"')
         .collect();
     if cleaned.is_empty() { "upload".to_string() } else { cleaned }
 }
@@ -2074,6 +2082,15 @@ mod upload_helpers_tests {
         assert_eq!(sanitize_filename("a\nb.png"), "ab.png");
         assert_eq!(sanitize_filename("x/y\\z.txt"), "xyz.txt");
         assert_eq!(sanitize_filename("ok\u{7f}name"), "okname");
+        // Strip double-quote so the Content-Disposition header stays RFC 6266-clean.
+        assert_eq!(sanitize_filename("foo\"bar.txt"), "foobar.txt");
+    }
+
+    #[test]
+    fn embedded_response_has_csp() {
+        if let Some(resp) = try_serve_embedded("index.html") {
+            assert!(resp.headers().get("Content-Security-Policy").is_some());
+        } // index.html is always present in the bundle
     }
 
     #[test]

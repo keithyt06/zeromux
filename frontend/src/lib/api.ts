@@ -320,6 +320,37 @@ export async function getSessionFile(id: string, path: string, baseDir?: string)
   return data.content
 }
 
+// Single-level directory listing (FileBrowser). Backend caps at 2000 entries.
+export interface DirListEntry {
+  name: string
+  type: 'dir' | 'file'
+  size: number
+  mtime: number
+  writable: boolean
+}
+
+export async function listDir(id: string, path = ''): Promise<{ entries: DirListEntry[]; truncated: boolean }> {
+  const params = new URLSearchParams()
+  if (path) params.set('path', path)
+  const qs = params.toString()
+  const res = await api(`/api/sessions/${id}/dir/list${qs ? `?${qs}` : ''}`)
+  if (!res.ok) throw new Error(await res.text())
+  return res.json()
+}
+
+// Authed raw-file URL for <img src>/<a href download>. These element loads carry
+// no Authorization header, so we append ?token= the same way wsUrl does (the
+// backend accepts ?token= for both JWT and legacy modes — see try_jwt_auth /
+// try_legacy_auth). The cookie alone is unreliable for localStorage-only sessions.
+export function fileRawUrl(id: string, path: string): string {
+  const token = getToken()
+  const jwt = document.cookie.split(';').map(c => c.trim()).find(c => c.startsWith('zeromux_jwt='))?.split('=')[1] || ''
+  const authToken = token || jwt
+  const params = new URLSearchParams({ path })
+  if (authToken) params.set('token', authToken)
+  return `/api/sessions/${id}/file/raw?${params}`
+}
+
 // Git
 export interface GitCommit {
   hash: string

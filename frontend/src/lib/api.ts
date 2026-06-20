@@ -555,6 +555,65 @@ export async function getSchedulerHealth(): Promise<{ heartbeat_ms: number; heal
   return res.json()
 }
 
+// Per-run metrics
+export type RunOutcome = 'completed' | 'errored' | 'timeout' | 'cancelled'
+
+export interface RunMetric {
+  run_id: string
+  session_id: string
+  work_dir: string
+  agent_type: SessionType
+  turn_seq: number
+  started_ms: number
+  ended_ms: number | null
+  duration_ms: number | null
+  outcome: RunOutcome
+  failure_kind?: string | null
+  verdict?: string | null
+  verdict_source: 'none' | 'agent_marker' | 'human'
+  cost_usd?: number | null
+  tokens_in?: number | null
+  tokens_out?: number | null
+}
+
+export interface RunStats {
+  count: number
+  avg_ms: number
+  p50_ms: number
+  p95_ms: number
+  max_ms: number
+  completed_count: number
+  errored_count: number
+  timeout_count: number
+  cancelled_count: number
+}
+
+export async function getSessionRuns(
+  id: string,
+  opts: { limit?: number; before?: number } = {},
+): Promise<{ runs: RunMetric[]; stats: RunStats }> {
+  const qs = new URLSearchParams()
+  if (opts.limit != null) qs.set('limit', String(opts.limit))
+  if (opts.before != null) qs.set('before', String(opts.before))
+  const q = qs.toString()
+  const res = await api(`/api/sessions/${id}/runs${q ? `?${q}` : ''}`)
+  if (!res.ok) throw new Error(await res.text())
+  return res.json()
+}
+
+export async function postRunVerdict(
+  id: string,
+  runId: string,
+  verdict: string,
+  note?: string,
+): Promise<void> {
+  const res = await api(`/api/sessions/${id}/runs/${runId}/verdict`, {
+    method: 'POST',
+    body: JSON.stringify({ verdict, note: note ?? null }),
+  })
+  if (!res.ok) throw new Error(await res.text())
+}
+
 export function wsUrl(path: string): string {
   const proto = location.protocol === 'https:' ? 'wss:' : 'ws:'
   const token = getToken()

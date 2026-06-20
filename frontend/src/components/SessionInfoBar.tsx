@@ -1,7 +1,7 @@
 import { useState, useEffect, useCallback } from 'react'
 import type { SessionInfo, SessionMetaStatus, NoteEntry } from '../lib/api'
 import { updateSession, listNotes, createNote, deleteNote } from '../lib/api'
-import { ChevronDown, ChevronRight, FileText, StickyNote, GitBranch, X, Activity } from 'lucide-react'
+import { ChevronDown, ChevronRight, FileText, StickyNote, GitBranch, X, Activity, BarChart3 } from 'lucide-react'
 
 interface Props {
   session: SessionInfo
@@ -14,6 +14,11 @@ interface Props {
   showEvents: boolean
   onOpenSidebar?: () => void
   onQueueMode?: (mode: string) => void
+  // Inline run-metrics panel toggle (agent sessions only). Lives alongside the
+  // chat (not a full-screen overlay), so it's a simple boolean rather than an
+  // overlay mode.
+  onToggleMetrics?: () => void
+  showMetrics?: boolean
 }
 
 const STATUS_OPTIONS: { value: SessionMetaStatus; label: string; color: string }[] = [
@@ -28,7 +33,7 @@ export function StatusDot({ status }: { status: SessionMetaStatus }) {
   return <span className={`inline-block w-2 h-2 rounded-full ${opt?.color || 'bg-gray-400'} shrink-0`} />
 }
 
-export default function SessionInfoBar({ session, onUpdate, onToggleFiles, onToggleGit, onToggleEvents, showFiles, showGit, showEvents, onOpenSidebar, onQueueMode }: Props) {
+export default function SessionInfoBar({ session, onUpdate, onToggleFiles, onToggleGit, onToggleEvents, showFiles, showGit, showEvents, onOpenSidebar, onQueueMode, onToggleMetrics, showMetrics }: Props) {
   const [expanded, setExpanded] = useState(false)
   const [queueMode, setQueueMode] = useState('collect')
   const [desc, setDesc] = useState(session.description)
@@ -164,6 +169,19 @@ export default function SessionInfoBar({ session, onUpdate, onToggleFiles, onTog
           >
             <Activity size={14} />
           </button>
+          {onToggleMetrics && (
+            <button
+              onClick={onToggleMetrics}
+              className={`p-1 rounded transition-colors ${
+                showMetrics
+                  ? 'text-[var(--accent-blue)] bg-[var(--bg-primary)]'
+                  : 'text-[var(--text-secondary)] hover:text-[var(--text-primary)]'
+              }`}
+              title="运行记录"
+            >
+              <BarChart3 size={14} />
+            </button>
+          )}
         </div>
       </div>
 

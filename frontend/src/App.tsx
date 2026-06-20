@@ -23,6 +23,9 @@ export default function App() {
   const [overlay, setOverlay] = useState<Record<string, OverlayView>>({})
   // session id → turns_completed already seen (red-dot read baseline)
   const [readCounts, setReadCounts] = useState<Record<string, number>>({})
+  // session id → inline run-metrics panel visibility. Inline (alongside chat),
+  // not an overlay mode, so it coexists with the conversation.
+  const [metricsOpen, setMetricsOpen] = useState<Record<string, boolean>>({})
   const baselineInit = useRef(false)
   // WS-only controls each AcpChatView registers, keyed by session id, so the
   // sibling SessionInfoBar can drive them (G2b queue mode).
@@ -229,6 +232,10 @@ export default function App() {
             onQueueMode={activeSession.type !== 'tmux'
               ? (mode) => sessionControls.current[activeSession.id]?.setQueueMode(mode)
               : undefined}
+            onToggleMetrics={activeSession.type !== 'tmux'
+              ? () => setMetricsOpen(m => ({ ...m, [activeSession.id]: !m[activeSession.id] }))
+              : undefined}
+            showMetrics={!!metricsOpen[activeSession.id]}
           />
         )}
         {/* Mobile: show menu button when no active session */}
@@ -255,7 +262,7 @@ export default function App() {
                   {s.type === 'tmux' ? (
                     <TerminalView sessionId={s.id} active={isActive && view === 'none'} theme={themeCtx.theme} />
                   ) : (
-                    <AcpChatView sessionId={s.id} active={isActive && view === 'none'} agentType={s.type} onRegisterControls={registerControls} />
+                    <AcpChatView sessionId={s.id} active={isActive && view === 'none'} agentType={s.type} onRegisterControls={registerControls} showMetrics={!!metricsOpen[s.id]} />
                   )}
                 </div>
                 {view === 'files' && <MarkdownViewer sessionId={s.id} sessionType={s.type} />}

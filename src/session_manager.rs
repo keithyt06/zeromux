@@ -636,7 +636,10 @@ impl SessionManager {
     }
 
     /// Watchdog: find *interactive* sessions (no `source_task_id`) that are
-    /// Running and have been silent for at least `idle_ms` (by `last_activity_ms`).
+    /// Running and have emitted no event for at least `idle_ms` — true silence
+    /// detection. `last_activity_ms` is bumped on every persisted event in
+    /// `record_and_broadcast`, so an actively-streaming long turn is NOT killed;
+    /// only a genuinely silent (wedged) one is.
     /// Scheduled runs (`source_task_id.is_some()`) are excluded — they have their
     /// own reconcile path in scheduled_tasks.rs and must not be double-handled.
     /// Pure filter over the in-memory map; the caller sends TimeoutKill.
@@ -1541,6 +1544,12 @@ impl SessionManager {
     fn record_and_broadcast(&self, id: &str, data: String) {
         let mut map = self.sessions.lock().unwrap();
         if let Some(s) = map.get_mut(id) {
+            // Every persisted event (ContentBlock/Result/…) is real activity, so
+            // bump last_activity_ms here. This makes it a true silence timestamp
+            // (updated within a turn, not just at turn boundaries), which the
+            // interactive watchdog (running_idle_too_long) relies on to avoid
+            // killing healthy long-running turns. Lock already held; no await/I/O.
+            s.last_activity_ms = now_millis();
             let data_len = data.len();
             s.scrollback.push_back(data.clone());
             s.scrollback_bytes += data_len;
@@ -3610,6 +3619,27 @@ mod running_summary_tests {
         got.sort();
         assert_eq!(got, vec!["boundary".to_string(), "kill_me".to_string()],
             "only interactive + Running + silent>=idle sessions; scheduled/idle/fresh excluded");
+    }
+
+    #[test]
+    fn record_and_broadcast_bumps_last_activity_so_streaming_turn_is_not_killed() {
+        // A turn that started long ago but is actively streaming must survive:
+        // record_and_broadcast bumps last_activity_ms, so the watchdog sees recent
+        // activity and does NOT kill it. A second, silent session IS killed.
+        let now = now_millis();
+        let idle = 30 * 60_000i64; // 30 min
+        let long_ago = now - idle - 60_000; // turn started well past the threshold
+        let (m, _tmp) = mgr_with(vec![
+            aged_session("streaming", None, TurnState::Running, long_ago),
+            aged_session("silent", None, TurnState::Running, long_ago),
+        ]);
+
+        // "streaming" receives a fresh event; "silent" does not.
+        m.record_and_broadcast("streaming", "some output".to_string());
+
+        let killed = m.running_idle_too_long(now_millis(), idle);
+        assert_eq!(killed, vec!["silent".to_string()],
+            "streaming session bumped last_activity_ms and must be spared; only the silent one is killed");
     }
 
     #[tokio::test]

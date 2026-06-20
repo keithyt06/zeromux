@@ -146,6 +146,11 @@ pub fn metrics_dir() -> std::path::PathBuf {
 
 /// 单个全局 worker。fan-out 在 finalize 处 try_send;worker 用 spawn_blocking 落盘,
 /// fsync 永不落在对话延迟路径。队列满时 try_send 端 best-effort 丢弃(见 Task 5)。
+// The on-disk `<sid>.ndjson` is an append-only audit log (~one short line per
+// turn, no bodies); the app never reads it back. The in-memory VecDeque (cap 50,
+// see `runs_for_session`) is the source of truth for queries. On-disk GC via
+// `gc_retain` is a deferred seam (tracked) — not wired here, so the files grow
+// unbounded by design until that lands.
 pub fn spawn_writer() -> tokio::sync::mpsc::Sender<RunMetric> {
     let (tx, mut rx) = tokio::sync::mpsc::channel::<RunMetric>(256);
     // Spawn the drain task only when a Tokio runtime is present. In production

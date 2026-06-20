@@ -5,10 +5,12 @@ use std::path::Path;
 use std::str::FromStr;
 use std::sync::Mutex;
 
-/// Idle threshold after which a silent *interactive* (non-scheduled) agent
-/// session is assumed wedged and gets a TimeoutKill. Scheduled runs use their
-/// own per-task `idle_timeout_min`; this is a conservative fixed value for
-/// interactive sessions, which today have no kill/timeout detection at all.
+/// Silence threshold: an *interactive* (non-scheduled) agent session that has
+/// emitted no event for this long is assumed wedged and gets a TimeoutKill.
+/// This is true silence (time since last event), not total turn runtime —
+/// `last_activity_ms` is bumped on every streamed event, so healthy
+/// long-running turns survive. Scheduled runs use their own per-task
+/// `idle_timeout_min`; this is a conservative fixed value for interactive sessions.
 /// Constant for now — per-session/self-tuning thresholds are a documented future
 /// seam (spec §8).
 const INTERACTIVE_IDLE_MS: i64 = 30 * 60_000; // 30 minutes

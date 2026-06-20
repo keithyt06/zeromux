@@ -1,0 +1,12 @@
+{
+  "name": "ZeroMux",
+  "short_name": "ZeroMux",
+  "theme_color": "#f7b500",
+  "background_color": "#11161d",
+  "display": "standalone",
+  "start_url": "/",
+  "icons": [
+    { "src": "/icon-192.png", "sizes": "192x192", "type": "image/png" },
+    { "src": "/icon-512.png", "sizes": "512x512", "type": "image/png" }
+  ]
+}

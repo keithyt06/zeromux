@@ -26,9 +26,11 @@ pub fn build_router(state: Arc<AppState>) -> Router {
         .route("/api/sessions/{id}/logs", get(session_logs))
         .route("/api/sessions/{id}/files", get(list_session_files))
         .route("/api/sessions/{id}/file", get(get_session_file))
+        .route("/api/sessions/{id}/file/raw", get(get_file_raw))
         .route("/api/sessions/{id}/file", post(write_session_file))
         .route("/api/sessions/{id}/file", delete(delete_session_file))
         .route("/api/sessions/{id}/file/rename", post(rename_session_file))
+        .route("/api/sessions/{id}/dir/list", get(list_dir))
         .route("/api/sessions/{id}/upload", post(upload_session_file)
             .layer(DefaultBodyLimit::max(28_311_552)))
         .route("/api/sessions/{id}/dir", post(create_session_dir))
@@ -196,6 +198,15 @@ fn try_serve_embedded(path: &str) -> Option<Response> {
         Response::builder()
             .header("Content-Type", mime.as_ref())
             .header("Cache-Control", "public, max-age=3600")
+            // Global CSP backstop (defense-in-depth): even if a raw endpoint were
+            // misconfigured, agent-generated content can't execute in the app origin.
+            .header(
+                "Content-Security-Policy",
+                "default-src 'self'; img-src 'self' data:; style-src 'self' 'unsafe-inline'; \
+                 script-src 'self' blob:; worker-src 'self' blob:; \
+                 connect-src 'self' ws: wss:; frame-src 'self'; \
+                 object-src 'none'; base-uri 'self'",
+            )
             .body(axum::body::Body::from(file.data.to_vec()))
             .unwrap()
     })
@@ -821,12 +832,14 @@ async fn get_session_file(
 ) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
     let base = resolve_base_dir(&state, &id, query.base_dir.as_deref())?;
 
-    // Security: resolve and check path is under base
-    let file_path = base.join(&query.path).canonicalize()
-        .map_err(|e| (StatusCode::BAD_REQUEST, format!("Invalid path: {}", e)))?;
+    // Security: resolve + verify the real path is under base (follows symlinks).
+    let file_path = resolve_and_verify(&base, &query.path)?;
 
-    if !file_path.starts_with(&base) {
-        return Err((StatusCode::FORBIDDEN, "Path traversal denied".to_string()));
+    // Refuse credential / sensitive files by name.
+    if let Some(name) = file_path.file_name().and_then(|s| s.to_str()) {
+        if is_credential_path(name) {
+            return Err((StatusCode::FORBIDDEN, "Credential file access denied".to_string()));
+        }
     }
 
     // Size check (1MB max)
@@ -843,6 +856,34 @@ async fn get_session_file(
         "path": query.path,
         "content": content,
     })))
+}
+
+/// raw download triple: never inline-render a user file (prevents same-origin XSS).
+fn build_raw_headers(filename: &str) -> (&'static str, &'static str, String) {
+    let safe = sanitize_filename(filename);
+    ("application/octet-stream", "nosniff", format!("attachment; filename=\"{}\"", safe))
+}
+
+async fn get_file_raw(
+    State(state): State<Arc<AppState>>,
+    axum::extract::Path(id): axum::extract::Path<String>,
+    Query(query): Query<FileQuery>,
+) -> Result<Response, (StatusCode, String)> {
+    let base = resolve_base_dir(&state, &id, query.base_dir.as_deref())?;
+    let real = resolve_and_verify(&base, &query.path)?;
+    let fname = real.file_name().and_then(|s| s.to_str()).unwrap_or("download");
+    if is_credential_path(fname) {
+        return Err((StatusCode::FORBIDDEN, "Forbidden".into()));
+    }
+    let bytes = std::fs::read(&real)
+        .map_err(|e| (StatusCode::NOT_FOUND, format!("Not found: {e}")))?;
+    let (ct, nosniff, disp) = build_raw_headers(fname);
+    Ok(Response::builder()
+        .header("Content-Type", ct)
+        .header("X-Content-Type-Options", nosniff)
+        .header("Content-Disposition", disp)
+        .body(axum::body::Body::from(bytes))
+        .unwrap())
 }
 
 /// Resolve the effective base directory: use base_dir_override if provided, otherwise session work_dir.
@@ -908,6 +949,147 @@ fn resolve_session_path(
     Ok((base, joined))
 }
 
+// ── Unified path-safety helpers ──
+//
+// These are the single source of truth for file-endpoint safety, wired into the
+// read/write/upload handlers below.
+
+/// Credential / sensitive filenames: never enumerated by `list`, refused by `download`.
+/// Operates on the file NAME only (no directory components), case-insensitive.
+fn is_credential_path(name: &str) -> bool {
+    let n = name.to_ascii_lowercase();
+    n.starts_with(".env")
+        || n == ".aws" || n == ".ssh" || n == ".netrc" || n == ".npmrc"
+        || n.starts_with("id_")            // id_rsa / id_ed25519 ...
+        || n.ends_with(".pem") || n.ends_with(".key") || n.ends_with(".p12")
+        || n.ends_with("credentials")
+}
+
+/// Write-blocked control dirs: if any component of the canonical real path matches,
+/// writes are denied (defends against a symlinked parent dir bypassing the check).
+fn is_write_blocked(canonical: &std::path::Path) -> bool {
+    canonical.components().any(|c| {
+        matches!(c, std::path::Component::Normal(s)
+            if matches!(s.to_str(), Some(".git") | Some(".zeromux") | Some(".zeromux-worktrees") | Some(".ssh")))
+    })
+}
+
+/// Unified resolve + verify: lexical `..` guard → `base.join(rel)` → canonicalize →
+/// `starts_with(base_canonical)` recheck. canonicalize failure (dangling / escaping
+/// symlink) → 403. canonicalize follows symlinks, so a symlink whose real target is
+/// outside base is rejected by the post-canonicalize recheck.
+///
+/// NOTE: O_NOFOLLOW / openat2 full-descent is the strongest design, but Rust has no
+/// cross-platform wrapper. This MVP uses canonicalize + starts_with recheck to shrink
+/// the window to near-zero (for reads it is sufficient: the file already exists and
+/// canonicalize yields its real path). The residual canonicalize→open TOCTOU window is
+/// low-risk in the single-user work_dir scenario; openat2 hardening is a deferred seam.
+fn resolve_and_verify(
+    base_canonical: &std::path::Path,
+    rel: &str,
+) -> Result<std::path::PathBuf, (StatusCode, String)> {
+    use std::path::{Component, Path};
+    // Lexical layer: reject absolute paths and escaping `..`.
+    let mut probe = base_canonical.to_path_buf();
+    for comp in Path::new(rel).components() {
+        match comp {
+            Component::Normal(c) => probe.push(c),
+            Component::CurDir => {}
+            Component::ParentDir => {
+                probe.pop();
+                if !probe.starts_with(base_canonical) {
+                    return Err((StatusCode::FORBIDDEN, "Path traversal denied".into()));
+                }
+            }
+            _ => return Err((StatusCode::BAD_REQUEST, "Invalid path component".into())),
+        }
+    }
+    // Physical layer: after canonicalize (follows symlinks) the path must still be in base.
+    let real = probe
+        .canonicalize()
+        .map_err(|_| (StatusCode::FORBIDDEN, "Path not resolvable under workspace".into()))?;
+    if !real.starts_with(base_canonical) {
+        return Err((StatusCode::FORBIDDEN, "Path escapes workspace".into()));
+    }
+    Ok(real)
+}
+
+// ── Single-level directory listing (dir/list) ──
+
+struct DirEntryOut {
+    name: String,
+    kind: &'static str,
+    size: u64,
+    mtime: u64,
+    writable: bool,
+}
+
+/// List one directory level (non-recursive). Credential files are never enumerated.
+/// Caps at 2000 entries and sets `truncated`. Dirs sort before files, then by name.
+fn list_dir_entries(
+    base_canonical: &std::path::Path,
+    rel: &str,
+) -> Result<(Vec<DirEntryOut>, bool), (StatusCode, String)> {
+    let dir = if rel.is_empty() {
+        base_canonical.to_path_buf()
+    } else {
+        resolve_and_verify(base_canonical, rel)?
+    };
+    if !dir.is_dir() {
+        return Err((StatusCode::BAD_REQUEST, "Not a directory".into()));
+    }
+    let rd = std::fs::read_dir(&dir)
+        .map_err(|e| (StatusCode::BAD_REQUEST, format!("Cannot read dir: {e}")))?;
+    let mut out = Vec::new();
+    let mut truncated = false;
+    for entry in rd.flatten() {
+        if out.len() >= 2000 {
+            truncated = true;
+            break;
+        }
+        let name = entry.file_name().to_string_lossy().to_string();
+        if is_credential_path(&name) {
+            continue; // never enumerate credentials
+        }
+        let ft = entry.file_type().ok();
+        let is_dir = ft.map(|t| t.is_dir()).unwrap_or(false);
+        let meta = entry.metadata().ok();
+        out.push(DirEntryOut {
+            kind: if is_dir { "dir" } else { "file" },
+            size: meta.as_ref().map(|m| m.len()).unwrap_or(0),
+            mtime: meta
+                .as_ref()
+                .and_then(|m| m.modified().ok())
+                .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                .map(|d| d.as_secs())
+                .unwrap_or(0),
+            writable: !is_write_blocked(&dir.join(&name)),
+            name,
+        });
+    }
+    // dirs first ("dir" > "file" reverse-sorted via b.kind), then case-insensitive name
+    out.sort_by(|a, b| (b.kind, a.name.to_lowercase()).cmp(&(a.kind, b.name.to_lowercase())));
+    Ok((out, truncated))
+}
+
+async fn list_dir(
+    State(state): State<Arc<AppState>>,
+    axum::extract::Path(id): axum::extract::Path<String>,
+    Query(query): Query<DirQuery>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    let base = resolve_base_dir(&state, &id, None)?;
+    let (entries, truncated) = list_dir_entries(&base, query.path.as_deref().unwrap_or(""))?;
+    let arr: Vec<_> = entries
+        .iter()
+        .map(|e| {
+            serde_json::json!({
+                "name": e.name, "type": e.kind, "size": e.size, "mtime": e.mtime, "writable": e.writable,
+            })
+        })
+        .collect();
+    Ok(Json(serde_json::json!({ "entries": arr, "truncated": truncated })))
+}
+
 // ── File write (create/edit) ──
 
 #[derive(serde::Deserialize)]
@@ -921,13 +1103,24 @@ async fn write_session_file(
     axum::extract::Path(id): axum::extract::Path<String>,
     Json(req): Json<WriteFileReq>,
 ) -> Result<StatusCode, (StatusCode, String)> {
-    let (_base, file_path) = resolve_session_path(&state, &id, &req.path)?;
+    let base = resolve_base_dir(&state, &id, None)?;
 
-    // Ensure parent directory exists
-    if let Some(parent) = file_path.parent() {
-        std::fs::create_dir_all(parent)
-            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("Cannot create dir: {}", e)))?;
+    // The parent directory must already exist (we do not implicitly create
+    // client-named directory trees). Resolve + verify the real parent is under base,
+    // then write the leaf file inside it.
+    let rel = std::path::Path::new(&req.path);
+    let file_name = rel
+        .file_name()
+        .and_then(|s| s.to_str())
+        .ok_or((StatusCode::BAD_REQUEST, "Invalid file path".to_string()))?;
+    let parent_rel = rel.parent().map(|p| p.to_string_lossy().into_owned()).unwrap_or_default();
+    let real_parent = resolve_and_verify(&base, &parent_rel)?;
+
+    if is_write_blocked(&real_parent) {
+        return Err((StatusCode::FORBIDDEN, "Writes to control directories denied".to_string()));
     }
+
+    let file_path = real_parent.join(file_name);
 
     std::fs::write(&file_path, &req.content)
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("Write failed: {}", e)))?;
@@ -1015,7 +1208,7 @@ fn next_candidate(name: &str, n: usize) -> String {
 fn sanitize_filename(name: &str) -> String {
     let cleaned: String = name
         .chars()
-        .filter(|&c| c >= '\u{20}' && c != '\u{7f}' && c != '/' && c != '\\')
+        .filter(|&c| c >= '\u{20}' && c != '\u{7f}' && c != '/' && c != '\\' && c != '"')
         .collect();
     if cleaned.is_empty() { "upload".to_string() } else { cleaned }
 }
@@ -1040,6 +1233,19 @@ fn dedupe_and_create(dir: &std::path::Path, name: &str) -> std::io::Result<(std:
     Err(std::io::Error::new(std::io::ErrorKind::AlreadyExists, "too many name collisions"))
 }
 
+/// Split an upload relative path into (target directory, safe file name). Preserves the
+/// directory part (fixes the bug where only file_name() was taken, so uploads always
+/// landed in work_dir root regardless of the browsed subdir).
+fn split_upload_target(base: &std::path::Path, rel: &str) -> (std::path::PathBuf, String) {
+    let p = std::path::Path::new(rel);
+    let name = sanitize_filename(p.file_name().and_then(|s| s.to_str()).unwrap_or("upload"));
+    let dir = match p.parent() {
+        Some(par) if !par.as_os_str().is_empty() => base.join(par),
+        _ => base.to_path_buf(),
+    };
+    (dir, name)
+}
+
 #[derive(serde::Deserialize)]
 struct UploadReq {
     path: String,
@@ -1058,13 +1264,22 @@ async fn upload_session_file(
     axum::extract::Path(id): axum::extract::Path<String>,
     Json(req): Json<UploadReq>,
 ) -> Result<Json<UploadResp>, (StatusCode, String)> {
-    let safe_name = sanitize_filename(
-        std::path::Path::new(&req.path)
-            .file_name()
-            .and_then(|s| s.to_str())
-            .unwrap_or("upload"),
-    );
-    let (base, _joined) = resolve_session_path(&state, &id, &safe_name)?;
+    let base = resolve_base_dir(&state, &id, None)?;
+
+    // Honor the directory part of the upload path (e.g. "sub/dir/pic.png" → base/sub/dir).
+    let (target_dir, safe_name) = split_upload_target(&base, &req.path);
+
+    // Verify the target directory's real path is under base. Its relative part is the
+    // upload path with the leaf name stripped; the directory must already exist.
+    let parent_rel = target_dir
+        .strip_prefix(&base)
+        .map(|p| p.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    let real_target = resolve_and_verify(&base, &parent_rel)?;
+
+    if is_write_blocked(&real_target) {
+        return Err((StatusCode::FORBIDDEN, "Writes to control directories denied".to_string()));
+    }
 
     let bytes = base64::Engine::decode(&base64::engine::general_purpose::STANDARD, &req.data)
         .map_err(|e| (StatusCode::BAD_REQUEST, format!("Invalid base64: {}", e)))?;
@@ -1073,10 +1288,7 @@ async fn upload_session_file(
         return Err((StatusCode::BAD_REQUEST, "File too large (max 20MB)".to_string()));
     }
 
-    std::fs::create_dir_all(&base)
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("Cannot create dir: {}", e)))?;
-
-    let (mut file, actual_name) = dedupe_and_create(&base, &safe_name)
+    let (mut file, actual_name) = dedupe_and_create(&real_target, &safe_name)
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("Create failed: {}", e)))?;
     use std::io::Write;
     file.write_all(&bytes)
@@ -1783,6 +1995,70 @@ async fn scheduler_health(
 }
 
 #[cfg(test)]
+mod path_safety_tests {
+    use super::*;
+    use std::os::unix::fs::symlink;
+
+    #[test]
+    fn resolve_and_verify_rejects_symlink_escape() {
+        let tmp = std::env::temp_dir().join(format!("zmfb-{}", std::process::id()));
+        let base = tmp.join("work");
+        std::fs::create_dir_all(&base).unwrap();
+        let outside = tmp.join("secret.txt");
+        std::fs::write(&outside, "topsecret").unwrap();
+        // base/leak -> ../secret.txt (escapes base)
+        let _ = symlink(&outside, base.join("leak"));
+        let base_c = base.canonicalize().unwrap();
+        // 跟随 symlink 后 canonical 落在 base 外 → 必须拒
+        assert!(resolve_and_verify(&base_c, "leak").is_err());
+        // 正常文件放行
+        std::fs::write(base.join("ok.txt"), "hi").unwrap();
+        assert!(resolve_and_verify(&base_c, "ok.txt").is_ok());
+    }
+
+    #[test]
+    fn build_raw_headers_are_safe() {
+        let h = build_raw_headers("evil.html");
+        assert_eq!(h.0, "application/octet-stream");
+        assert_eq!(h.1, "nosniff");
+        assert!(h.2.contains("attachment"));
+    }
+
+    #[test]
+    fn credential_names_flagged() {
+        assert!(is_credential_path(".env"));
+        assert!(is_credential_path("id_rsa"));
+        assert!(is_credential_path("server.pem"));
+        assert!(is_credential_path(".aws"));
+        assert!(!is_credential_path("README.md"));
+    }
+
+    #[test]
+    fn write_blocked_for_control_dirs() {
+        let p = std::path::Path::new("/home/u/work/.git/config");
+        assert!(is_write_blocked(p));
+        let p2 = std::path::Path::new("/home/u/work/src/main.rs");
+        assert!(!is_write_blocked(p2));
+    }
+
+    #[test]
+    fn list_dir_filters_credentials_and_marks_types() {
+        let tmp = std::env::temp_dir().join(format!("zmld-{}", std::process::id()));
+        std::fs::create_dir_all(tmp.join("sub")).unwrap();
+        std::fs::write(tmp.join("a.txt"), "x").unwrap();
+        std::fs::write(tmp.join(".env"), "SECRET=1").unwrap();
+        let base = tmp.canonicalize().unwrap();
+        let (entries, _trunc) = list_dir_entries(&base, "").unwrap();
+        let names: Vec<&str> = entries.iter().map(|e| e.name.as_str()).collect();
+        assert!(names.contains(&"a.txt"));
+        assert!(names.contains(&"sub"));
+        assert!(!names.contains(&".env")); // credential 不枚举
+        let sub = entries.iter().find(|e| e.name == "sub").unwrap();
+        assert_eq!(sub.kind, "dir");
+    }
+}
+
+#[cfg(test)]
 mod upload_helpers_tests {
     use super::*;
 
@@ -1807,6 +2083,24 @@ mod upload_helpers_tests {
         assert_eq!(sanitize_filename("a\nb.png"), "ab.png");
         assert_eq!(sanitize_filename("x/y\\z.txt"), "xyz.txt");
         assert_eq!(sanitize_filename("ok\u{7f}name"), "okname");
+        // Strip double-quote so the Content-Disposition header stays RFC 6266-clean.
+        assert_eq!(sanitize_filename("foo\"bar.txt"), "foobar.txt");
+    }
+
+    #[test]
+    fn embedded_response_has_csp() {
+        if let Some(resp) = try_serve_embedded("index.html") {
+            let csp = resp
+                .headers()
+                .get("Content-Security-Policy")
+                .expect("CSP header present")
+                .to_str()
+                .unwrap();
+            // AudioWorklet (voice transcription) loads from a blob: URL; the CSP
+            // must permit blob: in script-src/worker-src or voice input breaks.
+            assert!(csp.contains("script-src 'self' blob:"));
+            assert!(csp.contains("worker-src 'self' blob:"));
+        } // index.html is always present in the bundle
     }
 
     #[test]
@@ -1838,6 +2132,19 @@ mod upload_helpers_tests {
         assert_eq!(n3, "a-2.png");
 
         assert_eq!(std::fs::read(d.join("a.png")).unwrap(), b"one");
+    }
+
+    #[test]
+    fn upload_targets_subdir_not_root() {
+        // Pure helper behavior: base + "sub/dir/pic.png" → dir base/sub/dir, name pic.png.
+        let base = std::path::Path::new("/home/u/work");
+        let (dir, name) = split_upload_target(base, "sub/dir/pic.png");
+        assert_eq!(dir, std::path::Path::new("/home/u/work/sub/dir"));
+        assert_eq!(name, "pic.png");
+        // Bare filename → lands in base.
+        let (dir2, name2) = split_upload_target(base, "pic.png");
+        assert_eq!(dir2, base);
+        assert_eq!(name2, "pic.png");
     }
 
     #[test]

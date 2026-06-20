@@ -908,6 +908,75 @@ fn resolve_session_path(
     Ok((base, joined))
 }
 
+// ── Unified path-safety helpers (B-Task 1; wired into endpoints in B-Task 2) ──
+//
+// These are the single source of truth for file-endpoint safety. They are not yet
+// called by the existing handlers (that rewiring is B-Task 2), so they carry a
+// narrow #[allow(dead_code)] until then.
+
+/// Credential / sensitive filenames: never enumerated by `list`, refused by `download`.
+/// Operates on the file NAME only (no directory components), case-insensitive.
+#[allow(dead_code)]
+fn is_credential_path(name: &str) -> bool {
+    let n = name.to_ascii_lowercase();
+    n.starts_with(".env")
+        || n == ".aws" || n == ".ssh" || n == ".netrc" || n == ".npmrc"
+        || n.starts_with("id_")            // id_rsa / id_ed25519 ...
+        || n.ends_with(".pem") || n.ends_with(".key") || n.ends_with(".p12")
+        || n.ends_with("credentials")
+}
+
+/// Write-blocked control dirs: if any component of the canonical real path matches,
+/// writes are denied (defends against a symlinked parent dir bypassing the check).
+#[allow(dead_code)]
+fn is_write_blocked(canonical: &std::path::Path) -> bool {
+    canonical.components().any(|c| {
+        matches!(c, std::path::Component::Normal(s)
+            if matches!(s.to_str(), Some(".git") | Some(".zeromux") | Some(".zeromux-worktrees") | Some(".ssh")))
+    })
+}
+
+/// Unified resolve + verify: lexical `..` guard → `base.join(rel)` → canonicalize →
+/// `starts_with(base_canonical)` recheck. canonicalize failure (dangling / escaping
+/// symlink) → 403. canonicalize follows symlinks, so a symlink whose real target is
+/// outside base is rejected by the post-canonicalize recheck.
+///
+/// NOTE: O_NOFOLLOW / openat2 full-descent is the strongest design, but Rust has no
+/// cross-platform wrapper. This MVP uses canonicalize + starts_with recheck to shrink
+/// the window to near-zero (for reads it is sufficient: the file already exists and
+/// canonicalize yields its real path). The residual canonicalize→open TOCTOU window is
+/// low-risk in the single-user work_dir scenario; openat2 hardening is a deferred seam.
+#[allow(dead_code)]
+fn resolve_and_verify(
+    base_canonical: &std::path::Path,
+    rel: &str,
+) -> Result<std::path::PathBuf, (StatusCode, String)> {
+    use std::path::{Component, Path};
+    // Lexical layer: reject absolute paths and escaping `..`.
+    let mut probe = base_canonical.to_path_buf();
+    for comp in Path::new(rel).components() {
+        match comp {
+            Component::Normal(c) => probe.push(c),
+            Component::CurDir => {}
+            Component::ParentDir => {
+                probe.pop();
+                if !probe.starts_with(base_canonical) {
+                    return Err((StatusCode::FORBIDDEN, "Path traversal denied".into()));
+                }
+            }
+            _ => return Err((StatusCode::BAD_REQUEST, "Invalid path component".into())),
+        }
+    }
+    // Physical layer: after canonicalize (follows symlinks) the path must still be in base.
+    let real = probe
+        .canonicalize()
+        .map_err(|_| (StatusCode::FORBIDDEN, "Path not resolvable under workspace".into()))?;
+    if !real.starts_with(base_canonical) {
+        return Err((StatusCode::FORBIDDEN, "Path escapes workspace".into()));
+    }
+    Ok(real)
+}
+
 // ── File write (create/edit) ──
 
 #[derive(serde::Deserialize)]
@@ -1780,6 +1849,46 @@ async fn scheduler_health(
     let now = chrono::Utc::now().timestamp_millis();
     let healthy = hb != 0 && now - hb < 180_000;
     Ok(Json(serde_json::json!({ "heartbeat_ms": hb, "healthy": healthy })))
+}
+
+#[cfg(test)]
+mod path_safety_tests {
+    use super::*;
+    use std::os::unix::fs::symlink;
+
+    #[test]
+    fn resolve_and_verify_rejects_symlink_escape() {
+        let tmp = std::env::temp_dir().join(format!("zmfb-{}", std::process::id()));
+        let base = tmp.join("work");
+        std::fs::create_dir_all(&base).unwrap();
+        let outside = tmp.join("secret.txt");
+        std::fs::write(&outside, "topsecret").unwrap();
+        // base/leak -> ../secret.txt (escapes base)
+        let _ = symlink(&outside, base.join("leak"));
+        let base_c = base.canonicalize().unwrap();
+        // 跟随 symlink 后 canonical 落在 base 外 → 必须拒
+        assert!(resolve_and_verify(&base_c, "leak").is_err());
+        // 正常文件放行
+        std::fs::write(base.join("ok.txt"), "hi").unwrap();
+        assert!(resolve_and_verify(&base_c, "ok.txt").is_ok());
+    }
+
+    #[test]
+    fn credential_names_flagged() {
+        assert!(is_credential_path(".env"));
+        assert!(is_credential_path("id_rsa"));
+        assert!(is_credential_path("server.pem"));
+        assert!(is_credential_path(".aws"));
+        assert!(!is_credential_path("README.md"));
+    }
+
+    #[test]
+    fn write_blocked_for_control_dirs() {
+        let p = std::path::Path::new("/home/u/work/.git/config");
+        assert!(is_write_blocked(p));
+        let p2 = std::path::Path::new("/home/u/work/src/main.rs");
+        assert!(!is_write_blocked(p2));
+    }
 }
 
 #[cfg(test)]

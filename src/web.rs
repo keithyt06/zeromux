@@ -26,6 +26,7 @@ pub fn build_router(state: Arc<AppState>) -> Router {
         .route("/api/sessions/{id}/logs", get(session_logs))
         .route("/api/sessions/{id}/files", get(list_session_files))
         .route("/api/sessions/{id}/file", get(get_session_file))
+        .route("/api/sessions/{id}/file/raw", get(get_file_raw))
         .route("/api/sessions/{id}/file", post(write_session_file))
         .route("/api/sessions/{id}/file", delete(delete_session_file))
         .route("/api/sessions/{id}/file/rename", post(rename_session_file))
@@ -846,6 +847,34 @@ async fn get_session_file(
         "path": query.path,
         "content": content,
     })))
+}
+
+/// raw download triple: never inline-render a user file (prevents same-origin XSS).
+fn build_raw_headers(filename: &str) -> (&'static str, &'static str, String) {
+    let safe = sanitize_filename(filename);
+    ("application/octet-stream", "nosniff", format!("attachment; filename=\"{}\"", safe))
+}
+
+async fn get_file_raw(
+    State(state): State<Arc<AppState>>,
+    axum::extract::Path(id): axum::extract::Path<String>,
+    Query(query): Query<FileQuery>,
+) -> Result<Response, (StatusCode, String)> {
+    let base = resolve_base_dir(&state, &id, query.base_dir.as_deref())?;
+    let real = resolve_and_verify(&base, &query.path)?;
+    let fname = real.file_name().and_then(|s| s.to_str()).unwrap_or("download");
+    if is_credential_path(fname) {
+        return Err((StatusCode::FORBIDDEN, "Forbidden".into()));
+    }
+    let bytes = std::fs::read(&real)
+        .map_err(|e| (StatusCode::NOT_FOUND, format!("Not found: {e}")))?;
+    let (ct, nosniff, disp) = build_raw_headers(fname);
+    Ok(Response::builder()
+        .header("Content-Type", ct)
+        .header("X-Content-Type-Options", nosniff)
+        .header("Content-Disposition", disp)
+        .body(axum::body::Body::from(bytes))
+        .unwrap())
 }
 
 /// Resolve the effective base directory: use base_dir_override if provided, otherwise session work_dir.
@@ -1976,6 +2005,14 @@ mod path_safety_tests {
         // 正常文件放行
         std::fs::write(base.join("ok.txt"), "hi").unwrap();
         assert!(resolve_and_verify(&base_c, "ok.txt").is_ok());
+    }
+
+    #[test]
+    fn build_raw_headers_are_safe() {
+        let h = build_raw_headers("evil.html");
+        assert_eq!(h.0, "application/octet-stream");
+        assert_eq!(h.1, "nosniff");
+        assert!(h.2.contains("attachment"));
     }
 
     #[test]

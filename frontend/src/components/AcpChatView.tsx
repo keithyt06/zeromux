@@ -8,6 +8,7 @@ import { usePromptPresets } from '../lib/usePromptPresets'
 import { applyPreset } from '../lib/applyPreset'
 import { buildPromptWithAttachments } from '../lib/attachments'
 import { MicButton } from './MicButton'
+import { RunMetricsPanel } from './RunMetricsPanel'
 import { useTranscribe } from '../lib/transcribe'
 import { foldTranscript, type WireEvent, type Block, type TurnGroup } from '../lib/transcript'
 import { partitionBlocks, type Density } from '../lib/density'
@@ -52,12 +53,14 @@ interface Props {
   // Lets the parent (App→SessionInfoBar) drive WS-only controls that live in
   // this component. Registered on mount, cleared on unmount. (G2b queue mode.)
   onRegisterControls?: (sessionId: string, api: { setQueueMode: (mode: string) => void } | null) => void
+  // Inline run-metrics panel visibility, owned by App (toggled from SessionInfoBar).
+  showMetrics?: boolean
 }
 
 // `active` is accepted (App passes it for all session views) but no longer used:
 // the Composer owns its own textarea and we intentionally don't auto-focus it,
 // so switching to a chat session doesn't pop the mobile keyboard.
-export default function AcpChatView({ sessionId, agentType = 'claude', onRegisterControls }: Props) {
+export default function AcpChatView({ sessionId, agentType = 'claude', onRegisterControls, showMetrics }: Props) {
   // Raw wire-event log; the rendered transcript is DERIVED from it by grouping
   // on turn_id (T1). This is what fixes "send while streaming" misalignment:
   // a new prompt carries the NEXT turn_id, so it folds into its own group
@@ -84,6 +87,14 @@ export default function AcpChatView({ sessionId, agentType = 'claude', onRegiste
   const [queuedCount, setQueuedCount] = useState(0)
   const [turnStartedMs, setTurnStartedMs] = useState<number | null>(null)
   const [nowMs, setNowMs] = useState(() => Date.now())
+  // Bumped (debounced) on each turn boundary so the inline RunMetricsPanel
+  // re-GETs runs once the backend has flushed the just-finished run record.
+  const [metricsRefresh, setMetricsRefresh] = useState(0)
+  const metricsDebounce = useRef<ReturnType<typeof setTimeout> | undefined>(undefined)
+  const bumpMetrics = useCallback(() => {
+    if (metricsDebounce.current) clearTimeout(metricsDebounce.current)
+    metricsDebounce.current = setTimeout(() => setMetricsRefresh(n => n + 1), 300)
+  }, [])
   // 输出密度(G2b/P2):concise(默认)折叠思考+原始工具输入;full 全显。
   const [density, setDensity] = useState<Density>('concise')
   // 首次精简提示:一次性、可关。localStorage 跨会话只显示一次。
@@ -229,6 +240,7 @@ export default function AcpChatView({ sessionId, agentType = 'claude', onRegiste
         appendEvent(evt as unknown as WireEvent)
         setBusy(false)
         setTurnStartedMs(null)
+        bumpMetrics()
         break
       }
 
@@ -236,6 +248,7 @@ export default function AcpChatView({ sessionId, agentType = 'claude', onRegiste
         pushNotice({ id: newId(), kind: 'error', text: evt.message || 'Unknown error' })
         setBusy(false)
         setTurnStartedMs(null)
+        bumpMetrics()
         break
       }
 
@@ -243,6 +256,7 @@ export default function AcpChatView({ sessionId, agentType = 'claude', onRegiste
         pushNotice({ id: newId(), kind: 'system', text: `Process exited (code: ${evt.code || 0})` })
         setBusy(false)
         setTurnStartedMs(null)
+        bumpMetrics()
         break
       }
 
@@ -255,7 +269,7 @@ export default function AcpChatView({ sessionId, agentType = 'claude', onRegiste
         break
       }
     }
-  }, [pushNotice, appendEvent])
+  }, [pushNotice, appendEvent, bumpMetrics])
 
   // Composer 已 trim 且非空才回调；后端 fan-out 会在重发前自动打断在途轮次，
   // 前端只需发 prompt。
@@ -344,8 +358,19 @@ export default function AcpChatView({ sessionId, agentType = 'claude', onRegiste
     return () => window.removeEventListener('keydown', onKey)
   }, [presetOpen, closePreset])
 
+  // Clear the pending metrics-refresh timer on unmount.
+  useEffect(() => () => { if (metricsDebounce.current) clearTimeout(metricsDebounce.current) }, [])
+
   return (
     <div className="flex flex-col h-full">
+      {showMetrics && (
+        <RunMetricsPanel
+          sessionId={sessionId}
+          turnStartedMs={turnStartedMs}
+          running={busy}
+          refreshKey={metricsRefresh}
+        />
+      )}
       <div ref={scrollRef} className="flex-1 overflow-y-auto px-5 py-4 space-y-4">
         {showDensityHint && (
           <div className="flex items-center gap-2 text-[11px] text-[var(--text-muted)] bg-[var(--bg-secondary)] border border-[var(--border)] rounded px-2 py-1">

@@ -203,7 +203,8 @@ fn try_serve_embedded(path: &str) -> Option<Response> {
             .header(
                 "Content-Security-Policy",
                 "default-src 'self'; img-src 'self' data:; style-src 'self' 'unsafe-inline'; \
-                 script-src 'self'; connect-src 'self' ws: wss:; frame-src 'self'; \
+                 script-src 'self' blob:; worker-src 'self' blob:; \
+                 connect-src 'self' ws: wss:; frame-src 'self'; \
                  object-src 'none'; base-uri 'self'",
             )
             .body(axum::body::Body::from(file.data.to_vec()))
@@ -2089,7 +2090,16 @@ mod upload_helpers_tests {
     #[test]
     fn embedded_response_has_csp() {
         if let Some(resp) = try_serve_embedded("index.html") {
-            assert!(resp.headers().get("Content-Security-Policy").is_some());
+            let csp = resp
+                .headers()
+                .get("Content-Security-Policy")
+                .expect("CSP header present")
+                .to_str()
+                .unwrap();
+            // AudioWorklet (voice transcription) loads from a blob: URL; the CSP
+            // must permit blob: in script-src/worker-src or voice input breaks.
+            assert!(csp.contains("script-src 'self' blob:"));
+            assert!(csp.contains("worker-src 'self' blob:"));
         } // index.html is always present in the bundle
     }
 

@@ -125,6 +125,38 @@ pub fn gc_retain(runs: &mut VecDeque<RunMetric>, now_ms: i64, keep_count: usize,
     }
 }
 
+pub fn metrics_dir() -> std::path::PathBuf {
+    let home = std::env::var("HOME").unwrap_or_else(|_| "/home/ubuntu".to_string());
+    std::path::Path::new(&home).join(".zeromux").join("run-metrics")
+}
+
+/// 单个全局 worker。fan-out 在 finalize 处 try_send;worker 用 spawn_blocking 落盘,
+/// fsync 永不落在对话延迟路径。队列满时 try_send 端 best-effort 丢弃(见 Task 5)。
+pub fn spawn_writer() -> tokio::sync::mpsc::Sender<RunMetric> {
+    let (tx, mut rx) = tokio::sync::mpsc::channel::<RunMetric>(256);
+    tokio::spawn(async move {
+        while let Some(m) = rx.recv().await {
+            let _ = tokio::task::spawn_blocking(move || {
+                use std::io::Write;
+                let dir = metrics_dir();
+                if std::fs::create_dir_all(&dir).is_err() { return; }
+                let path = dir.join(format!("{}.ndjson", sanitize(&m.session_id)));
+                if let Ok(line) = serde_json::to_string(&m) {
+                    if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(&path) {
+                        let _ = writeln!(f, "{}", line);
+                    }
+                }
+            }).await;
+        }
+    });
+    tx
+}
+
+/// session_id 是 server 生成的 hex,但仍防御性剥离路径分隔符。
+fn sanitize(s: &str) -> String {
+    s.chars().filter(|c| c.is_ascii_alphanumeric() || *c == '-' || *c == '_').collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -189,5 +221,30 @@ mod tests {
         gc_retain(&mut runs, now, 50, 30 * 86_400_000);
         assert_eq!(runs.len(), 1);
         assert_eq!(runs[0].run_id, "fresh");
+    }
+
+    #[tokio::test]
+    async fn writer_appends_ndjson_line() {
+        // 用临时 HOME 隔离
+        let tmp = std::env::temp_dir().join(format!("zmtest-{}", std::process::id()));
+        std::fs::create_dir_all(&tmp).unwrap();
+        std::env::set_var("HOME", &tmp);
+
+        let tx = spawn_writer();
+        let m = RunMetric {
+            run_id: "r1".into(), session_id: "sessA".into(), work_dir: "/w".into(),
+            agent_type: "claude".into(), turn_seq: 1, started_ms: 0, ended_ms: 100,
+            duration_ms: 100, outcome: RunOutcome::Completed, failure_kind: None,
+            verdict: None, verdict_source: VerdictSource::None, cost_usd: Some(0.01),
+            tokens_in: Some(5), tokens_out: Some(9), input_snapshot_ref: None,
+        };
+        tx.send(m).await.unwrap();
+        // 给 worker 落盘时间
+        for _ in 0..50 {
+            let p = metrics_dir().join("sessA.ndjson");
+            if p.exists() && std::fs::read_to_string(&p).unwrap().contains("\"r1\"") { return; }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        panic!("ndjson line not written");
     }
 }

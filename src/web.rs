@@ -937,6 +937,11 @@ fn resolve_base_dir(
 /// Canonicalize `dir` and assert it stays under $HOME. This is the load-bearing
 /// boundary for base_dir overrides (re-rootable file browsing): anything that
 /// resolves outside $HOME — including via symlink — is rejected with 403.
+///
+/// The base itself must also be a directory that does not sit at or inside a
+/// sensitive dir (.ssh/.aws/.gnupg/.git). The per-request `descends_into_sensitive_dir`
+/// guard only inspects components *below* base, so it cannot catch a base that IS
+/// the sensitive dir — that check has to live here, anchored at $HOME.
 fn ensure_under_home(dir: &str) -> Result<std::path::PathBuf, (StatusCode, String)> {
     let base = std::path::Path::new(dir).canonicalize()
         .map_err(|e| (StatusCode::BAD_REQUEST, format!("Invalid path: {}", e)))?;
@@ -947,6 +952,17 @@ fn ensure_under_home(dir: &str) -> Result<std::path::PathBuf, (StatusCode, Strin
 
     if !base.starts_with(&home_path) {
         return Err((StatusCode::FORBIDDEN, "Path must be under home directory".to_string()));
+    }
+
+    if !base.is_dir() {
+        return Err((StatusCode::BAD_REQUEST, "Base must be a directory".to_string()));
+    }
+
+    // Reject a base that is, or descends into, a sensitive dir. Anchor at $HOME
+    // so every component between $HOME and the base is inspected (including the
+    // base's own final component, which the below-base guard would miss).
+    if descends_into_sensitive_dir(&home_path, &base) {
+        return Err((StatusCode::FORBIDDEN, "Access to sensitive directory denied".to_string()));
     }
 
     Ok(base)
@@ -2229,6 +2245,85 @@ mod path_safety_tests {
         assert!(
             matches!(outside_res, Err((StatusCode::FORBIDDEN, _))),
             "path outside $HOME must be 403, got {outside_res:?}"
+        );
+    }
+
+    #[test]
+    fn ensure_under_home_rejects_base_at_or_in_sensitive_dir() {
+        // Regression: the re-rootable browser lets base_dir be ANY dir under
+        // $HOME — including a sensitive one. descends_into_sensitive_dir only
+        // inspects components *below* base, so a base that IS .ssh/.aws/.git
+        // passed every per-request guard and exposed .ssh/config, known_hosts,
+        // .aws/config, .git/config — files whose leaf names aren't credential-
+        // shaped. The boundary must reject the base itself, anchored at $HOME.
+        let _guard = crate::session_manager::HOME_ENV_LOCK.lock().unwrap();
+        let prev = std::env::var("HOME").ok();
+        let home = std::env::temp_dir()
+            .join(format!("zmfb-sens-{}", std::process::id()))
+            .canonicalize()
+            .unwrap_or_else(|_| {
+                let p = std::env::temp_dir().join(format!("zmfb-sens-{}", std::process::id()));
+                std::fs::create_dir_all(&p).unwrap();
+                p.canonicalize().unwrap()
+            });
+        let ssh = home.join(".ssh");
+        let git_cfg_dir = home.join("proj").join(".git");
+        std::fs::create_dir_all(&ssh).unwrap();
+        std::fs::create_dir_all(&git_cfg_dir).unwrap();
+        let ok_dir = home.join("proj").join("src");
+        std::fs::create_dir_all(&ok_dir).unwrap();
+        std::env::set_var("HOME", &home);
+
+        let ssh_res = ensure_under_home(ssh.canonicalize().unwrap().to_str().unwrap());
+        let git_res = ensure_under_home(git_cfg_dir.canonicalize().unwrap().to_str().unwrap());
+        let ok_res = ensure_under_home(ok_dir.canonicalize().unwrap().to_str().unwrap());
+
+        match prev {
+            Some(h) => std::env::set_var("HOME", h),
+            None => std::env::remove_var("HOME"),
+        }
+
+        assert!(
+            matches!(ssh_res, Err((StatusCode::FORBIDDEN, _))),
+            "base_dir == ~/.ssh must be 403, got {ssh_res:?}"
+        );
+        assert!(
+            matches!(git_res, Err((StatusCode::FORBIDDEN, _))),
+            "base_dir descending into .git must be 403, got {git_res:?}"
+        );
+        assert!(ok_res.is_ok(), "a normal project dir under $HOME must be accepted");
+    }
+
+    #[test]
+    fn ensure_under_home_rejects_non_directory_base() {
+        // base_dir must be a directory. A base pointing at a file (e.g.
+        // ~/.ssh/config) with an empty rel path would otherwise resolve the
+        // file itself as the read target, sidestepping the rel-path + leaf
+        // guards. Reject non-dirs at the boundary.
+        let _guard = crate::session_manager::HOME_ENV_LOCK.lock().unwrap();
+        let prev = std::env::var("HOME").ok();
+        let home = std::env::temp_dir()
+            .join(format!("zmfb-file-{}", std::process::id()))
+            .canonicalize()
+            .unwrap_or_else(|_| {
+                let p = std::env::temp_dir().join(format!("zmfb-file-{}", std::process::id()));
+                std::fs::create_dir_all(&p).unwrap();
+                p.canonicalize().unwrap()
+            });
+        let file = home.join("a-file.txt");
+        std::fs::write(&file, "x").unwrap();
+        std::env::set_var("HOME", &home);
+
+        let res = ensure_under_home(file.canonicalize().unwrap().to_str().unwrap());
+
+        match prev {
+            Some(h) => std::env::set_var("HOME", h),
+            None => std::env::remove_var("HOME"),
+        }
+
+        assert!(
+            matches!(res, Err((StatusCode::BAD_REQUEST, _))),
+            "base_dir pointing at a file must be rejected, got {res:?}"
         );
     }
 }

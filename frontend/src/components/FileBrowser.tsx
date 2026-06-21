@@ -1,5 +1,6 @@
 import { useState, useEffect, useCallback, useRef } from 'react'
 import MarkdownContent from './markdown/MarkdownContent'
+import DirectoryPicker from './DirectoryPicker'
 import {
   listDir, fileRawUrl, getSessionFile,
   uploadSessionFile, createSessionDir, deleteSessionDir,
@@ -9,11 +10,17 @@ import type { DirListEntry } from '../lib/api'
 import {
   RefreshCw, Folder, FileText, Download, Upload, FolderPlus,
   MoreHorizontal, Pencil, Trash2, ChevronRight, Home, AlertCircle,
+  HardDrive, X,
 } from 'lucide-react'
 
 interface Props {
   sessionId: string
 }
+
+// Per-session persisted browse root. Empty string = use the session work_dir
+// (default, focuses the current project). An absolute path re-roots the browser
+// to anywhere under $HOME (the backend enforces that bound).
+const rootKey = (sessionId: string) => `zeromux:fb-root:${sessionId}`
 
 type Preview =
   | { kind: 'image'; path: string }
@@ -64,6 +71,11 @@ function fileToBase64(file: File): Promise<string> {
 
 export function FileBrowser({ sessionId }: Props) {
   const [cwd, setCwd] = useState('')
+  // Browse root (absolute path) or '' = work_dir. Lazy-init from localStorage.
+  const [root, setRoot] = useState<string>(() => {
+    try { return localStorage.getItem(rootKey(sessionId)) || '' } catch { return '' }
+  })
+  const [pickingRoot, setPickingRoot] = useState(false)
   const [entries, setEntries] = useState<DirListEntry[]>([])
   const [truncated, setTruncated] = useState(false)
   const [loading, setLoading] = useState(true)
@@ -72,6 +84,12 @@ export function FileBrowser({ sessionId }: Props) {
   const [menu, setMenu] = useState<RowMenu>(null)
   const [dragOver, setDragOver] = useState(false)
   const [uploadMsg, setUploadMsg] = useState<string | null>(null)
+
+  // When re-rooted (root set), the browser is READ-ONLY: the write endpoints
+  // (upload/mkdir/rename/delete) ignore base_dir and would silently target the
+  // work_dir, not the chosen root. So writes are only offered at the default root.
+  const effectiveBase = root || undefined
+  const readOnly = root !== ''
 
   const uploadRef = useRef<HTMLInputElement>(null)
 
@@ -84,7 +102,7 @@ export function FileBrowser({ sessionId }: Props) {
   // inside the async closure, never synchronously in the effect body.
   useEffect(() => {
     let ignore = false
-    listDir(sessionId, cwd)
+    listDir(sessionId, cwd, effectiveBase)
       .then(data => {
         if (ignore) return
         setEntries(data.entries)
@@ -99,7 +117,24 @@ export function FileBrowser({ sessionId }: Props) {
         setLoading(false)
       })
     return () => { ignore = true }
-  }, [sessionId, cwd, reloadKey])
+  }, [sessionId, cwd, effectiveBase, reloadKey])
+
+  // Switch browse root to an absolute path under $HOME; reset into its top level.
+  const chooseRoot = (abs: string) => {
+    setPickingRoot(false)
+    setPreview(null)
+    setCwd('')
+    setRoot(abs)
+    try { localStorage.setItem(rootKey(sessionId), abs) } catch { /* ignore */ }
+  }
+
+  // Back to the session work_dir (default root).
+  const resetRoot = () => {
+    setPreview(null)
+    setCwd('')
+    setRoot('')
+    try { localStorage.removeItem(rootKey(sessionId)) } catch { /* ignore */ }
+  }
 
   // Close row menu on outside click.
   useEffect(() => {
@@ -130,7 +165,7 @@ export function FileBrowser({ sessionId }: Props) {
     if (HTML_EXTS.includes(e) || MD_EXTS.includes(e) || TEXT_EXTS.includes(e)) {
       setPreview({ kind: 'loading', path })
       try {
-        const text = await getSessionFile(sessionId, path)
+        const text = await getSessionFile(sessionId, path, effectiveBase)
         if (HTML_EXTS.includes(e)) setPreview({ kind: 'html', path, text })
         else if (MD_EXTS.includes(e)) setPreview({ kind: 'markdown', path, text })
         else setPreview({ kind: 'text', path, text })
@@ -144,6 +179,7 @@ export function FileBrowser({ sessionId }: Props) {
 
   // ── Upload (drag-drop + picker), targeting the current cwd ──
   const uploadFiles = async (files: FileList | File[]) => {
+    if (readOnly) return // re-rooted browser is read-only (writes hit work_dir)
     for (const file of Array.from(files)) {
       const path = join(cwd, file.name)
       // Pre-check existence in the current listing for an overwrite confirm.
@@ -178,6 +214,7 @@ export function FileBrowser({ sessionId }: Props) {
   const handleDrop = (e: React.DragEvent) => {
     e.preventDefault()
     setDragOver(false)
+    if (readOnly) return
     if (e.dataTransfer.files?.length) uploadFiles(e.dataTransfer.files)
   }
 
@@ -236,7 +273,7 @@ export function FileBrowser({ sessionId }: Props) {
   return (
     <div
       className="flex h-full min-w-0"
-      onDragOver={e => { e.preventDefault(); setDragOver(true) }}
+      onDragOver={e => { if (readOnly) return; e.preventDefault(); setDragOver(true) }}
       onDragLeave={e => { if (e.currentTarget === e.target) setDragOver(false) }}
       onDrop={handleDrop}
     >
@@ -249,20 +286,31 @@ export function FileBrowser({ sessionId }: Props) {
           </span>
           <div className="flex items-center gap-0.5">
             <button
-              onClick={handleMkdir}
-              className="p-1 text-[var(--text-secondary)] hover:text-[var(--accent-green-text)] rounded transition-colors"
-              title="新建文件夹"
-            >
-              <FolderPlus size={12} />
-            </button>
-            <button
-              onClick={() => uploadRef.current?.click()}
+              onClick={() => setPickingRoot(true)}
               className="p-1 text-[var(--text-secondary)] hover:text-[var(--accent-blue)] rounded transition-colors"
-              title="上传到当前目录"
+              title="选择根目录"
             >
-              <Upload size={12} />
+              <HardDrive size={12} />
             </button>
-            <input ref={uploadRef} type="file" multiple className="hidden" onChange={handlePick} />
+            {!readOnly && (
+              <>
+                <button
+                  onClick={handleMkdir}
+                  className="p-1 text-[var(--text-secondary)] hover:text-[var(--accent-green-text)] rounded transition-colors"
+                  title="新建文件夹"
+                >
+                  <FolderPlus size={12} />
+                </button>
+                <button
+                  onClick={() => uploadRef.current?.click()}
+                  className="p-1 text-[var(--text-secondary)] hover:text-[var(--accent-blue)] rounded transition-colors"
+                  title="上传到当前目录"
+                >
+                  <Upload size={12} />
+                </button>
+                <input ref={uploadRef} type="file" multiple className="hidden" onChange={handlePick} />
+              </>
+            )}
             <button
               onClick={reload}
               className="p-1 text-[var(--text-secondary)] hover:text-[var(--text-primary)] rounded transition-colors"
@@ -277,11 +325,21 @@ export function FileBrowser({ sessionId }: Props) {
         <div className="flex items-center flex-wrap gap-0.5 px-2 py-1.5 border-b border-[var(--border)] text-[11px]">
           <button
             onClick={() => goCrumb(-1)}
-            className="flex items-center gap-1 px-1 py-0.5 rounded text-[var(--text-secondary)] hover:text-[var(--text-primary)] hover:bg-[var(--bg-tertiary)] transition-colors"
+            className="flex items-center gap-1 px-1 py-0.5 rounded text-[var(--text-secondary)] hover:text-[var(--text-primary)] hover:bg-[var(--bg-tertiary)] transition-colors truncate max-w-[10rem]"
+            title={readOnly ? root : '会话工作目录'}
           >
-            <Home size={11} />
-            根目录
+            <Home size={11} className="shrink-0" />
+            {readOnly ? (root.split('/').filter(Boolean).pop() || root) : '根目录'}
           </button>
+          {readOnly && (
+            <button
+              onClick={resetRoot}
+              className="flex items-center px-1 py-0.5 rounded text-[var(--text-muted)] hover:text-[var(--accent-red)] hover:bg-[var(--bg-tertiary)] transition-colors"
+              title="回到会话工作目录"
+            >
+              <X size={11} />
+            </button>
+          )}
           {crumbs.map((seg, i) => (
             <span key={i} className="flex items-center gap-0.5">
               <ChevronRight size={10} className="text-[var(--text-muted)]" />
@@ -321,7 +379,7 @@ export function FileBrowser({ sessionId }: Props) {
                 </button>
                 {en.type === 'file' && (
                   <a
-                    href={fileRawUrl(sessionId, join(cwd, en.name))}
+                    href={fileRawUrl(sessionId, join(cwd, en.name), effectiveBase)}
                     download={en.name}
                     onClick={e => e.stopPropagation()}
                     className="p-1 text-[var(--text-muted)] hover:text-[var(--accent-blue)] opacity-0 group-hover/row:opacity-100 transition-opacity shrink-0"
@@ -330,16 +388,18 @@ export function FileBrowser({ sessionId }: Props) {
                     <Download size={11} />
                   </a>
                 )}
-                <button
-                  onClick={e => {
-                    e.stopPropagation()
-                    setMenu({ x: e.clientX, y: e.clientY, entry: en })
-                  }}
-                  className="p-1 text-[var(--text-muted)] hover:text-[var(--text-primary)] opacity-0 group-hover/row:opacity-100 transition-opacity shrink-0"
-                  title="更多"
-                >
-                  <MoreHorizontal size={11} />
-                </button>
+                {!readOnly && (
+                  <button
+                    onClick={e => {
+                      e.stopPropagation()
+                      setMenu({ x: e.clientX, y: e.clientY, entry: en })
+                    }}
+                    className="p-1 text-[var(--text-muted)] hover:text-[var(--text-primary)] opacity-0 group-hover/row:opacity-100 transition-opacity shrink-0"
+                    title="更多"
+                  >
+                    <MoreHorizontal size={11} />
+                  </button>
+                )}
               </div>
             ))
           )}
@@ -355,7 +415,7 @@ export function FileBrowser({ sessionId }: Props) {
           <div className="flex items-center px-4 h-9 border-b border-[var(--border)] bg-[var(--bg-secondary)] shrink-0">
             <span className="text-[10px] text-[var(--text-muted)] font-mono truncate flex-1">{preview.path}</span>
             <a
-              href={fileRawUrl(sessionId, preview.path)}
+              href={fileRawUrl(sessionId, preview.path, effectiveBase)}
               download
               className="flex items-center gap-1 px-2 py-0.5 text-[10px] text-[var(--text-secondary)] hover:text-[var(--text-primary)] border border-[var(--border)] rounded transition-colors"
             >
@@ -375,7 +435,7 @@ export function FileBrowser({ sessionId }: Props) {
             <div className="p-6 text-sm text-[var(--accent-red)]">{preview.message}</div>
           ) : preview.kind === 'image' ? (
             <div className="flex items-center justify-center h-full p-6">
-              <img src={fileRawUrl(sessionId, preview.path)} alt={preview.path} className="max-w-full max-h-full object-contain" />
+              <img src={fileRawUrl(sessionId, preview.path, effectiveBase)} alt={preview.path} className="max-w-full max-h-full object-contain" />
             </div>
           ) : preview.kind === 'html' ? (
             // srcDoc (NOT src=data:/blob:) — CSP frame-src 'self' blocks those.
@@ -394,7 +454,7 @@ export function FileBrowser({ sessionId }: Props) {
               <AlertCircle size={24} />
               <span className="text-sm">不支持预览</span>
               <a
-                href={fileRawUrl(sessionId, preview.path)}
+                href={fileRawUrl(sessionId, preview.path, effectiveBase)}
                 download
                 className="flex items-center gap-1 px-3 py-1 text-xs text-[var(--text-secondary)] hover:text-[var(--text-primary)] border border-[var(--border)] rounded transition-colors"
               >
@@ -438,6 +498,19 @@ export function FileBrowser({ sessionId }: Props) {
             <Trash2 size={12} />
             删除
           </button>
+        </div>
+      )}
+
+      {/* Root picker: re-root the browser anywhere under $HOME (read-only) */}
+      {pickingRoot && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/50 p-4">
+          <div className="w-full max-w-md bg-[var(--bg-secondary)] border border-[var(--border)] rounded-lg shadow-xl overflow-hidden">
+            <DirectoryPicker
+              initialPath={root || undefined}
+              onSelect={chooseRoot}
+              onCancel={() => setPickingRoot(false)}
+            />
+          </div>
         </div>
       )}
     </div>

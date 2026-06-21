@@ -217,6 +217,9 @@ fn try_serve_embedded(path: &str) -> Option<Response> {
 #[derive(serde::Deserialize)]
 struct DirQuery {
     path: Option<String>,
+    /// Optional browse root override (absolute path). resolve_base_dir enforces
+    /// it stays under $HOME; None falls back to the session work_dir.
+    base_dir: Option<String>,
 }
 
 async fn list_directories(
@@ -928,7 +931,14 @@ fn resolve_base_dir(
             .ok_or((StatusCode::NOT_FOUND, "Session not found".to_string()))?
     };
 
-    let base = std::path::Path::new(&dir).canonicalize()
+    ensure_under_home(&dir)
+}
+
+/// Canonicalize `dir` and assert it stays under $HOME. This is the load-bearing
+/// boundary for base_dir overrides (re-rootable file browsing): anything that
+/// resolves outside $HOME — including via symlink — is rejected with 403.
+fn ensure_under_home(dir: &str) -> Result<std::path::PathBuf, (StatusCode, String)> {
+    let base = std::path::Path::new(dir).canonicalize()
         .map_err(|e| (StatusCode::BAD_REQUEST, format!("Invalid path: {}", e)))?;
 
     let home = std::env::var("HOME").unwrap_or_else(|_| "/home/ubuntu".to_string());
@@ -1135,7 +1145,7 @@ async fn list_dir(
     Query(query): Query<DirQuery>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
     require_session_access(&state, &user, &id)?;
-    let base = resolve_base_dir(&state, &id, None)?;
+    let base = resolve_base_dir(&state, &id, query.base_dir.as_deref())?;
     let (entries, truncated) = list_dir_entries(&base, query.path.as_deref().unwrap_or(""))?;
     let arr: Vec<_> = entries
         .iter()
@@ -2168,6 +2178,58 @@ mod path_safety_tests {
         assert!(!names.contains(&".env")); // credential 不枚举
         let sub = entries.iter().find(|e| e.name == "sub").unwrap();
         assert_eq!(sub.kind, "dir");
+    }
+
+    #[test]
+    fn list_dir_entries_lists_an_arbitrary_root_subtree() {
+        // Re-rooting: listing a directory other than work_dir returns its own
+        // children. This is what base_dir threading enables in list_dir.
+        let tmp = std::env::temp_dir().join(format!("zmld-root-{}", std::process::id()));
+        let other = tmp.join("other-project");
+        std::fs::create_dir_all(other.join("nested")).unwrap();
+        std::fs::write(other.join("readme.md"), "hi").unwrap();
+        let base = other.canonicalize().unwrap();
+        let (entries, _trunc) = list_dir_entries(&base, "").unwrap();
+        let names: Vec<&str> = entries.iter().map(|e| e.name.as_str()).collect();
+        assert!(names.contains(&"readme.md"));
+        assert!(names.contains(&"nested"));
+    }
+
+    #[test]
+    fn ensure_under_home_rejects_outside_accepts_inside() {
+        // The $HOME boundary is the only thing standing between a base_dir
+        // override and arbitrary filesystem reads. Pin it: a path that
+        // canonicalizes outside $HOME is rejected with 403; one inside is ok.
+        // resolve_base_dir delegates to ensure_under_home for exactly this.
+        let _guard = crate::session_manager::HOME_ENV_LOCK.lock().unwrap();
+        let prev = std::env::var("HOME").ok();
+        let home = std::env::temp_dir()
+            .join(format!("zmfb-home-{}", std::process::id()))
+            .canonicalize()
+            .unwrap_or_else(|_| {
+                let p = std::env::temp_dir().join(format!("zmfb-home-{}", std::process::id()));
+                std::fs::create_dir_all(&p).unwrap();
+                p.canonicalize().unwrap()
+            });
+        let inside = home.join("inside-dir");
+        std::fs::create_dir_all(&inside).unwrap();
+        std::env::set_var("HOME", &home);
+
+        let inside_canon = inside.canonicalize().unwrap();
+        let inside_res = ensure_under_home(inside_canon.to_str().unwrap());
+        // / is guaranteed to exist and to be outside our fake temp HOME.
+        let outside_res = ensure_under_home("/");
+
+        match prev {
+            Some(h) => std::env::set_var("HOME", h),
+            None => std::env::remove_var("HOME"),
+        }
+
+        assert!(inside_res.is_ok(), "path inside $HOME must be accepted");
+        assert!(
+            matches!(outside_res, Err((StatusCode::FORBIDDEN, _))),
+            "path outside $HOME must be 403, got {outside_res:?}"
+        );
     }
 }
 

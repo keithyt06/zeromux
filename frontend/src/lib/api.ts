@@ -329,9 +329,10 @@ export interface DirListEntry {
   writable: boolean
 }
 
-export async function listDir(id: string, path = ''): Promise<{ entries: DirListEntry[]; truncated: boolean }> {
+export async function listDir(id: string, path = '', baseDir?: string): Promise<{ entries: DirListEntry[]; truncated: boolean }> {
   const params = new URLSearchParams()
   if (path) params.set('path', path)
+  if (baseDir) params.set('base_dir', baseDir)
   const qs = params.toString()
   const res = await api(`/api/sessions/${id}/dir/list${qs ? `?${qs}` : ''}`)
   if (!res.ok) throw new Error(await res.text())
@@ -342,11 +343,12 @@ export async function listDir(id: string, path = ''): Promise<{ entries: DirList
 // no Authorization header, so we append ?token= the same way wsUrl does (the
 // backend accepts ?token= for both JWT and legacy modes — see try_jwt_auth /
 // try_legacy_auth). The cookie alone is unreliable for localStorage-only sessions.
-export function fileRawUrl(id: string, path: string): string {
+export function fileRawUrl(id: string, path: string, baseDir?: string): string {
   const token = getToken()
   const jwt = document.cookie.split(';').map(c => c.trim()).find(c => c.startsWith('zeromux_jwt='))?.split('=')[1] || ''
   const authToken = token || jwt
   const params = new URLSearchParams({ path })
+  if (baseDir) params.set('base_dir', baseDir)
   if (authToken) params.set('token', authToken)
   return `/api/sessions/${id}/file/raw?${params}`
 }

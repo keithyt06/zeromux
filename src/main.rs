@@ -68,6 +68,13 @@ struct Args {
     #[arg(long, default_value = ".")]
     work_dir: String,
 
+    /// Give each agent session its own git worktree (.zeromux-worktrees/<id>/).
+    /// Off by default: `git worktree add` checks out the whole tree, which is
+    /// very slow on JuiceFS / S3-backed filesystems and dominates New Session
+    /// latency. Enable only when concurrent agents must not share a working tree.
+    #[arg(long)]
+    worktree_isolation: bool,
+
     /// Log directory (enables I/O logging when set)
     #[arg(long)]
     log_dir: Option<String>,
@@ -269,6 +276,7 @@ async fn main() {
             args.codex_path.clone(),
             args.codex_reasoning.clone(),
             args.shell.clone(),
+            args.worktree_isolation,
         ),
         password_hash,
         shell: args.shell,
@@ -345,6 +353,11 @@ async fn main() {
     let app = web::build_router(state.clone());
 
     let addr = format!("{}:{}", args.host, args.port);
+    if args.worktree_isolation {
+        println!("Worktree isolation: ON (each agent session gets its own git worktree)");
+    } else {
+        println!("Worktree isolation: OFF — agent sessions share the repo working tree (like tmux); pass --worktree-isolation to isolate concurrent agents");
+    }
     println!("ZeroMux listening on http://{}", addr);
 
     let listener = tokio::net::TcpListener::bind(&addr).await.unwrap();

@@ -93,7 +93,7 @@ Two modes, chosen at startup by whether `--github-client-id`/`--github-client-se
 
 ### Git worktree isolation
 
-Agent sessions (Claude/Kiro/Codex) created inside a git repo get an isolated detached worktree under `.zeromux-worktrees/<short-id>/` (`resolve_work_dir`), removed on session delete. tmux sessions run in the work dir directly. If worktree creation fails, it falls back to the base dir with a warning.
+Worktree isolation is **opt-in** via `--worktree-isolation` (default OFF). `git worktree add` checks out the whole tree, which is ~24s on the JuiceFS/S3-backed production filesystem and dominates New Session latency, so the default is to run agent sessions directly in the work dir — the same as tmux sessions, which already share the tree. With the flag ON, agent sessions (Claude/Kiro/Codex) created inside a git repo get an isolated detached worktree under `.zeromux-worktrees/<short-id>/` (`resolve_work_dir`), removed on session delete; if worktree creation fails, it falls back to the base dir with a warning. Trade-off when OFF: concurrent agents on the same repo share one working tree and git index — fine for the single-user deployment, but enable the flag if you run simultaneous agents that must not collide.
 
 ### Notes & voice (peripheral features)
 

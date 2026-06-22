@@ -254,6 +254,9 @@ pub struct SessionManager {
     codex_path: String,
     codex_reasoning: String,
     shell: String,
+    /// Whether agent sessions get an isolated git worktree. Off by default —
+    /// `git worktree add` is prohibitively slow on JuiceFS / S3-backed FS.
+    worktree_isolation: bool,
     /// Scheduled-tasks store, set at startup after construction. Fan-out tasks
     /// use it to finalize scheduled runs. None when no scheduler is wired.
     scheduled: Mutex<Option<Arc<crate::scheduled_tasks::ScheduledStore>>>,
@@ -372,14 +375,18 @@ fn work_dir_under_home(work_dir: &str) -> Result<PathBuf, String> {
     Ok(canonical)
 }
 
-fn resolve_work_dir(work_dir: &str, session_id: &str) -> (PathBuf, Option<PathBuf>) {
+fn resolve_work_dir(work_dir: &str, session_id: &str, isolation: bool) -> (PathBuf, Option<PathBuf>) {
     let base = if work_dir == "." {
         std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."))
     } else {
         PathBuf::from(work_dir)
     };
 
-    if is_git_repo(&base) {
+    // Worktree isolation is opt-in: on JuiceFS / S3-backed filesystems a single
+    // `git worktree add` checks out the whole tree over high-latency FUSE round
+    // trips (~24s here), which is the dominant New Session latency. When off,
+    // agent sessions run directly in the base dir (like tmux already does).
+    if isolation && is_git_repo(&base) {
         match create_worktree(&base, session_id) {
             Ok(wt_path) => (wt_path.clone(), Some(wt_path)),
             Err(e) => {
@@ -530,6 +537,7 @@ impl SessionManager {
         codex_path: String,
         codex_reasoning: String,
         shell: String,
+        worktree_isolation: bool,
     ) -> Arc<Self> {
         let mgr = Arc::new(Self {
             sessions: Mutex::new(HashMap::new()),
@@ -541,6 +549,7 @@ impl SessionManager {
             codex_path,
             codex_reasoning,
             shell,
+            worktree_isolation,
             scheduled: Mutex::new(None),
             run_metrics_tx: crate::run_metrics::spawn_writer(),
         });
@@ -882,7 +891,7 @@ impl SessionManager {
         source_task_id: Option<String>,
     ) -> Result<String, String> {
         let id = uuid::Uuid::new_v4().to_string();
-        let (effective_dir, worktree_path) = resolve_work_dir(work_dir, &id);
+        let (effective_dir, worktree_path) = resolve_work_dir(work_dir, &id, self.worktree_isolation);
 
         let running = self
             .spawn_claude(&id, &effective_dir.to_string_lossy(), owner_id, None)
@@ -1145,7 +1154,7 @@ impl SessionManager {
         owner_id: &str,
     ) -> Result<String, String> {
         let id = uuid::Uuid::new_v4().to_string();
-        let (effective_dir, worktree_path) = resolve_work_dir(work_dir, &id);
+        let (effective_dir, worktree_path) = resolve_work_dir(work_dir, &id, self.worktree_isolation);
 
         let running = self
             .spawn_kiro(&id, &effective_dir.to_string_lossy(), owner_id, None)
@@ -1248,7 +1257,7 @@ impl SessionManager {
         owner_id: &str,
     ) -> Result<String, String> {
         let id = uuid::Uuid::new_v4().to_string();
-        let (effective_dir, worktree_path) = resolve_work_dir(work_dir, &id);
+        let (effective_dir, worktree_path) = resolve_work_dir(work_dir, &id, self.worktree_isolation);
 
         let running = self
             .spawn_codex(&id, &effective_dir.to_string_lossy(), owner_id, None)
@@ -2990,6 +2999,70 @@ mod work_dir_confinement_tests {
 }
 
 #[cfg(test)]
+mod resolve_work_dir_tests {
+    use super::resolve_work_dir;
+
+    fn git_init(path: &std::path::Path) {
+        let ok = std::process::Command::new("git")
+            .args(["init", "-q"])
+            .current_dir(path)
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false);
+        assert!(ok, "git init failed — git must be on PATH for this test");
+    }
+
+    /// With isolation OFF (the default), a git repo must NOT get a worktree —
+    /// `git worktree add` is the 24s-on-JuiceFS cost we are eliminating. The
+    /// effective dir is the base dir itself and no worktree path is returned.
+    #[test]
+    fn isolation_off_skips_worktree_in_git_repo() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path();
+        git_init(path);
+
+        let (effective, worktree) = resolve_work_dir(&path.to_string_lossy(), "sid12345", false);
+        assert_eq!(effective, path, "effective dir must be the base dir");
+        assert!(worktree.is_none(), "no worktree must be created when isolation is off");
+        assert!(
+            !path.join(".zeromux-worktrees").exists(),
+            "the .zeromux-worktrees dir must not be created when isolation is off"
+        );
+    }
+
+    /// With isolation ON in a git repo, a dedicated worktree is created under
+    /// `.zeromux-worktrees/` and returned as the effective dir.
+    #[test]
+    fn isolation_on_creates_worktree_in_git_repo() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path();
+        git_init(path);
+        // `git worktree add` needs at least one commit to anchor HEAD.
+        for args in [
+            vec!["config", "user.email", "t@t"],
+            vec!["config", "user.name", "t"],
+            vec!["commit", "--allow-empty", "-q", "-m", "init"],
+        ] {
+            let ok = std::process::Command::new("git")
+                .args(&args)
+                .current_dir(path)
+                .status()
+                .map(|s| s.success())
+                .unwrap_or(false);
+            assert!(ok, "git {:?} failed", args);
+        }
+
+        let (effective, worktree) = resolve_work_dir(&path.to_string_lossy(), "sidABCDE", true);
+        let wt = worktree.expect("a worktree must be created when isolation is on");
+        assert_eq!(effective, wt, "effective dir must be the worktree path");
+        assert!(
+            wt.starts_with(path.join(".zeromux-worktrees")),
+            "worktree must live under .zeromux-worktrees"
+        );
+    }
+}
+
+#[cfg(test)]
 mod resume_token_tests {
     use super::ResumeToken;
 
@@ -3129,6 +3202,7 @@ mod decide_spawn_tests {
             "codex".into(),
             "off".into(),
             "bash".into(),
+            false,
         );
         (mgr, dir)
     }
@@ -3276,7 +3350,7 @@ mod turn_state_tests {
             let store = Arc::new(crate::session_store::SessionStore::open(dir.path()).unwrap());
             let mgr = SessionManager::new(
                 events, store,
-                "claude".into(), "kiro".into(), "codex".into(), "off".into(), "bash".into(),
+                "claude".into(), "kiro".into(), "codex".into(), "off".into(), "bash".into(), false,
             );
             (mgr, dir)
         };
@@ -3538,7 +3612,7 @@ mod running_summary_tests {
         let store = Arc::new(crate::session_store::SessionStore::open(dir.path()).unwrap());
         let m = SessionManager::new(
             events, store,
-            "claude".into(), "kiro-cli".into(), "codex".into(), "off".into(), "bash".into(),
+            "claude".into(), "kiro-cli".into(), "codex".into(), "off".into(), "bash".into(), false,
         );
         {
             let mut map = m.sessions.lock().unwrap();

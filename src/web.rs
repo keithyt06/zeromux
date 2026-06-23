@@ -1241,6 +1241,10 @@ async fn delete_session_file(
         return Err((StatusCode::FORBIDDEN, "Path traversal denied".to_string()));
     }
 
+    if is_write_blocked(&base, &file_path) {
+        return Err((StatusCode::FORBIDDEN, "Writes to control directories denied".to_string()));
+    }
+
     if !file_path.is_file() {
         return Err((StatusCode::NOT_FOUND, "Not a file".to_string()));
     }
@@ -1274,6 +1278,10 @@ async fn rename_session_file(
 
     if !from_path.starts_with(&base) {
         return Err((StatusCode::FORBIDDEN, "Path traversal denied".to_string()));
+    }
+
+    if is_write_blocked(&base, &from_path) || is_write_blocked(&base, &to_path) {
+        return Err((StatusCode::FORBIDDEN, "Writes to control directories denied".to_string()));
     }
 
     if to_path.exists() {
@@ -1412,7 +1420,11 @@ async fn create_session_dir(
     Json(req): Json<DirOpReq>,
 ) -> Result<StatusCode, (StatusCode, String)> {
     require_session_access(&state, &user, &id)?;
-    let (_base, dir_path) = resolve_session_path(&state, &id, &req.path)?;
+    let (base, dir_path) = resolve_session_path(&state, &id, &req.path)?;
+
+    if is_write_blocked(&base, &dir_path) {
+        return Err((StatusCode::FORBIDDEN, "Writes to control directories denied".to_string()));
+    }
 
     std::fs::create_dir_all(&dir_path)
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("Cannot create dir: {}", e)))?;
@@ -1434,6 +1446,10 @@ async fn delete_session_dir(
 
     if !dir_path.starts_with(&base) {
         return Err((StatusCode::FORBIDDEN, "Path traversal denied".to_string()));
+    }
+
+    if is_write_blocked(&base, &dir_path) {
+        return Err((StatusCode::FORBIDDEN, "Writes to control directories denied".to_string()));
     }
 
     if !dir_path.is_dir() {
@@ -1466,6 +1482,10 @@ async fn rename_session_dir(
 
     if !from_path.starts_with(&base) {
         return Err((StatusCode::FORBIDDEN, "Path traversal denied".to_string()));
+    }
+
+    if is_write_blocked(&base, &from_path) || is_write_blocked(&base, &to_path) {
+        return Err((StatusCode::FORBIDDEN, "Writes to control directories denied".to_string()));
     }
 
     if !from_path.is_dir() {
@@ -2160,6 +2180,12 @@ mod path_safety_tests {
         let base = std::path::Path::new("/home/u/work");
         // A control dir *below* base is blocked.
         assert!(is_write_blocked(base, std::path::Path::new("/home/u/work/.git/config")));
+        // The bare control-dir leaf itself is blocked too — this is the delete/rename
+        // vector: delete_session_dir(".git") resolves to the dir node, not a child of
+        // it, so the guard must fire on the directory itself, not only on descents.
+        assert!(is_write_blocked(base, std::path::Path::new("/home/u/work/.git")));
+        assert!(is_write_blocked(base, std::path::Path::new("/home/u/work/.zeromux")));
+        assert!(is_write_blocked(base, std::path::Path::new("/home/u/work/.zeromux-worktrees")));
         // A normal file below base is allowed.
         assert!(!is_write_blocked(base, std::path::Path::new("/home/u/work/src/main.rs")));
     }

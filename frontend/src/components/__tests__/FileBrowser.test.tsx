@@ -63,6 +63,37 @@ describe('FileBrowser', () => {
     expect(screen.getByTitle('回到会话工作目录')).toBeInTheDocument()
   })
 
+  it('hides the row action menu for non-writable entries (control dirs)', async () => {
+    // The backend marks .git/.zeromux/.ssh/.aws etc. writable:false. The row
+    // "更多" (rename/delete) menu must not appear for them — clicking it would
+    // only 403. Writable entries keep the menu.
+    vi.spyOn(api, 'listDir').mockResolvedValue({
+      entries: [
+        { name: '.git', type: 'dir', size: 0, mtime: 0, writable: false },
+        { name: 'src', type: 'dir', size: 0, mtime: 0, writable: true },
+      ],
+      truncated: false,
+    })
+    render(<FileBrowser sessionId="s1" />)
+    await screen.findByText('src')
+    // Exactly one row-action menu button: the writable 'src', not '.git'.
+    expect(screen.getAllByTitle('更多')).toHaveLength(1)
+  })
+
+  it('surfaces the actual saved name when an upload is de-duplicated', async () => {
+    vi.spyOn(api, 'listDir').mockResolvedValue({ entries: [], truncated: false })
+    // Backend renamed pic.png -> pic-1.png (collision); the UI must say so.
+    vi.spyOn(api, 'uploadSessionFile').mockResolvedValue('pic-1.png')
+    render(<FileBrowser sessionId="s1" />)
+    await waitFor(() => expect(screen.getByTitle('上传到当前目录')).toBeInTheDocument())
+    const file = new File(['x'], 'pic.png', { type: 'image/png' })
+    // Drive the exported upload path directly via the hidden input.
+    const input = document.querySelector('input[type="file"]') as HTMLInputElement
+    Object.defineProperty(input, 'files', { value: [file] })
+    input.dispatchEvent(new Event('change', { bubbles: true }))
+    await waitFor(() => expect(screen.getByText(/pic-1\.png/)).toBeInTheDocument())
+  })
+
   it('reset returns to work_dir root (default base, write controls back)', async () => {
     localStorage.setItem('zeromux:fb-root:s1', '/home/ubuntu/other')
     const spy = vi.spyOn(api, 'listDir').mockResolvedValue({ entries: [], truncated: false })

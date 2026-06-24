@@ -180,6 +180,11 @@ export function FileBrowser({ sessionId }: Props) {
   // ── Upload (drag-drop + picker), targeting the current cwd ──
   const uploadFiles = async (files: FileList | File[]) => {
     if (readOnly) return // re-rooted browser is read-only (writes hit work_dir)
+    // Terminal message to show after the loop. Distinct from the transient
+    // "上传 …" progress text, which is replaced before the loop ends — so we don't
+    // unconditionally clear at the end (that flashed away errors and the dedupe
+    // notice). Null = nothing worth keeping on screen.
+    let finalMsg: string | null = null
     for (const file of Array.from(files)) {
       const path = join(cwd, file.name)
       // Pre-check existence in the current listing for an overwrite confirm.
@@ -189,7 +194,11 @@ export function FileBrowser({ sessionId }: Props) {
       try {
         setUploadMsg(`上传 ${file.name}…`)
         const base64 = await fileToBase64(file)
-        await uploadSessionFile(sessionId, path, base64)
+        // Backend de-duplicates name collisions (pic.png → pic-1.png) and returns
+        // the actual saved name. Surface it when it differs, else the user looks
+        // for the original name and thinks the upload failed.
+        const saved = await uploadSessionFile(sessionId, path, base64)
+        if (saved && saved !== file.name) finalMsg = `已存为 ${saved}`
       } catch (e) {
         const msg = errMsg(e)
         // 409 = conflict (race: created after our listing). Offer overwrite.
@@ -199,15 +208,15 @@ export function FileBrowser({ sessionId }: Props) {
               const base64 = await fileToBase64(file)
               await uploadSessionFile(sessionId, path, base64)
             } catch (e2) {
-              setUploadMsg(`上传失败: ${errMsg(e2)}`)
+              finalMsg = `上传失败: ${errMsg(e2)}`
             }
           }
         } else {
-          setUploadMsg(`上传失败: ${msg}`)
+          finalMsg = `上传失败: ${msg}`
         }
       }
     }
-    setUploadMsg(null)
+    setUploadMsg(finalMsg)
     reload()
   }
 
@@ -388,7 +397,7 @@ export function FileBrowser({ sessionId }: Props) {
                     <Download size={11} />
                   </a>
                 )}
-                {!readOnly && (
+                {!readOnly && en.writable && (
                   <button
                     onClick={e => {
                       e.stopPropagation()

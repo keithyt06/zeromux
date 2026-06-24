@@ -1035,8 +1035,12 @@ fn descends_into_sensitive_dir(base: &std::path::Path, canonical: &std::path::Pa
     })
 }
 
-/// Write-blocked control dirs: deny writes that descend into a control directory
-/// (.git/.zeromux/.zeromux-worktrees/.ssh) *below the workspace base*.
+/// Write-blocked control / credential dirs: deny writes that descend into a control
+/// directory below the workspace base. The set must cover *both* the runtime control
+/// dirs (.git/.zeromux/.zeromux-worktrees) and every dir the read guard
+/// (`descends_into_sensitive_dir`) refuses (.ssh/.aws/.gnupg) — otherwise a session
+/// rooted at $HOME could delete/rename a dir it cannot even read (e.g. wipe ~/.aws
+/// credentials or ~/.gnupg keys), an asymmetry with no legitimate use.
 ///
 /// Only components below `base` are inspected. Agent sessions run with a base of
 /// `<repo>/.zeromux-worktrees/<id>/`, so checking the full canonical path would (and
@@ -1049,7 +1053,9 @@ fn is_write_blocked(base: &std::path::Path, canonical: &std::path::Path) -> bool
     };
     rel.components().any(|c| {
         matches!(c, std::path::Component::Normal(s)
-            if matches!(s.to_str(), Some(".git") | Some(".zeromux") | Some(".zeromux-worktrees") | Some(".ssh")))
+            if matches!(s.to_str(),
+                Some(".git") | Some(".zeromux") | Some(".zeromux-worktrees")
+                | Some(".ssh") | Some(".aws") | Some(".gnupg")))
     })
 }
 
@@ -1091,6 +1097,40 @@ fn resolve_and_verify(
         return Err((StatusCode::FORBIDDEN, "Path escapes workspace".into()));
     }
     Ok(real)
+}
+
+/// Resolve a WRITE/CREATE/RENAME destination whose leaf may not exist yet, giving it
+/// the same physical-layer symlink defense `resolve_and_verify` gives reads.
+///
+/// `resolve_and_verify` canonicalizes the whole path, which requires the target to
+/// already exist — wrong for a create/rename-to/mkdir destination. Instead we
+/// canonicalize the **parent** (which must exist) and re-check it is under base, then
+/// re-attach the leaf. This closes the escape where the destination was resolved
+/// lexically (via `resolve_session_path`): a symlinked path component would redirect
+/// `std::fs::rename`/`create_dir_all` outside base or into a control dir, invisibly to
+/// the literal-component guards. Finally `is_write_blocked` is applied to the resolved
+/// real target so a control-dir parent OR a control-named leaf (e.g. mkdir ".git",
+/// rename → ".aws") is refused.
+fn resolve_write_target(
+    base_canonical: &std::path::Path,
+    rel: &str,
+) -> Result<std::path::PathBuf, (StatusCode, String)> {
+    let rel_path = std::path::Path::new(rel);
+    let leaf = rel_path
+        .file_name()
+        .ok_or((StatusCode::BAD_REQUEST, "Invalid path".to_string()))?;
+    let parent_rel = rel_path
+        .parent()
+        .map(|p| p.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    // Canonicalize the parent (must exist) and confirm it stays under base after
+    // following any symlinks. resolve_and_verify on the empty rel returns base itself.
+    let real_parent = resolve_and_verify(base_canonical, &parent_rel)?;
+    let target = real_parent.join(leaf);
+    if is_write_blocked(base_canonical, &target) {
+        return Err((StatusCode::FORBIDDEN, "Writes to control directories denied".to_string()));
+    }
+    Ok(target)
 }
 
 // ── Single-level directory listing (dir/list) ──
@@ -1270,8 +1310,7 @@ async fn rename_session_file(
     Json(req): Json<RenameReq>,
 ) -> Result<StatusCode, (StatusCode, String)> {
     require_session_access(&state, &user, &id)?;
-    let (base, _) = resolve_session_path(&state, &id, &req.from)?;
-    let (_, to_path) = resolve_session_path(&state, &id, &req.to)?;
+    let base = resolve_base_dir(&state, &id, None)?;
 
     let from_path = base.join(&req.from).canonicalize()
         .map_err(|e| (StatusCode::NOT_FOUND, format!("Source not found: {}", e)))?;
@@ -1280,18 +1319,17 @@ async fn rename_session_file(
         return Err((StatusCode::FORBIDDEN, "Path traversal denied".to_string()));
     }
 
-    if is_write_blocked(&base, &from_path) || is_write_blocked(&base, &to_path) {
+    if is_write_blocked(&base, &from_path) {
         return Err((StatusCode::FORBIDDEN, "Writes to control directories denied".to_string()));
     }
 
+    // Physical-layer resolve of the destination: parent must exist and stay under base
+    // after symlink resolution, and the leaf may not be control-named. The destination
+    // parent must already exist (no implicit tree creation across a symlink).
+    let to_path = resolve_write_target(&base, &req.to)?;
+
     if to_path.exists() {
         return Err((StatusCode::CONFLICT, "Destination already exists".to_string()));
-    }
-
-    // Ensure parent of destination exists
-    if let Some(parent) = to_path.parent() {
-        std::fs::create_dir_all(parent)
-            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("Cannot create dir: {}", e)))?;
     }
 
     std::fs::rename(&from_path, &to_path)
@@ -1420,11 +1458,11 @@ async fn create_session_dir(
     Json(req): Json<DirOpReq>,
 ) -> Result<StatusCode, (StatusCode, String)> {
     require_session_access(&state, &user, &id)?;
-    let (base, dir_path) = resolve_session_path(&state, &id, &req.path)?;
-
-    if is_write_blocked(&base, &dir_path) {
-        return Err((StatusCode::FORBIDDEN, "Writes to control directories denied".to_string()));
-    }
+    let base = resolve_base_dir(&state, &id, None)?;
+    // Physical-layer resolve: the parent must exist and stay under base after symlink
+    // resolution; a control-named leaf is refused. Closes the symlinked-parent escape
+    // that lexical resolution (resolve_session_path) left open for mkdir.
+    let dir_path = resolve_write_target(&base, &req.path)?;
 
     std::fs::create_dir_all(&dir_path)
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("Cannot create dir: {}", e)))?;
@@ -1474,8 +1512,7 @@ async fn rename_session_dir(
     Json(req): Json<RenameReq>,
 ) -> Result<StatusCode, (StatusCode, String)> {
     require_session_access(&state, &user, &id)?;
-    let (base, _) = resolve_session_path(&state, &id, &req.from)?;
-    let (_, to_path) = resolve_session_path(&state, &id, &req.to)?;
+    let base = resolve_base_dir(&state, &id, None)?;
 
     let from_path = base.join(&req.from).canonicalize()
         .map_err(|e| (StatusCode::NOT_FOUND, format!("Source not found: {}", e)))?;
@@ -1484,13 +1521,17 @@ async fn rename_session_dir(
         return Err((StatusCode::FORBIDDEN, "Path traversal denied".to_string()));
     }
 
-    if is_write_blocked(&base, &from_path) || is_write_blocked(&base, &to_path) {
+    if is_write_blocked(&base, &from_path) {
         return Err((StatusCode::FORBIDDEN, "Writes to control directories denied".to_string()));
     }
 
     if !from_path.is_dir() {
         return Err((StatusCode::BAD_REQUEST, "Not a directory".to_string()));
     }
+
+    // Physical-layer resolve of the destination (parent canonicalized under base,
+    // control-named leaf refused) — closes the symlinked-parent escape on dir rename.
+    let to_path = resolve_write_target(&base, &req.to)?;
 
     if to_path.exists() {
         return Err((StatusCode::CONFLICT, "Destination already exists".to_string()));
@@ -2144,6 +2185,35 @@ mod path_safety_tests {
     }
 
     #[test]
+    fn write_target_rejects_symlinked_parent_escape() {
+        // The create/rename DESTINATION must get the same physical-layer symlink
+        // defense reads get. Pre-fix it was resolved lexically (resolve_session_path),
+        // so a symlinked path component redirected the write outside base — into a
+        // control dir or another tree — undetected by the literal-component guards.
+        let tmp = std::env::temp_dir().join(format!("zmwt-{}", std::process::id()));
+        let base = tmp.join("work");
+        std::fs::create_dir_all(&base).unwrap();
+        let outside = tmp.join("outside");
+        std::fs::create_dir_all(&outside).unwrap();
+        // base/link -> ../outside : a dir symlink whose real target escapes base.
+        let _ = symlink(&outside, base.join("link"));
+        let base_c = base.canonicalize().unwrap();
+
+        // Writing/creating through the symlinked parent must be refused: the real
+        // parent canonicalizes outside base.
+        assert!(resolve_write_target(&base_c, "link/evil").is_err());
+
+        // A normal nested target whose parent exists is allowed.
+        std::fs::create_dir_all(base.join("sub")).unwrap();
+        assert!(resolve_write_target(&base_c, "sub/newfile.txt").is_ok());
+
+        // A leaf named like a control dir is refused even under a normal parent
+        // (e.g. rename a dir TO ".git", or mkdir ".aws").
+        assert!(resolve_write_target(&base_c, "sub/.git").is_err());
+        assert!(resolve_write_target(&base_c, ".aws").is_err());
+    }
+
+    #[test]
     fn build_raw_headers_are_safe() {
         let h = build_raw_headers("evil.html");
         assert_eq!(h.0, "application/octet-stream");
@@ -2186,6 +2256,12 @@ mod path_safety_tests {
         assert!(is_write_blocked(base, std::path::Path::new("/home/u/work/.git")));
         assert!(is_write_blocked(base, std::path::Path::new("/home/u/work/.zeromux")));
         assert!(is_write_blocked(base, std::path::Path::new("/home/u/work/.zeromux-worktrees")));
+        // Credential dirs that are READ-blocked must also be WRITE-blocked, else a
+        // session rooted at $HOME could delete_session_dir(".aws"/".gnupg") and wipe
+        // AWS creds / GPG keys — read-blocked but, pre-fix, deletable/renamable.
+        assert!(is_write_blocked(base, std::path::Path::new("/home/u/work/.aws")));
+        assert!(is_write_blocked(base, std::path::Path::new("/home/u/work/.aws/credentials")));
+        assert!(is_write_blocked(base, std::path::Path::new("/home/u/work/.gnupg")));
         // A normal file below base is allowed.
         assert!(!is_write_blocked(base, std::path::Path::new("/home/u/work/src/main.rs")));
     }

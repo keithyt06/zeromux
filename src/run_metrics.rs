@@ -112,6 +112,30 @@ pub fn diff_cost(
     (Some(delta), Some(cur))
 }
 
+/// fan-out 接入处的"按边界"成本决策。`will_record` = 本边界是否带 turn-start
+/// 时间戳(即是否会落一条 RunMetric)。返回 `(本轮 cost, 新 prev, 新 first_seen)`。
+///
+/// **不变量(修 interrupt-resend lifetime 漏算)**:`prev`/`first_seen` 只在
+/// 边界真正落 metric 时推进。被打断的 resend 旧 turn 会照常发来一个带累计 cost 的
+/// Result,但它没有 turn-start 时间戳(单槽 `run_started_ms` 已被新 turn 覆盖)→
+/// 其 metric 被丢弃。若此时仍推进 `prev`,该轮增量便凭空消失,`lifetime_cost_usd`
+/// 系统性偏低(spec §4.1 警示的"偏低更隐蔽")。故 `!will_record` 时不推进基线,
+/// 让该增量自然并入下一条被记录的 turn —— 累计 telescoping 保持精确。
+pub fn diff_cost_at_boundary(
+    prev: Option<f64>,
+    cur: Option<f64>,
+    first_seen: bool,
+    is_resumed: bool,
+    will_record: bool,
+) -> (Option<f64>, Option<f64>, bool) {
+    if !will_record {
+        return (None, prev, first_seen); // 丢弃的边界:不推进基线
+    }
+    let (delta, new_prev) = diff_cost(prev, cur, !first_seen, is_resumed);
+    let new_first = first_seen || cur.is_some();
+    (delta, new_prev, new_first)
+}
+
 fn percentile(sorted: &[i64], p: f64) -> i64 {
     if sorted.is_empty() { return 0; }
     // nearest-rank: rank = ceil(p * n), 1-indexed
@@ -356,5 +380,37 @@ mod tests {
         let (d, p) = diff_cost(Some(0.10), Some(0.04), false, false);
         assert_eq!(d, Some(0.0));
         assert_eq!(p, Some(0.04)); // 仍推进基线
+    }
+
+    #[test]
+    fn boundary_dropped_does_not_advance_baseline_and_no_cost_lost() {
+        // interrupt-resend:turn N(被打断)与 resend N+1 各发来一个带累计 cost 的
+        // Result,FIFO 先到的是 N。单槽 run_started_ms 已被 N+1 覆盖 → 只有先到的
+        // 边界会落 metric。模拟:
+        //   边界1(will_record=true,total=0.10)→ 记 0.10,prev→0.10
+        //   边界2(will_record=false,total=0.18)→ 丢弃:cost None,prev 不动(仍 0.10)
+        //   下一条被记录的 turn(total=0.25)→ 增量 = 0.25-0.10 = 0.15,
+        //     恰含被丢弃边界的 0.08 增量(telescoping 不丢钱)。
+        let (d1, p1, f1) = diff_cost_at_boundary(Some(0.0), Some(0.10), false, false, true);
+        assert_eq!(d1, Some(0.10));
+        assert_eq!(p1, Some(0.10));
+        assert!(f1);
+
+        let (d2, p2, f2) = diff_cost_at_boundary(p1, Some(0.18), f1, false, false);
+        assert_eq!(d2, None);          // 丢弃边界不计 cost
+        assert_eq!(p2, Some(0.10));    // 基线不被未记录边界推进
+        assert!(f2);
+
+        let (d3, _p3, _) = diff_cost_at_boundary(p2, Some(0.25), f2, false, true);
+        assert!((d3.unwrap() - 0.15).abs() < 1e-9); // 0.10(本轮)+0.08(并入的漏算)
+    }
+
+    #[test]
+    fn boundary_record_path_matches_plain_diff_cost() {
+        // will_record=true 时行为应与 diff_cost 等价(冷启动首轮)。
+        let (d, p, f) = diff_cost_at_boundary(Some(0.0), Some(0.28), false, false, true);
+        assert_eq!(d, Some(0.28));
+        assert_eq!(p, Some(0.28));
+        assert!(f);
     }
 }

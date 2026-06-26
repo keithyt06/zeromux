@@ -666,7 +666,15 @@ async fn get_session_runs(
         .sessions
         .runs_for_session(&id, &user.id, query.limit, query.before)
         .ok_or(StatusCode::NOT_FOUND)?;
-    Ok(Json(serde_json::json!({ "runs": runs, "stats": stats })))
+    let (lt_turns, lt_dur, lt_cost) = state
+        .sessions
+        .session_lifetime(&id)
+        .unwrap_or((0, 0, 0.0));
+    Ok(Json(serde_json::json!({
+        "runs": runs,
+        "stats": stats,
+        "lifetime": { "turns": lt_turns, "duration_ms": lt_dur, "cost_usd": lt_cost }
+    })))
 }
 
 #[derive(serde::Deserialize)]

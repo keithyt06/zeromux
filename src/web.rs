@@ -939,9 +939,9 @@ fn resolve_base_dir(
 /// resolves outside $HOME — including via symlink — is rejected with 403.
 ///
 /// The base itself must also be a directory that does not sit at or inside a
-/// sensitive dir (.ssh/.aws/.gnupg/.git). The per-request `descends_into_sensitive_dir`
-/// guard only inspects components *below* base, so it cannot catch a base that IS
-/// the sensitive dir — that check has to live here, anchored at $HOME.
+/// sensitive dir (see `base_dir_at_or_in_sensitive`). The per-request descent guard
+/// only inspects components *below* base, so it cannot catch a base that IS the
+/// sensitive dir — that check has to live here, anchored at $HOME.
 fn ensure_under_home(dir: &str) -> Result<std::path::PathBuf, (StatusCode, String)> {
     let base = std::path::Path::new(dir).canonicalize()
         .map_err(|e| (StatusCode::BAD_REQUEST, format!("Invalid path: {}", e)))?;
@@ -958,10 +958,13 @@ fn ensure_under_home(dir: &str) -> Result<std::path::PathBuf, (StatusCode, Strin
         return Err((StatusCode::BAD_REQUEST, "Base must be a directory".to_string()));
     }
 
-    // Reject a base that is, or descends into, a sensitive dir. Anchor at $HOME
-    // so every component between $HOME and the base is inspected (including the
-    // base's own final component, which the below-base guard would miss).
-    if descends_into_sensitive_dir(&home_path, &base) {
+    // Reject a base that is, or descends into, a sensitive dir. Anchor at $HOME so
+    // every component between $HOME and the base is inspected (including the base's
+    // own final component, which the below-base guard would miss). This also closes
+    // the override leak where base_dir=~/.zeromux would put the data dir's contents
+    // (OAuth DB, transcripts) directly below base, where the descent guard — which
+    // strips the base prefix — can no longer see the `.zeromux` component.
+    if base_dir_at_or_in_sensitive(&home_path, &base) {
         return Err((StatusCode::FORBIDDEN, "Access to sensitive directory denied".to_string()));
     }
 
@@ -1019,43 +1022,66 @@ fn is_credential_path(name: &str) -> bool {
         || n.ends_with("credentials")
 }
 
-/// Sensitive directories that must never be traversed by read endpoints (a path
-/// that descends *into* one of these, e.g. `.ssh/config` or `.aws/credentials`,
-/// is refused even though the leaf name itself isn't credential-shaped). Checked
-/// against the components below the workspace base.
-fn descends_into_sensitive_dir(base: &std::path::Path, canonical: &std::path::Path) -> bool {
+/// The single denylist of control / credential directory names. READ and WRITE
+/// guards both derive from this list so they can never drift apart — drift (a name
+/// added to one guard but not the other) was the root cause of a string of P1s.
+///
+/// Two classes, equally blocked in both directions:
+/// - credential dirs (.ssh/.aws/.gnupg) — read would exfiltrate secrets; write would
+///   let a session rooted at $HOME wipe/replace AWS creds or GPG keys.
+/// - app/control dirs (.git/.zeromux/.zeromux-worktrees) — .zeromux holds the OAuth
+///   user DB, notes/prompts DBs, and agent run transcripts (cross-user exfiltration on
+///   read); .git/.zeromux-worktrees hold repo/session internals.
+const SENSITIVE_DIR_NAMES: &[&str] = &[
+    ".ssh", ".aws", ".gnupg", ".git", ".zeromux", ".zeromux-worktrees",
+];
+
+/// True if any path component below `base` is a sensitive/control directory.
+/// Only components below `base` are inspected: agent sessions run with a base of
+/// `<repo>/.zeromux-worktrees/<id>/`, so checking the full canonical path would (and
+/// did) match `.zeromux-worktrees` in the base prefix and 403 *every* op in an agent
+/// workspace. A path that isn't under `base` is refused defensively.
+fn path_hits_sensitive_dir(base: &std::path::Path, canonical: &std::path::Path) -> bool {
     let rel = match canonical.strip_prefix(base) {
         Ok(r) => r,
         Err(_) => return true,
     };
     rel.components().any(|c| {
         matches!(c, std::path::Component::Normal(s)
-            if matches!(s.to_str(),
-                Some(".ssh") | Some(".aws") | Some(".gnupg") | Some(".git")))
+            if s.to_str().is_some_and(|name| SENSITIVE_DIR_NAMES.contains(&name)))
     })
 }
 
-/// Write-blocked control / credential dirs: deny writes that descend into a control
-/// directory below the workspace base. The set must cover *both* the runtime control
-/// dirs (.git/.zeromux/.zeromux-worktrees) and every dir the read guard
-/// (`descends_into_sensitive_dir`) refuses (.ssh/.aws/.gnupg) — otherwise a session
-/// rooted at $HOME could delete/rename a dir it cannot even read (e.g. wipe ~/.aws
-/// credentials or ~/.gnupg keys), an asymmetry with no legitimate use.
-///
-/// Only components below `base` are inspected. Agent sessions run with a base of
-/// `<repo>/.zeromux-worktrees/<id>/`, so checking the full canonical path would (and
-/// did) match `.zeromux-worktrees` in the base prefix and 403 *every* write in an
-/// agent workspace. A path that isn't under `base` is refused defensively.
+/// READ guard: refuse any path that descends *into* a sensitive dir (e.g.
+/// `.ssh/config`, `.zeromux/zeromux.db`) even when the leaf name looks innocuous.
+fn descends_into_sensitive_dir(base: &std::path::Path, canonical: &std::path::Path) -> bool {
+    path_hits_sensitive_dir(base, canonical)
+}
+
+/// WRITE guard: refuse writes/deletes/renames that touch a control dir OR a
+/// control-named leaf below base (so `delete_session_dir(".git")` and `mkdir ".aws"`
+/// are refused, not just descents into them). Identical denylist to the read guard.
 fn is_write_blocked(base: &std::path::Path, canonical: &std::path::Path) -> bool {
-    let rel = match canonical.strip_prefix(base) {
+    path_hits_sensitive_dir(base, canonical)
+}
+
+/// BASE-ACCEPTANCE guard for `ensure_under_home`: refuse a browse *root* that is, or
+/// sits inside (between $HOME and itself), a sensitive dir. Same source list as the
+/// descent guard EXCEPT `.zeromux-worktrees`: a worktree-isolated agent session's
+/// server-set work_dir legitimately IS `<repo>/.zeromux-worktrees/<id>`, so rejecting
+/// it as a base would 403 every file op for those sessions. The descent guard still
+/// strips that base prefix, so children of the worktree base are evaluated normally.
+/// Deriving from the one source list (minus the single documented exception) keeps the
+/// read/write parity intact while allowing the one legitimate sensitive base.
+fn base_dir_at_or_in_sensitive(home: &std::path::Path, base: &std::path::Path) -> bool {
+    let rel = match base.strip_prefix(home) {
         Ok(r) => r,
         Err(_) => return true,
     };
     rel.components().any(|c| {
         matches!(c, std::path::Component::Normal(s)
-            if matches!(s.to_str(),
-                Some(".git") | Some(".zeromux") | Some(".zeromux-worktrees")
-                | Some(".ssh") | Some(".aws") | Some(".gnupg")))
+            if s.to_str().is_some_and(|name|
+                name != ".zeromux-worktrees" && SENSITIVE_DIR_NAMES.contains(&name)))
     })
 }
 
@@ -2238,11 +2264,40 @@ mod path_safety_tests {
         assert!(descends_into_sensitive_dir(base, std::path::Path::new("/home/u/work/.aws/credentials")));
         assert!(descends_into_sensitive_dir(base, std::path::Path::new("/home/u/work/.git/config")));
         assert!(descends_into_sensitive_dir(base, std::path::Path::new("/home/u/work/sub/.gnupg/x")));
+        // App state / control dirs must be READ-blocked too, not only write-blocked:
+        // ~/.zeromux holds zeromux.db (OAuth user table), notes/prompts DBs, and
+        // runs/*/events.ndjson (agent transcripts); .zeromux-worktrees holds other
+        // sessions' isolated checkouts. Pre-fix these were write-blocked but readable
+        // via get_file_raw/list_dir with base_dir=$HOME — a cross-user exfiltration.
+        assert!(descends_into_sensitive_dir(base, std::path::Path::new("/home/u/work/.zeromux/zeromux.db")));
+        assert!(descends_into_sensitive_dir(base, std::path::Path::new("/home/u/work/.zeromux/runs/r1/events.ndjson")));
+        assert!(descends_into_sensitive_dir(base, std::path::Path::new("/home/u/work/.zeromux-worktrees/other/secret.md")));
         // Normal paths pass.
         assert!(!descends_into_sensitive_dir(base, std::path::Path::new("/home/u/work/src/main.rs")));
         assert!(!descends_into_sensitive_dir(base, std::path::Path::new("/home/u/work/README.md")));
         // Anything outside base is refused defensively.
         assert!(descends_into_sensitive_dir(base, std::path::Path::new("/etc/passwd")));
+    }
+
+    #[test]
+    fn read_and_write_denylists_are_identical() {
+        // Root cause of the recurring sensitive-dir P1s: the read guard
+        // (descends_into_sensitive_dir) and the write guard (is_write_blocked) were
+        // hand-maintained denylists that drifted (.zeromux was added to writes only).
+        // Both now delegate to one shared list, so for every candidate the two guards
+        // must agree. This test fails the instant they diverge again.
+        let base = std::path::Path::new("/home/u/work");
+        for sub in [
+            ".git", ".zeromux", ".zeromux-worktrees", ".ssh", ".aws", ".gnupg",
+            "src", "README.md", "notes",
+        ] {
+            let p = base.join(sub).join("leaf");
+            assert_eq!(
+                descends_into_sensitive_dir(base, &p),
+                is_write_blocked(base, &p),
+                "read/write guards disagree on {sub}",
+            );
+        }
     }
 
     #[test]
@@ -2370,14 +2425,20 @@ mod path_safety_tests {
             });
         let ssh = home.join(".ssh");
         let git_cfg_dir = home.join("proj").join(".git");
+        let zeromux = home.join(".zeromux");
         std::fs::create_dir_all(&ssh).unwrap();
         std::fs::create_dir_all(&git_cfg_dir).unwrap();
+        std::fs::create_dir_all(&zeromux).unwrap();
         let ok_dir = home.join("proj").join("src");
         std::fs::create_dir_all(&ok_dir).unwrap();
         std::env::set_var("HOME", &home);
 
         let ssh_res = ensure_under_home(ssh.canonicalize().unwrap().to_str().unwrap());
         let git_res = ensure_under_home(git_cfg_dir.canonicalize().unwrap().to_str().unwrap());
+        // base_dir=~/.zeromux would otherwise expose the OAuth DB / transcripts: the
+        // .zeromux component becomes the (stripped) base prefix, invisible to the
+        // descent guard, so the base-acceptance guard must reject it here.
+        let zeromux_res = ensure_under_home(zeromux.canonicalize().unwrap().to_str().unwrap());
         let ok_res = ensure_under_home(ok_dir.canonicalize().unwrap().to_str().unwrap());
 
         match prev {
@@ -2393,7 +2454,45 @@ mod path_safety_tests {
             matches!(git_res, Err((StatusCode::FORBIDDEN, _))),
             "base_dir descending into .git must be 403, got {git_res:?}"
         );
+        assert!(
+            matches!(zeromux_res, Err((StatusCode::FORBIDDEN, _))),
+            "base_dir == ~/.zeromux must be 403, got {zeromux_res:?}"
+        );
         assert!(ok_res.is_ok(), "a normal project dir under $HOME must be accepted");
+    }
+
+    #[test]
+    fn ensure_under_home_accepts_worktree_isolated_base() {
+        // Regression guard for the fix that added .zeromux-worktrees to the descent
+        // denylist: a worktree-isolated agent session's server-set work_dir IS
+        // <repo>/.zeromux-worktrees/<id>. The base-acceptance guard must NOT reject
+        // it (that would 403 every file op for worktree sessions), even though the
+        // descent guard blocks .zeromux-worktrees components below an arbitrary base.
+        let _guard = crate::session_manager::HOME_ENV_LOCK.lock().unwrap();
+        let prev = std::env::var("HOME").ok();
+        let home = std::env::temp_dir()
+            .join(format!("zmfb-wt-{}", std::process::id()))
+            .canonicalize()
+            .unwrap_or_else(|_| {
+                let p = std::env::temp_dir().join(format!("zmfb-wt-{}", std::process::id()));
+                std::fs::create_dir_all(&p).unwrap();
+                p.canonicalize().unwrap()
+            });
+        let wt = home.join("repo").join(".zeromux-worktrees").join("abc123");
+        std::fs::create_dir_all(&wt).unwrap();
+        std::env::set_var("HOME", &home);
+
+        let wt_res = ensure_under_home(wt.canonicalize().unwrap().to_str().unwrap());
+
+        match prev {
+            Some(h) => std::env::set_var("HOME", h),
+            None => std::env::remove_var("HOME"),
+        }
+
+        assert!(
+            wt_res.is_ok(),
+            "a worktree-isolated session base must be accepted, got {wt_res:?}"
+        );
     }
 
     #[test]

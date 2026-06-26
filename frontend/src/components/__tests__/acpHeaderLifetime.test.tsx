@@ -6,6 +6,7 @@ describe('SessionLifetimeBadge', () => {
   it('renders turns, duration, cost for claude', () => {
     render(<SessionLifetimeBadge agentType="claude" lifetime={{ turns: 3, duration_ms: 125000, cost_usd: 0.42 }} />)
     expect(screen.getByText(/3\s*轮/)).toBeInTheDocument()
+    expect(screen.getByText(/2m05s/)).toBeInTheDocument()
     expect(screen.getByText(/\$0\.42/)).toBeInTheDocument()
   })
 

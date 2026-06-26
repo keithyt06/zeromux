@@ -1,10 +1,10 @@
 type Lifetime = { turns: number; duration_ms: number; cost_usd: number }
 
 function fmtDur(ms: number): string {
-  const s = Math.round(ms / 1000)
-  if (s < 60) return `${s}秒`
+  const s = ms / 1000
+  if (s < 60) return `${s.toFixed(s < 10 ? 1 : 0)}s`
   const m = Math.floor(s / 60)
-  return `${m}分`
+  return `${m}m${String(Math.floor(s % 60)).padStart(2, '0')}s`
 }
 
 export function SessionLifetimeBadge({ agentType, lifetime }: { agentType: string; lifetime: Lifetime }) {

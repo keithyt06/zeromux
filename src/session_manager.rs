@@ -868,6 +868,7 @@ impl SessionManager {
             input_rx,
             self.events.clone(),
             "claude-code",
+            resume.is_some(),
             work_dir.to_string(),
             owner_id.to_string(),
             self.weak(),
@@ -1929,6 +1930,7 @@ fn spawn_acp_fanout(
     mut input_rx: mpsc::Receiver<SessionInput>,
     events: Arc<EventStore>,
     agent_label: &'static str,
+    is_resumed: bool,
     work_dir: String,
     owner_id: String,
     mgr: Weak<SessionManager>,
@@ -1958,6 +1960,11 @@ fn spawn_acp_fanout(
         // branch and overrides the terminal-event inference (classify_outcome).
         let mut pending_outcome: Option<crate::run_metrics::RunOutcome> = None;
         let mut run_started_ms: Option<i64> = None;
+        // ── cost 差分状态(仅 claude-code;见 cost-calibration spec)──
+        // 冷启动:prev=Some(0.0)→首轮增量=total 本身;resume:prev=None→首轮记 0。
+        let mut prev_cost: Option<f64> = if is_resumed { None } else { Some(0.0) };
+        let mut first_cost_seen = false;
+        let is_claude = agent_label == "claude-code";
         loop {
             tokio::select! {
                 event = process.event_rx.recv() => {
@@ -2032,9 +2039,18 @@ fn spawn_acp_fanout(
                                     _ => crate::run_metrics::TerminalEvt::Exit,
                                 };
                                 let outcome = crate::run_metrics::classify_outcome(term, pending_outcome.take());
-                                let (mc, mt_in, mt_out) = match &evt {
+                                let (raw_cost, mt_in, mt_out) = match &evt {
                                     AcpEvent::Result { cost_usd, tokens_in, tokens_out, .. } => (*cost_usd, *tokens_in, *tokens_out),
                                     _ => (None, None, None),
+                                };
+                                let mc = if is_claude {
+                                    let is_first = !first_cost_seen;
+                                    let (delta, new_prev) = crate::run_metrics::diff_cost(prev_cost, raw_cost, is_first, is_resumed);
+                                    // 推进基线:只要 raw_cost 非 None 就推进(含 Cancelled 但有值;spec §3.3)
+                                    if raw_cost.is_some() { first_cost_seen = true; prev_cost = new_prev; }
+                                    delta
+                                } else {
+                                    raw_cost // Kiro/Codex 恒 None,不动
                                 };
                                 let fk = match outcome {
                                     crate::run_metrics::RunOutcome::Errored => Some(
@@ -3988,5 +4004,17 @@ mod lifetime_tests {
         assert_eq!(lt, 3);                 // includes None turn
         assert_eq!(ld, 150);               // 3 × 50
         assert!((lc - 0.08).abs() < 1e-9); // 0.05 + 0.03, skip None
+    }
+}
+
+#[cfg(test)]
+mod cost_diff_integration_guard_tests {
+    #[test]
+    fn diff_cost_only_applies_to_claude_label() {
+        // 文档化不变量:非 claude-code label 不调用 diff_cost(Kiro/Codex cost 恒 None)。
+        // 这里断言纯函数对 None 输入的恒等行为,作为接入处的回归锚点。
+        let (d, p) = crate::run_metrics::diff_cost(Some(0.0), None, true, false);
+        assert_eq!(d, None);
+        assert_eq!(p, Some(0.0));
     }
 }

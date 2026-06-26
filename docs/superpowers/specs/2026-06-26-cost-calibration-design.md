@@ -91,6 +91,8 @@ pub lifetime_cost_usd: f64,
 
 在 `record_run_metric`(`session_manager.rs:584`)入队 `RunMetric` 的**同时**累加这三个字段(此处尚未被 cap-50 丢弃,是唯一能看到每一条的地方)。`runs_for_session` 直接返回这三个字段,**不在读路径对 VecDeque 求和**。
 
+> **三维度同源(代码核实后定)**:Session 已有 `turns_completed: u32`(`session_manager.rs:229`,在 `mark_turn(Idle)` 即 `:479` 累加),它服务别的用途且累加点与 `record_run_metric` 不同——混用会让"轮次 N 但成本只累加 N−1 次"的口径错位。因此**三个维度(turns/duration/cost)全部新增字段并统一在 `record_run_metric` 这一个点累加**,不复用 `turns_completed`,换取三维度同源、口径绝对一致。
+
 **额外收益**:`record_run_metric` 是三后端共享的单点,累加放这里天然覆盖 Claude/Kiro/Codex 全部 run,无需碰三份扇出拷贝(`2017/2546/2792`)。
 
 ### 4.2 累加细节

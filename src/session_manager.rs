@@ -229,6 +229,11 @@ pub struct Session {
     turns_completed: u32,
     /// 本会话最近的 per-run 度量历史(cap 50, GC 30d)。进程死后仍保留供重连查看。
     run_metrics: std::collections::VecDeque<crate::run_metrics::RunMetric>,
+    /// 会话级单调累计(不受 run_metrics cap-50 截断;三维度同源,统一在
+    /// record_run_metric 累加,含后台调度运行)。
+    lifetime_turns: u64,
+    lifetime_duration_ms: i64,
+    lifetime_cost_usd: f64,
     /// 运行态；None = 未运行（可按 resume_token 重生）。
     running: Option<RunningProcess>,
     /// Output history for replay on reconnect (base64 for PTY, JSON for ACP/Kiro)
@@ -589,6 +594,9 @@ impl SessionManager {
                 while s.run_metrics.len() > 50 {
                     s.run_metrics.pop_front();
                 }
+                s.lifetime_turns += 1;
+                s.lifetime_duration_ms += m.duration_ms;
+                s.lifetime_cost_usd += m.cost_usd.unwrap_or(0.0);
             }
         } // lock released before any send
         let _ = self.run_metrics_tx.try_send(m);
@@ -622,6 +630,13 @@ impl SessionManager {
             runs.truncate(n);
         }
         Some((runs, stats))
+    }
+
+    /// 会话级累计 (turns, duration_ms, cost_usd)。owner 校验留给调用方/上层端点。
+    pub fn session_lifetime(&self, sid: &str) -> Option<(u64, i64, f64)> {
+        let map = self.sessions.lock().unwrap();
+        let s = map.get(sid)?;
+        Some((s.lifetime_turns, s.lifetime_duration_ms, s.lifetime_cost_usd))
     }
 
     /// Owner-scoped set of a human 👍/👎 verdict on one run. Returns `false` if
@@ -816,6 +831,9 @@ impl SessionManager {
             last_activity_ms: now_millis(),
             turns_completed: 0,
             run_metrics: VecDeque::new(),
+            lifetime_turns: 0,
+            lifetime_duration_ms: 0,
+            lifetime_cost_usd: 0.0,
             running: Some(running),
             scrollback: VecDeque::new(),
             scrollback_bytes: 0,
@@ -923,6 +941,9 @@ impl SessionManager {
             last_activity_ms: now_millis(),
             turns_completed: 0,
             run_metrics: VecDeque::new(),
+            lifetime_turns: 0,
+            lifetime_duration_ms: 0,
+            lifetime_cost_usd: 0.0,
             running: Some(running),
             scrollback: VecDeque::new(),
             scrollback_bytes: 0,
@@ -1186,6 +1207,9 @@ impl SessionManager {
             last_activity_ms: now_millis(),
             turns_completed: 0,
             run_metrics: VecDeque::new(),
+            lifetime_turns: 0,
+            lifetime_duration_ms: 0,
+            lifetime_cost_usd: 0.0,
             running: Some(running),
             scrollback: VecDeque::new(),
             scrollback_bytes: 0,
@@ -1289,6 +1313,9 @@ impl SessionManager {
             last_activity_ms: now_millis(),
             turns_completed: 0,
             run_metrics: VecDeque::new(),
+            lifetime_turns: 0,
+            lifetime_duration_ms: 0,
+            lifetime_cost_usd: 0.0,
             running: Some(running),
             scrollback: VecDeque::new(),
             scrollback_bytes: 0,
@@ -1748,6 +1775,9 @@ impl SessionManager {
                     last_activity_ms: now_millis(),
                     turns_completed: 0,
                     run_metrics: VecDeque::new(),
+                    lifetime_turns: 0,
+                    lifetime_duration_ms: 0,
+                    lifetime_cost_usd: 0.0,
                     running: None,
                     scrollback: VecDeque::new(),
                     scrollback_bytes: 0,
@@ -3139,6 +3169,9 @@ mod decide_spawn_tests {
             last_activity_ms: 0,
             turns_completed: 0,
             run_metrics: VecDeque::new(),
+            lifetime_turns: 0,
+            lifetime_duration_ms: 0,
+            lifetime_cost_usd: 0.0,
             running: None,
             scrollback: VecDeque::new(),
             scrollback_bytes: 0,
@@ -3322,6 +3355,9 @@ mod turn_state_tests {
             last_activity_ms: 0,
             turns_completed: 0,
             run_metrics: VecDeque::new(),
+            lifetime_turns: 0,
+            lifetime_duration_ms: 0,
+            lifetime_cost_usd: 0.0,
             running: Some(RunningProcess {
                 event_tx, input_tx, pty_pid: None,
                 turn_state: TurnState::Idle,
@@ -3593,6 +3629,9 @@ mod running_summary_tests {
             last_activity_ms: 0,
             turns_completed: 0,
             run_metrics: VecDeque::new(),
+            lifetime_turns: 0,
+            lifetime_duration_ms: 0,
+            lifetime_cost_usd: 0.0,
             running: Some(RunningProcess {
                 event_tx,
                 input_tx,
@@ -3834,5 +3873,120 @@ mod tests {
         assert_eq!(m.outcome, crate::run_metrics::RunOutcome::Completed);
         assert_eq!(m.cost_usd, Some(0.05));
         assert_eq!(m.turn_seq, 3);
+    }
+}
+
+#[cfg(test)]
+mod lifetime_tests {
+    use super::*;
+
+    fn make_manager() -> (Arc<SessionManager>, tempfile::TempDir) {
+        let dir = tempfile::tempdir().unwrap();
+        let events = Arc::new(crate::events::EventStore::open(dir.path()).unwrap());
+        let store = Arc::new(crate::session_store::SessionStore::open(dir.path()).unwrap());
+        let mgr = SessionManager::new(
+            events, store,
+            "claude".into(), "kiro".into(), "codex".into(), "off".into(), "bash".into(), false,
+        );
+        (mgr, dir)
+    }
+
+    fn make_session(id: &str, owner: &str) -> Session {
+        Session {
+            id: id.into(),
+            name: "n".into(),
+            session_type: SessionType::Claude,
+            cols: 80,
+            rows: 24,
+            work_dir: "/tmp".into(),
+            owner_id: owner.into(),
+            description: String::new(),
+            name_is_auto: true,
+            status: SessionMeta::Idle,
+            resume_token: None,
+            worktree_path: None,
+            created_ms: 0,
+            source_task_id: None,
+            spawning: false,
+            last_activity_ms: 0,
+            turns_completed: 0,
+            run_metrics: VecDeque::new(),
+            lifetime_turns: 0,
+            lifetime_duration_ms: 0,
+            lifetime_cost_usd: 0.0,
+            running: None,
+            scrollback: VecDeque::new(),
+            scrollback_bytes: 0,
+        }
+    }
+
+    #[test]
+    fn lifetime_accumulates_beyond_cap50() {
+        let (mgr, _dir) = make_manager();
+        let sid = "s-life";
+        let s = make_session(sid, "owner1");
+        mgr.sessions.lock().unwrap().insert(sid.into(), s);
+
+        for i in 0..80u64 {
+            let m = crate::run_metrics::RunMetric {
+                run_id: format!("r{i}"),
+                session_id: sid.into(),
+                work_dir: "/w".into(),
+                agent_type: "claude-code".into(),
+                turn_seq: i,
+                started_ms: 0,
+                ended_ms: 100,
+                duration_ms: 100,
+                outcome: crate::run_metrics::RunOutcome::Completed,
+                failure_kind: None,
+                verdict: None,
+                verdict_source: crate::run_metrics::VerdictSource::None,
+                cost_usd: Some(0.01),
+                tokens_in: None,
+                tokens_out: None,
+                input_snapshot_ref: None,
+            };
+            mgr.record_run_metric(sid, m);
+        }
+
+        let (lt, ld, lc) = mgr.session_lifetime(sid).unwrap();
+        assert_eq!(lt, 80);               // not truncated by cap-50
+        assert_eq!(ld, 8000);             // 80 × 100ms
+        assert!((lc - 0.80).abs() < 1e-9); // 80 × 0.01
+    }
+
+    #[test]
+    fn lifetime_cost_skips_none_but_counts_turn() {
+        let (mgr, _dir) = make_manager();
+        let sid = "s-none";
+        let s = make_session(sid, "owner1");
+        mgr.sessions.lock().unwrap().insert(sid.into(), s);
+
+        for c in [Some(0.05), None, Some(0.03)] {
+            let m = crate::run_metrics::RunMetric {
+                run_id: "r".into(),
+                session_id: sid.into(),
+                work_dir: "/w".into(),
+                agent_type: "claude-code".into(),
+                turn_seq: 0,
+                started_ms: 0,
+                ended_ms: 50,
+                duration_ms: 50,
+                outcome: crate::run_metrics::RunOutcome::Completed,
+                failure_kind: None,
+                verdict: None,
+                verdict_source: crate::run_metrics::VerdictSource::None,
+                cost_usd: c,
+                tokens_in: None,
+                tokens_out: None,
+                input_snapshot_ref: None,
+            };
+            mgr.record_run_metric(sid, m);
+        }
+
+        let (lt, ld, lc) = mgr.session_lifetime(sid).unwrap();
+        assert_eq!(lt, 3);                 // includes None turn
+        assert_eq!(ld, 150);               // 3 × 50
+        assert!((lc - 0.08).abs() < 1e-9); // 0.05 + 0.03, skip None
     }
 }

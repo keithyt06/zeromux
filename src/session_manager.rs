@@ -2043,11 +2043,16 @@ fn spawn_acp_fanout(
                                     AcpEvent::Result { cost_usd, tokens_in, tokens_out, .. } => (*cost_usd, *tokens_in, *tokens_out),
                                     _ => (None, None, None),
                                 };
+                                // 本边界是否会落 metric:由单槽 run_started_ms 决定。被打断的
+                                // resend 旧 turn 会发来带累计 cost 的 Result,但其时间戳已被新 turn
+                                // 覆盖 → 不落 metric。此时**不能**推进 prev_cost,否则该轮增量凭空
+                                // 消失、lifetime_cost_usd 偏低(见 diff_cost_at_boundary 文档)。
+                                let will_record = run_started_ms.is_some();
                                 let mc = if is_claude {
-                                    let is_first = !first_cost_seen;
-                                    let (delta, new_prev) = crate::run_metrics::diff_cost(prev_cost, raw_cost, is_first, is_resumed);
-                                    // 推进基线:只要 raw_cost 非 None 就推进(含 Cancelled 但有值;spec §3.3)
-                                    if raw_cost.is_some() { first_cost_seen = true; prev_cost = new_prev; }
+                                    let (delta, new_prev, new_seen) = crate::run_metrics::diff_cost_at_boundary(
+                                        prev_cost, raw_cost, first_cost_seen, is_resumed, will_record);
+                                    prev_cost = new_prev;
+                                    first_cost_seen = new_seen;
                                     delta
                                 } else {
                                     raw_cost // Kiro/Codex 恒 None,不动

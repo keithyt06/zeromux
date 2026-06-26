@@ -86,6 +86,32 @@ pub fn duration_ms(started_ms: i64, ended_ms: i64) -> i64 {
     if d < 0 { 0 } else { d }
 }
 
+/// 把 Claude CLI 的累计 `total_cost_usd` 差分成本轮增量。
+/// 返回 `(本轮增量, 更新后的 prev)`。tokens 不走此函数(实证证实单轮)。
+///
+/// - `cur == None`：本轮不计成本,prev 不推进。
+/// - resume 首轮(`is_first && is_resumed`,prev=None）：记 None,prev 设为 cur，
+///   避免把 CLI 恢复的历史累计额误算成本轮花费。
+/// - 冷启动首轮(`is_first && !is_resumed`)：调用方把 prev 初始化为 `Some(0.0)`，
+///   故增量 = cur - 0 = cur 本身。
+/// - 负差 clamp 到 0(对齐 `duration_ms` 的单调回拨保护）。
+pub fn diff_cost(
+    prev: Option<f64>,
+    cur: Option<f64>,
+    is_first: bool,
+    is_resumed: bool,
+) -> (Option<f64>, Option<f64>) {
+    let Some(cur) = cur else {
+        return (None, prev); // None：不计、不推进
+    };
+    if is_first && is_resumed {
+        return (None, Some(cur)); // resume 首轮:不误算历史额
+    }
+    let base = prev.unwrap_or(0.0);
+    let delta = (cur - base).max(0.0);
+    (Some(delta), Some(cur))
+}
+
 fn percentile(sorted: &[i64], p: f64) -> i64 {
     if sorted.is_empty() { return 0; }
     // nearest-rank: rank = ceil(p * n), 1-indexed
@@ -283,5 +309,52 @@ mod tests {
             None => std::env::remove_var("HOME"),
         }
         assert!(written, "ndjson line not written");
+    }
+
+    #[test]
+    fn diff_cost_normal_cumulative_sequence() {
+        // 累计 0.01 → 0.03 → 0.06,增量应为 0.01 / 0.02 / 0.03
+        let (d1, p1) = diff_cost(Some(0.0), Some(0.01), true, false);
+        assert!((d1.unwrap() - 0.01).abs() < 1e-9);
+        let (d2, p2) = diff_cost(p1, Some(0.03), false, false);
+        assert!((d2.unwrap() - 0.02).abs() < 1e-9);
+        let (d3, _p3) = diff_cost(p2, Some(0.06), false, false);
+        assert!((d3.unwrap() - 0.03).abs() < 1e-9);
+    }
+
+    #[test]
+    fn diff_cost_cold_start_first_turn_keeps_full_value() {
+        // 冷启动:prev 由调用方初始化为 Some(0.0),首轮增量 = total 本身
+        let (d, p) = diff_cost(Some(0.0), Some(0.28), true, false);
+        assert_eq!(d, Some(0.28));
+        assert_eq!(p, Some(0.28));
+    }
+
+    #[test]
+    fn diff_cost_resume_first_turn_records_zero() {
+        // resume 首轮:prev=None,记 None,prev 设为该轮 total
+        let (d, p) = diff_cost(None, Some(0.50), true, true);
+        assert_eq!(d, None);
+        assert_eq!(p, Some(0.50));
+        // 下一轮正常差分
+        let (d2, _) = diff_cost(p, Some(0.55), false, true);
+        assert!((d2.unwrap() - 0.05).abs() < 1e-9);
+    }
+
+    #[test]
+    fn diff_cost_none_does_not_advance_prev() {
+        let (d, p) = diff_cost(Some(0.03), None, false, false);
+        assert_eq!(d, None);
+        assert_eq!(p, Some(0.03)); // 基线不变
+        // 下一轮以旧基线差分
+        let (d2, _) = diff_cost(p, Some(0.05), false, false);
+        assert!((d2.unwrap() - 0.02).abs() < 1e-9);
+    }
+
+    #[test]
+    fn diff_cost_negative_clamped_to_zero() {
+        let (d, p) = diff_cost(Some(0.10), Some(0.04), false, false);
+        assert_eq!(d, Some(0.0));
+        assert_eq!(p, Some(0.04)); // 仍推进基线
     }
 }

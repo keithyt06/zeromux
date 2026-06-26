@@ -1,7 +1,7 @@
 import { useState, useEffect, useCallback } from 'react'
 import { ChevronRight, ThumbsUp, ThumbsDown } from 'lucide-react'
 import { getSessionRuns, postRunVerdict } from '../lib/api'
-import type { RunMetric, RunStats, RunOutcome } from '../lib/api'
+import type { RunMetric, RunStats, RunOutcome, SessionLifetime } from '../lib/api'
 
 interface Props {
   sessionId: string
@@ -11,6 +11,8 @@ interface Props {
   running: boolean
   // Bumped by the parent on each turn boundary (debounced) to re-GET runs.
   refreshKey?: number
+  // Called after each successful fetch so the parent can show lifetime stats.
+  onLifetime?: (lt: SessionLifetime) => void
 }
 
 // HONEST labels (spec-mandated, tested): a non-erroring exit is NOT proof the
@@ -51,7 +53,7 @@ function Pill({ label, value }: { label: string; value: string }) {
   )
 }
 
-export function RunMetricsPanel({ sessionId, turnStartedMs, running, refreshKey }: Props) {
+export function RunMetricsPanel({ sessionId, turnStartedMs, running, refreshKey, onLifetime }: Props) {
   const [runs, setRuns] = useState<RunMetric[]>([])
   const [stats, setStats] = useState<RunStats | null>(null)
   const [nowMs, setNowMs] = useState(() => Date.now())
@@ -61,8 +63,9 @@ export function RunMetricsPanel({ sessionId, turnStartedMs, running, refreshKey 
       const data = await getSessionRuns(sessionId, { limit: 50 })
       setRuns(data.runs)
       setStats(data.stats)
+      if (data.lifetime && onLifetime) onLifetime(data.lifetime)
     } catch { /* ignore */ }
-  }, [sessionId])
+  }, [sessionId, onLifetime])
 
   // On mount + whenever the parent signals a turn boundary.
   useEffect(() => { load() }, [load, refreshKey])

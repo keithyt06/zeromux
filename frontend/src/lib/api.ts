@@ -621,10 +621,16 @@ export interface RunStats {
   cancelled_count: number
 }
 
+export interface SessionLifetime {
+  turns: number
+  duration_ms: number
+  cost_usd: number
+}
+
 export async function getSessionRuns(
   id: string,
   opts: { limit?: number; before?: number } = {},
-): Promise<{ runs: RunMetric[]; stats: RunStats }> {
+): Promise<{ runs: RunMetric[]; stats: RunStats; lifetime?: SessionLifetime }> {
   const qs = new URLSearchParams()
   if (opts.limit != null) qs.set('limit', String(opts.limit))
   if (opts.before != null) qs.set('before', String(opts.before))

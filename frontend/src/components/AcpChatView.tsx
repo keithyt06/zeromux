@@ -1,5 +1,5 @@
 import { useState, useEffect, useRef, useCallback, useMemo, memo, createElement } from 'react'
-import { wsUrl, uploadSessionFile } from '../lib/api'
+import { wsUrl, uploadSessionFile, getSessionRuns } from '../lib/api'
 import { ChevronDown, Wrench, Brain, AlertCircle, FileText, Terminal, Search, Bot, Paperclip, ListPlus, X, type LucideIcon } from 'lucide-react'
 import MarkdownContent from './markdown/MarkdownContent'
 import Composer from './Composer'
@@ -9,6 +9,7 @@ import { applyPreset } from '../lib/applyPreset'
 import { buildPromptWithAttachments } from '../lib/attachments'
 import { MicButton } from './MicButton'
 import { RunMetricsPanel } from './RunMetricsPanel'
+import { SessionLifetimeBadge } from './SessionLifetimeBadge'
 import { useTranscribe } from '../lib/transcribe'
 import { foldTranscript, type WireEvent, type Block, type TurnGroup } from '../lib/transcript'
 import { partitionBlocks, type Density } from '../lib/density'
@@ -95,6 +96,14 @@ export default function AcpChatView({ sessionId, agentType = 'claude', onRegiste
     if (metricsDebounce.current) clearTimeout(metricsDebounce.current)
     metricsDebounce.current = setTimeout(() => setMetricsRefresh(n => n + 1), 300)
   }, [])
+  // Session lifetime (cumulative turns/duration/cost) — fetched from /runs
+  // independently of showMetrics so the header badge is always available.
+  const [lifetime, setLifetime] = useState({ turns: 0, duration_ms: 0, cost_usd: 0 })
+  useEffect(() => {
+    getSessionRuns(sessionId, { limit: 0 })
+      .then(data => { if (data.lifetime) setLifetime(data.lifetime) })
+      .catch(() => { /* ignore — lifetime badge is non-critical */ })
+  }, [sessionId, metricsRefresh])
   // 输出密度(G2b/P2):concise(默认)折叠思考+原始工具输入;full 全显。
   const [density, setDensity] = useState<Density>('concise')
   // 首次精简提示:一次性、可关。localStorage 跨会话只显示一次。
@@ -363,6 +372,11 @@ export default function AcpChatView({ sessionId, agentType = 'claude', onRegiste
 
   return (
     <div className="flex flex-col h-full">
+      {lifetime.turns > 0 && (
+        <div className="px-5 pt-2 pb-0 flex justify-end">
+          <SessionLifetimeBadge agentType={agentType} lifetime={lifetime} />
+        </div>
+      )}
       {showMetrics && (
         <RunMetricsPanel
           sessionId={sessionId}

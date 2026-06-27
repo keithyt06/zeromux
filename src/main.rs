@@ -9,6 +9,7 @@ mod event_stream;
 mod events;
 mod logger;
 mod notes;
+mod push;
 mod oauth;
 mod prompts;
 mod prompts_seed;
@@ -146,6 +147,7 @@ pub struct AppState {
     pub jwt_secret: String,
     pub allowed_users: Vec<String>,
     pub external_url: String,
+    pub push: Option<std::sync::Arc<crate::push::PushService>>,
 }
 
 fn gen_random_string(len: usize) -> String {
@@ -267,6 +269,45 @@ async fn main() {
         println!("Legacy password auth mode");
     }
 
+    // Build PushService: load (or generate) VAPID key, open push subscription store
+    // (dedicated push.db in data_dir), create reqwest client. On failure, log a
+    // warning and disable push — must never prevent startup.
+    let push_service: Option<Arc<push::PushService>> = {
+        let data_path = std::path::Path::new(&data_dir_str);
+        let vapid_result = push::load_or_generate_vapid(data_path);
+        match vapid_result {
+            Err(e) => {
+                eprintln!("WARNING: push disabled — VAPID key error: {}", e);
+                None
+            }
+            Ok(vapid) => {
+                let push_db_path = data_path.join("push.db");
+                match push::PushStore::open(&push_db_path) {
+                    Err(e) => {
+                        eprintln!("WARNING: push disabled — push store error: {}", e);
+                        None
+                    }
+                    Ok(store) => {
+                        let client = reqwest::Client::builder()
+                            .redirect(reqwest::redirect::Policy::none())
+                            .build()
+                            .unwrap_or_default();
+                        match push::PushService::new(vapid, Arc::new(store), client) {
+                            Err(e) => {
+                                eprintln!("WARNING: push disabled — PushService init error: {}", e);
+                                None
+                            }
+                            Ok(svc) => {
+                                println!("Push notifications enabled");
+                                Some(Arc::new(svc))
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    };
+
     let state = Arc::new(AppState {
         sessions: session_manager::SessionManager::new(
             event_store.clone(),
@@ -299,7 +340,14 @@ async fn main() {
         jwt_secret,
         allowed_users,
         external_url,
+        push: push_service.clone(),
     });
+
+    // Wire PushService into SessionManager and ScheduledStore if available.
+    if let Some(ref p) = push_service {
+        state.sessions.set_push(p.clone());
+        state.scheduled_tasks.set_push(p.clone());
+    }
 
     // Restore persisted session metadata (running=None until respawned).
     state.sessions.load_persisted();

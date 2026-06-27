@@ -389,6 +389,8 @@ pub struct TaskRun {
 
 pub struct ScheduledStore {
     conn: Mutex<Connection>,
+    /// Push notification service, wired at startup. None = disabled.
+    push: Mutex<Option<std::sync::Arc<crate::push::PushService>>>,
 }
 
 impl ScheduledStore {
@@ -428,7 +430,16 @@ impl ScheduledStore {
                 }
             }
         }
-        Ok(Self { conn: Mutex::new(conn) })
+        Ok(Self { conn: Mutex::new(conn), push: Mutex::new(None) })
+    }
+
+    /// Wire push notification service (called once at startup).
+    pub fn set_push(&self, p: std::sync::Arc<crate::push::PushService>) {
+        *self.push.lock().unwrap() = Some(p);
+    }
+
+    fn push_handle(&self) -> Option<std::sync::Arc<crate::push::PushService>> {
+        self.push.lock().unwrap().clone()
     }
 
     pub fn upsert_config(&self, c: &TaskConfig) -> Result<(), String> {
@@ -525,20 +536,55 @@ impl ScheduledStore {
     /// Some(cutoff) for the timeout watchdog (only runs whose started_ms is older
     /// than cutoff → `watchdog_timeout`).
     pub fn reconcile_orphans(&self, cutoff_ms: Option<i64>) -> Result<usize, String> {
-        let conn = self.conn.lock().unwrap();
-        // Stamp ended_ms too: the confirmation queue orders by it and the card
-        // renders it, so an orphaned/aborted run with NULL ended_ms sorts last
-        // and shows no timestamp. (reconcile_timeouts_per_task already does this;
-        // both abort paths must agree.)
-        let now = chrono::Utc::now().timestamp_millis();
-        let n = match cutoff_ms {
-            None => conn.execute(
-                "UPDATE agent_task_runs SET state='aborted', failure_kind='orphaned_restart', ended_ms=?1 \
-                 WHERE state IN ('claimed','running')", params![now]),
-            Some(c) => conn.execute(
-                "UPDATE agent_task_runs SET state='aborted', failure_kind='watchdog_timeout', ended_ms=?2 \
-                 WHERE state IN ('claimed','running') AND started_ms < ?1", params![c, now]),
-        }.map_err(|e| e.to_string())?;
+        // Collect candidate side-effecting active run IDs before the UPDATE (for push).
+        let candidate_ids: Vec<String> = {
+            let conn = self.conn.lock().unwrap();
+            if let Some(c) = cutoff_ms {
+                let mut stmt = conn.prepare(
+                    "SELECT r.id FROM agent_task_runs r JOIN agent_runs_config c ON c.id=r.task_id \
+                     WHERE r.state IN ('claimed','running') AND c.side_effects=1 AND r.started_ms < ?1"
+                ).map_err(|e| e.to_string())?;
+                let ids: Vec<String> = stmt.query_map(params![c], |r| r.get::<_, String>(0))
+                    .map_err(|e| e.to_string())?
+                    .flatten().collect();
+                ids
+            } else {
+                let mut stmt = conn.prepare(
+                    "SELECT r.id FROM agent_task_runs r JOIN agent_runs_config c ON c.id=r.task_id \
+                     WHERE r.state IN ('claimed','running') AND c.side_effects=1"
+                ).map_err(|e| e.to_string())?;
+                let ids: Vec<String> = stmt.query_map(params![], |r| r.get::<_, String>(0))
+                    .map_err(|e| e.to_string())?
+                    .flatten().collect();
+                ids
+            }
+        };
+        let n = {
+            let conn = self.conn.lock().unwrap();
+            // Stamp ended_ms too: the confirmation queue orders by it and the card
+            // renders it, so an orphaned/aborted run with NULL ended_ms sorts last
+            // and shows no timestamp. (reconcile_timeouts_per_task already does this;
+            // both abort paths must agree.)
+            let now = chrono::Utc::now().timestamp_millis();
+            match cutoff_ms {
+                None => conn.execute(
+                    "UPDATE agent_task_runs SET state='aborted', failure_kind='orphaned_restart', ended_ms=?1 \
+                     WHERE state IN ('claimed','running')", params![now]),
+                Some(c) => conn.execute(
+                    "UPDATE agent_task_runs SET state='aborted', failure_kind='watchdog_timeout', ended_ms=?2 \
+                     WHERE state IN ('claimed','running') AND started_ms < ?1", params![c, now]),
+            }.map_err(|e| e.to_string())?
+        };
+        // Push confirm notifications for newly-queued runs (fire-and-forget via tokio::spawn).
+        if n > 0 && !candidate_ids.is_empty() {
+            let refs: Vec<&str> = candidate_ids.iter().map(|s| s.as_str()).collect();
+            let newly = self.newly_queued_confirmations(&refs);
+            if !newly.is_empty() {
+                if let Some(push) = self.push_handle() {
+                    spawn_confirm_pushes(push, newly);
+                }
+            }
+        }
         Ok(n)
     }
 
@@ -564,6 +610,7 @@ impl ScheduledStore {
             rows.collect::<Result<_,_>>().map_err(|e| e.to_string())?
         };
         let mut n = 0usize;
+        let mut aborted_ids: Vec<String> = Vec::new();
         for (id, started_ms, idle_cfg, max_cfg) in candidates {
             let last = events_mtime_ms(&id);
             if let Some(kind) = stale_verdict(
@@ -573,7 +620,18 @@ impl ScheduledStore {
                 // set_run_state 的 state IN ('claimed','running') 终态守卫保证
                 // 与 fanout 正常 finalize 不双写(spec §11 竞态:先到者赢)。
                 self.set_run_state(&id, "aborted", None, None, Some(kind), Some(now_ms))?;
+                aborted_ids.push(id);
                 n += 1;
+            }
+        }
+        // Push confirm notifications for newly-queued runs.
+        if !aborted_ids.is_empty() {
+            let refs: Vec<&str> = aborted_ids.iter().map(|s| s.as_str()).collect();
+            let newly = self.newly_queued_confirmations(&refs);
+            if !newly.is_empty() {
+                if let Some(push) = self.push_handle() {
+                    spawn_confirm_pushes(push, newly);
+                }
             }
         }
         Ok(n)
@@ -643,6 +701,42 @@ impl ScheduledStore {
                            WHERE c.id = agent_task_runs.task_id AND c.side_effects=1)",
             params![run_id, status]).map_err(|e| e.to_string())?;
         Ok(n == 1)
+    }
+
+    /// For each run_id in `run_ids`, check whether it satisfies the full
+    /// confirmation-queue predicate (side-effecting + aborted + unknown terminal +
+    /// confirm_status NULL). Returns the ones that do as
+    /// `(run_id, owner_id, task_name, failure_kind)` tuples.
+    ///
+    /// Used by reconcile functions to determine which newly-aborted runs require
+    /// a push notification to the owner.
+    pub fn newly_queued_confirmations(&self, run_ids: &[&str]) -> Vec<(String, String, String, Option<String>)> {
+        if run_ids.is_empty() {
+            return Vec::new();
+        }
+        let conn = self.conn.lock().unwrap();
+        let placeholders: Vec<String> = (1..=run_ids.len()).map(|i| format!("?{i}")).collect();
+        let sql = format!(
+            "SELECT r.id, c.owner_id, c.name, r.failure_kind \
+             FROM agent_task_runs r JOIN agent_runs_config c ON c.id = r.task_id \
+             WHERE r.id IN ({}) \
+               AND c.side_effects=1 \
+               AND r.state='aborted' \
+               AND r.failure_kind IN ('watchdog_timeout','orphaned_restart','idle_timeout') \
+               AND r.confirm_status IS NULL",
+            placeholders.join(",")
+        );
+        let mut stmt = match conn.prepare(&sql) {
+            Ok(s) => s,
+            Err(e) => { tracing::warn!("newly_queued_confirmations prepare: {e}"); return Vec::new(); }
+        };
+        let rows = stmt.query_map(rusqlite::params_from_iter(run_ids.iter().map(|s| *s)), |r| {
+            Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?, r.get::<_, String>(2)?, r.get::<_, Option<String>>(3)?))
+        });
+        match rows {
+            Ok(rows) => rows.flatten().collect(),
+            Err(e) => { tracing::warn!("newly_queued_confirmations query: {e}"); Vec::new() }
+        }
     }
 
     /// Create a new claimed run linked to the original via replay_of, carrying
@@ -779,6 +873,52 @@ pub fn run_output_tail(run_id: &str, max_lines: usize) -> Vec<String> {
 }
 
 use std::sync::atomic::{AtomicI64, Ordering};
+
+/// Per-owner push decision: individual payload (count==1) or batch (count>1).
+/// Returns (owner_id, payload) pairs — one per owner.  Pure function, easy to test.
+pub(crate) fn confirm_push_plan(
+    entries: &[(String, String, String, Option<String>)],
+) -> Vec<(String, crate::push::PushPayload)> {
+    // Collect per-owner entries in insertion order to keep individual payload deterministic.
+    let mut by_owner: std::collections::HashMap<String, Vec<(String, String, Option<String>)>> =
+        std::collections::HashMap::new();
+    for (run_id, owner_id, task_name, failure_kind) in entries {
+        by_owner
+            .entry(owner_id.clone())
+            .or_default()
+            .push((run_id.clone(), task_name.clone(), failure_kind.clone()));
+    }
+    let mut plans = Vec::new();
+    for (owner_id, owner_entries) in by_owner {
+        let payload = if owner_entries.len() == 1 {
+            let (run_id, task_name, failure_kind) = &owner_entries[0];
+            crate::push::payload_for("confirm", task_name, run_id, failure_kind.as_deref())
+        } else {
+            crate::push::confirm_batch_payload(owner_entries.len())
+        };
+        plans.push((owner_id, payload));
+    }
+    plans
+}
+
+/// Fire-and-forget push notifications for newly-queued confirmation entries.
+/// Called from reconcile functions after aborting runs. Per-owner: individual
+/// payload when exactly 1 entry, batch when >1. Never awaits — safe to call
+/// from sync context (spawns async tasks).
+fn spawn_confirm_pushes(
+    push: std::sync::Arc<crate::push::PushService>,
+    entries: Vec<(String, String, String, Option<String>)>,
+) {
+    if entries.is_empty() {
+        return;
+    }
+    for (owner_id, payload) in confirm_push_plan(&entries) {
+        let p = push.clone();
+        tokio::spawn(async move {
+            p.send_to_user(&owner_id, &payload).await;
+        });
+    }
+}
 
 /// Spawn the supervised scheduler. The outer task respawns the inner loop if it
 /// panics (so a single bad tick can't silently kill scheduling), updates a
@@ -1168,5 +1308,63 @@ mod store_tests {
             "tail pulls prose from content_block/result, skips tool_use + system");
         // missing file → empty, never an error (best-effort, spec §6.1)
         assert!(super::run_output_tail("nope_missing", 10).is_empty());
+    }
+
+    #[test]
+    fn newly_queued_confirmations_only_side_effecting() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = ScheduledStore::open(dir.path()).unwrap();
+        // Task A: side-effecting; Task B: read-only
+        let mk_cfg = |id: &str, se: bool| TaskConfig {
+            id: id.into(), owner_id: "u".into(), name: id.into(), trigger_type: "cron".into(),
+            trigger_spec: "0 0 * * * *".into(), tz: "Asia/Shanghai".into(), agent_type: "claude".into(),
+            work_dir: ".".into(), prompt: "p".into(), enabled: true, retention_n: 20, created_ms: 1,
+            side_effects: se, max_runtime_min: None, idle_timeout_min: None };
+        s.upsert_config(&mk_cfg("tA", true)).unwrap();
+        s.upsert_config(&mk_cfg("tB", false)).unwrap();
+        let mk_run = |id: &str, task: &str| TaskRun {
+            id: id.into(), task_id: task.into(), scheduled_for_ms: 1,
+            state: "claimed".into(), session_id: None, verdict: None, failure_kind: None,
+            started_ms: Some(1), ended_ms: None, input_snapshot: None,
+            confirm_status: None, replay_of: None };
+        s.claim_run(&mk_run("runA", "tA")).unwrap();
+        s.set_run_state("runA", "aborted", None, None, Some("watchdog_timeout"), Some(2)).unwrap();
+        s.claim_run(&mk_run("runB", "tB")).unwrap();
+        s.set_run_state("runB", "aborted", None, None, Some("watchdog_timeout"), Some(2)).unwrap();
+        let newly = s.newly_queued_confirmations(&["runA", "runB"]);
+        let ids: Vec<_> = newly.iter().map(|c| c.0.as_str()).collect();
+        assert!(ids.contains(&"runA"), "side_effects=1 run must be in newly_queued list");
+        assert!(!ids.contains(&"runB"), "side_effects=0 run must not be in newly_queued list");
+        // owner_id must be populated
+        assert_eq!(newly[0].1, "u");
+        // task_name must be populated
+        assert_eq!(newly[0].2, "tA");
+        // failure_kind must be present
+        assert_eq!(newly[0].3.as_deref(), Some("watchdog_timeout"));
+    }
+
+    #[test]
+    fn confirm_push_plan_per_owner_batching() {
+        // ownerA has 1 entry → individual payload (kind=="confirm", task name present)
+        // ownerB has 2 entries → batch payload (kind=="confirm_batch", count in title)
+        let entries: Vec<(String, String, String, Option<String>)> = vec![
+            ("runA1".into(), "ownerA".into(), "taskA".into(), None),
+            ("runB1".into(), "ownerB".into(), "taskB1".into(), Some("watchdog_timeout".into())),
+            ("runB2".into(), "ownerB".into(), "taskB2".into(), None),
+        ];
+        let plan = super::confirm_push_plan(&entries);
+        // Exactly one notification per owner
+        assert_eq!(plan.len(), 2);
+        let a = plan.iter().find(|(o, _)| o == "ownerA").expect("ownerA must have a plan entry");
+        let b = plan.iter().find(|(o, _)| o == "ownerB").expect("ownerB must have a plan entry");
+        // ownerA: individual — title/body contain the task name, session_id is the run_id
+        assert_eq!(a.1.kind, "confirm", "ownerA (count=1) must use individual payload");
+        assert!(a.1.title.contains("taskA") || a.1.body.contains("taskA"),
+            "individual payload must reference the task name");
+        assert_eq!(a.1.session_id, "runA1", "individual payload session_id must be the run_id");
+        // ownerB: batch — title contains the count, session_id is empty
+        assert_eq!(b.1.kind, "confirm", "ownerB (count=2) must also use confirm kind");
+        assert!(b.1.title.contains('2'), "batch payload title must include count=2");
+        assert!(b.1.session_id.is_empty(), "batch payload has empty session_id");
     }
 }

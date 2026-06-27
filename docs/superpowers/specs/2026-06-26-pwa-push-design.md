@@ -22,23 +22,21 @@ PWA 基础已就位(`index.html:7` manifest 链接,`manifest.json` 含 `display:
 
 **结论**:方案 C 成立。`web-push` 做难且易错的 RFC8188 加密 + VAPID 签名;取出 `payload.content` + `crypto_headers` 用现有 reqwest(rustls)POST。不引入 isahc(libcurl)/hyper(OpenSSL),保持单二进制纯 rustls、体积优化栈。VAPID 密钥对 `web-push` 不生成 → 用 `p256` crate 生成。
 
-## 3. 依赖变更(诚实记账 — 评审 P1-3)
+## 3. 依赖变更(实测后修订 — 评审 P1-3 + 执行期依赖树核实)
+
+> **执行期发现并修正(2026-06-26)**:原定 `web-push 0.11` 经 `cargo tree` 核实**无条件**拉入 `ece 2.3.1 → openssl 0.10 → openssl-sys`(features 空 = **动态链接系统 libssl/libcrypto**,非 vendored)。这违背方案 C 初衷(避 isahc/libcurl 那类 C 库/系统链接,保纯 rustls 单二进制易交叉构建)——实证门只验了 API 字段未验依赖树。`ece` 唯一后端是 `backend-openssl` 且 web-push 对 ece 非 optional,**关不掉**。故改用纯 rust 的 `web-push-native`。
 
 `Cargo.toml` 新增:
-- `web-push = "0.11"`,`default-features = false`(**仅用其 builder/RFC8188 加密/VapidSignatureBuilder,不用其 isahc/hyper client**)。
-- `p256 = { version = "0.13", features = ["pem", "ecdsa"] }`(VAPID 密钥对生成 + PKCS8 PEM 导出 + uncompressed 公钥)。
+- `web-push-native = "0.4"` —— **纯 rust**:`aes-gcm`(RFC8291 加密)+ `ece-native` + `p256` + `jwt-simple(pure-rust)`,经 `cargo tree` 核实**无 openssl/isahc/curl**(`superboring` 是 boring 的纯 rust 替代)。比 web-push 0.11 更契合方案 C。
+- `p256 = { version = "0.13", features = ["pem", "ecdsa"] }`(VAPID 密钥对生成 + PKCS8 PEM 导出 + uncompressed 公钥;`web-push-native` 的 VAPID 复用同一密钥)。
 
-**web-push 0.11 引入的传递依赖(实测记账,非"只是没引入 isahc")**:
-- `http = "0.2"` —— 与全栈现用 `http 1`(axum 0.8 / reqwest 0.12 / tokio-tungstenite 0.29)**重复一份**(major 共存不报错,纯增体积)。
-- `jwt-simple`(web-push 的 VapidSignatureBuilder 内部签名栈)—— 与现有 `jsonwebtoken 9`(OAuth 用)**两套 JWT 实现并存**。
-- `ece`(RFC8188 AES128GCM 加密)、`pem`、`sec1_decode`、`ct-codecs`。
+**`web-push-native 0.4` API(方案 C 落地)**:`WebPushBuilder::new(endpoint, p256::PublicKey, Auth).with_vapid(&ES256KeyPair, "mailto:...").build(content)` → `http::Request<Vec<u8>>`(已含加密 body + Content-Encoding 等全部 headers)。从 Request 取 body + headers 用**现有 reqwest** POST。VAPID 内置(jwt-simple ES256KeyPair,纯 rust)。
 
-**对体积优化单二进制(opt-level=z + lto + strip)的代价决策**:
-- 接受 `ece`(加密是难且易错的密码学,自写承担正确性风险——实证门已定用 web-push 做加密)。
-- **接受 jwt-simple 进树**(本期不为砍它而自拼 VAPID `Authorization: vapid t=,k=` 头——那增加手写面,收益仅省一个 crate)。记为已知体积代价。
-- **实现期硬性验证**:`cargo build --release` 后对比 strip 后 binary size diff,记录到实现报告;若增量 > 1.5MB,回头评估"只用 ece 加密 + jsonwebtoken+p256 自拼 VAPID 头"的瘦身路径。
+**传递依赖记账**:仍引入 `jwt-simple(pure-rust)`、`aes-gcm`、`ece-native`、可能一份 `http`(从 Request 类型)。**但无 openssl/C 库系统链接** —— 这是相对 web-push 0.11 的关键改善。
 
-p256 `to_pkcs8_pem()` 出 PKCS8(`BEGIN PRIVATE KEY`),`VapidSignatureBuilder::from_pem` 接受 PKCS8 与 SEC1 两种 —— 经核实兼容,这条链无坑。
+**实现期硬性验证**:`cargo build --release` 后 ① `ldd target/release/zeromux | grep -i ssl` 应**无** libssl(确认未引入系统 openssl);② 记录 strip 后 binary size diff,> 1.5MB 标记后续瘦身。
+
+p256 私钥 → `web-push-native` 的 VAPID:用 jwt-simple `ES256KeyPair::from_pem(pkcs8_pem)`(Task1 已产出 PKCS8 PEM);公钥仍 uncompressed base64url 给前端。
 
 复用现有:`reqwest 0.12`(rustls,发送)、`base64 0.22`、`rand 0.9`、`rusqlite`(经 db 层)。
 

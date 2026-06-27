@@ -1,8 +1,10 @@
-export function vapidKeyToUint8Array(b64url: string): Uint8Array {
+export function vapidKeyToUint8Array(b64url: string): Uint8Array<ArrayBuffer> {
   const pad = '='.repeat((4 - (b64url.length % 4)) % 4)
   const b64 = (b64url + pad).replace(/-/g, '+').replace(/_/g, '/')
   const raw = atob(b64)
-  const arr = new Uint8Array(raw.length)
+  // Allocate an explicit ArrayBuffer (not ArrayBufferLike) so the result is
+  // accepted as BufferSource by pushManager.subscribe's applicationServerKey.
+  const arr = new Uint8Array(new ArrayBuffer(raw.length))
   for (let i = 0; i < raw.length; i++) arr[i] = raw.charCodeAt(i)
   return arr
 }

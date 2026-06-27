@@ -874,10 +874,37 @@ pub fn run_output_tail(run_id: &str, max_lines: usize) -> Vec<String> {
 
 use std::sync::atomic::{AtomicI64, Ordering};
 
+/// Per-owner push decision: individual payload (count==1) or batch (count>1).
+/// Returns (owner_id, payload) pairs — one per owner.  Pure function, easy to test.
+pub(crate) fn confirm_push_plan(
+    entries: &[(String, String, String, Option<String>)],
+) -> Vec<(String, crate::push::PushPayload)> {
+    // Collect per-owner entries in insertion order to keep individual payload deterministic.
+    let mut by_owner: std::collections::HashMap<String, Vec<(String, String, Option<String>)>> =
+        std::collections::HashMap::new();
+    for (run_id, owner_id, task_name, failure_kind) in entries {
+        by_owner
+            .entry(owner_id.clone())
+            .or_default()
+            .push((run_id.clone(), task_name.clone(), failure_kind.clone()));
+    }
+    let mut plans = Vec::new();
+    for (owner_id, owner_entries) in by_owner {
+        let payload = if owner_entries.len() == 1 {
+            let (run_id, task_name, failure_kind) = &owner_entries[0];
+            crate::push::payload_for("confirm", task_name, run_id, failure_kind.as_deref())
+        } else {
+            crate::push::confirm_batch_payload(owner_entries.len())
+        };
+        plans.push((owner_id, payload));
+    }
+    plans
+}
+
 /// Fire-and-forget push notifications for newly-queued confirmation entries.
-/// Called from reconcile functions after aborting runs. Each entry is either
-/// sent as a "confirm" payload (individual) or batched when there are many.
-/// Never awaits — safe to call from sync context (spawns async tasks).
+/// Called from reconcile functions after aborting runs. Per-owner: individual
+/// payload when exactly 1 entry, batch when >1. Never awaits — safe to call
+/// from sync context (spawns async tasks).
 fn spawn_confirm_pushes(
     push: std::sync::Arc<crate::push::PushService>,
     entries: Vec<(String, String, String, Option<String>)>,
@@ -885,25 +912,10 @@ fn spawn_confirm_pushes(
     if entries.is_empty() {
         return;
     }
-    if entries.len() > 1 {
-        // Multiple entries: group by owner_id and send one batch notification per owner.
-        let mut by_owner: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
-        for (_, owner_id, _, _) in &entries {
-            *by_owner.entry(owner_id.clone()).or_insert(0) += 1;
-        }
-        for (owner_id, count) in by_owner {
-            let p = push.clone();
-            let payload = crate::push::confirm_batch_payload(count);
-            tokio::spawn(async move {
-                p.send_to_user(&owner_id, &payload).await;
-            });
-        }
-    } else {
-        // Single entry: individual "confirm" notification.
-        let (run_id, owner_id, task_name, failure_kind) = entries.into_iter().next().unwrap();
-        let payload = crate::push::payload_for("confirm", &task_name, &run_id, failure_kind.as_deref());
+    for (owner_id, payload) in confirm_push_plan(&entries) {
+        let p = push.clone();
         tokio::spawn(async move {
-            push.send_to_user(&owner_id, &payload).await;
+            p.send_to_user(&owner_id, &payload).await;
         });
     }
 }
@@ -1329,5 +1341,30 @@ mod store_tests {
         assert_eq!(newly[0].2, "tA");
         // failure_kind must be present
         assert_eq!(newly[0].3.as_deref(), Some("watchdog_timeout"));
+    }
+
+    #[test]
+    fn confirm_push_plan_per_owner_batching() {
+        // ownerA has 1 entry → individual payload (kind=="confirm", task name present)
+        // ownerB has 2 entries → batch payload (kind=="confirm_batch", count in title)
+        let entries: Vec<(String, String, String, Option<String>)> = vec![
+            ("runA1".into(), "ownerA".into(), "taskA".into(), None),
+            ("runB1".into(), "ownerB".into(), "taskB1".into(), Some("watchdog_timeout".into())),
+            ("runB2".into(), "ownerB".into(), "taskB2".into(), None),
+        ];
+        let plan = super::confirm_push_plan(&entries);
+        // Exactly one notification per owner
+        assert_eq!(plan.len(), 2);
+        let a = plan.iter().find(|(o, _)| o == "ownerA").expect("ownerA must have a plan entry");
+        let b = plan.iter().find(|(o, _)| o == "ownerB").expect("ownerB must have a plan entry");
+        // ownerA: individual — title/body contain the task name, session_id is the run_id
+        assert_eq!(a.1.kind, "confirm", "ownerA (count=1) must use individual payload");
+        assert!(a.1.title.contains("taskA") || a.1.body.contains("taskA"),
+            "individual payload must reference the task name");
+        assert_eq!(a.1.session_id, "runA1", "individual payload session_id must be the run_id");
+        // ownerB: batch — title contains the count, session_id is empty
+        assert_eq!(b.1.kind, "confirm", "ownerB (count=2) must also use confirm kind");
+        assert!(b.1.title.contains('2'), "batch payload title must include count=2");
+        assert!(b.1.session_id.is_empty(), "batch payload has empty session_id");
     }
 }

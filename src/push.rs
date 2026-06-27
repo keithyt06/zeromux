@@ -318,6 +318,7 @@ impl PushService {
 
     /// Returns the last epoch_ms at which a turn_done push was sent for this
     /// (user_id, session_id) pair. None if never pushed.
+    /// Note: 0 is treated as "never pushed" (epoch_ms is always > 0 in practice).
     pub fn last_turn_push(&self, user_id: &str, session_id: &str) -> Option<i64> {
         let map = self.debounce.lock().unwrap();
         let v = map.get(&(user_id.to_string(), session_id.to_string())).copied()?;
@@ -333,22 +334,9 @@ impl PushService {
     /// Fire-and-forget: call via tokio::spawn.
     /// Sends `payload` to every subscription of `user_id`.
     /// Each subscription is tried independently; errors are logged, not propagated.
+    /// Debounce/filtering for turn_done is the caller's responsibility (session_manager
+    /// uses should_push_turn_done + mark_turn_pushed before calling this).
     pub async fn send_to_user(&self, user_id: &str, payload: &PushPayload) {
-        // turn_done debounce: skip if same (user, session) was pushed within 30s
-        if payload.kind == "turn_done" {
-            let now_ms = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_millis() as i64)
-                .unwrap_or(0);
-            let key = (user_id.to_string(), payload.session_id.clone());
-            let mut map = self.debounce.lock().unwrap();
-            let last = map.get(&key).copied().unwrap_or(0);
-            if now_ms - last < 30_000 {
-                return;
-            }
-            map.insert(key, now_ms);
-        }
-
         let subs = self.store.list_for_user(user_id);
         let json_bytes = match serde_json::to_vec(payload) {
             Ok(b) => b,

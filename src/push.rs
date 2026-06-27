@@ -256,6 +256,8 @@ pub fn handle_delivery_outcome(store: &PushStore, endpoint: &str, o: DeliveryOut
 
 pub struct PushService {
     pub vapid: Vapid,
+    /// VAPID keypair parsed once at construction; ES256KeyPair is Send+Sync (plain p256 bytes)
+    vapid_kp: web_push_native::jwt_simple::algorithms::ES256KeyPair,
     pub store: std::sync::Arc<PushStore>,
     pub client: reqwest::Client,
     /// Debounce map: (user_id, session_id) → last turn_done push epoch_ms
@@ -263,13 +265,18 @@ pub struct PushService {
 }
 
 impl PushService {
-    pub fn new(vapid: Vapid, store: std::sync::Arc<PushStore>, client: reqwest::Client) -> Self {
-        PushService {
+    pub fn new(vapid: Vapid, store: std::sync::Arc<PushStore>, client: reqwest::Client) -> Result<Self, String> {
+        let vapid_kp = web_push_native::jwt_simple::algorithms::ES256KeyPair::from_pem(
+            &vapid.pkcs8_pem,
+        )
+        .map_err(|e| format!("push: load vapid key: {e}"))?;
+        Ok(PushService {
             vapid,
+            vapid_kp,
             store,
             client,
             debounce: Mutex::new(std::collections::HashMap::new()),
-        }
+        })
     }
 
     /// Fire-and-forget: call via tokio::spawn.
@@ -300,17 +307,6 @@ impl PushService {
             }
         };
 
-        // Load VAPID key once per send call
-        let vapid_kp = match web_push_native::jwt_simple::algorithms::ES256KeyPair::from_pem(
-            &self.vapid.pkcs8_pem,
-        ) {
-            Ok(kp) => kp,
-            Err(e) => {
-                tracing::warn!("push: load vapid key: {e}");
-                return;
-            }
-        };
-
         let urgency = if payload.kind == "turn_done" { "low" } else { "high" };
 
         for sub in subs {
@@ -320,7 +316,7 @@ impl PushService {
             }
 
             let outcome = self
-                .deliver_one(&sub, &json_bytes, &vapid_kp, urgency)
+                .deliver_one(&sub, &json_bytes, &self.vapid_kp, urgency)
                 .await;
             handle_delivery_outcome(&self.store, &sub.endpoint, outcome);
         }
@@ -383,7 +379,7 @@ impl PushService {
 
         let builder =
             WebPushBuilder::new(endpoint_uri, ua_public, ua_auth)
-                .with_vapid(vapid_kp, "mailto:admin@zeromux");
+                .with_vapid(vapid_kp, "mailto:admin@zeromux.keithyu.cloud");
 
         let req: http::Request<Vec<u8>> = match builder.build(body.to_vec()) {
             Ok(r) => r,

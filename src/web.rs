@@ -2689,11 +2689,11 @@ struct UnsubReq {
 
 async fn push_unsubscribe(
     State(state): State<Arc<AppState>>,
-    _user: axum::Extension<CurrentUser>,
+    user: axum::Extension<CurrentUser>,
     Json(req): Json<UnsubReq>,
 ) -> Result<Json<serde_json::Value>, StatusCode> {
     if let Some(p) = state.push.as_ref() {
-        p.store().delete(&req.endpoint);
+        p.store().delete_for_user(&req.endpoint, &user.id);
     }
     Ok(Json(serde_json::json!({ "ok": true })))
 }

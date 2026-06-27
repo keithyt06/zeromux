@@ -149,6 +149,17 @@ impl PushStore {
             params![endpoint],
         );
     }
+
+    /// Delete a subscription only if it belongs to `user_id`.
+    /// Used by the /api/push/unsubscribe handler to prevent cross-user deletion.
+    /// The internal 410-cleanup path uses `delete` (no user context available there).
+    pub fn delete_for_user(&self, endpoint: &str, user_id: &str) {
+        let conn = self.conn.lock().unwrap();
+        let _ = conn.execute(
+            "DELETE FROM push_subscriptions WHERE endpoint = ?1 AND user_id = ?2",
+            params![endpoint, user_id],
+        );
+    }
 }
 
 // ── SSRF guard ────────────────────────────────────────────────────────────────
@@ -488,6 +499,28 @@ mod tests {
         assert_eq!(u1[0].p256dh, "p1b");               // upsert 覆盖
         store.delete("https://ep/a");
         assert_eq!(store.list_for_user("u1").len(), 1);
+    }
+
+    #[test]
+    fn delete_for_user_scopes_to_owner() {
+        let store = PushStore::open_in_memory().unwrap();
+        // Two users, each with their own distinct endpoint
+        store.upsert("u1", "https://ep/u1", "p1", "a1").unwrap();
+        store.upsert("u2", "https://ep/u2", "p2", "a2").unwrap();
+
+        // u2 tries to delete u1's endpoint — must be a no-op
+        store.delete_for_user("https://ep/u1", "u2");
+        assert_eq!(store.list_for_user("u1").len(), 1, "u1 sub must survive u2 delete attempt");
+
+        // u2's sub must also be untouched after the failed cross-user delete
+        assert_eq!(store.list_for_user("u2").len(), 1, "u2 sub must be unaffected");
+
+        // u1 deletes their own endpoint — must succeed
+        store.delete_for_user("https://ep/u1", "u1");
+        assert_eq!(store.list_for_user("u1").len(), 0, "u1 sub must be gone after owner deletes it");
+
+        // u2's sub is still untouched
+        assert_eq!(store.list_for_user("u2").len(), 1, "u2 sub must remain after u1 deletes their own");
     }
 
     #[test]

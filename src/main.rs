@@ -288,7 +288,10 @@ async fn main() {
                         None
                     }
                     Ok(store) => {
-                        let client = reqwest::Client::new();
+                        let client = reqwest::Client::builder()
+                            .redirect(reqwest::redirect::Policy::none())
+                            .build()
+                            .unwrap_or_default();
                         match push::PushService::new(vapid, Arc::new(store), client) {
                             Err(e) => {
                                 eprintln!("WARNING: push disabled — PushService init error: {}", e);

@@ -21,7 +21,7 @@ export function shouldSuppress(visibleActiveSessions: string[], payloadSessionId
 export type PushState = 'unsupported' | 'denied' | 'enabled' | 'disabled'
 
 export async function getPushState(): Promise<PushState> {
-  if (!('PushManager' in window) || !('serviceWorker' in navigator)) return 'unsupported'
+  if (!('PushManager' in window) || !('serviceWorker' in navigator) || !('Notification' in window)) return 'unsupported'
   if (Notification.permission === 'denied') return 'denied'
   const reg = await navigator.serviceWorker.getRegistration()
   const sub = await reg?.pushManager.getSubscription()

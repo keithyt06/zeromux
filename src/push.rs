@@ -279,6 +279,16 @@ impl PushService {
         })
     }
 
+    /// Returns the VAPID public key as a base64url string (for the frontend).
+    pub fn vapid_public_key(&self) -> String {
+        self.vapid.public_key_b64url.clone()
+    }
+
+    /// Returns a reference to the underlying push subscription store.
+    pub fn store(&self) -> &PushStore {
+        &self.store
+    }
+
     /// Fire-and-forget: call via tokio::spawn.
     /// Sends `payload` to every subscription of `user_id`.
     /// Each subscription is tried independently; errors are logged, not propagated.

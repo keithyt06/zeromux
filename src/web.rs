@@ -56,6 +56,9 @@ pub fn build_router(state: Arc<AppState>) -> Router {
         .route("/api/scheduled-tasks/{id}/runs", get(list_scheduled_runs))
         .route("/api/scheduler/health", get(scheduler_health))
         .route("/api/directories", get(list_directories))
+        .route("/api/push/vapid-key", get(push_vapid_key))
+        .route("/api/push/subscribe", post(push_subscribe))
+        .route("/api/push/unsubscribe", post(push_unsubscribe))
         .route("/api/tmux/sessions", get(list_tmux_sessions))
         .route("/api/admin/users", get(crate::admin::list_users))
         .route(
@@ -2639,6 +2642,60 @@ mod upload_helpers_tests {
         assert_eq!(take(".."), "upload");        // file_name() 对 ".." 返回 None
         assert_eq!(take("/abs/path/file.png"), "file.png");
     }
+}
+
+// ── Push notification REST endpoints ──────────────────────────────────────────
+
+async fn push_vapid_key(
+    State(state): State<Arc<AppState>>,
+) -> Result<Json<serde_json::Value>, StatusCode> {
+    match state.push.as_ref() {
+        Some(p) => Ok(Json(serde_json::json!({ "key": p.vapid_public_key() }))),
+        None => Err(StatusCode::SERVICE_UNAVAILABLE),
+    }
+}
+
+#[derive(serde::Deserialize)]
+struct SubscribeReq {
+    endpoint: String,
+    keys: SubKeys,
+}
+
+#[derive(serde::Deserialize)]
+struct SubKeys {
+    p256dh: String,
+    auth: String,
+}
+
+async fn push_subscribe(
+    State(state): State<Arc<AppState>>,
+    user: axum::Extension<CurrentUser>,
+    Json(req): Json<SubscribeReq>,
+) -> Result<Json<serde_json::Value>, StatusCode> {
+    let p = state.push.as_ref().ok_or(StatusCode::SERVICE_UNAVAILABLE)?;
+    if !crate::push::endpoint_is_safe(&req.endpoint) {
+        return Err(StatusCode::BAD_REQUEST);
+    }
+    p.store()
+        .upsert(&user.id, &req.endpoint, &req.keys.p256dh, &req.keys.auth)
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    Ok(Json(serde_json::json!({ "ok": true })))
+}
+
+#[derive(serde::Deserialize)]
+struct UnsubReq {
+    endpoint: String,
+}
+
+async fn push_unsubscribe(
+    State(state): State<Arc<AppState>>,
+    _user: axum::Extension<CurrentUser>,
+    Json(req): Json<UnsubReq>,
+) -> Result<Json<serde_json::Value>, StatusCode> {
+    if let Some(p) = state.push.as_ref() {
+        p.store().delete(&req.endpoint);
+    }
+    Ok(Json(serde_json::json!({ "ok": true })))
 }
 
 #[cfg(test)]

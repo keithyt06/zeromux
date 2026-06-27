@@ -147,6 +147,7 @@ pub struct AppState {
     pub jwt_secret: String,
     pub allowed_users: Vec<String>,
     pub external_url: String,
+    pub push: Option<std::sync::Arc<crate::push::PushService>>,
 }
 
 fn gen_random_string(len: usize) -> String {
@@ -300,6 +301,7 @@ async fn main() {
         jwt_secret,
         allowed_users,
         external_url,
+        push: None, // Task5 will wire PushService here
     });
 
     // Restore persisted session metadata (running=None until respawned).

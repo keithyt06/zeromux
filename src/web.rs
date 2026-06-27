@@ -105,10 +105,7 @@ pub fn build_router(state: Arc<AppState>) -> Router {
             "/ws/acp/{session_id}",
             get(crate::acp::ws_handler::ws_acp),
         )
-        .route(
-            "/ws/transcribe",
-            get(crate::transcribe::transcribe_ws),
-        );
+        ;
 
     Router::new()
         .merge(api)
@@ -206,7 +203,7 @@ fn try_serve_embedded(path: &str) -> Option<Response> {
             .header(
                 "Content-Security-Policy",
                 "default-src 'self'; img-src 'self' data:; style-src 'self' 'unsafe-inline'; \
-                 script-src 'self' blob:; worker-src 'self' blob:; \
+                 script-src 'self'; worker-src 'self'; \
                  connect-src 'self' ws: wss:; frame-src 'self'; \
                  object-src 'none'; base-uri 'self'",
             )
@@ -2578,10 +2575,9 @@ mod upload_helpers_tests {
                 .expect("CSP header present")
                 .to_str()
                 .unwrap();
-            // AudioWorklet (voice transcription) loads from a blob: URL; the CSP
-            // must permit blob: in script-src/worker-src or voice input breaks.
-            assert!(csp.contains("script-src 'self' blob:"));
-            assert!(csp.contains("worker-src 'self' blob:"));
+            assert!(csp.contains("script-src 'self'"));
+            assert!(csp.contains("worker-src 'self'"));
+            assert!(!csp.contains("blob:"), "blob: should not be in CSP after voice removal");
         } // index.html is always present in the bundle
     }
 

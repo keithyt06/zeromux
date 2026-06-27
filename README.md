@@ -2,7 +2,7 @@
 
 A single-binary, web-based terminal multiplexer and AI agent orchestration platform built with Rust.
 
-ZeroMux lets you manage multiple terminal sessions and **three AI coding agents — Claude Code, Kiro CLI, and OpenAI Codex** — from a browser, with built-in file browsing, git visualization, session notes, voice input, an activity dashboard, and multi-client support. Sessions survive server restarts and reconnect automatically.
+ZeroMux lets you manage multiple terminal sessions and **three AI coding agents — Claude Code, Kiro CLI, and OpenAI Codex** — from a browser, with built-in file browsing, git visualization, session notes, an activity dashboard, and multi-client support. Sessions survive server restarts and reconnect automatically.
 
 > 中文文档见 [README_ZH.md](README_ZH.md)。
 
@@ -14,7 +14,6 @@ ZeroMux lets you manage multiple terminal sessions and **three AI coding agents 
 - **Session Persistence & Recovery** — Session metadata is persisted to SQLite; after a server restart (or an idle hibernation) sessions are lazily respawned on reconnect, resuming agent context where the backend supports it (Claude `--resume`, Kiro `session/load`, Codex `codex-reply`, tmux re-attach)
 - **Active Session Management** — Per-session turn state (Idle/Running) with live status dots, a completion red-dot for finished turns in background sessions, an **Interrupt** button to cancel an in-flight turn, send-while-busy (auto-interrupt + resend), a stuck-turn timer, and inline session rename
 - **Activity Dashboard** — A cross-session feed of agent `task_done` events (per-user scoped) with summaries, working directory, and cost
-- **Voice Input** — Push-to-talk microphone next to the chat input streams audio to AWS Transcribe Streaming for real-time Chinese transcription; results populate the textarea, never auto-send
 - **Resilient WebSockets** — Server-side keepalive ping + frontend auto-reconnect with backoff, so idle-timeout proxies (nginx, Cloudflare) can't silently freeze a session
 - **Multi-Client WebSocket** — Broadcast architecture allows multiple browser tabs/devices to view and drive the same session simultaneously
 - **Session Notes** — Per-working-directory note timeline with markdown files as source of truth and SQLite index, stored centrally in `~/.zeromux/notes/`
@@ -117,18 +116,6 @@ For multi-user setups with GitHub authentication:
 ```
 
 The first user to log in is automatically promoted to admin. In OAuth mode, sessions and events are scoped per user; admins can see all.
-
-### AWS Credentials (optional, required for voice input)
-
-The voice input feature calls AWS Transcribe Streaming using the default AWS credential chain:
-
-1. Env vars: `AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY` / `AWS_SESSION_TOKEN` / `AWS_REGION`
-2. Shared config: `~/.aws/credentials [default]` + `~/.aws/config [default]`
-3. EC2 IAM instance role (recommended deployment)
-
-Required IAM permission: `transcribe:StartStreamTranscription`.
-
-Voice input is the only feature that uses AWS — without credentials, the rest of ZeroMux works normally; pressing the mic button surfaces an "AWS credentials not configured" error.
 
 ## Architecture
 
@@ -234,7 +221,6 @@ Notes are scoped by working directory — sessions sharing the same work_dir sha
 |------|----------|-------------|
 | `/ws/term/{id}` | Binary (base64) | Terminal I/O (multi-client) |
 | `/ws/acp/{id}` | JSON | Agent stream — Claude/Kiro/Codex (multi-client) |
-| `/ws/transcribe` | Binary | Mic audio → AWS Transcribe Streaming |
 
 WebSocket auth is via a `?token=` query param. Only the session owner (or an admin) may attach. ACP client messages: `{"type":"prompt","text":...}`, `{"type":"interrupt"}`, `{"type":"cancel"}`. Multiple clients can connect to the same session simultaneously, each receiving the full broadcast stream.
 

@@ -3,9 +3,7 @@ mod admin;
 mod auth;
 mod auto_titler;
 mod auto_update;
-mod aws_sigv4;
 mod db;
-mod event_stream;
 mod events;
 mod logger;
 mod notes;
@@ -18,7 +16,6 @@ mod run_metrics;
 mod scheduled_tasks;
 mod session_manager;
 mod session_store;
-mod transcribe;
 mod web;
 mod ws_handler;
 

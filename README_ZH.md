@@ -2,7 +2,7 @@
 
 基于 Rust 的单二进制 Web 终端复用器与 AI Agent 编排平台。
 
-ZeroMux 让你在浏览器中管理多个终端会话和**三种 AI 编程代理 —— Claude Code、Kiro CLI 与 OpenAI Codex** —— 内置文件浏览、Git 可视化、会话笔记、语音输入、活动看板和多客户端支持。会话可在服务端重启后存活并自动重连。
+ZeroMux 让你在浏览器中管理多个终端会话和**三种 AI 编程代理 —— Claude Code、Kiro CLI 与 OpenAI Codex** —— 内置文件浏览、Git 可视化、会话笔记、活动看板和多客户端支持。会话可在服务端重启后存活并自动重连。
 
 > English docs: [README.md](README.md)
 
@@ -14,7 +14,6 @@ ZeroMux 让你在浏览器中管理多个终端会话和**三种 AI 编程代理
 - **会话持久化与恢复** — 会话元数据持久化到 SQLite；服务端重启（或空闲休眠）后，会话在重连时惰性重生，并在后端支持的前提下恢复 Agent 上下文（Claude `--resume`、Kiro `session/load`、Codex `codex-reply`、tmux 重新 attach）
 - **会话主动管理** — 每会话的轮次状态（空闲/运行中）+ 实时状态圆点、后台会话完成轮次的红点提醒、**中断（Interrupt）** 按钮取消进行中的轮次、忙时可继续发送（自动中断+重发）、卡死轮次计时器，以及侧边栏内联重命名
 - **活动看板** — 跨会话的 Agent `task_done` 事件流（按用户隔离），含摘要、工作目录和成本
-- **语音输入** — 输入框旁的麦克风按钮，按住说话调用 AWS Transcribe Streaming 实时转写中文，松开停止；结果填进输入框，需手动点 Send 才发送
 - **健壮的 WebSocket** — 服务端心跳 ping + 前端指数退避自动重连，避免空闲超时代理（nginx、Cloudflare）悄无声息地冻结会话
 - **多客户端 WebSocket** — 广播架构允许多个浏览器标签页/设备同时查看并操作同一会话
 - **会话笔记** — 按工作目录聚合的笔记时间线，markdown 文件为数据源，SQLite 为查询索引，集中存储在 `~/.zeromux/notes/`
@@ -117,18 +116,6 @@ docker run -p 8080:8080 -v zeromux-data:/root/.zeromux zeromux --password "my-se
 ```
 
 第一个登录的用户自动成为管理员。OAuth 模式下，会话和事件按用户隔离；管理员可查看全部。
-
-### AWS 凭证（可选，启用语音输入需要）
-
-语音输入功能调用 AWS Transcribe Streaming，沿用 AWS 默认 credential chain：
-
-1. 环境变量：`AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY` / `AWS_SESSION_TOKEN` / `AWS_REGION`
-2. 共享配置：`~/.aws/credentials [default]` + `~/.aws/config [default]`
-3. EC2 IAM Instance Role（推荐部署模式）
-
-需要的 IAM 权限：`transcribe:StartStreamTranscription`。
-
-未配置 AWS 凭证不影响其他功能，仅麦克风按钮在使用时显示 "AWS credentials not configured" 错误。
 
 ## 架构
 
@@ -234,7 +221,6 @@ docker run -p 8080:8080 -v zeromux-data:/root/.zeromux zeromux --password "my-se
 |------|------|------|
 | `/ws/term/{id}` | Binary (base64) | 终端 I/O（多客户端） |
 | `/ws/acp/{id}` | JSON | Agent 数据流 —— Claude/Kiro/Codex（多客户端） |
-| `/ws/transcribe` | Binary | 麦克风音频 → AWS Transcribe Streaming |
 
 WebSocket 通过 `?token=` 查询参数认证。仅会话所有者（或管理员）可连接。ACP 客户端消息：`{"type":"prompt","text":...}`、`{"type":"interrupt"}`、`{"type":"cancel"}`。多个客户端可同时连接同一会话，各自独立接收完整的广播流。
 

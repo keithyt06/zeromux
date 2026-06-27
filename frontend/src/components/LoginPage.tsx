@@ -1,7 +1,6 @@
 import { useState, useEffect, type FormEvent } from 'react'
 import type { AuthMode } from '../lib/api'
 import { getAuthMode } from '../lib/api'
-import { BrandLogo } from './BrandLogo'
 
 interface Props {
   onLegacyLogin: (password: string, remember?: boolean) => Promise<void>
@@ -33,9 +32,8 @@ export default function LoginPage({ onLegacyLogin }: Props) {
 
   return (
     <div className="h-full bg-[var(--bg-primary)] flex items-center justify-center">
-      <div className="bg-[var(--bg-secondary)] border border-[var(--border)] rounded-lg p-8 w-80 space-y-5">
-        <div className="flex items-center gap-2.5">
-          <BrandLogo size={28} />
+      <div className="bg-[var(--bg-secondary)] border border-[var(--border)] rounded-lg p-8 w-80 space-y-4">
+        <div className="flex justify-center">
           <h1 className="text-lg font-bold text-[var(--text-primary)]">ZeroMux</h1>
         </div>
 

@@ -7,10 +7,8 @@ import PromptManager from './PromptManager'
 import { usePromptPresets } from '../lib/usePromptPresets'
 import { applyPreset } from '../lib/applyPreset'
 import { buildPromptWithAttachments } from '../lib/attachments'
-import { MicButton } from './MicButton'
 import { RunMetricsPanel } from './RunMetricsPanel'
 import { SessionLifetimeBadge } from './SessionLifetimeBadge'
-import { useTranscribe } from '../lib/transcribe'
 import { foldTranscript, type WireEvent, type Block, type TurnGroup } from '../lib/transcript'
 import { partitionBlocks, type Density } from '../lib/density'
 
@@ -117,11 +115,6 @@ export default function AcpChatView({ sessionId, agentType = 'claude', onRegiste
   const expandDensity = useCallback(() => setDensity('full'), [])
   const wsRef = useRef<WebSocket | null>(null)
   const scrollRef = useRef<HTMLDivElement>(null)
-
-  const transcribe = useTranscribe({
-    language: 'zh-CN',
-    onFinal: (text) => setInput(prev => prev + text),
-  })
 
   const scrollBottom = useCallback(() => {
     requestAnimationFrame(() => {
@@ -408,13 +401,6 @@ export default function AcpChatView({ sessionId, agentType = 'claude', onRegiste
       </div>
 
       <div className="relative flex flex-col px-4 py-3 border-t border-[var(--border)] bg-[var(--bg-secondary)]">
-        {(transcribe.partial || transcribe.error) && (
-          <div className="px-2 pb-1 text-xs italic text-[var(--text-muted)]">
-            {transcribe.error
-              ? <span className="text-[var(--accent-red)]">⚠ {transcribe.error}</span>
-              : transcribe.partial}
-          </div>
-        )}
         {queuedCount > 0 && (
           <div className="px-2 pb-1 text-xs text-[var(--text-muted)]">
             已排队 {queuedCount} 条，本轮结束后合并发送
@@ -539,12 +525,6 @@ export default function AcpChatView({ sessionId, agentType = 'claude', onRegiste
                 className="self-end p-2 text-[var(--text-muted)] hover:text-[var(--text-primary)] rounded-lg transition-colors" title="文件">
                 <FileText size={16} />
               </button>
-              <MicButton
-                isRecording={transcribe.isRecording}
-                supported={transcribe.supported}
-                onPressStart={transcribe.start}
-                onPressEnd={transcribe.stop}
-              />
             </div>
           }
         />

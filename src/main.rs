@@ -9,6 +9,7 @@ mod event_stream;
 mod events;
 mod logger;
 mod notes;
+mod push;
 mod oauth;
 mod prompts;
 mod prompts_seed;

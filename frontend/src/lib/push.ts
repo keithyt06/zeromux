@@ -56,3 +56,13 @@ export async function disablePush(): Promise<void> {
     await sub.unsubscribe()
   }
 }
+
+export async function setLevels(levels: PushLevels): Promise<void> {
+  const cache = await caches.open('zmx-push')
+  await cache.put('levels', new Response(JSON.stringify(levels)))
+  localStorage.setItem('zmx_push_levels', JSON.stringify(levels))
+}
+
+export function getLevels(): PushLevels {
+  try { return JSON.parse(localStorage.getItem('zmx_push_levels') || '') } catch { return { important: true, routine: false } }
+}

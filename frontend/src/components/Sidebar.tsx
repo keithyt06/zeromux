@@ -2,10 +2,11 @@ import { useState, useEffect, useCallback, useRef } from 'react'
 import type { SessionInfo, SessionType, DirEntry, UserInfo, TmuxSession } from '../lib/api'
 import { listDirectories, listTmuxSessions, getSchedulerHealth } from '../lib/api'
 import type { Theme } from '../lib/theme'
-import { Terminal, Plus, X, PanelLeftClose, PanelLeft, Sun, Moon, Folder, FolderGit2, ChevronLeft, Home, LogOut, Users, MonitorUp, Link, Clock } from 'lucide-react'
+import { Terminal, Plus, X, PanelLeftClose, PanelLeft, Sun, Moon, Folder, FolderGit2, ChevronLeft, Home, LogOut, Users, MonitorUp, Link, Clock, Bell } from 'lucide-react'
 import AdminPanel from './AdminPanel'
 import ScheduledTasksPanel from './ScheduledTasksPanel'
 import PromptManager from './PromptManager'
+import PushSettings from './PushSettings'
 import { usePromptPresets } from '../lib/usePromptPresets'
 import { applyPreset } from '../lib/applyPreset'
 import { ClaudeCodeIcon, KiroIcon, CodexIcon } from './BrandIcons'
@@ -71,6 +72,7 @@ export default function Sidebar({ sessions, activeId, onSelect, onCreate, onDele
   const presetStore = usePromptPresets()
   const [showAdmin, setShowAdmin] = useState(false)
   const [showScheduled, setShowScheduled] = useState(false)
+  const [showPushSettings, setShowPushSettings] = useState(false)
   const [schedulerHealthy, setSchedulerHealthy] = useState(true)
   const [editingId, setEditingId] = useState<string | null>(null)
 
@@ -290,6 +292,13 @@ export default function Sidebar({ sessions, activeId, onSelect, onCreate, onDele
         </div>
         <div className="flex items-center gap-0.5">
           <button
+            onClick={() => setShowPushSettings(true)}
+            className="p-1 text-[var(--text-secondary)] hover:text-[var(--accent-blue)] rounded transition-colors"
+            title="推送通知设置"
+          >
+            <Bell size={14} />
+          </button>
+          <button
             onClick={() => setShowScheduled(true)}
             className="relative p-1 text-[var(--text-secondary)] hover:text-[var(--accent-blue)] rounded transition-colors"
             title={schedulerHealthy ? '定时任务' : '调度器异常'}
@@ -345,6 +354,9 @@ export default function Sidebar({ sessions, activeId, onSelect, onCreate, onDele
 
       {/* Scheduled Tasks overlay */}
       {showScheduled && <ScheduledTasksPanel onClose={() => setShowScheduled(false)} />}
+
+      {/* Push Settings overlay */}
+      {showPushSettings && <PushSettings onClose={() => setShowPushSettings(false)} />}
 
       {/* Sessions */}
       <div className="flex-1 overflow-y-auto py-1">

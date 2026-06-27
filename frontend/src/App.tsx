@@ -96,6 +96,31 @@ export default function App() {
     return () => { cancelled = true; clearInterval(id) }
   }, [authState])
 
+  // SW: report active session on change (allows SW to suppress front-tab notifications)
+  useEffect(() => {
+    const sw = navigator.serviceWorker?.controller
+    if (sw) sw.postMessage({ type: 'active_session', id: activeId, visible: document.visibilityState === 'visible' })
+  }, [activeId])
+  useEffect(() => {
+    const onVis = () => navigator.serviceWorker?.controller?.postMessage(
+      { type: 'active_session', id: activeId, visible: document.visibilityState === 'visible' })
+    document.addEventListener('visibilitychange', onVis)
+    return () => document.removeEventListener('visibilitychange', onVis)
+  }, [activeId])
+  // SW: listen for notification click → deep-link to session
+  useEffect(() => {
+    const onMsg = (e: MessageEvent) => {
+      if (e.data?.type === 'open_session' && e.data.id) setActiveId(e.data.id)
+    }
+    navigator.serviceWorker?.addEventListener('message', onMsg)
+    return () => navigator.serviceWorker?.removeEventListener('message', onMsg)
+  }, [])
+  // Deep-link: parse ?session= query param on startup
+  useEffect(() => {
+    const sid = new URLSearchParams(location.search).get('session')
+    if (sid) setActiveId(sid)
+  }, [])
+
   // First time we have a session list, treat all existing completions as read
   // so pre-existing history doesn't light up every row's red dot.
   useEffect(() => {

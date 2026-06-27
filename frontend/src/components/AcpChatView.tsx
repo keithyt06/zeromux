@@ -79,7 +79,6 @@ export default function AcpChatView({ sessionId, agentType = 'claude', onRegiste
   const [busy, setBusy] = useState(false)
   const [pending, setPending] = useState<string[]>([])   // 已上传待发的实际路径
   const [uploading, setUploading] = useState(0)           // 上传中计数
-  const imageInputRef = useRef<HTMLInputElement>(null)
   const fileInputRef = useRef<HTMLInputElement>(null)
   // collect:本轮进行中追加排队的条数(后端 ephemeral System{subtype:"queued"})。
   // 合并 turn 发出(下一个 Running)或 turn 结束时清零。
@@ -444,8 +443,6 @@ export default function AcpChatView({ sessionId, agentType = 'claude', onRegiste
             )}
           </div>
         )}
-        <input ref={imageInputRef} type="file" accept="image/*" multiple className="hidden"
-          onChange={e => { handleFiles(e.target.files); e.target.value = '' }} />
         <input ref={fileInputRef} type="file" accept="*/*" multiple className="hidden"
           onChange={e => { handleFiles(e.target.files); e.target.value = '' }} />
         {presetOpen && (
@@ -517,13 +514,9 @@ export default function AcpChatView({ sessionId, agentType = 'claude', onRegiste
               >
                 <ListPlus size={16} />
               </button>
-              <button onClick={() => imageInputRef.current?.click()} aria-label="attach image"
-                className="self-end p-2 text-[var(--text-muted)] hover:text-[var(--text-primary)] rounded-lg transition-colors" title="图片">
+              <button onClick={() => fileInputRef.current?.click()} aria-label="attach"
+                className="self-end p-2 text-[var(--text-muted)] hover:text-[var(--text-primary)] rounded-lg transition-colors" title="附件">
                 <Paperclip size={16} />
-              </button>
-              <button onClick={() => fileInputRef.current?.click()} aria-label="attach file"
-                className="self-end p-2 text-[var(--text-muted)] hover:text-[var(--text-primary)] rounded-lg transition-colors" title="文件">
-                <FileText size={16} />
               </button>
             </div>
           }

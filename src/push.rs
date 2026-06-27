@@ -183,10 +183,278 @@ pub fn endpoint_is_safe(endpoint: &str) -> bool {
     true
 }
 
+// ── PushPayload + text generation ────────────────────────────────────────────
+
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
+pub struct PushPayload {
+    pub kind: String,
+    pub session_id: String,
+    pub title: String,
+    pub body: String,
+}
+
+fn failure_kind_zh(fk: Option<&str>) -> &'static str {
+    match fk {
+        Some("idle_timeout") => "因空闲超时中断",
+        Some("watchdog_timeout") => "因运行超时中断",
+        Some("orphaned_restart") => "因重启中断",
+        Some("cli_error") => "传输错误",
+        Some("cli_exited") => "进程退出",
+        _ => "运行中断",
+    }
+}
+
+pub fn payload_for(kind: &str, name: &str, session_id: &str, fk: Option<&str>) -> PushPayload {
+    let (title, body) = match kind {
+        "turn_done" => (format!("✅ {name} 完成"), "本轮已结束".to_string()),
+        "run_failed" => (
+            format!("⚠️ {name} 失败"),
+            // strip leading "因" for body, keep the rest
+            failure_kind_zh(fk)
+                .trim_start_matches('因')
+                .to_string(),
+        ),
+        "confirm" => (
+            format!("❓ {name} 需确认"),
+            format!("{},等待确认", failure_kind_zh(fk)),
+        ),
+        _ => (name.to_string(), String::new()),
+    };
+    PushPayload {
+        kind: kind.to_string(),
+        session_id: session_id.to_string(),
+        title,
+        body,
+    }
+}
+
+pub fn confirm_batch_payload(n: usize) -> PushPayload {
+    PushPayload {
+        kind: "confirm".into(),
+        session_id: String::new(),
+        title: format!("❓ {n} 个任务待确认"),
+        body: "重启后需逐一确认".into(),
+    }
+}
+
+// ── Delivery outcome + 410 pruning ───────────────────────────────────────────
+
+#[derive(PartialEq, Debug)]
+pub enum DeliveryOutcome {
+    Ok,
+    Gone,
+    TransientErr,
+}
+
+pub fn handle_delivery_outcome(store: &PushStore, endpoint: &str, o: DeliveryOutcome) {
+    if o == DeliveryOutcome::Gone {
+        store.delete(endpoint);
+    }
+}
+
+// ── PushService ───────────────────────────────────────────────────────────────
+
+pub struct PushService {
+    pub vapid: Vapid,
+    pub store: std::sync::Arc<PushStore>,
+    pub client: reqwest::Client,
+    /// Debounce map: (user_id, session_id) → last turn_done push epoch_ms
+    pub debounce: Mutex<std::collections::HashMap<(String, String), i64>>,
+}
+
+impl PushService {
+    pub fn new(vapid: Vapid, store: std::sync::Arc<PushStore>, client: reqwest::Client) -> Self {
+        PushService {
+            vapid,
+            store,
+            client,
+            debounce: Mutex::new(std::collections::HashMap::new()),
+        }
+    }
+
+    /// Fire-and-forget: call via tokio::spawn.
+    /// Sends `payload` to every subscription of `user_id`.
+    /// Each subscription is tried independently; errors are logged, not propagated.
+    pub async fn send_to_user(&self, user_id: &str, payload: &PushPayload) {
+        // turn_done debounce: skip if same (user, session) was pushed within 30s
+        if payload.kind == "turn_done" {
+            let now_ms = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_millis() as i64)
+                .unwrap_or(0);
+            let key = (user_id.to_string(), payload.session_id.clone());
+            let mut map = self.debounce.lock().unwrap();
+            let last = map.get(&key).copied().unwrap_or(0);
+            if now_ms - last < 30_000 {
+                return;
+            }
+            map.insert(key, now_ms);
+        }
+
+        let subs = self.store.list_for_user(user_id);
+        let json_bytes = match serde_json::to_vec(payload) {
+            Ok(b) => b,
+            Err(e) => {
+                tracing::warn!("push: serialize payload: {e}");
+                return;
+            }
+        };
+
+        // Load VAPID key once per send call
+        let vapid_kp = match web_push_native::jwt_simple::algorithms::ES256KeyPair::from_pem(
+            &self.vapid.pkcs8_pem,
+        ) {
+            Ok(kp) => kp,
+            Err(e) => {
+                tracing::warn!("push: load vapid key: {e}");
+                return;
+            }
+        };
+
+        let urgency = if payload.kind == "turn_done" { "low" } else { "high" };
+
+        for sub in subs {
+            if !endpoint_is_safe(&sub.endpoint) {
+                tracing::warn!("push: skipping unsafe endpoint: {}", sub.endpoint);
+                continue;
+            }
+
+            let outcome = self
+                .deliver_one(&sub, &json_bytes, &vapid_kp, urgency)
+                .await;
+            handle_delivery_outcome(&self.store, &sub.endpoint, outcome);
+        }
+    }
+
+    async fn deliver_one(
+        &self,
+        sub: &Subscription,
+        body: &[u8],
+        vapid_kp: &web_push_native::jwt_simple::algorithms::ES256KeyPair,
+        urgency: &str,
+    ) -> DeliveryOutcome {
+        use base64::Engine;
+        use web_push_native::{Auth, WebPushBuilder};
+
+        // Decode subscription keys
+        let p256dh_bytes = match base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .decode(&sub.p256dh)
+        {
+            Ok(b) => b,
+            Err(e) => {
+                tracing::warn!("push: decode p256dh for {}: {e}", sub.endpoint);
+                return DeliveryOutcome::TransientErr;
+            }
+        };
+        let auth_bytes = match base64::engine::general_purpose::URL_SAFE_NO_PAD.decode(&sub.auth) {
+            Ok(b) => b,
+            Err(e) => {
+                tracing::warn!("push: decode auth for {}: {e}", sub.endpoint);
+                return DeliveryOutcome::TransientErr;
+            }
+        };
+
+        let ua_public =
+            match web_push_native::p256::PublicKey::from_sec1_bytes(&p256dh_bytes) {
+                Ok(k) => k,
+                Err(e) => {
+                    tracing::warn!("push: parse p256dh for {}: {e}", sub.endpoint);
+                    return DeliveryOutcome::TransientErr;
+                }
+            };
+
+        if auth_bytes.len() != 16 {
+            tracing::warn!(
+                "push: auth must be 16 bytes for {}, got {}",
+                sub.endpoint,
+                auth_bytes.len()
+            );
+            return DeliveryOutcome::TransientErr;
+        }
+        let ua_auth = Auth::clone_from_slice(&auth_bytes);
+
+        let endpoint_uri: http::Uri = match sub.endpoint.parse() {
+            Ok(u) => u,
+            Err(e) => {
+                tracing::warn!("push: parse endpoint uri for {}: {e}", sub.endpoint);
+                return DeliveryOutcome::TransientErr;
+            }
+        };
+
+        let builder =
+            WebPushBuilder::new(endpoint_uri, ua_public, ua_auth)
+                .with_vapid(vapid_kp, "mailto:admin@zeromux");
+
+        let req: http::Request<Vec<u8>> = match builder.build(body.to_vec()) {
+            Ok(r) => r,
+            Err(e) => {
+                tracing::warn!("push: build request for {}: {e}", sub.endpoint);
+                return DeliveryOutcome::TransientErr;
+            }
+        };
+
+        // Convert http::Request → reqwest request
+        let mut rb = self.client.post(&sub.endpoint);
+        for (name, value) in req.headers() {
+            rb = rb.header(name, value);
+        }
+        rb = rb
+            .header("Urgency", urgency)
+            .body(req.into_body());
+
+        match rb.send().await {
+            Ok(resp) => {
+                let status = resp.status().as_u16();
+                if status == 404 || status == 410 {
+                    DeliveryOutcome::Gone
+                } else if (200..300).contains(&status) {
+                    DeliveryOutcome::Ok
+                } else {
+                    tracing::warn!(
+                        "push: transient error {} for {}",
+                        status,
+                        sub.endpoint
+                    );
+                    DeliveryOutcome::TransientErr
+                }
+            }
+            Err(e) => {
+                tracing::warn!("push: send error for {}: {e}", sub.endpoint);
+                DeliveryOutcome::TransientErr
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::fs;
+
+    #[test]
+    fn payload_text_by_kind() {
+        let t = payload_for("turn_done", "重构会话", "s1", None);
+        assert!(t.title.contains("重构会话") && t.title.contains("完成"));
+        let f = payload_for("run_failed", "夜跑", "s2", Some("idle_timeout"));
+        assert!(f.title.contains("失败"));
+        assert!(f.body.contains("空闲") || f.body.contains("超时")); // failure_kind 中文
+        let c = payload_for("confirm", "备份任务", "s3", Some("watchdog_timeout"));
+        assert!(c.title.contains("需确认"));
+        assert!(c.body.contains("中断")); // 含中断原因
+        let batch = confirm_batch_payload(3);
+        assert!(batch.title.contains("3") && batch.title.contains("确认"));
+    }
+
+    #[test]
+    fn gone_outcome_removes_subscription() {
+        let store = PushStore::open_in_memory().unwrap();
+        store.upsert("u1", "https://ep/gone", "p", "a").unwrap();
+        handle_delivery_outcome(&store, "https://ep/gone", DeliveryOutcome::Gone);
+        assert_eq!(store.list_for_user("u1").len(), 0);
+        store.upsert("u1", "https://ep/ok", "p", "a").unwrap();
+        handle_delivery_outcome(&store, "https://ep/ok", DeliveryOutcome::TransientErr);
+        assert_eq!(store.list_for_user("u1").len(), 1); // 非 Gone 不删
+    }
 
     #[test]
     fn endpoint_ssrf_validation() {

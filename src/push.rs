@@ -1,5 +1,7 @@
 use std::path::Path;
+use std::sync::Mutex;
 use base64::Engine;
+use rusqlite::{params, Connection};
 
 #[derive(Clone)]
 pub struct Vapid {
@@ -58,10 +60,161 @@ pub fn load_or_generate_vapid(dir: &Path) -> Result<Vapid, String> {
     })
 }
 
+// ── Push subscriptions ────────────────────────────────────────────────────────
+
+pub struct Subscription {
+    pub endpoint: String,
+    pub p256dh: String,
+    pub auth: String,
+}
+
+pub struct PushStore {
+    conn: Mutex<Connection>,
+}
+
+const CREATE_SQL: &str = "
+CREATE TABLE IF NOT EXISTS push_subscriptions (
+    endpoint   TEXT PRIMARY KEY,
+    user_id    TEXT NOT NULL,
+    p256dh     TEXT NOT NULL,
+    auth       TEXT NOT NULL,
+    created_ms INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_push_user ON push_subscriptions(user_id);
+";
+
+impl PushStore {
+    fn init(conn: Connection) -> Result<Self, String> {
+        conn.execute_batch(CREATE_SQL)
+            .map_err(|e| format!("push_store init: {e}"))?;
+        Ok(PushStore { conn: Mutex::new(conn) })
+    }
+
+    pub fn open(db_path: &Path) -> Result<Self, String> {
+        let conn = Connection::open(db_path)
+            .map_err(|e| format!("push_store open: {e}"))?;
+        Self::init(conn)
+    }
+
+    #[cfg(test)]
+    pub fn open_in_memory() -> Result<Self, String> {
+        let conn = Connection::open_in_memory()
+            .map_err(|e| format!("push_store in_memory: {e}"))?;
+        Self::init(conn)
+    }
+
+    pub fn upsert(&self, user_id: &str, endpoint: &str, p256dh: &str, auth: &str) -> Result<(), String> {
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as i64)
+            .unwrap_or(0);
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "INSERT INTO push_subscriptions (endpoint, user_id, p256dh, auth, created_ms)
+             VALUES (?1, ?2, ?3, ?4, ?5)
+             ON CONFLICT(endpoint) DO UPDATE SET
+                 user_id    = excluded.user_id,
+                 p256dh     = excluded.p256dh,
+                 auth       = excluded.auth,
+                 created_ms = excluded.created_ms",
+            params![endpoint, user_id, p256dh, auth, now_ms],
+        )
+        .map_err(|e| format!("upsert: {e}"))?;
+        Ok(())
+    }
+
+    pub fn list_for_user(&self, user_id: &str) -> Vec<Subscription> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = match conn.prepare(
+            "SELECT endpoint, p256dh, auth FROM push_subscriptions WHERE user_id = ?1",
+        ) {
+            Ok(s) => s,
+            Err(_) => return vec![],
+        };
+        stmt.query_map(params![user_id], |row| {
+            Ok(Subscription {
+                endpoint: row.get(0)?,
+                p256dh: row.get(1)?,
+                auth: row.get(2)?,
+            })
+        })
+        .map(|rows| rows.flatten().collect())
+        .unwrap_or_default()
+    }
+
+    pub fn delete(&self, endpoint: &str) {
+        let conn = self.conn.lock().unwrap();
+        let _ = conn.execute(
+            "DELETE FROM push_subscriptions WHERE endpoint = ?1",
+            params![endpoint],
+        );
+    }
+}
+
+// ── SSRF guard ────────────────────────────────────────────────────────────────
+
+pub fn endpoint_is_safe(endpoint: &str) -> bool {
+    let url = match url::Url::parse(endpoint) {
+        Ok(u) => u,
+        Err(_) => return false,
+    };
+    if url.scheme() != "https" {
+        return false;
+    }
+    // Use url::Host enum to correctly handle IPv4, IPv6, and domain cases
+    match url.host() {
+        None => return false,
+        Some(url::Host::Domain(d)) => {
+            if d.eq_ignore_ascii_case("localhost") {
+                return false;
+            }
+        }
+        Some(url::Host::Ipv4(v4)) => {
+            if v4.is_loopback() || v4.is_private() || v4.is_link_local() || v4.is_unspecified() {
+                return false;
+            }
+        }
+        Some(url::Host::Ipv6(v6)) => {
+            if v6.is_loopback() || v6.is_unspecified() {
+                return false;
+            }
+        }
+    }
+    true
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::fs;
+
+    #[test]
+    fn endpoint_ssrf_validation() {
+        assert!(endpoint_is_safe("https://fcm.googleapis.com/fcm/send/abc"));
+        assert!(endpoint_is_safe("https://updates.push.services.mozilla.com/wpush/v2/x"));
+        assert!(!endpoint_is_safe("http://fcm.googleapis.com/x"));   // 非 https
+        assert!(!endpoint_is_safe("https://localhost/x"));
+        assert!(!endpoint_is_safe("https://127.0.0.1/x"));
+        assert!(!endpoint_is_safe("https://10.0.0.5/x"));
+        assert!(!endpoint_is_safe("https://192.168.1.1/x"));
+        assert!(!endpoint_is_safe("https://[::1]/x"));
+        assert!(!endpoint_is_safe("not a url"));
+    }
+
+    #[test]
+    fn push_store_upsert_list_delete() {
+        let store = PushStore::open_in_memory().unwrap();
+        store.upsert("u1", "https://ep/a", "p1", "a1").unwrap();
+        store.upsert("u1", "https://ep/b", "p2", "a2").unwrap();
+        store.upsert("u1", "https://ep/a", "p1b", "a1b").unwrap(); // 同 endpoint upsert
+        store.upsert("u2", "https://ep/c", "p3", "a3").unwrap();
+        let mut u1 = store.list_for_user("u1");
+        u1.sort_by(|a, b| a.endpoint.cmp(&b.endpoint));
+        assert_eq!(u1.len(), 2);                       // a(更新后) + b,不重复
+        assert_eq!(u1[0].p256dh, "p1b");               // upsert 覆盖
+        store.delete("https://ep/a");
+        assert_eq!(store.list_for_user("u1").len(), 1);
+    }
 
     #[test]
     fn vapid_load_or_generate_idempotent() {

@@ -3991,6 +3991,7 @@ dependencies = [
  "tower-http",
  "tracing",
  "tracing-subscriber",
+ "url",
  "uuid",
  "web-push-native",
  "zstd",

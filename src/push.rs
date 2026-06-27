@@ -194,6 +194,22 @@ pub fn endpoint_is_safe(endpoint: &str) -> bool {
     true
 }
 
+// ── Turn-done debounce + long-wait gate ──────────────────────────────────────
+
+/// Pure function: should we send a turn_done push notification?
+/// - turn_dur_ms < 60_000 → no (fast turns not worth waking phone)
+/// - last_push_ms within 30_000 ms of now → no (debounce)
+/// - otherwise → yes
+pub fn should_push_turn_done(now_ms: i64, last_push_ms: Option<i64>, turn_dur_ms: i64) -> bool {
+    if turn_dur_ms < 60_000 {
+        return false;
+    }
+    match last_push_ms {
+        Some(l) if now_ms - l < 30_000 => false,
+        _ => true,
+    }
+}
+
 // ── PushPayload + text generation ────────────────────────────────────────────
 
 #[derive(Debug, serde::Serialize, serde::Deserialize)]
@@ -298,6 +314,20 @@ impl PushService {
     /// Returns a reference to the underlying push subscription store.
     pub fn store(&self) -> &PushStore {
         &self.store
+    }
+
+    /// Returns the last epoch_ms at which a turn_done push was sent for this
+    /// (user_id, session_id) pair. None if never pushed.
+    pub fn last_turn_push(&self, user_id: &str, session_id: &str) -> Option<i64> {
+        let map = self.debounce.lock().unwrap();
+        let v = map.get(&(user_id.to_string(), session_id.to_string())).copied()?;
+        if v == 0 { None } else { Some(v) }
+    }
+
+    /// Record that we just sent a turn_done push for this (user_id, session_id).
+    pub fn mark_turn_pushed(&self, user_id: &str, session_id: &str, now_ms: i64) {
+        let mut map = self.debounce.lock().unwrap();
+        map.insert((user_id.to_string(), session_id.to_string()), now_ms);
     }
 
     /// Fire-and-forget: call via tokio::spawn.
@@ -521,6 +551,15 @@ mod tests {
 
         // u2's sub is still untouched
         assert_eq!(store.list_for_user("u2").len(), 1, "u2 sub must remain after u1 deletes their own");
+    }
+
+    #[test]
+    fn turn_done_debounce_and_threshold() {
+        // 久候门槛 60s + 去抖 30s
+        assert!(!should_push_turn_done(100_000, None, 5_000));               // turn 仅5s < 60s 不推
+        assert!(should_push_turn_done(100_000, None, 70_000));               // 70s 久候 推
+        assert!(!should_push_turn_done(100_000, Some(90_000), 70_000));      // 距上次 10s < 30s 去抖
+        assert!(should_push_turn_done(200_000, Some(90_000), 70_000));       // 距上次 110s 推
     }
 
     #[test]

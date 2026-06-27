@@ -265,6 +265,9 @@ pub struct SessionManager {
     /// Scheduled-tasks store, set at startup after construction. Fan-out tasks
     /// use it to finalize scheduled runs. None when no scheduler is wired.
     scheduled: Mutex<Option<Arc<crate::scheduled_tasks::ScheduledStore>>>,
+    /// Push notification service, wired at startup. None when push is disabled
+    /// (VAPID key generation failed or no subscriptions configured).
+    push: Mutex<Option<Arc<crate::push::PushService>>>,
     /// Per-run metrics writer channel. `record_run_metric` pushes into the
     /// session's in-memory VecDeque (under lock) and then `try_send`s here
     /// (outside the lock) so the async writer fsyncs off the conversation path.
@@ -556,6 +559,7 @@ impl SessionManager {
             shell,
             worktree_isolation,
             scheduled: Mutex::new(None),
+            push: Mutex::new(None),
             run_metrics_tx: crate::run_metrics::spawn_writer(),
         });
         *mgr.self_weak.lock().unwrap() = Arc::downgrade(&mgr);
@@ -569,6 +573,22 @@ impl SessionManager {
     /// Wire the scheduled-tasks store (called once at startup).
     pub fn set_scheduled_store(&self, store: Arc<crate::scheduled_tasks::ScheduledStore>) {
         *self.scheduled.lock().unwrap() = Some(store);
+    }
+
+    /// Wire push notification service (called once at startup). None = disabled.
+    pub fn set_push(&self, p: Arc<crate::push::PushService>) {
+        *self.push.lock().unwrap() = Some(p);
+    }
+
+    /// Clone push handle (lock-in / lock-out pattern): acquire lock, clone Arc, release lock.
+    /// Never hold the lock across an await.
+    fn push_handle(&self) -> Option<Arc<crate::push::PushService>> {
+        self.push.lock().unwrap().clone()
+    }
+
+    /// Look up a session's display name. Returns None if the session doesn't exist.
+    pub fn session_name(&self, id: &str) -> Option<String> {
+        self.sessions.lock().unwrap().get(id).map(|s| s.name.clone())
     }
 
     /// Finalize a scheduled run exactly once (called by the agent fan-out on the
@@ -2011,6 +2031,27 @@ fn spawn_acp_fanout(
                                 if let Some(m) = mgr.upgrade() {
                                     m.mark_turn(&sid, TurnState::Idle, boundary_count);
                                 }
+                                // turn_done push: settling boundary of a non-scheduled
+                                // turn (active_run_id still None → human-interactive turn).
+                                // Must read active_run_id.is_none() BEFORE the take() below.
+                                // Fire-and-forget via tokio::spawn; never await in the fan-out.
+                                if boundary_count >= turn_seq && active_run_id.is_none() {
+                                    if let Some(m) = mgr.upgrade() {
+                                        if let Some(p) = m.push_handle() {
+                                            let now = now_millis();
+                                            let dur = run_started_ms.as_ref().map(|s| now - s).unwrap_or(0);
+                                            let name = m.session_name(&sid).unwrap_or_default();
+                                            let uid = owner_id.clone();
+                                            let sid2 = sid.clone();
+                                            tokio::spawn(async move {
+                                                if crate::push::should_push_turn_done(now, p.last_turn_push(&uid, &sid2), dur) {
+                                                    p.mark_turn_pushed(&uid, &sid2, now);
+                                                    p.send_to_user(&uid, &crate::push::payload_for("turn_done", &name, &sid2, None)).await;
+                                                }
+                                            });
+                                        }
+                                    }
+                                }
                                 // Finalize a scheduled run exactly once, keyed
                                 // on active_run_id, mapped by terminal event type.
                                 if let Some(rid) = active_run_id.take() {
@@ -2021,8 +2062,30 @@ fn spawn_acp_fanout(
                                                 m.finalize_run(&rid, "succeeded", verdict.as_deref(),
                                                     if verdict.is_some() { None } else { Some("no_verdict") });
                                             }
-                                            AcpEvent::Error { .. } => m.finalize_run(&rid, "failed", None, Some("cli_error")),
-                                            AcpEvent::Exit { .. } => m.finalize_run(&rid, "failed", None, Some("cli_exited")),
+                                            AcpEvent::Error { .. } => {
+                                                m.finalize_run(&rid, "failed", None, Some("cli_error"));
+                                                // run_failed push: scheduled run ended with error
+                                                if let Some(p2) = m.push_handle() {
+                                                    let name = m.session_name(&sid).unwrap_or_default();
+                                                    let uid = owner_id.clone();
+                                                    let sid2 = sid.clone();
+                                                    tokio::spawn(async move {
+                                                        p2.send_to_user(&uid, &crate::push::payload_for("run_failed", &name, &sid2, Some("cli_error"))).await;
+                                                    });
+                                                }
+                                            }
+                                            AcpEvent::Exit { .. } => {
+                                                m.finalize_run(&rid, "failed", None, Some("cli_exited"));
+                                                // run_failed push: scheduled run exited unexpectedly
+                                                if let Some(p2) = m.push_handle() {
+                                                    let name = m.session_name(&sid).unwrap_or_default();
+                                                    let uid = owner_id.clone();
+                                                    let sid2 = sid.clone();
+                                                    tokio::spawn(async move {
+                                                        p2.send_to_user(&uid, &crate::push::payload_for("run_failed", &name, &sid2, Some("cli_exited"))).await;
+                                                    });
+                                                }
+                                            }
                                             _ => { active_run_id = Some(rid); } // not terminal, keep waiting
                                         }
                                     }

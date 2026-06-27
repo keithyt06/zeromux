@@ -83,7 +83,7 @@ All three normalize to a common `AcpEvent` enum (`src/acp/process.rs`) that the 
 
 ### HTTP/WS surface (`src/web.rs`)
 
-`build_router` composes four route groups: authed `/api/*`, the auth-exempt `/api/me`, OAuth/login routes, and WebSockets (`/ws/term/{id}`, `/ws/acp/{id}`, `/ws/transcribe`). A `/assets/*` route plus SPA fallback serve the embedded frontend. WS auth is via a `?token=` query param verified by `auth::verify_ws_token` (browsers can't set headers on WS upgrades).
+`build_router` composes four route groups: authed `/api/*`, the auth-exempt `/api/me`, OAuth/login routes, and WebSockets (`/ws/term/{id}`, `/ws/acp/{id}`). A `/assets/*` route plus SPA fallback serve the embedded frontend. WS auth is via a `?token=` query param verified by `auth::verify_ws_token` (browsers can't set headers on WS upgrades).
 
 ### Auth (`src/auth.rs`, `src/oauth.rs`, `src/db.rs`)
 
@@ -95,10 +95,9 @@ Two modes, chosen at startup by whether `--github-client-id`/`--github-client-se
 
 Worktree isolation is **opt-in** via `--worktree-isolation` (default OFF). `git worktree add` checks out the whole tree, which is ~24s on the JuiceFS/S3-backed production filesystem and dominates New Session latency, so the default is to run agent sessions directly in the work dir — the same as tmux sessions, which already share the tree. With the flag ON, agent sessions (Claude/Kiro/Codex) created inside a git repo get an isolated detached worktree under `.zeromux-worktrees/<short-id>/` (`resolve_work_dir`), removed on session delete; if worktree creation fails, it falls back to the base dir with a warning. Trade-off when OFF: concurrent agents on the same repo share one working tree and git index — fine for the single-user deployment, but enable the flag if you run simultaneous agents that must not collide.
 
-### Notes & voice (peripheral features)
+### Notes (peripheral feature)
 
 - **Notes** (`src/notes.rs`): markdown files with YAML frontmatter under `~/.zeromux/notes/{dir_hash}/` are the source of truth; SQLite is only a query index. Notes are scoped by working directory, so sessions sharing a `work_dir` share notes.
-- **Voice** (`src/transcribe.rs`, `src/aws_sigv4.rs`): the **only** feature touching AWS. Streams mic audio to AWS Transcribe Streaming (hand-rolled SigV4, no SDK) for Chinese transcription; requires `transcribe:StartStreamTranscription`. Absence of AWS creds disables only this feature.
 
 ### Frontend (`frontend/src/`)
 

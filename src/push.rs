@@ -164,6 +164,31 @@ impl PushStore {
 
 // ── SSRF guard ────────────────────────────────────────────────────────────────
 
+/// True if an IPv4 address must not be the target of an outbound push request.
+fn ipv4_blocked(v4: std::net::Ipv4Addr) -> bool {
+    let o = v4.octets();
+    v4.is_loopback()
+        || v4.is_private()
+        || v4.is_link_local()        // 169.254.0.0/16, incl. cloud metadata 169.254.169.254
+        || v4.is_unspecified()
+        || v4.is_broadcast()
+        // CGNAT / shared address space 100.64.0.0/10 (is_shared() is still unstable)
+        || (o[0] == 100 && (o[1] & 0xc0) == 64)
+}
+
+/// True if an IPv6 address must not be the target of an outbound push request.
+/// IPv4-mapped/compatible forms are reclassified through `ipv4_blocked` so that
+/// re-encoding an internal IPv4 as a v6 literal cannot bypass the v4 denylist.
+fn ipv6_blocked(v6: std::net::Ipv6Addr) -> bool {
+    if let Some(v4) = v6.to_ipv4_mapped() {
+        return ipv4_blocked(v4);
+    }
+    v6.is_loopback()
+        || v6.is_unspecified()
+        || v6.is_unique_local()        // fc00::/7
+        || v6.is_unicast_link_local()  // fe80::/10
+}
+
 pub fn endpoint_is_safe(endpoint: &str) -> bool {
     let url = match url::Url::parse(endpoint) {
         Ok(u) => u,
@@ -172,26 +197,16 @@ pub fn endpoint_is_safe(endpoint: &str) -> bool {
     if url.scheme() != "https" {
         return false;
     }
-    // Use url::Host enum to correctly handle IPv4, IPv6, and domain cases
+    // Use url::Host enum to correctly handle IPv4, IPv6, and domain cases.
+    // NOTE: a domain that *resolves* to an internal IP (DNS rebinding) is not
+    // caught here — that requires resolve-and-pin at connect time and is a
+    // separate, larger change; the attacker model here is an approved user.
     match url.host() {
-        None => return false,
-        Some(url::Host::Domain(d)) => {
-            if d.eq_ignore_ascii_case("localhost") {
-                return false;
-            }
-        }
-        Some(url::Host::Ipv4(v4)) => {
-            if v4.is_loopback() || v4.is_private() || v4.is_link_local() || v4.is_unspecified() {
-                return false;
-            }
-        }
-        Some(url::Host::Ipv6(v6)) => {
-            if v6.is_loopback() || v6.is_unspecified() {
-                return false;
-            }
-        }
+        None => false,
+        Some(url::Host::Domain(d)) => !d.eq_ignore_ascii_case("localhost"),
+        Some(url::Host::Ipv4(v4)) => !ipv4_blocked(v4),
+        Some(url::Host::Ipv6(v6)) => !ipv6_blocked(v6),
     }
-    true
 }
 
 // ── Turn-done debounce + long-wait gate ──────────────────────────────────────
@@ -502,6 +517,16 @@ mod tests {
         assert!(!endpoint_is_safe("https://192.168.1.1/x"));
         assert!(!endpoint_is_safe("https://[::1]/x"));
         assert!(!endpoint_is_safe("not a url"));
+        // IPv6 parity (regression): the v6 branch previously only checked
+        // loopback/unspecified, so IPv4-mapped, ULA and link-local v6 all slipped
+        // through — including the cloud metadata address re-encoded as v6.
+        assert!(!endpoint_is_safe("https://[::ffff:127.0.0.1]/x"));      // mapped loopback
+        assert!(!endpoint_is_safe("https://[::ffff:169.254.169.254]/x")); // mapped metadata
+        assert!(!endpoint_is_safe("https://[::ffff:10.0.0.5]/x"));        // mapped RFC1918
+        assert!(!endpoint_is_safe("https://[fc00::1]/x"));               // unique-local
+        assert!(!endpoint_is_safe("https://[fe80::1]/x"));               // link-local
+        assert!(!endpoint_is_safe("https://169.254.169.254/x"));         // metadata stays blocked
+        assert!(!endpoint_is_safe("https://100.64.0.1/x"));              // CGNAT / shared
     }
 
     #[test]

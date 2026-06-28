@@ -1587,9 +1587,11 @@ struct GitLogQuery {
 
 async fn git_log(
     State(state): State<Arc<AppState>>,
+    user: axum::Extension<CurrentUser>,
     axum::extract::Path(id): axum::extract::Path<String>,
     Query(query): Query<GitLogQuery>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    require_session_access(&state, &user, &id)?;
     let work_dir = state
         .sessions
         .work_dir(&id)
@@ -1678,9 +1680,11 @@ struct GitShowQuery {
 
 async fn git_show(
     State(state): State<Arc<AppState>>,
+    user: axum::Extension<CurrentUser>,
     axum::extract::Path(id): axum::extract::Path<String>,
     Query(query): Query<GitShowQuery>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    require_session_access(&state, &user, &id)?;
     let work_dir = state
         .sessions
         .work_dir(&id)
@@ -1807,24 +1811,63 @@ fn truncate_diff(diff: &str, limit: usize) -> (String, bool) {
     (diff[..end].to_string(), true)
 }
 
-/// Drop files whose path contains any SENSITIVE_DIR_NAMES component, so a
-/// worktree diff can never surface .ssh/.aws/etc. contents.
+/// Single source of truth for "must not surface in the worktree view": a path is
+/// excluded if ANY component is a SENSITIVE_DIR_NAMES dir (.ssh/.aws/.git/...) OR the
+/// leaf is a credential file per `is_credential_path` (.env/*.pem/id_*/*credentials/...).
+/// The file-browser read path already blocks the latter (`get_file_raw`/`list_dir`);
+/// deriving both the worktree file list AND the diff exclusion from this one predicate
+/// keeps them from drifting — the drift that leaked tracked .env/*.pem diffs before.
+fn worktree_path_excluded(path: &str) -> bool {
+    let p = std::path::Path::new(path);
+    let dir_hit = p.components().any(|c| matches!(c, std::path::Component::Normal(n)
+        if n.to_str().is_some_and(|s| SENSITIVE_DIR_NAMES.contains(&s))));
+    let leaf_hit = p
+        .file_name()
+        .and_then(|n| n.to_str())
+        .is_some_and(is_credential_path);
+    dir_hit || leaf_hit
+}
+
+/// Drop files whose path is excluded (sensitive dir component or credential leaf),
+/// so a worktree diff can never surface .ssh/.aws/.env/*.pem contents.
 fn filter_sensitive_files(files: Vec<WorktreeFile>) -> Vec<WorktreeFile> {
     files
         .into_iter()
-        .filter(|f| {
-            !std::path::Path::new(&f.path)
-                .components()
-                .any(|c| matches!(c, std::path::Component::Normal(n)
-                    if n.to_str().is_some_and(|s| SENSITIVE_DIR_NAMES.contains(&s))))
-        })
+        .filter(|f| !worktree_path_excluded(&f.path))
         .collect()
+}
+
+/// Strip whole per-file sections from a `git diff` body whose path is excluded.
+/// The git-side pathspec already drops sensitive *dirs*; this second pass closes
+/// credential *leaf* files (.env/*.pem/id_*/...) that pathspec globs translate
+/// imperfectly, using the SAME predicate as the file list so the two can't drift.
+/// A section starts at a `diff --git a/<p> b/<p>` line and runs until the next one.
+fn filter_diff_excluded(diff: &str) -> String {
+    let mut out = String::with_capacity(diff.len());
+    let mut skipping = false;
+    for line in diff.split_inclusive('\n') {
+        if let Some(rest) = line.strip_prefix("diff --git ") {
+            // `a/<path> b/<path>` — take the b/ side (new path); fall back to a/.
+            let path = rest
+                .rsplit_once(" b/")
+                .map(|(_, b)| b.trim_end_matches(['\n', '\r']))
+                .or_else(|| rest.strip_prefix("a/").map(|s| s.split(' ').next().unwrap_or(s)))
+                .unwrap_or("");
+            skipping = worktree_path_excluded(path);
+        }
+        if !skipping {
+            out.push_str(line);
+        }
+    }
+    out
 }
 
 async fn git_worktree(
     State(state): State<Arc<AppState>>,
+    user: axum::Extension<CurrentUser>,
     axum::extract::Path(id): axum::extract::Path<String>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    require_session_access(&state, &user, &id)?;
     let stored_dir = state
         .sessions
         .work_dir(&id)
@@ -1838,15 +1881,20 @@ async fn git_worktree(
     let work_dir = live_dir.unwrap_or(stored_dir);
 
     // Safety: refuse if work_dir is $HOME itself or sits in a sensitive dir —
-    // `git diff` would otherwise leak .aws/.ssh/.env contents wholesale.
+    // `git diff` would otherwise leak .aws/.ssh/.env contents wholesale. Fail CLOSED:
+    // if the path can't be canonicalized (missing/escaping symlink), refuse rather
+    // than fall through to running git in an unverified dir.
     let home = std::env::var("HOME").unwrap_or_default();
     let home_path = std::path::Path::new(&home);
-    if let Ok(canon) = std::fs::canonicalize(&work_dir) {
-        if canon == home_path || base_dir_at_or_in_sensitive(home_path, &canon) {
-            return Ok(Json(serde_json::json!({
-                "is_git": false, "files": [], "diff": "", "truncated": false
-            })));
+    let safe_empty = Json(serde_json::json!({
+        "is_git": false, "files": [], "diff": "", "truncated": false
+    }));
+    match std::fs::canonicalize(&work_dir) {
+        Ok(canon) if canon == home_path || base_dir_at_or_in_sensitive(home_path, &canon) => {
+            return Ok(safe_empty);
         }
+        Ok(_) => {}
+        Err(_) => return Ok(safe_empty),
     }
     let dir = std::path::Path::new(&work_dir);
 
@@ -1887,14 +1935,17 @@ async fn git_worktree(
             diff_args.push(format!(":(exclude,glob){name}")); // file/dir named <name> at root
             diff_args.push(format!(":(exclude,glob)**/{name}")); // ...at any depth
         }
-        std::process::Command::new("git")
+        let raw = std::process::Command::new("git")
             .args(&diff_args)
             .current_dir(dir)
             .output()
             .ok()
             .filter(|o| o.status.success())
             .map(|o| String::from_utf8_lossy(&o.stdout).to_string())
-            .unwrap_or_default()
+            .unwrap_or_default();
+        // Second pass: drop credential-leaf file sections (.env/*.pem/id_*/...) that
+        // the dir-only pathspec can't express, via the shared file-list predicate.
+        filter_diff_excluded(&raw)
     } else {
         String::new()
     };
@@ -2732,6 +2783,67 @@ mod path_safety_tests {
         let out = filter_sensitive_files(files);
         assert_eq!(out.len(), 1);
         assert_eq!(out[0].path, "src/main.rs");
+    }
+
+    #[test]
+    fn filter_sensitive_files_drops_credential_leaf_files() {
+        // Parity with the file-browser read guard (is_credential_path): a tracked-
+        // and-modified .env / *.pem / id_rsa / *credentials must NOT surface in the
+        // worktree file list (and, via worktree_excluded, not in the diff body either),
+        // even though none of these are SENSITIVE_DIR_NAMES *directories*.
+        let files = vec![
+            WorktreeFile { path: "src/main.rs".into(), status: " M".into(), staged: false, old_path: None },
+            WorktreeFile { path: ".env".into(), status: " M".into(), staged: false, old_path: None },
+            WorktreeFile { path: "config/.env.production".into(), status: " M".into(), staged: false, old_path: None },
+            WorktreeFile { path: "deploy.pem".into(), status: " M".into(), staged: false, old_path: None },
+            WorktreeFile { path: "keys/id_rsa".into(), status: " M".into(), staged: false, old_path: None },
+            WorktreeFile { path: "aws-credentials".into(), status: " M".into(), staged: false, old_path: None },
+        ];
+        let out = filter_sensitive_files(files);
+        assert_eq!(out.len(), 1, "only the non-credential file survives");
+        assert_eq!(out[0].path, "src/main.rs");
+    }
+
+    #[test]
+    fn filter_diff_excluded_drops_credential_and_dir_sections() {
+        // A real-shaped multi-file diff: .env and .ssh/config sections must be
+        // stripped wholesale; main.rs survives intact.
+        let diff = "\
+diff --git a/.env b/.env
+index 1..2 100644
+--- a/.env
++++ b/.env
++SECRET=LEAKED
+diff --git a/src/main.rs b/src/main.rs
+index 3..4 100644
+--- a/src/main.rs
++++ b/src/main.rs
++let x = 1;
+diff --git a/.ssh/config b/.ssh/config
+index 5..6 100644
+--- a/.ssh/config
++++ b/.ssh/config
++Host leaked
+";
+        let out = filter_diff_excluded(diff);
+        assert!(!out.contains("LEAKED"), "credential .env hunk must be gone");
+        assert!(!out.contains("Host leaked"), ".ssh/config hunk must be gone");
+        assert!(out.contains("let x = 1;"), "main.rs hunk must survive");
+        assert!(out.contains("diff --git a/src/main.rs"));
+        assert!(!out.contains("diff --git a/.env"));
+    }
+
+    #[test]
+    fn worktree_excluded_matches_filter_for_credentials_and_dirs() {
+        // The diff-exclusion predicate MUST drop exactly what the file-list filter
+        // drops, so a file can never appear in one but leak through the other.
+        for p in [".ssh/config", ".aws/credentials", ".env", "config/.env.local",
+                  "deploy.pem", "keys/id_ed25519", "x.key", "aws-credentials"] {
+            assert!(worktree_path_excluded(p), "{p} must be excluded");
+        }
+        for p in ["src/main.rs", "README.md", "Cargo.toml"] {
+            assert!(!worktree_path_excluded(p), "{p} must NOT be excluded");
+        }
     }
 }
 

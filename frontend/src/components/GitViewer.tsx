@@ -239,6 +239,18 @@ function WorktreePanel({ wt, selected, onSelect, onRefresh, onForward }: {
   onRefresh: () => void
   onForward?: (text: string) => void
 }) {
+  // After a forward, show a brief "已发送给 agent" line and disable both buttons so
+  // a second tap can't queue a duplicate prompt (the chat where it lands is hidden
+  // behind this overlay, so the panel itself must give the only feedback).
+  const [sent, setSent] = useState(false)
+  const forward = useCallback((text: string, confirmMsg?: string) => {
+    if (!onForward) return
+    if (confirmMsg && !window.confirm(confirmMsg)) return
+    onForward(text)
+    setSent(true)
+    setTimeout(() => setSent(false), 4000)
+  }, [onForward])
+
   if (wt && !wt.is_git) {
     return (
       <div className="flex flex-1 items-center justify-center text-sm text-[var(--text-muted)]">
@@ -292,11 +304,18 @@ function WorktreePanel({ wt, selected, onSelect, onRefresh, onForward }: {
           )}
         </div>
         {wt?.is_git && wt.files.length > 0 && onForward && (
-          <div className="flex gap-2 p-2 border-t border-[var(--border)]">
-            <button onClick={() => onForward(COMMIT_PROMPT)}
-              className="px-2 py-1 text-xs rounded bg-[var(--bg-tertiary)] text-[var(--text-primary)] hover:bg-[var(--bg-hover)]">让 agent 提交</button>
-            <button onClick={() => onForward(DISCARD_PROMPT)}
-              className="px-2 py-1 text-xs rounded bg-[var(--bg-tertiary)] text-[var(--accent-red)] hover:bg-[var(--bg-hover)]">让 agent 撤销改动</button>
+          <div className="border-t border-[var(--border)]">
+            {sent && (
+              <div className="px-2 pt-2 text-[10px] text-[var(--accent-green)]">
+                已发送给 agent,切到 Chat 查看执行
+              </div>
+            )}
+            <div className="flex gap-2 p-2">
+              <button onClick={() => forward(COMMIT_PROMPT)} disabled={sent}
+                className="px-2 py-1 text-xs rounded bg-[var(--bg-tertiary)] text-[var(--text-primary)] hover:bg-[var(--bg-hover)] disabled:opacity-40 disabled:cursor-not-allowed">让 agent 提交</button>
+              <button onClick={() => forward(DISCARD_PROMPT, '确认让 agent 撤销当前工作区的全部未提交改动?此操作不可恢复。')} disabled={sent}
+                className="px-2 py-1 text-xs rounded bg-[var(--bg-tertiary)] text-[var(--accent-red)] hover:bg-[var(--bg-hover)] disabled:opacity-40 disabled:cursor-not-allowed">让 agent 撤销改动</button>
+            </div>
           </div>
         )}
       </div>

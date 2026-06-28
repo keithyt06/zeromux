@@ -1,6 +1,7 @@
 import { useState, useEffect, useCallback, useMemo, useRef } from 'react'
 import type { SessionInfo, SessionType, UserInfo } from './lib/api'
-import { listSessions, createSession, deleteSession, checkAuth, legacyLogin, clearAuth, renameSession, listConfirmations } from './lib/api'
+import { listSessions, createSession, deleteSession, checkAuth, legacyLogin, clearAuth, renameSession, listConfirmations, getSessionStatus } from './lib/api'
+import { deepLinkView } from './lib/deeplink'
 import { useTheme } from './lib/theme'
 import Sidebar from './components/Sidebar'
 import TerminalView from './components/TerminalView'
@@ -110,7 +111,14 @@ export default function App() {
   // SW: listen for notification click → deep-link to session
   useEffect(() => {
     const onMsg = (e: MessageEvent) => {
-      if (e.data?.type === 'open_session' && e.data.id) setActiveId(e.data.id)
+      if (e.data?.type === 'open_session' && e.data.id) {
+        const targetSession: string = e.data.id
+        setActiveId(targetSession)
+        // route to worktree diff if the finished turn left uncommitted changes
+        getSessionStatus(targetSession)
+          .then(st => setOverlay(prev => ({ ...prev, [targetSession]: deepLinkView(st.git_dirty) })))
+          .catch(() => {})
+      }
     }
     navigator.serviceWorker?.addEventListener('message', onMsg)
     return () => navigator.serviceWorker?.removeEventListener('message', onMsg)

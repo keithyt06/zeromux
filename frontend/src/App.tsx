@@ -29,8 +29,8 @@ export default function App() {
   const baselineInit = useRef(false)
   // WS-only controls each AcpChatView registers, keyed by session id, so the
   // sibling SessionInfoBar can drive them (G2b queue mode).
-  const sessionControls = useRef<Record<string, { setQueueMode: (mode: string) => void }>>({})
-  const registerControls = useCallback((sid: string, api: { setQueueMode: (mode: string) => void } | null) => {
+  const sessionControls = useRef<Record<string, { setQueueMode: (mode: string) => void; sendPrompt: (text: string) => void }>>({})
+  const registerControls = useCallback((sid: string, api: { setQueueMode: (mode: string) => void; sendPrompt: (text: string) => void } | null) => {
     if (api) sessionControls.current[sid] = api
     else delete sessionControls.current[sid]
   }, [])
@@ -291,7 +291,7 @@ export default function App() {
                   )}
                 </div>
                 {view === 'files' && <FileBrowser sessionId={s.id} />}
-                {view === 'git' && <GitViewer sessionId={s.id} />}
+                {view === 'git' && <GitViewer sessionId={s.id} onForward={(t) => sessionControls.current[s.id]?.sendPrompt(t)} />}
                 {view === 'events' && <AgentDashboard sessionId={s.id} />}
               </div>
             )

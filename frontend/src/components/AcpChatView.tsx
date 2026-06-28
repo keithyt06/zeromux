@@ -51,7 +51,7 @@ interface Props {
   agentType?: 'claude' | 'kiro' | 'codex'
   // Lets the parent (App→SessionInfoBar) drive WS-only controls that live in
   // this component. Registered on mount, cleared on unmount. (G2b queue mode.)
-  onRegisterControls?: (sessionId: string, api: { setQueueMode: (mode: string) => void } | null) => void
+  onRegisterControls?: (sessionId: string, api: { setQueueMode: (mode: string) => void; sendPrompt: (text: string) => void } | null) => void
   // Inline run-metrics panel visibility, owned by App (toggled from SessionInfoBar).
   showMetrics?: boolean
 }
@@ -347,9 +347,9 @@ export default function AcpChatView({ sessionId, agentType = 'claude', onRegiste
   // Register WS-only controls so SessionInfoBar (rendered by App, a sibling)
   // can drive them for the active session. Clear on unmount.
   useEffect(() => {
-    onRegisterControls?.(sessionId, { setQueueMode })
+    onRegisterControls?.(sessionId, { setQueueMode, sendPrompt })
     return () => onRegisterControls?.(sessionId, null)
-  }, [sessionId, setQueueMode, onRegisterControls])
+  }, [sessionId, setQueueMode, sendPrompt, onRegisterControls])
 
   // Esc closes the preset popover (parity with the Sidebar pick-prompt step).
   useEffect(() => {

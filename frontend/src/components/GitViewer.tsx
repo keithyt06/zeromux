@@ -5,11 +5,16 @@ import { GitCommit as GitCommitIcon, RefreshCw, FileText, User, Calendar } from 
 
 interface Props {
   sessionId: string
+  onForward?: (text: string) => void
 }
 
 export function defaultGitTab(dirty: number): 'worktree' | 'history' {
   return dirty > 0 ? 'worktree' : 'history'
 }
+
+// Fixed prompts forwarded into the session's agent chat from the worktree panel.
+export const COMMIT_PROMPT = '把当前工作区的未提交改动提交,commit message 自行总结本次改动。'
+export const DISCARD_PROMPT = '撤销(git restore)当前工作区的全部未提交改动,不要提交。'
 
 // Colors for graph lanes
 const LANE_COLORS = [
@@ -27,7 +32,7 @@ function laneColor(index: number): string {
   return LANE_COLORS[index % LANE_COLORS.length]
 }
 
-export default function GitViewer({ sessionId }: Props) {
+export default function GitViewer({ sessionId, onForward }: Props) {
   const [entries, setEntries] = useState<GitGraphEntry[]>([])
   const [total, setTotal] = useState(0)
   const [loading, setLoading] = useState(true)
@@ -124,6 +129,7 @@ export default function GitViewer({ sessionId }: Props) {
           selected={wtSelected}
           onSelect={setWtSelected}
           onRefresh={loadWorktree}
+          onForward={onForward}
         />
       ) : (
     <div className="flex flex-1 min-h-0">
@@ -233,11 +239,12 @@ export default function GitViewer({ sessionId }: Props) {
 
 // ── Worktree panel ──
 
-function WorktreePanel({ wt, selected, onSelect, onRefresh }: {
+function WorktreePanel({ wt, selected, onSelect, onRefresh, onForward }: {
   wt: { files: WorktreeFile[]; diff: string; truncated: boolean; is_git: boolean } | null
   selected: string | null
   onSelect: (path: string) => void
   onRefresh: () => void
+  onForward?: (text: string) => void
 }) {
   if (wt && !wt.is_git) {
     return (
@@ -291,6 +298,14 @@ function WorktreePanel({ wt, selected, onSelect, onRefresh }: {
             })
           )}
         </div>
+        {wt?.is_git && wt.files.length > 0 && onForward && (
+          <div className="flex gap-2 p-2 border-t border-[var(--border)]">
+            <button onClick={() => onForward(COMMIT_PROMPT)}
+              className="px-2 py-1 text-xs rounded bg-[var(--bg-tertiary)] text-[var(--text-primary)] hover:bg-[var(--bg-hover)]">让 agent 提交</button>
+            <button onClick={() => onForward(DISCARD_PROMPT)}
+              className="px-2 py-1 text-xs rounded bg-[var(--bg-tertiary)] text-[var(--accent-red)] hover:bg-[var(--bg-hover)]">让 agent 撤销改动</button>
+          </div>
+        )}
       </div>
 
       {/* Diff view */}

@@ -42,6 +42,10 @@ function relativeTime(ms: number): string {
 
 /** Turn-state dot: hollow=hibernated, amber=stuck, green=running, gray=idle. */
 function TurnDot({ s }: { s: SessionInfo }) {
+  // Coarse stuck hint: re-evaluated on the 3s session-list poll re-render.
+  // Date.now() at render is intentional and harmless here (cosmetic dot, no
+  // dependent state/effect), so the purity rule is suppressed for this line.
+  // eslint-disable-next-line react-hooks/purity
   const stuck = isStuck(s.turn_state, s.last_activity_ms, Date.now())
   const cls = !s.running
     ? 'border border-[var(--text-secondary)]'

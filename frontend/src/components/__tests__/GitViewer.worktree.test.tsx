@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest'
-import { defaultGitTab, COMMIT_PROMPT, DISCARD_PROMPT } from '../GitViewer'
+import { defaultGitTab, COMMIT_PROMPT, DISCARD_PROMPT } from '../../lib/gitviewer'
 
 describe('defaultGitTab', () => {
   it('picks worktree when dirty', () => {

@@ -1884,6 +1884,8 @@ async fn git_worktree(
         for name in SENSITIVE_DIR_NAMES {
             diff_args.push(format!(":(exclude,glob){}/**", name));
             diff_args.push(format!(":(exclude,glob)**/{}/**", name));
+            diff_args.push(format!(":(exclude,glob){name}")); // file/dir named <name> at root
+            diff_args.push(format!(":(exclude,glob)**/{name}")); // ...at any depth
         }
         std::process::Command::new("git")
             .args(&diff_args)

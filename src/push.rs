@@ -225,6 +225,17 @@ pub fn should_push_turn_done(now_ms: i64, last_push_ms: Option<i64>, turn_dur_ms
     }
 }
 
+/// Debounce for stuck pushes: at least 5 minutes between pushes per session.
+/// The silence-threshold (600s) gating is done by the caller; this only
+/// suppresses repeats. Uses a SEPARATE debounce map from turn_done so the two
+/// kinds never overwrite each other.
+pub fn should_push_stuck(now_ms: i64, last_push_ms: Option<i64>) -> bool {
+    match last_push_ms {
+        Some(l) if now_ms - l < 5 * 60_000 => false,
+        _ => true,
+    }
+}
+
 // ── PushPayload + text generation ────────────────────────────────────────────
 
 #[derive(Debug, serde::Serialize, serde::Deserialize)]
@@ -259,6 +270,10 @@ pub fn payload_for(kind: &str, name: &str, session_id: &str, fk: Option<&str>) -
         "confirm" => (
             format!("❓ {name} 需确认"),
             format!("{},等待确认", failure_kind_zh(fk)),
+        ),
+        "stuck" => (
+            format!("⚠️ {name} 可能卡住"),
+            "已静默约 10 分钟无输出".to_string(),
         ),
         _ => (name.to_string(), String::new()),
     };
@@ -304,6 +319,9 @@ pub struct PushService {
     pub client: reqwest::Client,
     /// Debounce map: (user_id, session_id) → last turn_done push epoch_ms
     pub debounce: Mutex<std::collections::HashMap<(String, String), i64>>,
+    /// Separate debounce map for stuck pushes: (user_id, session_id) → last stuck push epoch_ms.
+    /// Distinct from `debounce` so stuck and turn_done never overwrite each other.
+    pub stuck_debounce: Mutex<std::collections::HashMap<(String, String), i64>>,
 }
 
 impl PushService {
@@ -318,6 +336,7 @@ impl PushService {
             store,
             client,
             debounce: Mutex::new(std::collections::HashMap::new()),
+            stuck_debounce: Mutex::new(std::collections::HashMap::new()),
         })
     }
 
@@ -343,6 +362,20 @@ impl PushService {
     /// Record that we just sent a turn_done push for this (user_id, session_id).
     pub fn mark_turn_pushed(&self, user_id: &str, session_id: &str, now_ms: i64) {
         let mut map = self.debounce.lock().unwrap();
+        map.insert((user_id.to_string(), session_id.to_string()), now_ms);
+    }
+
+    /// Returns the last epoch_ms at which a stuck push was sent for this
+    /// (user_id, session_id) pair. None if never pushed. Reads the separate
+    /// stuck_debounce map (never the turn_done map).
+    pub fn last_stuck_push(&self, user_id: &str, session_id: &str) -> Option<i64> {
+        let map = self.stuck_debounce.lock().unwrap();
+        map.get(&(user_id.to_string(), session_id.to_string())).copied()
+    }
+
+    /// Record that we just sent a stuck push for this (user_id, session_id).
+    pub fn mark_stuck_pushed(&self, user_id: &str, session_id: &str, now_ms: i64) {
+        let mut map = self.stuck_debounce.lock().unwrap();
         map.insert((user_id.to_string(), session_id.to_string()), now_ms);
     }
 
@@ -573,6 +606,52 @@ mod tests {
         assert!(should_push_turn_done(100_000, None, 70_000));               // 70s 久候 推
         assert!(!should_push_turn_done(100_000, Some(90_000), 70_000));      // 距上次 10s < 30s 去抖
         assert!(should_push_turn_done(200_000, Some(90_000), 70_000));       // 距上次 110s 推
+    }
+
+    #[test]
+    fn should_push_stuck_debounces() {
+        // never pushed → push
+        assert!(should_push_stuck(1_000_000, None));
+        // pushed 4min ago → still debounced (< 5min)
+        assert!(!should_push_stuck(1_000_000, Some(1_000_000 - 4 * 60_000)));
+        // pushed 6min ago → push again
+        assert!(should_push_stuck(1_000_000, Some(1_000_000 - 6 * 60_000)));
+    }
+
+    #[test]
+    fn stuck_payload_shape() {
+        let p = payload_for("stuck", "my-sess", "sid123", None);
+        assert!(p.title.contains("卡住"));
+        assert_eq!(p.kind, "stuck");
+    }
+
+    #[test]
+    fn stuck_and_turn_done_debounce_isolated() {
+        // Real isolation test: the two debounce kinds use SEPARATE maps, so marking
+        // a stuck push must not be visible to the turn_done lookup, and vice versa.
+        // PushService::new only parses the VAPID PEM (no network), so a bare instance
+        // is cheap to build here — same in-memory pattern as the vapid/store tests.
+        let dir = std::env::temp_dir().join(format!("zmx-push-isolate-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let _ = fs::remove_file(dir.join("vapid.json"));
+        let vapid = load_or_generate_vapid(&dir).unwrap();
+        let store = std::sync::Arc::new(PushStore::open_in_memory().unwrap());
+        let svc = PushService::new(vapid, store, reqwest::Client::new()).unwrap();
+
+        let (u, s, t) = ("u1", "sess1", 1_000_000_i64);
+
+        // Marking a stuck push must NOT leak into the turn_done map.
+        svc.mark_stuck_pushed(u, s, t);
+        assert_eq!(svc.last_stuck_push(u, s), Some(t));
+        assert_eq!(svc.last_turn_push(u, s), None, "stuck mark must not appear in turn_done map");
+
+        // And vice versa: marking a turn_done push must NOT leak into the stuck map.
+        let (u2, s2, t2) = ("u2", "sess2", 2_000_000_i64);
+        svc.mark_turn_pushed(u2, s2, t2);
+        assert_eq!(svc.last_turn_push(u2, s2), Some(t2));
+        assert_eq!(svc.last_stuck_push(u2, s2), None, "turn_done mark must not appear in stuck map");
+
+        fs::remove_dir_all(&dir).ok();
     }
 
     #[test]

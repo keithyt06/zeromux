@@ -1,6 +1,7 @@
 import { useState, useEffect, useCallback, useMemo, useRef } from 'react'
 import type { SessionInfo, SessionType, UserInfo } from './lib/api'
-import { listSessions, createSession, deleteSession, checkAuth, legacyLogin, clearAuth, renameSession, listConfirmations } from './lib/api'
+import { listSessions, createSession, deleteSession, checkAuth, legacyLogin, clearAuth, renameSession, listConfirmations, getSessionStatus } from './lib/api'
+import { deepLinkView } from './lib/deeplink'
 import { useTheme } from './lib/theme'
 import Sidebar from './components/Sidebar'
 import TerminalView from './components/TerminalView'
@@ -29,8 +30,8 @@ export default function App() {
   const baselineInit = useRef(false)
   // WS-only controls each AcpChatView registers, keyed by session id, so the
   // sibling SessionInfoBar can drive them (G2b queue mode).
-  const sessionControls = useRef<Record<string, { setQueueMode: (mode: string) => void }>>({})
-  const registerControls = useCallback((sid: string, api: { setQueueMode: (mode: string) => void } | null) => {
+  const sessionControls = useRef<Record<string, { setQueueMode: (mode: string) => void; sendPrompt: (text: string) => void }>>({})
+  const registerControls = useCallback((sid: string, api: { setQueueMode: (mode: string) => void; sendPrompt: (text: string) => void } | null) => {
     if (api) sessionControls.current[sid] = api
     else delete sessionControls.current[sid]
   }, [])
@@ -110,7 +111,14 @@ export default function App() {
   // SW: listen for notification click → deep-link to session
   useEffect(() => {
     const onMsg = (e: MessageEvent) => {
-      if (e.data?.type === 'open_session' && e.data.id) setActiveId(e.data.id)
+      if (e.data?.type === 'open_session' && e.data.id) {
+        const targetSession: string = e.data.id
+        setActiveId(targetSession)
+        // route to worktree diff if the finished turn left uncommitted changes
+        getSessionStatus(targetSession)
+          .then(st => setOverlay(prev => ({ ...prev, [targetSession]: deepLinkView(st.git_dirty) })))
+          .catch(() => {})
+      }
     }
     navigator.serviceWorker?.addEventListener('message', onMsg)
     return () => navigator.serviceWorker?.removeEventListener('message', onMsg)
@@ -291,7 +299,7 @@ export default function App() {
                   )}
                 </div>
                 {view === 'files' && <FileBrowser sessionId={s.id} />}
-                {view === 'git' && <GitViewer sessionId={s.id} />}
+                {view === 'git' && <GitViewer sessionId={s.id} onForward={(t) => sessionControls.current[s.id]?.sendPrompt(t)} />}
                 {view === 'events' && <AgentDashboard sessionId={s.id} />}
               </div>
             )

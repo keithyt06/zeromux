@@ -38,6 +38,7 @@ pub fn build_router(state: Arc<AppState>) -> Router {
         .route("/api/sessions/{id}/dir/rename", post(rename_session_dir))
         .route("/api/sessions/{id}/git/log", get(git_log))
         .route("/api/sessions/{id}/git/show", get(git_show))
+        .route("/api/sessions/{id}/git/worktree", get(git_worktree))
         .route("/api/sessions/{id}/runs", get(get_session_runs))
         .route("/api/sessions/{id}/runs/{run_id}/verdict", post(post_run_verdict))
         .route("/api/sessions/{id}/notes", get(list_notes))
@@ -1761,6 +1762,149 @@ async fn git_show(
     })))
 }
 
+#[derive(serde::Serialize)]
+struct WorktreeFile {
+    path: String,
+    status: String, // two-char porcelain code (index col + worktree col)
+    staged: bool,
+    old_path: Option<String>,
+}
+
+/// Parse `git status --porcelain=v1 -z` output into structured entries.
+/// Records are NUL-terminated; rename/copy (R/C) records consume a second
+/// NUL segment holding the old path (new path comes first under -z).
+fn parse_porcelain_z(raw: &str) -> Vec<WorktreeFile> {
+    let mut segs = raw.split('\0').filter(|s| !s.is_empty());
+    let mut out = Vec::new();
+    while let Some(seg) = segs.next() {
+        if seg.len() < 4 {
+            continue; // need "XY " + at least 1 path char
+        }
+        let code = &seg[0..2];
+        let path = seg[3..].to_string();
+        let x = code.as_bytes()[0] as char;
+        let staged = x != ' ' && x != '?';
+        let old_path = if x == 'R' || x == 'C' {
+            segs.next().map(|s| s.to_string())
+        } else {
+            None
+        };
+        out.push(WorktreeFile { path, status: code.to_string(), staged, old_path });
+    }
+    out
+}
+
+/// Truncate a diff string to a byte budget, returning (text, was_truncated).
+/// Truncates on a char boundary at or below the limit.
+fn truncate_diff(diff: &str, limit: usize) -> (String, bool) {
+    if diff.len() <= limit {
+        return (diff.to_string(), false);
+    }
+    let mut end = limit;
+    while end > 0 && !diff.is_char_boundary(end) {
+        end -= 1;
+    }
+    (diff[..end].to_string(), true)
+}
+
+/// Drop files whose path contains any SENSITIVE_DIR_NAMES component, so a
+/// worktree diff can never surface .ssh/.aws/etc. contents.
+fn filter_sensitive_files(files: Vec<WorktreeFile>) -> Vec<WorktreeFile> {
+    files
+        .into_iter()
+        .filter(|f| {
+            !std::path::Path::new(&f.path)
+                .components()
+                .any(|c| matches!(c, std::path::Component::Normal(n)
+                    if n.to_str().is_some_and(|s| SENSITIVE_DIR_NAMES.contains(&s))))
+        })
+        .collect()
+}
+
+async fn git_worktree(
+    State(state): State<Arc<AppState>>,
+    axum::extract::Path(id): axum::extract::Path<String>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    let stored_dir = state
+        .sessions
+        .work_dir(&id)
+        .ok_or((StatusCode::NOT_FOUND, "session not found".into()))?;
+    // live cwd for PTY sessions; agent sessions have no pty_pid → stored (correct).
+    let live_dir = state.sessions.pty_pid(&id).and_then(|pid| {
+        std::fs::read_link(format!("/proc/{}/cwd", pid))
+            .ok()
+            .map(|p| p.to_string_lossy().to_string())
+    });
+    let work_dir = live_dir.unwrap_or(stored_dir);
+
+    // Safety: refuse if work_dir is $HOME itself or sits in a sensitive dir —
+    // `git diff` would otherwise leak .aws/.ssh/.env contents wholesale.
+    let home = std::env::var("HOME").unwrap_or_default();
+    let home_path = std::path::Path::new(&home);
+    if let Ok(canon) = std::fs::canonicalize(&work_dir) {
+        if canon == home_path || base_dir_at_or_in_sensitive(home_path, &canon) {
+            return Ok(Json(serde_json::json!({
+                "is_git": false, "files": [], "diff": "", "truncated": false
+            })));
+        }
+    }
+    let dir = std::path::Path::new(&work_dir);
+
+    // porcelain status (-z); non-git repo → is_git:false
+    let status = std::process::Command::new("git")
+        .args(["status", "--porcelain=v1", "-z"])
+        .current_dir(dir)
+        .output();
+    let status = match status {
+        Ok(o) if o.status.success() => o,
+        _ => {
+            return Ok(Json(serde_json::json!({
+                "is_git": false, "files": [], "diff": "", "truncated": false
+            })));
+        }
+    };
+    let raw = String::from_utf8_lossy(&status.stdout);
+    let files = filter_sensitive_files(parse_porcelain_z(&raw));
+
+    // diff HEAD, but only if HEAD exists (fresh repo with no commits → empty).
+    let has_head = std::process::Command::new("git")
+        .args(["rev-parse", "--verify", "-q", "HEAD"])
+        .current_dir(dir)
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false);
+    let diff_raw = if has_head {
+        // Exclude every sensitive-named dir from the diff body via git pathspec
+        // magic, so a tracked-and-modified file under .ssh/.aws/.git/etc. can
+        // never leak its hunk (the file LIST is already filtered, but the diff
+        // text is whole-repo otherwise). Two pathspecs per name cover the dir at
+        // repo root and at any depth.
+        let mut diff_args: Vec<String> =
+            vec!["diff".into(), "HEAD".into(), "--".into(), ".".into()];
+        for name in SENSITIVE_DIR_NAMES {
+            diff_args.push(format!(":(exclude,glob){}/**", name));
+            diff_args.push(format!(":(exclude,glob)**/{}/**", name));
+            diff_args.push(format!(":(exclude,glob){name}")); // file/dir named <name> at root
+            diff_args.push(format!(":(exclude,glob)**/{name}")); // ...at any depth
+        }
+        std::process::Command::new("git")
+            .args(&diff_args)
+            .current_dir(dir)
+            .output()
+            .ok()
+            .filter(|o| o.status.success())
+            .map(|o| String::from_utf8_lossy(&o.stdout).to_string())
+            .unwrap_or_default()
+    } else {
+        String::new()
+    };
+    let (diff, truncated) = truncate_diff(&diff_raw, 512 * 1024);
+
+    Ok(Json(serde_json::json!({
+        "is_git": true, "files": files, "diff": diff, "truncated": truncated
+    })))
+}
+
 // ── Agent Events ──
 
 /// POST /api/events — create event (token auth via query param, for hooks)
@@ -2534,6 +2678,60 @@ mod path_safety_tests {
             matches!(res, Err((StatusCode::BAD_REQUEST, _))),
             "base_dir pointing at a file must be rejected, got {res:?}"
         );
+    }
+
+    #[test]
+    fn parse_porcelain_z_handles_all_states() {
+        // " M a.txt\0": worktree-modified, not staged
+        // "M  b.txt\0": index-modified, staged
+        // "A  c.txt\0": added (staged)
+        // " D d.txt\0": deleted in worktree
+        // "?? e.txt\0": untracked
+        // "R  new.txt\0old.txt\0": rename, new first then old
+        let raw = " M a.txt\0M  b.txt\0A  c.txt\0 D d.txt\0?? e.txt\0R  new.txt\0old.txt\0";
+        let files = parse_porcelain_z(raw);
+        assert_eq!(files.len(), 6);
+        assert_eq!(files[0].path, "a.txt");
+        assert_eq!(files[0].status, " M");
+        assert!(!files[0].staged);
+        assert_eq!(files[1].status, "M ");
+        assert!(files[1].staged);
+        assert_eq!(files[2].status, "A ");
+        assert!(files[2].staged);
+        assert_eq!(files[4].status, "??");
+        assert!(!files[4].staged);
+        assert_eq!(files[5].path, "new.txt");
+        assert_eq!(files[5].old_path.as_deref(), Some("old.txt"));
+        assert_eq!(files[5].status, "R ");
+    }
+
+    #[test]
+    fn parse_porcelain_z_empty_is_empty() {
+        assert!(parse_porcelain_z("").is_empty());
+    }
+
+    #[test]
+    fn truncate_diff_marks_when_over_limit() {
+        let big = "x".repeat(600_000);
+        let (d, t) = truncate_diff(&big, 512 * 1024);
+        assert!(t);
+        assert_eq!(d.len(), 512 * 1024);
+        let small = "abc";
+        let (d2, t2) = truncate_diff(small, 512 * 1024);
+        assert!(!t2);
+        assert_eq!(d2, "abc");
+    }
+
+    #[test]
+    fn filter_sensitive_files_drops_denylisted_paths() {
+        let files = vec![
+            WorktreeFile { path: "src/main.rs".into(), status: " M".into(), staged: false, old_path: None },
+            WorktreeFile { path: ".ssh/config".into(), status: " M".into(), staged: false, old_path: None },
+            WorktreeFile { path: ".aws/credentials".into(), status: " M".into(), staged: false, old_path: None },
+        ];
+        let out = filter_sensitive_files(files);
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].path, "src/main.rs");
     }
 }
 

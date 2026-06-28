@@ -18,6 +18,8 @@ ZeroMux lets you manage multiple terminal sessions and **three AI coding agents 
 - **Multi-Client WebSocket** — Broadcast architecture allows multiple browser tabs/devices to view and drive the same session simultaneously
 - **Session Notes** — Per-working-directory note timeline with markdown files as source of truth and SQLite index, stored centrally in `~/.zeromux/notes/`
 - **Git Viewer** — Branch/merge graph visualization with commit diffs, file stats, and ref badges (HEAD, branches, tags)
+- **Working-Tree Diff Review** — Inspect an agent's uncommitted changes (`git status` + `git diff HEAD`) in a "worktree changes" tab, then forward a commit/discard instruction back to the agent. Read-only on git; never writes directly. Sensitive dirs are refused and filtered out of the diff
+- **Stuck-Turn Surfacing** — A running turn silent past a threshold shows an amber dot in the session list (180s) and, when you're away (10min), a push notification
 - **File Browser** — Browse, edit, create, rename, upload, and delete files in session working directories
 - **Markdown Rendering** — KaTeX math, mermaid diagrams, syntax highlighting, and pipe tables in agent output, with content-hash caching to avoid re-render churn
 - **Git Worktrees** — Auto-creates isolated git worktrees for each AI agent session

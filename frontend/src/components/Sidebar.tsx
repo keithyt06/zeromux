@@ -9,6 +9,7 @@ import PromptManager from './PromptManager'
 import PushSettings from './PushSettings'
 import { usePromptPresets } from '../lib/usePromptPresets'
 import { applyPreset } from '../lib/applyPreset'
+import { isStuck } from '../lib/stuck'
 import { ClaudeCodeIcon, KiroIcon, CodexIcon } from './BrandIcons'
 
 interface Props {
@@ -39,14 +40,21 @@ function relativeTime(ms: number): string {
   return `${Math.floor(diff / 86_400_000)}d`
 }
 
-/** Turn-state dot: hollow=hibernated, green=running, gray=idle. */
+/** Turn-state dot: hollow=hibernated, amber=stuck, green=running, gray=idle. */
 function TurnDot({ s }: { s: SessionInfo }) {
+  // Coarse stuck hint: re-evaluated on the 3s session-list poll re-render.
+  // Date.now() at render is intentional and harmless here (cosmetic dot, no
+  // dependent state/effect), so the purity rule is suppressed for this line.
+  // eslint-disable-next-line react-hooks/purity
+  const stuck = isStuck(s.turn_state, s.last_activity_ms, Date.now())
   const cls = !s.running
     ? 'border border-[var(--text-secondary)]'
-    : s.turn_state === 'running'
-      ? 'bg-green-400'
-      : 'bg-[var(--text-secondary)]'
-  return <span className={`w-2 h-2 rounded-full shrink-0 ${cls}`} />
+    : stuck
+      ? 'bg-[var(--accent-yellow)]'
+      : s.turn_state === 'running'
+        ? 'bg-green-400'
+        : 'bg-[var(--text-secondary)]'
+  return <span className={`w-2 h-2 rounded-full shrink-0 ${cls}`} title={stuck ? '可能卡住' : undefined} />
 }
 
 type NewSessionStep = 'closed' | 'pick-type' | 'pick-terminal-mode' | 'pick-dir' | 'pick-tmux' | 'pick-prompt' | 'manage-prompts'

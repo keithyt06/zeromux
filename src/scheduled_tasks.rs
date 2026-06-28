@@ -954,6 +954,22 @@ pub fn spawn_scheduler(
                     for sid in stale {
                         m.send_timeout_kill(&sid, None).await;
                     }
+                    // stuck浮出推送:交互式会话 Running 且静默 >= 10min 推一次
+                    // (侧栏琥珀点用 180s,纯前端;此处仅推送,阈值更高以压低误报)。
+                    if let Some(push) = s.push_handle() {
+                        const STUCK_PUSH_MS: i64 = 600_000;
+                        let cands = m.stuck_push_candidates(now.timestamp_millis(), STUCK_PUSH_MS);
+                        for (sid, owner, name) in cands {
+                            if crate::push::should_push_stuck(
+                                now.timestamp_millis(),
+                                push.last_stuck_push(&owner, &sid),
+                            ) {
+                                push.mark_stuck_pushed(&owner, &sid, now.timestamp_millis());
+                                let payload = crate::push::payload_for("stuck", &name, &sid, None);
+                                push.send_to_user(&owner, &payload).await;
+                            }
+                        }
+                    }
                     let tasks = match s.list_enabled() { Ok(t) => t, Err(_) => { continue; } };
                     // retention: bound run history (rows + on-disk run dirs) per task.
                     // prune_runs exempts pending-confirmation runs, so this never

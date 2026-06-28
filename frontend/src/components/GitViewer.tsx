@@ -1,10 +1,12 @@
 import React, { useState, useEffect, useCallback } from 'react'
-import { getGitLog, getGitShow } from '../lib/api'
-import type { GitCommit, GitFileChange, GitGraphEntry } from '../lib/api'
+import { getGitLog, getGitShow, getGitWorktree, getSessionStatus } from '../lib/api'
+import type { GitCommit, GitFileChange, GitGraphEntry, WorktreeFile } from '../lib/api'
 import { GitCommit as GitCommitIcon, RefreshCw, FileText, User, Calendar } from 'lucide-react'
+import { defaultGitTab, COMMIT_PROMPT, DISCARD_PROMPT } from '../lib/gitviewer'
 
 interface Props {
   sessionId: string
+  onForward?: (text: string) => void
 }
 
 // Colors for graph lanes
@@ -23,7 +25,7 @@ function laneColor(index: number): string {
   return LANE_COLORS[index % LANE_COLORS.length]
 }
 
-export default function GitViewer({ sessionId }: Props) {
+export default function GitViewer({ sessionId, onForward }: Props) {
   const [entries, setEntries] = useState<GitGraphEntry[]>([])
   const [total, setTotal] = useState(0)
   const [loading, setLoading] = useState(true)
@@ -34,6 +36,10 @@ export default function GitViewer({ sessionId }: Props) {
   const [files, setFiles] = useState<GitFileChange[]>([])
   const [commitMeta, setCommitMeta] = useState<GitCommit | null>(null)
   const [loadingDiff, setLoadingDiff] = useState(false)
+
+  const [tab, setTab] = useState<'worktree' | 'history'>('history')
+  const [wt, setWt] = useState<{ files: WorktreeFile[]; diff: string; truncated: boolean; is_git: boolean } | null>(null)
+  const [wtSelected, setWtSelected] = useState<string | null>(null)
 
   const loadLog = useCallback(async () => {
     setLoading(true)
@@ -71,8 +77,55 @@ export default function GitViewer({ sessionId }: Props) {
 
   useEffect(() => { loadLog() }, [loadLog])
 
+  useEffect(() => {
+    let alive = true
+    getSessionStatus(sessionId).then(st => {
+      if (alive) setTab(defaultGitTab(st.git_dirty))
+    }).catch(() => {})
+    return () => { alive = false }
+  }, [sessionId])
+
+  const loadWorktree = useCallback(() => {
+    getGitWorktree(sessionId).then(setWt).catch(() => setWt(null))
+  }, [sessionId])
+  useEffect(() => { if (tab === 'worktree') loadWorktree() }, [tab, loadWorktree])
+
   return (
-    <div className="flex h-full">
+    <div className="flex flex-col h-full">
+      {/* Tab bar */}
+      <div className="flex items-center gap-1 px-2 h-9 border-b border-[var(--border)] bg-[var(--bg-secondary)] shrink-0">
+        <button
+          onClick={() => setTab('worktree')}
+          className={`text-[11px] px-2 py-0.5 rounded transition-colors ${
+            tab === 'worktree'
+              ? 'bg-[var(--bg-primary)] text-[var(--text-primary)] font-medium'
+              : 'text-[var(--text-secondary)] hover:text-[var(--text-primary)]'
+          }`}
+        >
+          工作区改动
+        </button>
+        <button
+          onClick={() => setTab('history')}
+          className={`text-[11px] px-2 py-0.5 rounded transition-colors ${
+            tab === 'history'
+              ? 'bg-[var(--bg-primary)] text-[var(--text-primary)] font-medium'
+              : 'text-[var(--text-secondary)] hover:text-[var(--text-primary)]'
+          }`}
+        >
+          历史提交
+        </button>
+      </div>
+
+      {tab === 'worktree' ? (
+        <WorktreePanel
+          wt={wt}
+          selected={wtSelected}
+          onSelect={setWtSelected}
+          onRefresh={loadWorktree}
+          onForward={onForward}
+        />
+      ) : (
+    <div className="flex flex-1 min-h-0">
       {/* Commit list with graph */}
       <div className="w-80 border-r border-[var(--border)] flex flex-col bg-[var(--bg-secondary)] shrink-0">
         <div className="flex items-center justify-between px-3 h-9 border-b border-[var(--border)]">
@@ -172,6 +225,112 @@ export default function GitViewer({ sessionId }: Props) {
         </div>
       </div>
     </div>
+      )}
+    </div>
+  )
+}
+
+// ── Worktree panel ──
+
+function WorktreePanel({ wt, selected, onSelect, onRefresh, onForward }: {
+  wt: { files: WorktreeFile[]; diff: string; truncated: boolean; is_git: boolean } | null
+  selected: string | null
+  onSelect: (path: string) => void
+  onRefresh: () => void
+  onForward?: (text: string) => void
+}) {
+  if (wt && !wt.is_git) {
+    return (
+      <div className="flex flex-1 items-center justify-center text-sm text-[var(--text-muted)]">
+        非 git 仓库
+      </div>
+    )
+  }
+
+  return (
+    <div className="flex flex-1 min-h-0">
+      {/* File list */}
+      <div className="w-80 border-r border-[var(--border)] flex flex-col bg-[var(--bg-secondary)] shrink-0">
+        <div className="flex items-center justify-between px-3 h-9 border-b border-[var(--border)]">
+          <span className="text-[10px] font-semibold text-[var(--text-muted)] uppercase tracking-wider">
+            Files {wt && wt.files.length > 0 && <span className="normal-case font-normal">({wt.files.length})</span>}
+          </span>
+          <button
+            onClick={onRefresh}
+            className="p-1 text-[var(--text-secondary)] hover:text-[var(--text-primary)] rounded transition-colors"
+            title="Refresh"
+          >
+            <RefreshCw size={12} />
+          </button>
+        </div>
+        <div className="flex-1 overflow-y-auto">
+          {!wt ? (
+            <div className="px-3 py-2 text-[10px] text-[var(--text-muted)]">Loading...</div>
+          ) : wt.files.length === 0 ? (
+            <div className="px-3 py-4 text-center">
+              <GitCommitIcon size={20} className="mx-auto text-[var(--text-muted)] mb-2" />
+              <p className="text-[10px] text-[var(--text-muted)]">No changes</p>
+            </div>
+          ) : (
+            wt.files.map(f => {
+              const isSelected = selected === f.path
+              return (
+                <button
+                  key={f.path}
+                  onClick={() => onSelect(f.path)}
+                  className={`w-full text-left flex items-center gap-2 px-3 py-1 transition-colors ${
+                    isSelected ? 'bg-[var(--bg-primary)]' : 'hover:bg-[var(--bg-tertiary)]'
+                  }`}
+                >
+                  <StatusBadge status={f.status} />
+                  <span className="text-[11px] font-mono text-[var(--text-primary)] truncate flex-1">
+                    {f.path}
+                  </span>
+                </button>
+              )
+            })
+          )}
+        </div>
+        {wt?.is_git && wt.files.length > 0 && onForward && (
+          <div className="flex gap-2 p-2 border-t border-[var(--border)]">
+            <button onClick={() => onForward(COMMIT_PROMPT)}
+              className="px-2 py-1 text-xs rounded bg-[var(--bg-tertiary)] text-[var(--text-primary)] hover:bg-[var(--bg-hover)]">让 agent 提交</button>
+            <button onClick={() => onForward(DISCARD_PROMPT)}
+              className="px-2 py-1 text-xs rounded bg-[var(--bg-tertiary)] text-[var(--accent-red)] hover:bg-[var(--bg-hover)]">让 agent 撤销改动</button>
+          </div>
+        )}
+      </div>
+
+      {/* Diff view */}
+      <div className="flex-1 flex flex-col min-w-0">
+        {wt?.truncated && (
+          <div className="px-4 py-1.5 text-[11px] text-[#e5a00d] bg-[color:rgba(229,160,13,0.12)] border-b border-[var(--border)] shrink-0">
+            diff 过大,已截断显示
+          </div>
+        )}
+        <div className="flex-1 overflow-auto">
+          <DiffView diff={wt?.diff ?? ''} />
+        </div>
+      </div>
+    </div>
+  )
+}
+
+// ── Worktree status badge ──
+
+function StatusBadge({ status }: { status: string }) {
+  const ch = status.trim()[0] ?? ''
+  let color = 'var(--text-secondary)'
+  if (ch === 'A') color = 'var(--accent-green)'
+  else if (ch === 'D') color = 'var(--accent-red)'
+  else if (ch === 'M') color = 'var(--accent-yellow)'
+  return (
+    <span
+      className="text-[10px] font-mono font-bold shrink-0 w-4 text-center"
+      style={{ color }}
+    >
+      {ch || '?'}
+    </span>
   )
 }
 

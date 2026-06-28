@@ -697,6 +697,20 @@ impl SessionManager {
             .collect()
     }
 
+    /// Candidates for a stuck-push: interactive (non-scheduled) sessions whose
+    /// current turn is Running but silent for >= idle_ms. Returns
+    /// (session_id, owner_id, name) so the caller can push without re-locking.
+    /// Mirrors running_idle_too_long's filter; that one kills, this one notifies.
+    pub fn stuck_push_candidates(&self, now_ms: i64, idle_ms: i64) -> Vec<(String, String, String)> {
+        let map = self.sessions.lock().unwrap();
+        map.values()
+            .filter(|s| s.source_task_id.is_none())
+            .filter(|s| s.running.as_ref().map(|rp| rp.turn_state == TurnState::Running).unwrap_or(false))
+            .filter(|s| now_ms - s.last_activity_ms >= idle_ms)
+            .map(|s| (s.id.clone(), s.owner_id.clone(), s.name.clone()))
+            .collect()
+    }
+
     /// Send a `TimeoutKill` to a session's fan-out so a silent/wedged run is
     /// terminated through the single fan-out exit (→ recorded as a Timeout metric,
     /// consistent with normal finalize). Clone the `input_tx` under the lock, then
@@ -3816,6 +3830,32 @@ mod running_summary_tests {
         got.sort();
         assert_eq!(got, vec!["boundary".to_string(), "kill_me".to_string()],
             "only interactive + Running + silent>=idle sessions; scheduled/idle/fresh excluded");
+    }
+
+    #[test]
+    fn stuck_push_candidates_returns_id_owner_name() {
+        let now = 10_000_000i64;
+        let idle = 600_000i64; // 10 min
+        let stale_ts = now - idle - 1; // older than threshold
+        let fresh_ts = now - 1; // within threshold
+        let (m, _tmp) = mgr_with(vec![
+            // interactive + Running + stale  → SHOULD be a candidate
+            aged_session("stuck_me", None, TurnState::Running, stale_ts),
+            // interactive + Running + fresh  → too recent, skip
+            aged_session("fresh", None, TurnState::Running, fresh_ts),
+            // interactive + Idle + stale     → not in a turn, skip
+            aged_session("idle_interactive", None, TurnState::Idle, stale_ts),
+            // scheduled + Running + stale     → has its own reconcile path, skip
+            aged_session("scheduled", Some("task1".into()), TurnState::Running, stale_ts),
+        ]);
+
+        let out = m.stuck_push_candidates(now, idle);
+        assert_eq!(out.len(), 1, "only the interactive + Running + silent>=idle session is a candidate");
+        let (id, owner, name) = &out[0];
+        assert_eq!(id, "stuck_me");
+        assert_eq!(owner, "o", "owner_id carried out for push (running_session seeds \"o\")");
+        assert_eq!(name, "n", "name carried out for push (running_session seeds \"n\")");
+        assert!(out.iter().any(|(id, owner, _name)| !id.is_empty() && !owner.is_empty()));
     }
 
     #[test]

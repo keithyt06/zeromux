@@ -11,6 +11,7 @@ import { RunMetricsPanel } from './RunMetricsPanel'
 import { SessionLifetimeBadge } from './SessionLifetimeBadge'
 import { foldTranscript, type WireEvent, type Block, type TurnGroup } from '../lib/transcript'
 import { partitionBlocks, type Density } from '../lib/density'
+import { STUCK_SILENCE_MS } from '../lib/stuck'
 
 // ── Message types ──
 
@@ -84,6 +85,10 @@ export default function AcpChatView({ sessionId, agentType = 'claude', onRegiste
   // 合并 turn 发出(下一个 Running)或 turn 结束时清零。
   const [queuedCount, setQueuedCount] = useState(0)
   const [turnStartedMs, setTurnStartedMs] = useState<number | null>(null)
+  // Timestamp of the last streamed agent output. "Stuck" is silence-based:
+  // a turn is stuck only when running AND no output has arrived for a while,
+  // not merely when the turn has run long. Stamped on content_block.
+  const [lastEventMs, setLastEventMs] = useState<number | null>(null)
   const [nowMs, setNowMs] = useState(() => Date.now())
   // Bumped (debounced) on each turn boundary so the inline RunMetricsPanel
   // re-GETs runs once the backend has flushed the just-finished run record.
@@ -234,6 +239,9 @@ export default function AcpChatView({ sessionId, agentType = 'claude', onRegiste
         // Stamp turn start if not already running (e.g. a turn observed from
         // another tab via replay, where this client didn't call sendPrompt).
         setTurnStartedMs(prev => prev ?? Date.now())
+        // Streamed output is the freshest evidence of liveness — drives the
+        // silence-based stuck heuristic below.
+        setLastEventMs(Date.now())
         break
       }
 
@@ -315,7 +323,11 @@ export default function AcpChatView({ sessionId, agentType = 'claude', onRegiste
     setInput('')
     setPending([])
     setBusy(true)
-    setTurnStartedMs(Date.now())
+    const sentAt = Date.now()
+    setTurnStartedMs(sentAt)
+    // Seed silence baseline from send time so a turn that never emits output is
+    // still measured (otherwise lastEventMs stays null → never stuck).
+    setLastEventMs(sentAt)
   }, [appendEvent, pending])
 
   // Stuck-turn timer: tick a 1s clock while busy so the elapsed display
@@ -328,7 +340,10 @@ export default function AcpChatView({ sessionId, agentType = 'claude', onRegiste
   }, [busy])
 
   const elapsed = turnStartedMs ? Math.floor((nowMs - turnStartedMs) / 1000) : 0
-  const stuck = elapsed > 180
+  // Silence-based, not turn-total-duration: a long but actively-streaming turn
+  // is not stuck. Mirrors the sidebar amber dot / backend STUCK_SILENCE_MS.
+  const stuck = busy && lastEventMs != null && (nowMs - lastEventMs) > STUCK_SILENCE_MS
+  const silenceSecs = lastEventMs != null ? Math.floor((nowMs - lastEventMs) / 1000) : 0
 
   const interrupt = useCallback(() => {
     if (wsRef.current?.readyState === WebSocket.OPEN) {
@@ -409,7 +424,7 @@ export default function AcpChatView({ sessionId, agentType = 'claude', onRegiste
           <div className="flex items-center gap-2 px-2 pb-1 text-xs">
             {stuck ? (
               <>
-                <span className="text-[var(--accent-red)]">已运行 {elapsed}s，可能卡住</span>
+                <span className="text-[var(--accent-red)]">已静默 {silenceSecs}s，可能卡住</span>
                 <button
                   onClick={interrupt}
                   className="px-2 py-0.5 text-[10px] font-semibold text-[var(--accent-red)] border border-[var(--accent-red)] rounded hover:bg-[var(--accent-red)] hover:text-white transition-colors"

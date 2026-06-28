@@ -1761,6 +1761,38 @@ async fn git_show(
     })))
 }
 
+#[derive(serde::Serialize)]
+struct WorktreeFile {
+    path: String,
+    status: String, // two-char porcelain code (index col + worktree col)
+    staged: bool,
+    old_path: Option<String>,
+}
+
+/// Parse `git status --porcelain=v1 -z` output into structured entries.
+/// Records are NUL-terminated; rename/copy (R/C) records consume a second
+/// NUL segment holding the old path (new path comes first under -z).
+fn parse_porcelain_z(raw: &str) -> Vec<WorktreeFile> {
+    let mut segs = raw.split('\0').filter(|s| !s.is_empty());
+    let mut out = Vec::new();
+    while let Some(seg) = segs.next() {
+        if seg.len() < 4 {
+            continue; // need "XY " + at least 1 path char
+        }
+        let code = &seg[0..2];
+        let path = seg[3..].to_string();
+        let x = code.as_bytes()[0] as char;
+        let staged = x != ' ' && x != '?';
+        let old_path = if x == 'R' || x == 'C' {
+            segs.next().map(|s| s.to_string())
+        } else {
+            None
+        };
+        out.push(WorktreeFile { path, status: code.to_string(), staged, old_path });
+    }
+    out
+}
+
 // ── Agent Events ──
 
 /// POST /api/events — create event (token auth via query param, for hooks)
@@ -2534,6 +2566,36 @@ mod path_safety_tests {
             matches!(res, Err((StatusCode::BAD_REQUEST, _))),
             "base_dir pointing at a file must be rejected, got {res:?}"
         );
+    }
+
+    #[test]
+    fn parse_porcelain_z_handles_all_states() {
+        // " M a.txt\0": worktree-modified, not staged
+        // "M  b.txt\0": index-modified, staged
+        // "A  c.txt\0": added (staged)
+        // " D d.txt\0": deleted in worktree
+        // "?? e.txt\0": untracked
+        // "R  new.txt\0old.txt\0": rename, new first then old
+        let raw = " M a.txt\0M  b.txt\0A  c.txt\0 D d.txt\0?? e.txt\0R  new.txt\0old.txt\0";
+        let files = parse_porcelain_z(raw);
+        assert_eq!(files.len(), 6);
+        assert_eq!(files[0].path, "a.txt");
+        assert_eq!(files[0].status, " M");
+        assert!(!files[0].staged);
+        assert_eq!(files[1].status, "M ");
+        assert!(files[1].staged);
+        assert_eq!(files[2].status, "A ");
+        assert!(files[2].staged);
+        assert_eq!(files[4].status, "??");
+        assert!(!files[4].staged);
+        assert_eq!(files[5].path, "new.txt");
+        assert_eq!(files[5].old_path.as_deref(), Some("old.txt"));
+        assert_eq!(files[5].status, "R ");
+    }
+
+    #[test]
+    fn parse_porcelain_z_empty_is_empty() {
+        assert!(parse_porcelain_z("").is_empty());
     }
 }
 

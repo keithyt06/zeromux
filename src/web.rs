@@ -1874,8 +1874,19 @@ async fn git_worktree(
         .map(|o| o.status.success())
         .unwrap_or(false);
     let diff_raw = if has_head {
+        // Exclude every sensitive-named dir from the diff body via git pathspec
+        // magic, so a tracked-and-modified file under .ssh/.aws/.git/etc. can
+        // never leak its hunk (the file LIST is already filtered, but the diff
+        // text is whole-repo otherwise). Two pathspecs per name cover the dir at
+        // repo root and at any depth.
+        let mut diff_args: Vec<String> =
+            vec!["diff".into(), "HEAD".into(), "--".into(), ".".into()];
+        for name in SENSITIVE_DIR_NAMES {
+            diff_args.push(format!(":(exclude,glob){}/**", name));
+            diff_args.push(format!(":(exclude,glob)**/{}/**", name));
+        }
         std::process::Command::new("git")
-            .args(["diff", "HEAD"])
+            .args(&diff_args)
             .current_dir(dir)
             .output()
             .ok()

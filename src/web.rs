@@ -42,6 +42,7 @@ pub fn build_router(state: Arc<AppState>) -> Router {
         .route("/api/vault/meta", get(vault_meta))
         .route("/api/vault/list", get(vault_list))
         .route("/api/vault/file", get(vault_file))
+        .route("/api/vault/file/raw", get(vault_file_raw))
         .route("/api/vault/search", get(vault_search))
         .route("/api/vault/resolve", get(vault_resolve))
         .route("/api/sessions/{id}/runs", get(get_session_runs))
@@ -2558,6 +2559,61 @@ async fn vault_file(
     Ok(Json(serde_json::json!({ "path": q.path, "content": content, "truncated": truncated })))
 }
 
+/// Whitelist of inline-renderable image types for the vault raw endpoint.
+/// SVG is deliberately excluded (executable XSS vector) → falls back to download.
+fn vault_image_mime(name: &str) -> Option<&'static str> {
+    let n = name.to_ascii_lowercase();
+    if n.ends_with(".png") {
+        Some("image/png")
+    } else if n.ends_with(".jpg") || n.ends_with(".jpeg") {
+        Some("image/jpeg")
+    } else if n.ends_with(".gif") {
+        Some("image/gif")
+    } else if n.ends_with(".webp") {
+        Some("image/webp")
+    } else {
+        None
+    }
+}
+
+async fn vault_file_raw(
+    State(state): State<Arc<AppState>>,
+    user: axum::Extension<CurrentUser>,
+    Query(q): Query<VaultFileQuery>,
+) -> Result<Response, (StatusCode, String)> {
+    let base = vault_base(&state, &user)?;
+    let base_path = std::path::Path::new(base);
+    let real = resolve_and_verify(base_path, &q.path)?;
+    if descends_into_sensitive_dir(base_path, &real) {
+        return Err((StatusCode::FORBIDDEN, "Forbidden".into()));
+    }
+    let fname = real.file_name().and_then(|s| s.to_str()).unwrap_or("download");
+    if is_credential_path(fname) {
+        return Err((StatusCode::FORBIDDEN, "Forbidden".into()));
+    }
+    let bytes = std::fs::read(&real)
+        .map_err(|e| (StatusCode::NOT_FOUND, format!("Not found: {e}")))?;
+    let resp = match vault_image_mime(fname) {
+        Some(mime) => Response::builder()
+            .header("Content-Type", mime)
+            .header("X-Content-Type-Options", "nosniff")
+            .header("Content-Disposition", "inline")
+            .body(axum::body::Body::from(bytes))
+            .unwrap(),
+        None => {
+            // non-image (incl. svg): force download, never inline-render
+            let safe = sanitize_filename(fname);
+            Response::builder()
+                .header("Content-Type", "application/octet-stream")
+                .header("X-Content-Type-Options", "nosniff")
+                .header("Content-Disposition", format!("attachment; filename=\"{}\"", safe))
+                .body(axum::body::Body::from(bytes))
+                .unwrap()
+        }
+    };
+    Ok(resp)
+}
+
 #[derive(serde::Deserialize)]
 struct VaultSearchQuery {
     q: String,
@@ -2616,6 +2672,17 @@ mod path_safety_tests {
         assert_eq!(vault_meta_name(true, Some("/home/u/obsidian")), "obsidian");
         assert_eq!(vault_meta_name(false, Some("/home/u/obsidian")), "");
         assert_eq!(vault_meta_name(true, None), "");
+    }
+
+    #[test]
+    fn vault_image_mime_whitelist() {
+        assert_eq!(vault_image_mime("a.png"), Some("image/png"));
+        assert_eq!(vault_image_mime("A.JPG"), Some("image/jpeg"));
+        assert_eq!(vault_image_mime("b.jpeg"), Some("image/jpeg"));
+        assert_eq!(vault_image_mime("c.gif"), Some("image/gif"));
+        assert_eq!(vault_image_mime("d.webp"), Some("image/webp"));
+        assert_eq!(vault_image_mime("e.svg"), None); // SVG not inlined (XSS)
+        assert_eq!(vault_image_mime("f.md"), None);
     }
 
     #[test]

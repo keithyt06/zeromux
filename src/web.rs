@@ -839,6 +839,23 @@ struct FileQuery {
     base_dir: Option<String>,
 }
 
+/// Read a text file, capping at 1MB. Over the cap, returns the first 1MB plus
+/// truncated=true (reader scenario: partial beats nothing). The slice is decoded
+/// with `from_utf8_lossy`, so a multibyte char split at the cap becomes U+FFFD —
+/// safe with no panic on a byte boundary. Shared by session and vault readers.
+pub(crate) fn read_text_file_capped(
+    file_path: &std::path::Path,
+) -> Result<(String, bool), (StatusCode, String)> {
+    let bytes = std::fs::read(file_path)
+        .map_err(|e| (StatusCode::NOT_FOUND, format!("File not found: {}", e)))?;
+    const CAP: usize = 1_048_576;
+    if bytes.len() <= CAP {
+        Ok((String::from_utf8_lossy(&bytes).to_string(), false))
+    } else {
+        Ok((String::from_utf8_lossy(&bytes[..CAP]).to_string(), true))
+    }
+}
+
 async fn get_session_file(
     State(state): State<Arc<AppState>>,
     user: axum::Extension<CurrentUser>,
@@ -952,6 +969,13 @@ fn resolve_base_dir(
 /// only inspects components *below* base, so it cannot catch a base that IS the
 /// sensitive dir — that check has to live here, anchored at $HOME.
 fn ensure_under_home(dir: &str) -> Result<std::path::PathBuf, (StatusCode, String)> {
+    validate_browse_root(dir)
+}
+
+/// Canonicalize + assert under $HOME + is a directory + not a sensitive dir.
+/// Shared by HTTP base-dir validation (`ensure_under_home`) and startup
+/// `--vault-dir` validation. Behavior is the verbatim former `ensure_under_home`.
+pub(crate) fn validate_browse_root(dir: &str) -> Result<std::path::PathBuf, (StatusCode, String)> {
     let base = std::path::Path::new(dir).canonicalize()
         .map_err(|e| (StatusCode::BAD_REQUEST, format!("Invalid path: {}", e)))?;
 
@@ -2395,6 +2419,37 @@ async fn scheduler_health(
 mod path_safety_tests {
     use super::*;
     use std::os::unix::fs::symlink;
+
+    #[test]
+    fn read_text_file_capped_truncates_over_1mb() {
+        use std::io::Write;
+        let dir = std::env::temp_dir().join(format!("zmx_cap_test_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let big = dir.join("big.md");
+        let mut f = std::fs::File::create(&big).unwrap();
+        f.write_all(&vec![b'x'; 1_048_576 + 100]).unwrap();
+        let (content, truncated) = read_text_file_capped(&big).unwrap();
+        assert!(truncated);
+        assert_eq!(content.len(), 1_048_576);
+        let small = dir.join("small.md");
+        std::fs::write(&small, b"hello").unwrap();
+        let (c2, t2) = read_text_file_capped(&small).unwrap();
+        assert!(!t2);
+        assert_eq!(c2, "hello");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn validate_browse_root_accepts_normal_rejects_sensitive() {
+        let home = std::env::var("HOME").unwrap();
+        // a normal existing dir under home: home itself's parent won't do; use home/.. is outside.
+        // Use HOME itself (a dir under home boundary check: home starts_with home = ok, is_dir ok,
+        // but base_dir_at_or_in_sensitive(home, home) → rel empty → false → accepted).
+        assert!(validate_browse_root(&home).is_ok());
+        let ssh = format!("{}/.ssh", home);
+        std::fs::create_dir_all(&ssh).ok();
+        assert!(validate_browse_root(&ssh).is_err()); // sensitive
+    }
 
     #[test]
     fn resolve_and_verify_rejects_symlink_escape() {

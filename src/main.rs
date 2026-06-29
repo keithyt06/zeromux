@@ -151,6 +151,7 @@ pub struct AppState {
     pub external_url: String,
     pub push: Option<std::sync::Arc<crate::push::PushService>>,
     pub vault_dir: Option<String>,
+    pub vault_index: Option<std::sync::Arc<web::VaultIndex>>,
 }
 
 fn gen_random_string(len: usize) -> String {
@@ -330,6 +331,9 @@ async fn main() {
     if let Some(ref v) = vault_dir {
         println!("[vault] serving read-only vault: {}", v);
     }
+    let vault_index = vault_dir.as_ref().map(|v| {
+        std::sync::Arc::new(web::build_vault_index(std::path::Path::new(v)))
+    });
 
     let state = Arc::new(AppState {
         sessions: session_manager::SessionManager::new(
@@ -365,6 +369,7 @@ async fn main() {
         external_url,
         push: push_service.clone(),
         vault_dir,
+        vault_index,
     });
 
     // Wire PushService into SessionManager and ScheduledStore if available.

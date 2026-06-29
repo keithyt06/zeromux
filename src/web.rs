@@ -2415,10 +2415,59 @@ async fn scheduler_health(
     Ok(Json(serde_json::json!({ "heartbeat_ms": hb, "healthy": healthy })))
 }
 
+pub(crate) struct VaultIndex {
+    pub by_basename: std::collections::HashMap<String, String>,
+}
+
+/// Walk the vault recursively, mapping each .md file's basename (sans extension)
+/// to its vault-relative path. On basename collision the first seen wins
+/// (Obsidian itself disambiguates by proximity; phase 1 keeps it simple).
+pub(crate) fn build_vault_index(vault_dir: &std::path::Path) -> VaultIndex {
+    let mut by_basename = std::collections::HashMap::new();
+    let mut stack = vec![vault_dir.to_path_buf()];
+    while let Some(dir) = stack.pop() {
+        let rd = match std::fs::read_dir(&dir) {
+            Ok(r) => r,
+            Err(_) => continue,
+        };
+        for entry in rd.flatten() {
+            let path = entry.path();
+            let name = entry.file_name().to_string_lossy().to_string();
+            if name.starts_with('.') {
+                continue;
+            } // skip .obsidian/.trash/.git
+            if path.is_dir() {
+                stack.push(path);
+            } else if name.to_ascii_lowercase().ends_with(".md") {
+                if let Ok(rel) = path.strip_prefix(vault_dir) {
+                    let base = name.trim_end_matches(".md").trim_end_matches(".MD").to_string();
+                    by_basename
+                        .entry(base)
+                        .or_insert_with(|| rel.to_string_lossy().to_string());
+                }
+            }
+        }
+    }
+    VaultIndex { by_basename }
+}
+
 #[cfg(test)]
 mod path_safety_tests {
     use super::*;
     use std::os::unix::fs::symlink;
+
+    #[test]
+    fn build_vault_index_maps_basename_to_relpath() {
+        let dir = std::env::temp_dir().join(format!("zmx_vidx_{}", std::process::id()));
+        std::fs::create_dir_all(dir.join("knowledge/aws")).unwrap();
+        std::fs::write(dir.join("knowledge/aws/EKS 网络模型.md"), b"x").unwrap();
+        std::fs::write(dir.join("待处理区.md"), b"y").unwrap();
+        let idx = build_vault_index(&dir);
+        assert_eq!(idx.by_basename.get("EKS 网络模型").map(|s| s.as_str()),
+                   Some("knowledge/aws/EKS 网络模型.md"));
+        assert_eq!(idx.by_basename.get("待处理区").map(|s| s.as_str()), Some("待处理区.md"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     #[test]
     fn read_text_file_capped_truncates_over_1mb() {

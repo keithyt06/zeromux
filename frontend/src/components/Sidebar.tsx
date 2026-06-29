@@ -1,10 +1,12 @@
 import { useState, useEffect, useCallback, useRef } from 'react'
 import type { SessionInfo, SessionType, DirEntry, UserInfo, TmuxSession } from '../lib/api'
-import { listDirectories, listTmuxSessions, getSchedulerHealth } from '../lib/api'
+import { listDirectories, listTmuxSessions, getSchedulerHealth, getVaultMeta } from '../lib/api'
+import { shouldShowVault } from '../lib/vault'
 import type { Theme } from '../lib/theme'
-import { Terminal, Plus, X, PanelLeftClose, PanelLeft, Sun, Moon, Folder, FolderGit2, ChevronLeft, Home, LogOut, Users, MonitorUp, Link, Clock, Bell } from 'lucide-react'
+import { Terminal, Plus, X, PanelLeftClose, PanelLeft, Sun, Moon, Folder, FolderGit2, ChevronLeft, Home, LogOut, Users, MonitorUp, Link, Clock, Bell, BookOpen } from 'lucide-react'
 import AdminPanel from './AdminPanel'
 import ScheduledTasksPanel from './ScheduledTasksPanel'
+import VaultReader from './VaultReader'
 import PromptManager from './PromptManager'
 import PushSettings from './PushSettings'
 import { usePromptPresets } from '../lib/usePromptPresets'
@@ -81,6 +83,8 @@ export default function Sidebar({ sessions, activeId, onSelect, onCreate, onDele
   const [showAdmin, setShowAdmin] = useState(false)
   const [showScheduled, setShowScheduled] = useState(false)
   const [showPushSettings, setShowPushSettings] = useState(false)
+  const [showVault, setShowVault] = useState(false)
+  const [vaultEnabled, setVaultEnabled] = useState(false)
   const [schedulerHealthy, setSchedulerHealthy] = useState(true)
   const [editingId, setEditingId] = useState<string | null>(null)
 
@@ -103,6 +107,9 @@ export default function Sidebar({ sessions, activeId, onSelect, onCreate, onDele
     const id = setInterval(check, 60_000)
     return () => { cancelled = true; clearInterval(id) }
   }, [])
+
+  // Vault availability (gate the Obsidian sidebar entry on server config)
+  useEffect(() => { getVaultMeta().then(m => setVaultEnabled(shouldShowVault(m))).catch(() => {}) }, [])
 
   // Directory browser state
   const [currentPath, setCurrentPath] = useState('')
@@ -306,6 +313,15 @@ export default function Sidebar({ sessions, activeId, onSelect, onCreate, onDele
           >
             <Bell size={14} />
           </button>
+          {vaultEnabled && (
+            <button
+              onClick={() => setShowVault(true)}
+              title="Obsidian 笔记库"
+              className="p-1 text-[var(--text-secondary)] hover:text-[var(--accent-blue)] rounded transition-colors"
+            >
+              <BookOpen size={18} />
+            </button>
+          )}
           <button
             onClick={() => setShowScheduled(true)}
             className="relative p-1 text-[var(--text-secondary)] hover:text-[var(--accent-blue)] rounded transition-colors"
@@ -365,6 +381,9 @@ export default function Sidebar({ sessions, activeId, onSelect, onCreate, onDele
 
       {/* Push Settings overlay */}
       {showPushSettings && <PushSettings onClose={() => setShowPushSettings(false)} />}
+
+      {/* Obsidian Vault reader overlay */}
+      {showVault && <VaultReader onClose={() => setShowVault(false)} />}
 
       {/* Sessions */}
       <div className="flex-1 overflow-y-auto py-1">

@@ -2485,20 +2485,27 @@ fn vault_base<'a>(
         .ok_or((StatusCode::NOT_FOUND, "Vault not configured".into()))
 }
 
-async fn vault_meta(
-    State(state): State<Arc<AppState>>,
-    user: axum::Extension<CurrentUser>,
-) -> Json<serde_json::Value> {
-    let enabled = user.is_admin() && state.vault_dir.is_some();
-    let name = state
-        .vault_dir
-        .as_deref()
+/// Vault folder basename, but only when the vault is enabled for this caller.
+/// Returns "" when not enabled so non-admins can't learn the folder name.
+fn vault_meta_name(enabled: bool, vault_dir: Option<&str>) -> String {
+    if !enabled {
+        return String::new();
+    }
+    vault_dir
         .and_then(|v| {
             std::path::Path::new(v)
                 .file_name()
                 .map(|n| n.to_string_lossy().to_string())
         })
-        .unwrap_or_default();
+        .unwrap_or_default()
+}
+
+async fn vault_meta(
+    State(state): State<Arc<AppState>>,
+    user: axum::Extension<CurrentUser>,
+) -> Json<serde_json::Value> {
+    let enabled = user.is_admin() && state.vault_dir.is_some();
+    let name = vault_meta_name(enabled, state.vault_dir.as_deref());
     Json(serde_json::json!({ "enabled": enabled, "name": name }))
 }
 
@@ -2603,6 +2610,13 @@ async fn vault_resolve(
 mod path_safety_tests {
     use super::*;
     use std::os::unix::fs::symlink;
+
+    #[test]
+    fn vault_meta_name_hidden_when_not_enabled() {
+        assert_eq!(vault_meta_name(true, Some("/home/u/obsidian")), "obsidian");
+        assert_eq!(vault_meta_name(false, Some("/home/u/obsidian")), "");
+        assert_eq!(vault_meta_name(true, None), "");
+    }
 
     #[test]
     fn build_vault_index_maps_basename_to_relpath() {

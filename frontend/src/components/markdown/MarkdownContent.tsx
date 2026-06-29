@@ -27,12 +27,14 @@ interface Props {
   text: string
   isComplete: boolean
   className?: string
+  resolveSrc?: (src: string) => string
+  onWikiLink?: (basename: string) => void
 }
 
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
 type RehypePlugin = any
 
-export default function MarkdownContent({ text, isComplete, className }: Props) {
+export default function MarkdownContent({ text, isComplete, className, resolveSrc, onWikiLink }: Props) {
   const deferredText = useDeferredValue(text)
   // Streaming: sanitize unclosed fences/tables/math. Complete: strip a whole-reply
   // ```markdown wrapper (kiro habit — nested fences mis-render) then use raw text.
@@ -61,15 +63,46 @@ export default function MarkdownContent({ text, isComplete, className }: Props) 
     ...(katexPlugin ? [[katexPlugin, { strict: 'ignore' }]] : []),
   ]
 
+  // Vault wikilinks: only when onWikiLink is provided, rewrite [[X]] into a
+  // markdown link that the custom `a` renderer intercepts. Default chat path
+  // (no onWikiLink) leaves [[X]] as literal text.
+  const wikiText = onWikiLink
+    ? rendered.replace(/\[\[([^\]]+)\]\]/g, (_m, name) => `[${name}](#wikilink:${encodeURIComponent(name)})`)
+    : rendered
+
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  const vaultComponents: any = {
+    ...markdownComponents,
+    code: CodeBlock,
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    ...(resolveSrc ? {
+      img: (props: any) => <img {...props} src={resolveSrc(props.src || '')} />,
+    } : {}),
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    ...(onWikiLink ? {
+      a: (props: any) => {
+        const href: string = props.href || ''
+        if (href.startsWith('#wikilink:')) {
+          const name = decodeURIComponent(href.slice('#wikilink:'.length))
+          return <a href="#" onClick={(e) => { e.preventDefault(); onWikiLink(name) }}
+                    className="text-[var(--accent-blue)] underline cursor-pointer">{props.children}</a>
+        }
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        return (markdownComponents.a as any)(props)
+      },
+    } : {}),
+  }
+
   return (
     <MarkdownContext.Provider value={{ isComplete }}>
       <div className={className}>
         <ReactMarkdown
           remarkPlugins={[remarkGfm, remarkMath]}
           rehypePlugins={rehypePlugins}
-          components={{ ...markdownComponents, code: CodeBlock }}
+          components={vaultComponents}
+          {...((onWikiLink || resolveSrc) ? { urlTransform: (url: string) => url } : {})}
         >
-          {rendered}
+          {wikiText}
         </ReactMarkdown>
       </div>
     </MarkdownContext.Provider>

@@ -39,6 +39,12 @@ pub fn build_router(state: Arc<AppState>) -> Router {
         .route("/api/sessions/{id}/git/log", get(git_log))
         .route("/api/sessions/{id}/git/show", get(git_show))
         .route("/api/sessions/{id}/git/worktree", get(git_worktree))
+        .route("/api/vault/meta", get(vault_meta))
+        .route("/api/vault/list", get(vault_list))
+        .route("/api/vault/file", get(vault_file))
+        .route("/api/vault/file/raw", get(vault_file_raw))
+        .route("/api/vault/search", get(vault_search))
+        .route("/api/vault/resolve", get(vault_resolve))
         .route("/api/sessions/{id}/runs", get(get_session_runs))
         .route("/api/sessions/{id}/runs/{run_id}/verdict", post(post_run_verdict))
         .route("/api/sessions/{id}/notes", get(list_notes))
@@ -839,6 +845,23 @@ struct FileQuery {
     base_dir: Option<String>,
 }
 
+/// Read a text file, capping at 1MB. Over the cap, returns the first 1MB plus
+/// truncated=true (reader scenario: partial beats nothing). The slice is decoded
+/// with `from_utf8_lossy`, so a multibyte char split at the cap becomes U+FFFD —
+/// safe with no panic on a byte boundary. Shared by session and vault readers.
+pub(crate) fn read_text_file_capped(
+    file_path: &std::path::Path,
+) -> Result<(String, bool), (StatusCode, String)> {
+    let bytes = std::fs::read(file_path)
+        .map_err(|e| (StatusCode::NOT_FOUND, format!("File not found: {}", e)))?;
+    const CAP: usize = 1_048_576;
+    if bytes.len() <= CAP {
+        Ok((String::from_utf8_lossy(&bytes).to_string(), false))
+    } else {
+        Ok((String::from_utf8_lossy(&bytes[..CAP]).to_string(), true))
+    }
+}
+
 async fn get_session_file(
     State(state): State<Arc<AppState>>,
     user: axum::Extension<CurrentUser>,
@@ -952,6 +975,13 @@ fn resolve_base_dir(
 /// only inspects components *below* base, so it cannot catch a base that IS the
 /// sensitive dir — that check has to live here, anchored at $HOME.
 fn ensure_under_home(dir: &str) -> Result<std::path::PathBuf, (StatusCode, String)> {
+    validate_browse_root(dir)
+}
+
+/// Canonicalize + assert under $HOME + is a directory + not a sensitive dir.
+/// Shared by HTTP base-dir validation (`ensure_under_home`) and startup
+/// `--vault-dir` validation. Behavior is the verbatim former `ensure_under_home`.
+pub(crate) fn validate_browse_root(dir: &str) -> Result<std::path::PathBuf, (StatusCode, String)> {
     let base = std::path::Path::new(dir).canonicalize()
         .map_err(|e| (StatusCode::BAD_REQUEST, format!("Invalid path: {}", e)))?;
 
@@ -2391,10 +2421,313 @@ async fn scheduler_health(
     Ok(Json(serde_json::json!({ "heartbeat_ms": hb, "healthy": healthy })))
 }
 
+pub(crate) struct VaultIndex {
+    pub by_basename: std::collections::HashMap<String, String>,
+}
+
+/// Walk the vault recursively, mapping each .md file's basename (sans extension)
+/// to its vault-relative path. On basename collision the first seen wins
+/// (Obsidian itself disambiguates by proximity; phase 1 keeps it simple).
+pub(crate) fn build_vault_index(vault_dir: &std::path::Path) -> VaultIndex {
+    let mut by_basename = std::collections::HashMap::new();
+    let mut stack = vec![vault_dir.to_path_buf()];
+    while let Some(dir) = stack.pop() {
+        let rd = match std::fs::read_dir(&dir) {
+            Ok(r) => r,
+            Err(_) => continue,
+        };
+        for entry in rd.flatten() {
+            let path = entry.path();
+            let name = entry.file_name().to_string_lossy().to_string();
+            if name.starts_with('.') {
+                continue;
+            } // skip .obsidian/.trash/.git
+            if path.is_dir() {
+                stack.push(path);
+            } else if name.to_ascii_lowercase().ends_with(".md") {
+                if let Ok(rel) = path.strip_prefix(vault_dir) {
+                    let base = name.trim_end_matches(".md").trim_end_matches(".MD").to_string();
+                    by_basename
+                        .entry(base)
+                        .or_insert_with(|| rel.to_string_lossy().to_string());
+                }
+            }
+        }
+    }
+    VaultIndex { by_basename }
+}
+
+/// Case-insensitive substring match over relative paths (filename + path).
+/// Empty query → no results. Caps at 100.
+fn vault_search_filter(paths: &[String], q: &str) -> Vec<String> {
+    if q.trim().is_empty() {
+        return Vec::new();
+    }
+    let ql = q.to_ascii_lowercase();
+    paths
+        .iter()
+        .filter(|p| p.to_ascii_lowercase().contains(&ql))
+        .take(100)
+        .cloned()
+        .collect()
+}
+
+/// vault endpoints: require admin (legacy mode synthesizes admin) and a configured vault.
+fn vault_base<'a>(
+    state: &'a AppState,
+    user: &CurrentUser,
+) -> Result<&'a str, (StatusCode, String)> {
+    if !user.is_admin() {
+        return Err((StatusCode::FORBIDDEN, "Admin only".into()));
+    }
+    state
+        .vault_dir
+        .as_deref()
+        .ok_or((StatusCode::NOT_FOUND, "Vault not configured".into()))
+}
+
+/// Vault folder basename, but only when the vault is enabled for this caller.
+/// Returns "" when not enabled so non-admins can't learn the folder name.
+fn vault_meta_name(enabled: bool, vault_dir: Option<&str>) -> String {
+    if !enabled {
+        return String::new();
+    }
+    vault_dir
+        .and_then(|v| {
+            std::path::Path::new(v)
+                .file_name()
+                .map(|n| n.to_string_lossy().to_string())
+        })
+        .unwrap_or_default()
+}
+
+async fn vault_meta(
+    State(state): State<Arc<AppState>>,
+    user: axum::Extension<CurrentUser>,
+) -> Json<serde_json::Value> {
+    let enabled = user.is_admin() && state.vault_dir.is_some();
+    let name = vault_meta_name(enabled, state.vault_dir.as_deref());
+    Json(serde_json::json!({ "enabled": enabled, "name": name }))
+}
+
+#[derive(serde::Deserialize)]
+struct VaultListQuery {
+    path: Option<String>,
+}
+
+async fn vault_list(
+    State(state): State<Arc<AppState>>,
+    user: axum::Extension<CurrentUser>,
+    Query(q): Query<VaultListQuery>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    let base = vault_base(&state, &user)?;
+    let base_path = std::path::Path::new(base);
+    let (entries, truncated) = list_dir_entries(base_path, q.path.as_deref().unwrap_or(""))?;
+    let arr: Vec<_> = entries
+        .iter()
+        .map(|e| {
+            serde_json::json!({
+                "name": e.name, "type": e.kind, "size": e.size, "mtime": e.mtime, "writable": e.writable,
+            })
+        })
+        .collect();
+    Ok(Json(serde_json::json!({ "entries": arr, "truncated": truncated })))
+}
+
+#[derive(serde::Deserialize)]
+struct VaultFileQuery {
+    path: String,
+}
+
+async fn vault_file(
+    State(state): State<Arc<AppState>>,
+    user: axum::Extension<CurrentUser>,
+    Query(q): Query<VaultFileQuery>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    let base = vault_base(&state, &user)?;
+    let base_path = std::path::Path::new(base);
+    let real = resolve_and_verify(base_path, &q.path)?;
+    if descends_into_sensitive_dir(base_path, &real) {
+        return Err((StatusCode::FORBIDDEN, "Access to sensitive directory denied".into()));
+    }
+    if let Some(n) = real.file_name().and_then(|s| s.to_str()) {
+        if is_credential_path(n) {
+            return Err((StatusCode::FORBIDDEN, "Credential file access denied".into()));
+        }
+    }
+    let (content, truncated) = read_text_file_capped(&real)?;
+    Ok(Json(serde_json::json!({ "path": q.path, "content": content, "truncated": truncated })))
+}
+
+/// Whitelist of inline-renderable image types for the vault raw endpoint.
+/// SVG is deliberately excluded (executable XSS vector) → falls back to download.
+fn vault_image_mime(name: &str) -> Option<&'static str> {
+    let n = name.to_ascii_lowercase();
+    if n.ends_with(".png") {
+        Some("image/png")
+    } else if n.ends_with(".jpg") || n.ends_with(".jpeg") {
+        Some("image/jpeg")
+    } else if n.ends_with(".gif") {
+        Some("image/gif")
+    } else if n.ends_with(".webp") {
+        Some("image/webp")
+    } else {
+        None
+    }
+}
+
+async fn vault_file_raw(
+    State(state): State<Arc<AppState>>,
+    user: axum::Extension<CurrentUser>,
+    Query(q): Query<VaultFileQuery>,
+) -> Result<Response, (StatusCode, String)> {
+    let base = vault_base(&state, &user)?;
+    let base_path = std::path::Path::new(base);
+    let real = resolve_and_verify(base_path, &q.path)?;
+    if descends_into_sensitive_dir(base_path, &real) {
+        return Err((StatusCode::FORBIDDEN, "Forbidden".into()));
+    }
+    let fname = real.file_name().and_then(|s| s.to_str()).unwrap_or("download");
+    if is_credential_path(fname) {
+        return Err((StatusCode::FORBIDDEN, "Forbidden".into()));
+    }
+    let bytes = std::fs::read(&real)
+        .map_err(|e| (StatusCode::NOT_FOUND, format!("Not found: {e}")))?;
+    let resp = match vault_image_mime(fname) {
+        Some(mime) => Response::builder()
+            .header("Content-Type", mime)
+            .header("X-Content-Type-Options", "nosniff")
+            .header("Content-Disposition", "inline")
+            .body(axum::body::Body::from(bytes))
+            .unwrap(),
+        None => {
+            // non-image (incl. svg): force download, never inline-render
+            let safe = sanitize_filename(fname);
+            Response::builder()
+                .header("Content-Type", "application/octet-stream")
+                .header("X-Content-Type-Options", "nosniff")
+                .header("Content-Disposition", format!("attachment; filename=\"{}\"", safe))
+                .body(axum::body::Body::from(bytes))
+                .unwrap()
+        }
+    };
+    Ok(resp)
+}
+
+#[derive(serde::Deserialize)]
+struct VaultSearchQuery {
+    q: String,
+}
+
+async fn vault_search(
+    State(state): State<Arc<AppState>>,
+    user: axum::Extension<CurrentUser>,
+    Query(query): Query<VaultSearchQuery>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    let _base = vault_base(&state, &user)?;
+    let paths: Vec<String> = state
+        .vault_index
+        .as_ref()
+        .map(|idx| idx.by_basename.values().cloned().collect())
+        .unwrap_or_default();
+    let results: Vec<serde_json::Value> = vault_search_filter(&paths, &query.q)
+        .into_iter()
+        .map(|p| {
+            let name = std::path::Path::new(&p)
+                .file_name()
+                .map(|n| n.to_string_lossy().to_string())
+                .unwrap_or_default();
+            serde_json::json!({ "path": p, "name": name })
+        })
+        .collect();
+    Ok(Json(serde_json::json!({ "results": results })))
+}
+
+#[derive(serde::Deserialize)]
+struct VaultResolveQuery {
+    name: String,
+}
+
+async fn vault_resolve(
+    State(state): State<Arc<AppState>>,
+    user: axum::Extension<CurrentUser>,
+    Query(q): Query<VaultResolveQuery>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    let _base = vault_base(&state, &user)?;
+    let path = state
+        .vault_index
+        .as_ref()
+        .and_then(|idx| idx.by_basename.get(&q.name).cloned())
+        .ok_or((StatusCode::NOT_FOUND, "Wikilink target not found".into()))?;
+    Ok(Json(serde_json::json!({ "path": path })))
+}
+
 #[cfg(test)]
 mod path_safety_tests {
     use super::*;
     use std::os::unix::fs::symlink;
+
+    #[test]
+    fn vault_meta_name_hidden_when_not_enabled() {
+        assert_eq!(vault_meta_name(true, Some("/home/u/obsidian")), "obsidian");
+        assert_eq!(vault_meta_name(false, Some("/home/u/obsidian")), "");
+        assert_eq!(vault_meta_name(true, None), "");
+    }
+
+    #[test]
+    fn vault_image_mime_whitelist() {
+        assert_eq!(vault_image_mime("a.png"), Some("image/png"));
+        assert_eq!(vault_image_mime("A.JPG"), Some("image/jpeg"));
+        assert_eq!(vault_image_mime("b.jpeg"), Some("image/jpeg"));
+        assert_eq!(vault_image_mime("c.gif"), Some("image/gif"));
+        assert_eq!(vault_image_mime("d.webp"), Some("image/webp"));
+        assert_eq!(vault_image_mime("e.svg"), None); // SVG not inlined (XSS)
+        assert_eq!(vault_image_mime("f.md"), None);
+    }
+
+    #[test]
+    fn build_vault_index_maps_basename_to_relpath() {
+        let dir = std::env::temp_dir().join(format!("zmx_vidx_{}", std::process::id()));
+        std::fs::create_dir_all(dir.join("knowledge/aws")).unwrap();
+        std::fs::write(dir.join("knowledge/aws/EKS 网络模型.md"), b"x").unwrap();
+        std::fs::write(dir.join("待处理区.md"), b"y").unwrap();
+        let idx = build_vault_index(&dir);
+        assert_eq!(idx.by_basename.get("EKS 网络模型").map(|s| s.as_str()),
+                   Some("knowledge/aws/EKS 网络模型.md"));
+        assert_eq!(idx.by_basename.get("待处理区").map(|s| s.as_str()), Some("待处理区.md"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn read_text_file_capped_truncates_over_1mb() {
+        use std::io::Write;
+        let dir = std::env::temp_dir().join(format!("zmx_cap_test_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let big = dir.join("big.md");
+        let mut f = std::fs::File::create(&big).unwrap();
+        f.write_all(&vec![b'x'; 1_048_576 + 100]).unwrap();
+        let (content, truncated) = read_text_file_capped(&big).unwrap();
+        assert!(truncated);
+        assert_eq!(content.len(), 1_048_576);
+        let small = dir.join("small.md");
+        std::fs::write(&small, b"hello").unwrap();
+        let (c2, t2) = read_text_file_capped(&small).unwrap();
+        assert!(!t2);
+        assert_eq!(c2, "hello");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn validate_browse_root_accepts_normal_rejects_sensitive() {
+        let home = std::env::var("HOME").unwrap();
+        // a normal existing dir under home: home itself's parent won't do; use home/.. is outside.
+        // Use HOME itself (a dir under home boundary check: home starts_with home = ok, is_dir ok,
+        // but base_dir_at_or_in_sensitive(home, home) → rel empty → false → accepted).
+        assert!(validate_browse_root(&home).is_ok());
+        let ssh = format!("{}/.ssh", home);
+        std::fs::create_dir_all(&ssh).ok();
+        assert!(validate_browse_root(&ssh).is_err()); // sensitive
+    }
 
     #[test]
     fn resolve_and_verify_rejects_symlink_escape() {
@@ -2844,6 +3177,21 @@ index 5..6 100644
         for p in ["src/main.rs", "README.md", "Cargo.toml"] {
             assert!(!worktree_path_excluded(p), "{p} must NOT be excluded");
         }
+    }
+
+    #[test]
+    fn vault_search_matches_name_and_path() {
+        let idx_paths = vec![
+            "knowledge/aws/EKS 网络模型.md".to_string(),
+            "journals/2026-06-29.md".to_string(),
+        ];
+        let r = vault_search_filter(&idx_paths, "eks");
+        assert_eq!(r.len(), 1);
+        assert_eq!(r[0], "knowledge/aws/EKS 网络模型.md");
+        let r2 = vault_search_filter(&idx_paths, "journals");
+        assert_eq!(r2.len(), 1);
+        let r3 = vault_search_filter(&idx_paths, "");
+        assert_eq!(r3.len(), 0); // empty query → no results
     }
 }
 

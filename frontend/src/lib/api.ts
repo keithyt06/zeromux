@@ -353,6 +353,46 @@ export function fileRawUrl(id: string, path: string, baseDir?: string): string {
   return `/api/sessions/${id}/file/raw?${params}`
 }
 
+// Vault (Obsidian reader)
+export async function getVaultMeta(): Promise<{ enabled: boolean; name: string }> {
+  const res = await api('/api/vault/meta')
+  if (!res.ok) return { enabled: false, name: '' }
+  return res.json()
+}
+export async function listVault(path = ''): Promise<{ entries: DirListEntry[]; truncated: boolean }> {
+  const params = new URLSearchParams()
+  if (path) params.set('path', path)
+  const qs = params.toString()
+  const res = await api(`/api/vault/list${qs ? `?${qs}` : ''}`)
+  if (!res.ok) throw new Error(await res.text())
+  return res.json()
+}
+export async function getVaultFile(path: string): Promise<{ content: string; truncated: boolean }> {
+  const res = await api(`/api/vault/file?path=${encodeURIComponent(path)}`)
+  if (!res.ok) throw new Error(await res.text())
+  const d = await res.json()
+  return { content: d.content, truncated: d.truncated }
+}
+export async function getVaultSearch(q: string): Promise<{ results: { path: string; name: string }[] }> {
+  const res = await api(`/api/vault/search?q=${encodeURIComponent(q)}`)
+  if (!res.ok) throw new Error(await res.text())
+  return res.json()
+}
+export async function resolveWikiLink(name: string): Promise<string | null> {
+  const res = await api(`/api/vault/resolve?name=${encodeURIComponent(name)}`)
+  if (!res.ok) return null
+  const d = await res.json()
+  return d.path ?? null
+}
+export function vaultRawUrl(path: string): string {
+  const token = getToken()
+  const jwt = document.cookie.split(';').map(c => c.trim()).find(c => c.startsWith('zeromux_jwt='))?.split('=')[1] || ''
+  const authToken = token || jwt
+  const params = new URLSearchParams({ path })
+  if (authToken) params.set('token', authToken)
+  return `/api/vault/file/raw?${params}`
+}
+
 // Git
 export interface GitCommit {
   hash: string

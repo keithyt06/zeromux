@@ -119,6 +119,11 @@ struct Args {
     /// 调度运行不受此限(永不强制穿透,E1)。默认 600。
     #[arg(long, default_value = "600")]
     auto_update_max_wait: u64,
+
+    /// Obsidian vault directory to serve read-only (admin-only). No default;
+    /// omitted = vault reader disabled. Must be under $HOME and not sensitive.
+    #[arg(long)]
+    vault_dir: Option<String>,
 }
 
 pub struct AppState {
@@ -145,6 +150,8 @@ pub struct AppState {
     pub allowed_users: Vec<String>,
     pub external_url: String,
     pub push: Option<std::sync::Arc<crate::push::PushService>>,
+    pub vault_dir: Option<String>,
+    pub vault_index: Option<std::sync::Arc<web::VaultIndex>>,
 }
 
 fn gen_random_string(len: usize) -> String {
@@ -305,6 +312,29 @@ async fn main() {
         }
     };
 
+    // Resolve vault dir (expand ~, validate; ignored if invalid/sensitive).
+    let vault_dir: Option<String> = args.vault_dir.as_ref().and_then(|v| {
+        let expanded = if v.starts_with("~/") {
+            let home = std::env::var("HOME").unwrap_or_else(|_| "/home/ubuntu".into());
+            v.replacen("~", &home, 1)
+        } else {
+            v.clone()
+        };
+        match web::validate_browse_root(&expanded) {
+            Ok(p) => Some(p.to_string_lossy().to_string()),
+            Err((_, msg)) => {
+                eprintln!("[vault] --vault-dir ignored ({}): {}", expanded, msg);
+                None
+            }
+        }
+    });
+    if let Some(ref v) = vault_dir {
+        println!("[vault] serving read-only vault: {}", v);
+    }
+    let vault_index = vault_dir.as_ref().map(|v| {
+        std::sync::Arc::new(web::build_vault_index(std::path::Path::new(v)))
+    });
+
     let state = Arc::new(AppState {
         sessions: session_manager::SessionManager::new(
             event_store.clone(),
@@ -338,6 +368,8 @@ async fn main() {
         allowed_users,
         external_url,
         push: push_service.clone(),
+        vault_dir,
+        vault_index,
     });
 
     // Wire PushService into SessionManager and ScheduledStore if available.

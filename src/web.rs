@@ -39,6 +39,11 @@ pub fn build_router(state: Arc<AppState>) -> Router {
         .route("/api/sessions/{id}/git/log", get(git_log))
         .route("/api/sessions/{id}/git/show", get(git_show))
         .route("/api/sessions/{id}/git/worktree", get(git_worktree))
+        .route("/api/vault/meta", get(vault_meta))
+        .route("/api/vault/list", get(vault_list))
+        .route("/api/vault/file", get(vault_file))
+        .route("/api/vault/search", get(vault_search))
+        .route("/api/vault/resolve", get(vault_resolve))
         .route("/api/sessions/{id}/runs", get(get_session_runs))
         .route("/api/sessions/{id}/runs/{run_id}/verdict", post(post_run_verdict))
         .route("/api/sessions/{id}/notes", get(list_notes))
@@ -2451,6 +2456,149 @@ pub(crate) fn build_vault_index(vault_dir: &std::path::Path) -> VaultIndex {
     VaultIndex { by_basename }
 }
 
+/// Case-insensitive substring match over relative paths (filename + path).
+/// Empty query → no results. Caps at 100.
+fn vault_search_filter(paths: &[String], q: &str) -> Vec<String> {
+    if q.trim().is_empty() {
+        return Vec::new();
+    }
+    let ql = q.to_ascii_lowercase();
+    paths
+        .iter()
+        .filter(|p| p.to_ascii_lowercase().contains(&ql))
+        .take(100)
+        .cloned()
+        .collect()
+}
+
+/// vault endpoints: require admin (legacy mode synthesizes admin) and a configured vault.
+fn vault_base<'a>(
+    state: &'a AppState,
+    user: &CurrentUser,
+) -> Result<&'a str, (StatusCode, String)> {
+    if !user.is_admin() {
+        return Err((StatusCode::FORBIDDEN, "Admin only".into()));
+    }
+    state
+        .vault_dir
+        .as_deref()
+        .ok_or((StatusCode::NOT_FOUND, "Vault not configured".into()))
+}
+
+async fn vault_meta(
+    State(state): State<Arc<AppState>>,
+    user: axum::Extension<CurrentUser>,
+) -> Json<serde_json::Value> {
+    let enabled = user.is_admin() && state.vault_dir.is_some();
+    let name = state
+        .vault_dir
+        .as_deref()
+        .and_then(|v| {
+            std::path::Path::new(v)
+                .file_name()
+                .map(|n| n.to_string_lossy().to_string())
+        })
+        .unwrap_or_default();
+    Json(serde_json::json!({ "enabled": enabled, "name": name }))
+}
+
+#[derive(serde::Deserialize)]
+struct VaultListQuery {
+    path: Option<String>,
+}
+
+async fn vault_list(
+    State(state): State<Arc<AppState>>,
+    user: axum::Extension<CurrentUser>,
+    Query(q): Query<VaultListQuery>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    let base = vault_base(&state, &user)?;
+    let base_path = std::path::Path::new(base);
+    let (entries, truncated) = list_dir_entries(base_path, q.path.as_deref().unwrap_or(""))?;
+    let arr: Vec<_> = entries
+        .iter()
+        .map(|e| {
+            serde_json::json!({
+                "name": e.name, "type": e.kind, "size": e.size, "mtime": e.mtime, "writable": e.writable,
+            })
+        })
+        .collect();
+    Ok(Json(serde_json::json!({ "entries": arr, "truncated": truncated })))
+}
+
+#[derive(serde::Deserialize)]
+struct VaultFileQuery {
+    path: String,
+}
+
+async fn vault_file(
+    State(state): State<Arc<AppState>>,
+    user: axum::Extension<CurrentUser>,
+    Query(q): Query<VaultFileQuery>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    let base = vault_base(&state, &user)?;
+    let base_path = std::path::Path::new(base);
+    let real = resolve_and_verify(base_path, &q.path)?;
+    if descends_into_sensitive_dir(base_path, &real) {
+        return Err((StatusCode::FORBIDDEN, "Access to sensitive directory denied".into()));
+    }
+    if let Some(n) = real.file_name().and_then(|s| s.to_str()) {
+        if is_credential_path(n) {
+            return Err((StatusCode::FORBIDDEN, "Credential file access denied".into()));
+        }
+    }
+    let (content, truncated) = read_text_file_capped(&real)?;
+    Ok(Json(serde_json::json!({ "path": q.path, "content": content, "truncated": truncated })))
+}
+
+#[derive(serde::Deserialize)]
+struct VaultSearchQuery {
+    q: String,
+}
+
+async fn vault_search(
+    State(state): State<Arc<AppState>>,
+    user: axum::Extension<CurrentUser>,
+    Query(query): Query<VaultSearchQuery>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    let _base = vault_base(&state, &user)?;
+    let paths: Vec<String> = state
+        .vault_index
+        .as_ref()
+        .map(|idx| idx.by_basename.values().cloned().collect())
+        .unwrap_or_default();
+    let results: Vec<serde_json::Value> = vault_search_filter(&paths, &query.q)
+        .into_iter()
+        .map(|p| {
+            let name = std::path::Path::new(&p)
+                .file_name()
+                .map(|n| n.to_string_lossy().to_string())
+                .unwrap_or_default();
+            serde_json::json!({ "path": p, "name": name })
+        })
+        .collect();
+    Ok(Json(serde_json::json!({ "results": results })))
+}
+
+#[derive(serde::Deserialize)]
+struct VaultResolveQuery {
+    name: String,
+}
+
+async fn vault_resolve(
+    State(state): State<Arc<AppState>>,
+    user: axum::Extension<CurrentUser>,
+    Query(q): Query<VaultResolveQuery>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    let _base = vault_base(&state, &user)?;
+    let path = state
+        .vault_index
+        .as_ref()
+        .and_then(|idx| idx.by_basename.get(&q.name).cloned())
+        .ok_or((StatusCode::NOT_FOUND, "Wikilink target not found".into()))?;
+    Ok(Json(serde_json::json!({ "path": path })))
+}
+
 #[cfg(test)]
 mod path_safety_tests {
     use super::*;
@@ -2948,6 +3096,21 @@ index 5..6 100644
         for p in ["src/main.rs", "README.md", "Cargo.toml"] {
             assert!(!worktree_path_excluded(p), "{p} must NOT be excluded");
         }
+    }
+
+    #[test]
+    fn vault_search_matches_name_and_path() {
+        let idx_paths = vec![
+            "knowledge/aws/EKS 网络模型.md".to_string(),
+            "journals/2026-06-29.md".to_string(),
+        ];
+        let r = vault_search_filter(&idx_paths, "eks");
+        assert_eq!(r.len(), 1);
+        assert_eq!(r[0], "knowledge/aws/EKS 网络模型.md");
+        let r2 = vault_search_filter(&idx_paths, "journals");
+        assert_eq!(r2.len(), 1);
+        let r3 = vault_search_filter(&idx_paths, "");
+        assert_eq!(r3.len(), 0); // empty query → no results
     }
 }
 

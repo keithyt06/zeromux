@@ -14,9 +14,7 @@ export default function VaultReader({ onClose }: { onClose: () => void }) {
   const [openPath, setOpenPath] = useState('')
   const [content, setContent] = useState('')
   const [truncated, setTruncated] = useState(false)
-  const [recent, setRecent] = useState<string[]>([])
-
-  useEffect(() => { setRecent(getRecentNotes()) }, [mode])
+  const [recent, setRecent] = useState<string[]>(() => getRecentNotes())
 
   const loadDir = useCallback((path: string) => {
     listVault(path).then(r => setEntries(filterVaultEntries(r.entries))).catch(() => setEntries([]))
@@ -24,8 +22,10 @@ export default function VaultReader({ onClose }: { onClose: () => void }) {
   useEffect(() => { loadDir(cwd) }, [cwd, loadDir])
 
   useEffect(() => {
-    if (!query.trim()) { setResults([]); return }
-    const t = setTimeout(() => { getVaultSearch(query).then(r => setResults(r.results)).catch(() => setResults([])) }, 200)
+    const t = setTimeout(() => {
+      if (!query.trim()) { setResults([]); return }
+      getVaultSearch(query).then(r => setResults(r.results)).catch(() => setResults([]))
+    }, 200)
     return () => clearTimeout(t)
   }, [query])
 

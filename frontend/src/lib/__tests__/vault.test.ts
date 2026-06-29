@@ -1,5 +1,6 @@
 import { describe, it, expect, beforeEach } from 'vitest'
 import { shouldShowVault, filterVaultEntries, resolveVaultImageSrc, getRecentNotes, pushRecentNote } from '../vault'
+import type { DirListEntry } from '../api'
 
 describe('shouldShowVault', () => {
   it('true only when enabled', () => {
@@ -11,14 +12,14 @@ describe('shouldShowVault', () => {
 
 describe('filterVaultEntries', () => {
   it('keeps dirs and .md, drops dotdirs and non-md files', () => {
-    const e = [
+    const e: DirListEntry[] = [
       { name: '.obsidian', type: 'dir', size: 0, mtime: 0, writable: false },
       { name: 'knowledge', type: 'dir', size: 0, mtime: 0, writable: false },
       { name: 'a.md', type: 'file', size: 1, mtime: 0, writable: false },
       { name: 'b.png', type: 'file', size: 1, mtime: 0, writable: false },
-    ] as any
+    ]
     const r = filterVaultEntries(e)
-    expect(r.map((x: any) => x.name)).toEqual(['knowledge', 'a.md'])
+    expect(r.map(x => x.name)).toEqual(['knowledge', 'a.md'])
   })
 })
 

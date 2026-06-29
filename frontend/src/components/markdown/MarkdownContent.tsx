@@ -1,5 +1,6 @@
 import { useDeferredValue, useEffect, useMemo, useState } from 'react'
 import ReactMarkdown from 'react-markdown'
+import type { Components, ExtraProps } from 'react-markdown'
 import remarkGfm from 'remark-gfm'
 import remarkMath from 'remark-math'
 import rehypeHighlight from 'rehype-highlight'
@@ -70,25 +71,22 @@ export default function MarkdownContent({ text, isComplete, className, resolveSr
     ? rendered.replace(/\[\[([^\]]+)\]\]/g, (_m, name) => `[${name}](#wikilink:${encodeURIComponent(name)})`)
     : rendered
 
-  // eslint-disable-next-line @typescript-eslint/no-explicit-any
-  const vaultComponents: any = {
+  const vaultComponents: Components = {
     ...markdownComponents,
     code: CodeBlock,
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
     ...(resolveSrc ? {
-      img: (props: any) => <img {...props} src={resolveSrc(props.src || '')} />,
+      img: ({ src, alt, title }: React.ComponentPropsWithoutRef<'img'> & ExtraProps) =>
+        <img src={resolveSrc(src || '')} alt={alt} title={title} />,
     } : {}),
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
     ...(onWikiLink ? {
-      a: (props: any) => {
-        const href: string = props.href || ''
-        if (href.startsWith('#wikilink:')) {
-          const name = decodeURIComponent(href.slice('#wikilink:'.length))
+      a: ({ href, children }: React.ComponentPropsWithoutRef<'a'> & ExtraProps) => {
+        if ((href || '').startsWith('#wikilink:')) {
+          const name = decodeURIComponent((href || '').slice('#wikilink:'.length))
           return <a href="#" onClick={(e) => { e.preventDefault(); onWikiLink(name) }}
-                    className="text-[var(--accent-blue)] underline cursor-pointer">{props.children}</a>
+                    className="text-[var(--accent-blue)] underline cursor-pointer">{children}</a>
         }
-        // eslint-disable-next-line @typescript-eslint/no-explicit-any
-        return (markdownComponents.a as any)(props)
+        const A = markdownComponents.a as React.FC<React.ComponentPropsWithoutRef<'a'> & ExtraProps>
+        return <A href={href}>{children}</A>
       },
     } : {}),
   }

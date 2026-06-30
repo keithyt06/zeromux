@@ -79,8 +79,12 @@ do_swap() {
   sudo systemctl start "$SERVICE"
 
   echo ">> Verifying (${HEALTH}) ..."
+  # Startup can take ~36s when --vault-dir is set: the vault index is walked
+  # synchronously before the HTTP listener binds, and the vault lives on the
+  # slow JuiceFS/S3-backed FS (6869 files / 12GB). A short window here would
+  # false-negative and roll back to the previous binary. Poll up to 90s.
   local code
-  for _ in $(seq 1 10); do
+  for _ in $(seq 1 90); do
     code="$(curl -s -o /dev/null -w '%{http_code}' "$HEALTH" || true)"
     [ "$code" = "200" ] && { SWAP_DONE=1; echo ">> OK: HTTP 200, deploy complete."; return 0; }
     sleep 1

@@ -11,6 +11,7 @@ import { markdownComponents } from '../markdownStyles'
 import { MarkdownContext } from './context'
 import CodeBlock from './CodeBlock'
 import { sanitizeStreamingMarkdown, unwrapMarkdownFence } from './sanitize'
+import { remarkWikilink } from './remarkWikilink'
 
 const HLJS_LANGS = [
   'bash', 'json', 'yaml',
@@ -64,12 +65,13 @@ export default function MarkdownContent({ text, isComplete, className, resolveSr
     ...(katexPlugin ? [[katexPlugin, { strict: 'ignore' }]] : []),
   ]
 
-  // Vault wikilinks: only when onWikiLink is provided, rewrite [[X]] into a
-  // markdown link that the custom `a` renderer intercepts. Default chat path
-  // (no onWikiLink) leaves [[X]] as literal text.
-  const wikiText = onWikiLink
-    ? rendered.replace(/\[\[([^\]]+)\]\]/g, (_m, name) => `[${name}](#wikilink:${encodeURIComponent(name)})`)
-    : rendered
+  // Vault wikilinks: only when onWikiLink is provided, a remark plugin rewrites
+  // [[X]] into link nodes the custom `a` renderer intercepts. It runs on mdast text
+  // nodes, so [[...]] inside code blocks is left untouched. Default chat path
+  // (no onWikiLink) never adds the plugin → [[X]] stays literal text.
+  const remarkPlugins = onWikiLink
+    ? [remarkGfm, remarkMath, remarkWikilink]
+    : [remarkGfm, remarkMath]
 
   const vaultComponents: Components = {
     ...markdownComponents,
@@ -95,12 +97,11 @@ export default function MarkdownContent({ text, isComplete, className, resolveSr
     <MarkdownContext.Provider value={{ isComplete }}>
       <div className={className}>
         <ReactMarkdown
-          remarkPlugins={[remarkGfm, remarkMath]}
+          remarkPlugins={remarkPlugins}
           rehypePlugins={rehypePlugins}
           components={vaultComponents}
-          {...((onWikiLink || resolveSrc) ? { urlTransform: (url: string) => url } : {})}
         >
-          {wikiText}
+          {rendered}
         </ReactMarkdown>
       </div>
     </MarkdownContext.Provider>

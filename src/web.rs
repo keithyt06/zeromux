@@ -2422,14 +2422,29 @@ async fn scheduler_health(
 }
 
 pub(crate) struct VaultIndex {
+    /// Wikilink resolution: basename (sans extension) → vault-relative path.
+    /// First-seen wins on collision (Obsidian disambiguates by proximity; phase 1
+    /// keeps it simple). Lossy by design — do NOT use this for search.
     pub by_basename: std::collections::HashMap<String, String>,
+    /// Every .md vault-relative path, deduplicated by nothing. Search iterates this
+    /// so collisions (per-folder README.md / index.md / 2026.md) stay findable —
+    /// `by_basename.values()` would silently drop all but the first of each basename.
+    pub all_paths: Vec<String>,
 }
 
-/// Walk the vault recursively, mapping each .md file's basename (sans extension)
-/// to its vault-relative path. On basename collision the first seen wins
-/// (Obsidian itself disambiguates by proximity; phase 1 keeps it simple).
+/// Walk the vault recursively, building the wikilink basename index and the full
+/// .md path list. On basename collision the first seen wins for `by_basename`, but
+/// every path is kept in `all_paths`.
+///
+/// Symlinked directories are NOT followed: `entry.file_type()` reports the link
+/// itself (unlike `path.is_dir()`, which follows it), so a symlink cycle inside the
+/// vault can't make this walk loop forever, and a symlink to a large external tree
+/// (e.g. $HOME) can't make it index far past the vault. This matters because the
+/// walk runs synchronously in `main()` before the HTTP listener binds — an unbounded
+/// walk would hang the entire boot, not just the vault feature.
 pub(crate) fn build_vault_index(vault_dir: &std::path::Path) -> VaultIndex {
     let mut by_basename = std::collections::HashMap::new();
+    let mut all_paths = Vec::new();
     let mut stack = vec![vault_dir.to_path_buf()];
     while let Some(dir) = stack.pop() {
         let rd = match std::fs::read_dir(&dir) {
@@ -2442,19 +2457,30 @@ pub(crate) fn build_vault_index(vault_dir: &std::path::Path) -> VaultIndex {
             if name.starts_with('.') {
                 continue;
             } // skip .obsidian/.trash/.git
-            if path.is_dir() {
+            // file_type() does NOT follow symlinks — a symlinked dir reports is_symlink(),
+            // not is_dir(), so we never descend into it (cycle / external-tree guard).
+            let ft = match entry.file_type() {
+                Ok(t) => t,
+                Err(_) => continue,
+            };
+            if ft.is_symlink() {
+                continue;
+            }
+            if ft.is_dir() {
                 stack.push(path);
             } else if name.to_ascii_lowercase().ends_with(".md") {
                 if let Ok(rel) = path.strip_prefix(vault_dir) {
+                    let rel_str = rel.to_string_lossy().to_string();
                     let base = name.trim_end_matches(".md").trim_end_matches(".MD").to_string();
                     by_basename
                         .entry(base)
-                        .or_insert_with(|| rel.to_string_lossy().to_string());
+                        .or_insert_with(|| rel_str.clone());
+                    all_paths.push(rel_str);
                 }
             }
         }
     }
-    VaultIndex { by_basename }
+    VaultIndex { by_basename, all_paths }
 }
 
 /// Case-insensitive substring match over relative paths (filename + path).
@@ -2470,6 +2496,15 @@ fn vault_search_filter(paths: &[String], q: &str) -> Vec<String> {
         .take(100)
         .cloned()
         .collect()
+}
+
+/// True if any component of the vault-relative path starts with '.'. The vault is
+/// strictly a `.md` reader; `.obsidian/` (plugin data, sometimes plugin API tokens in
+/// `data.json`), `.trash/`, `.git/` are not notes. The startup index already skips
+/// dot-prefixed names; the read endpoints (list/file/raw) must match it so a hand-crafted
+/// `?path=.obsidian/...` can't read non-note files the tree never surfaces.
+fn vault_path_has_dot_component(rel: &str) -> bool {
+    rel.split('/').any(|seg| seg.starts_with('.') && seg != "." && seg != "..")
 }
 
 /// vault endpoints: require admin (legacy mode synthesizes admin) and a configured vault.
@@ -2521,8 +2556,12 @@ async fn vault_list(
     Query(q): Query<VaultListQuery>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
     let base = vault_base(&state, &user)?;
+    let rel = q.path.as_deref().unwrap_or("");
+    if vault_path_has_dot_component(rel) {
+        return Err((StatusCode::FORBIDDEN, "Access to dot-directory denied".into()));
+    }
     let base_path = std::path::Path::new(base);
-    let (entries, truncated) = list_dir_entries(base_path, q.path.as_deref().unwrap_or(""))?;
+    let (entries, truncated) = list_dir_entries(base_path, rel)?;
     let arr: Vec<_> = entries
         .iter()
         .map(|e| {
@@ -2545,6 +2584,9 @@ async fn vault_file(
     Query(q): Query<VaultFileQuery>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
     let base = vault_base(&state, &user)?;
+    if vault_path_has_dot_component(&q.path) {
+        return Err((StatusCode::FORBIDDEN, "Access to dot-directory denied".into()));
+    }
     let base_path = std::path::Path::new(base);
     let real = resolve_and_verify(base_path, &q.path)?;
     if descends_into_sensitive_dir(base_path, &real) {
@@ -2582,6 +2624,9 @@ async fn vault_file_raw(
     Query(q): Query<VaultFileQuery>,
 ) -> Result<Response, (StatusCode, String)> {
     let base = vault_base(&state, &user)?;
+    if vault_path_has_dot_component(&q.path) {
+        return Err((StatusCode::FORBIDDEN, "Forbidden".into()));
+    }
     let base_path = std::path::Path::new(base);
     let real = resolve_and_verify(base_path, &q.path)?;
     if descends_into_sensitive_dir(base_path, &real) {
@@ -2625,10 +2670,13 @@ async fn vault_search(
     Query(query): Query<VaultSearchQuery>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
     let _base = vault_base(&state, &user)?;
+    // Search the FULL path list, not by_basename.values() — the latter is deduped
+    // by basename (first-wins), so per-folder README.md / index.md / 2026.md would be
+    // unsearchable past the first one.
     let paths: Vec<String> = state
         .vault_index
         .as_ref()
-        .map(|idx| idx.by_basename.values().cloned().collect())
+        .map(|idx| idx.all_paths.clone())
         .unwrap_or_default();
     let results: Vec<serde_json::Value> = vault_search_filter(&paths, &query.q)
         .into_iter()
@@ -2686,6 +2734,17 @@ mod path_safety_tests {
     }
 
     #[test]
+    fn vault_path_dot_component_guard() {
+        assert!(vault_path_has_dot_component(".obsidian"));
+        assert!(vault_path_has_dot_component(".obsidian/plugins/x/data.json"));
+        assert!(vault_path_has_dot_component("knowledge/.trash/old.md"));
+        assert!(vault_path_has_dot_component(".git/config"));
+        assert!(!vault_path_has_dot_component(""));
+        assert!(!vault_path_has_dot_component("knowledge/aws/note.md"));
+        assert!(!vault_path_has_dot_component("a/b.c.md")); // dot in filename, not a dot-dir
+    }
+
+    #[test]
     fn build_vault_index_maps_basename_to_relpath() {
         let dir = std::env::temp_dir().join(format!("zmx_vidx_{}", std::process::id()));
         std::fs::create_dir_all(dir.join("knowledge/aws")).unwrap();
@@ -2695,6 +2754,42 @@ mod path_safety_tests {
         assert_eq!(idx.by_basename.get("EKS 网络模型").map(|s| s.as_str()),
                    Some("knowledge/aws/EKS 网络模型.md"));
         assert_eq!(idx.by_basename.get("待处理区").map(|s| s.as_str()), Some("待处理区.md"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn build_vault_index_keeps_basename_collisions_in_all_paths() {
+        // Two notes share basename "README" in different folders. by_basename is
+        // first-wins (lossy), but all_paths must keep BOTH so search finds both.
+        let dir = std::env::temp_dir().join(format!("zmx_vidx_col_{}", std::process::id()));
+        std::fs::create_dir_all(dir.join("a")).unwrap();
+        std::fs::create_dir_all(dir.join("b")).unwrap();
+        std::fs::write(dir.join("a/README.md"), b"x").unwrap();
+        std::fs::write(dir.join("b/README.md"), b"y").unwrap();
+        let idx = build_vault_index(&dir);
+        assert_eq!(idx.by_basename.len(), 1, "by_basename dedupes by basename");
+        let mut readmes: Vec<&String> =
+            idx.all_paths.iter().filter(|p| p.ends_with("README.md")).collect();
+        readmes.sort();
+        assert_eq!(readmes, vec![&"a/README.md".to_string(), &"b/README.md".to_string()],
+                   "all_paths keeps both colliding notes");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn build_vault_index_does_not_follow_symlinked_dirs() {
+        use std::os::unix::fs::symlink;
+        // A symlink cycle inside the vault must not make the walk loop forever.
+        let dir = std::env::temp_dir().join(format!("zmx_vidx_sym_{}", std::process::id()));
+        std::fs::create_dir_all(dir.join("real")).unwrap();
+        std::fs::write(dir.join("real/note.md"), b"x").unwrap();
+        // self-referential cycle: dir/loop -> dir
+        let _ = symlink(&dir, dir.join("loop"));
+        let idx = build_vault_index(&dir); // must terminate
+        assert_eq!(idx.by_basename.get("note").map(|s| s.as_str()), Some("real/note.md"));
+        // The symlinked dir was not descended, so no duplicate "loop/real/note.md".
+        assert!(idx.all_paths.iter().all(|p| !p.starts_with("loop/")),
+                "symlinked dir must not be walked: {:?}", idx.all_paths);
         let _ = std::fs::remove_dir_all(&dir);
     }
 

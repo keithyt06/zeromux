@@ -2429,7 +2429,49 @@ pub(crate) struct VaultIndex {
     /// Every .md vault-relative path, deduplicated by nothing. Search iterates this
     /// so collisions (per-folder README.md / index.md / 2026.md) stay findable —
     /// `by_basename.values()` would silently drop all but the first of each basename.
+    /// Also the source for folder-qualified wikilink resolution (`[[folder/Note]]`).
     pub all_paths: Vec<String>,
+    /// Lowercased basename → vault-relative path, for case-insensitive wikilink
+    /// resolution (Obsidian wikilinks ignore case). First-seen wins, like `by_basename`.
+    pub by_basename_lc: std::collections::HashMap<String, String>,
+}
+
+/// Resolve a wikilink target (as produced by the frontend `remarkWikilink` plugin)
+/// to a vault-relative `.md` path. Handles the real-world Obsidian link forms that a
+/// bare `by_basename.get(name)` misses: `[[folder/Note]]` (folder-qualified — ~18% of
+/// links in a real vault), `[[Note.md]]` (explicit extension), and case differences.
+///
+/// Precedence: exact folder-qualified path (case-insensitive) → basename
+/// (case-insensitive). The heading/alias were already stripped client-side.
+pub(crate) fn resolve_wikilink(idx: &VaultIndex, name: &str) -> Option<String> {
+    let trimmed = name.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    // Drop an explicit .md extension the author may have typed.
+    let bare = trimmed
+        .strip_suffix(".md")
+        .or_else(|| trimmed.strip_suffix(".MD"))
+        .unwrap_or(trimmed);
+
+    if bare.contains('/') {
+        // Folder-qualified: match the full relative path case-insensitively. The index
+        // stores paths WITH the .md suffix, so compare against `<bare>.md`.
+        let want = format!("{}.md", bare).to_ascii_lowercase();
+        if let Some(p) = idx
+            .all_paths
+            .iter()
+            .find(|p| p.to_ascii_lowercase() == want)
+        {
+            return Some(p.clone());
+        }
+        // Fall back to the last segment as a plain basename (Obsidian tolerates a stale
+        // folder prefix when the note was moved).
+        let leaf = bare.rsplit('/').next().unwrap_or(bare);
+        return idx.by_basename_lc.get(&leaf.to_ascii_lowercase()).cloned();
+    }
+
+    idx.by_basename_lc.get(&bare.to_ascii_lowercase()).cloned()
 }
 
 /// Walk the vault recursively, building the wikilink basename index and the full
@@ -2444,6 +2486,7 @@ pub(crate) struct VaultIndex {
 /// walk would hang the entire boot, not just the vault feature.
 pub(crate) fn build_vault_index(vault_dir: &std::path::Path) -> VaultIndex {
     let mut by_basename = std::collections::HashMap::new();
+    let mut by_basename_lc = std::collections::HashMap::new();
     let mut all_paths = Vec::new();
     let mut stack = vec![vault_dir.to_path_buf()];
     while let Some(dir) = stack.pop() {
@@ -2472,6 +2515,9 @@ pub(crate) fn build_vault_index(vault_dir: &std::path::Path) -> VaultIndex {
                 if let Ok(rel) = path.strip_prefix(vault_dir) {
                     let rel_str = rel.to_string_lossy().to_string();
                     let base = name.trim_end_matches(".md").trim_end_matches(".MD").to_string();
+                    by_basename_lc
+                        .entry(base.to_ascii_lowercase())
+                        .or_insert_with(|| rel_str.clone());
                     by_basename
                         .entry(base)
                         .or_insert_with(|| rel_str.clone());
@@ -2480,7 +2526,7 @@ pub(crate) fn build_vault_index(vault_dir: &std::path::Path) -> VaultIndex {
             }
         }
     }
-    VaultIndex { by_basename, all_paths }
+    VaultIndex { by_basename, all_paths, by_basename_lc }
 }
 
 /// Case-insensitive substring match over relative paths (filename + path).
@@ -2562,8 +2608,13 @@ async fn vault_list(
     }
     let base_path = std::path::Path::new(base);
     let (entries, truncated) = list_dir_entries(base_path, rel)?;
+    // Never enumerate dot-entries (.obsidian/.git/.trash/.zeromux). list_dir_entries is
+    // shared with the session file browser and does not filter them; the vault index
+    // itself skips dot-names, so the reader API must match — the API is the trust
+    // boundary, not the frontend's filterVaultEntries.
     let arr: Vec<_> = entries
         .iter()
+        .filter(|e| !e.name.starts_with('.'))
         .map(|e| {
             serde_json::json!({
                 "name": e.name, "type": e.kind, "size": e.size, "mtime": e.mtime, "writable": e.writable,
@@ -2705,7 +2756,7 @@ async fn vault_resolve(
     let path = state
         .vault_index
         .as_ref()
-        .and_then(|idx| idx.by_basename.get(&q.name).cloned())
+        .and_then(|idx| resolve_wikilink(idx, &q.name))
         .ok_or((StatusCode::NOT_FOUND, "Wikilink target not found".into()))?;
     Ok(Json(serde_json::json!({ "path": path })))
 }
@@ -3287,6 +3338,75 @@ index 5..6 100644
         assert_eq!(r2.len(), 1);
         let r3 = vault_search_filter(&idx_paths, "");
         assert_eq!(r3.len(), 0); // empty query → no results
+    }
+
+    fn wikilink_idx() -> VaultIndex {
+        let dir = std::env::temp_dir().join(format!("zmx_wl_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("knowledge/aws")).unwrap();
+        std::fs::create_dir_all(dir.join("a")).unwrap();
+        std::fs::create_dir_all(dir.join("b")).unwrap();
+        std::fs::write(dir.join("knowledge/aws/EKS 网络模型.md"), b"x").unwrap();
+        std::fs::write(dir.join("a/README.md"), b"x").unwrap();
+        std::fs::write(dir.join("b/README.md"), b"y").unwrap();
+        let idx = build_vault_index(&dir);
+        let _ = std::fs::remove_dir_all(&dir);
+        idx
+    }
+
+    #[test]
+    fn resolve_wikilink_plain_basename() {
+        let idx = wikilink_idx();
+        assert_eq!(resolve_wikilink(&idx, "EKS 网络模型").as_deref(),
+                   Some("knowledge/aws/EKS 网络模型.md"));
+    }
+
+    #[test]
+    fn resolve_wikilink_folder_qualified() {
+        // [[knowledge/aws/EKS 网络模型]] — the 18% of real links that used to 404.
+        let idx = wikilink_idx();
+        assert_eq!(resolve_wikilink(&idx, "knowledge/aws/EKS 网络模型").as_deref(),
+                   Some("knowledge/aws/EKS 网络模型.md"));
+    }
+
+    #[test]
+    fn resolve_wikilink_explicit_extension() {
+        let idx = wikilink_idx();
+        assert_eq!(resolve_wikilink(&idx, "EKS 网络模型.md").as_deref(),
+                   Some("knowledge/aws/EKS 网络模型.md"));
+    }
+
+    #[test]
+    fn resolve_wikilink_case_insensitive() {
+        // Obsidian wikilinks are case-insensitive; ASCII case must fold.
+        let idx = wikilink_idx();
+        assert_eq!(resolve_wikilink(&idx, "eks 网络模型").as_deref(),
+                   Some("knowledge/aws/EKS 网络模型.md"));
+    }
+
+    #[test]
+    fn resolve_wikilink_folder_disambiguates_collision() {
+        // Two notes share basename README. A folder-qualified link must land in the
+        // right folder, not first-wins basename.
+        let idx = wikilink_idx();
+        assert_eq!(resolve_wikilink(&idx, "b/README").as_deref(), Some("b/README.md"));
+        assert_eq!(resolve_wikilink(&idx, "a/README").as_deref(), Some("a/README.md"));
+    }
+
+    #[test]
+    fn resolve_wikilink_not_found() {
+        let idx = wikilink_idx();
+        assert_eq!(resolve_wikilink(&idx, "does not exist"), None);
+    }
+
+    #[test]
+    fn vault_dot_entry_hidden_from_list() {
+        // vault_list filters entries whose name is a dot-entry (.obsidian/.git/.trash),
+        // matching the index's own dot-skip — the API is the trust boundary, not the UI.
+        assert!(vault_path_has_dot_component(".obsidian"));
+        assert!(vault_path_has_dot_component(".git"));
+        assert!(!vault_path_has_dot_component("note.md"));
+        assert!(!vault_path_has_dot_component("a.b.md"));
     }
 }
 

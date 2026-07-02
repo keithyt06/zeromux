@@ -2514,7 +2514,12 @@ pub(crate) fn build_vault_index(vault_dir: &std::path::Path) -> VaultIndex {
             } else if name.to_ascii_lowercase().ends_with(".md") {
                 if let Ok(rel) = path.strip_prefix(vault_dir) {
                     let rel_str = rel.to_string_lossy().to_string();
-                    let base = name.trim_end_matches(".md").trim_end_matches(".MD").to_string();
+                    // The ends_with(".md") guard above already proved the final 3 bytes
+                    // are an ASCII ".md" in SOME casing. `trim_end_matches(".md")` is a
+                    // literal match, so ".Md"/".mD" would slip through and leave the
+                    // extension on the basename key → `[[Note]]` 404s. Strip a fixed 3
+                    // bytes (safe: those bytes are ASCII, so the boundary is valid).
+                    let base = name[..name.len() - 3].to_string();
                     by_basename_lc
                         .entry(base.to_ascii_lowercase())
                         .or_insert_with(|| rel_str.clone());
@@ -2549,8 +2554,32 @@ fn vault_search_filter(paths: &[String], q: &str) -> Vec<String> {
 /// `data.json`), `.trash/`, `.git/` are not notes. The startup index already skips
 /// dot-prefixed names; the read endpoints (list/file/raw) must match it so a hand-crafted
 /// `?path=.obsidian/...` can't read non-note files the tree never surfaces.
+///
+/// LEXICAL only: it inspects the request string. It does NOT catch a dot-dir reached
+/// through a symlink whose own name is innocuous (e.g. `notes/pub -> ../.obsidian`,
+/// requested as `notes/pub/data.json`) — that string has no dot component, yet
+/// canonicalizes into `.obsidian`. `vault_real_hits_dot_component` closes that gap on
+/// the resolved (post-canonicalize) path; both guards run on every read endpoint.
 fn vault_path_has_dot_component(rel: &str) -> bool {
     rel.split('/').any(|seg| seg.starts_with('.') && seg != "." && seg != "..")
+}
+
+/// PHYSICAL dot-dir guard: true if any component of `real` BELOW `base` starts with '.'.
+/// `real` is the canonicalized path (symlinks already followed), so a symlink that lands
+/// inside `.obsidian`/`.trash`/`.git` is caught here even though its request string was
+/// clean. `.obsidian`/`.trash` are deliberately NOT in `SENSITIVE_DIR_NAMES` (that list
+/// is the file-browser's credential/control set), so the descent guard would miss them —
+/// this is the vault's own "notes only, no dot-dirs" boundary, enforced physically.
+/// A path not under `base` is treated as a hit (fail-closed), matching path_hits_sensitive_dir.
+fn vault_real_hits_dot_component(base: &std::path::Path, real: &std::path::Path) -> bool {
+    let rel = match real.strip_prefix(base) {
+        Ok(r) => r,
+        Err(_) => return true,
+    };
+    rel.components().any(|c| {
+        matches!(c, std::path::Component::Normal(s)
+            if s.to_str().is_some_and(|name| name.starts_with('.')))
+    })
 }
 
 /// vault endpoints: require admin (legacy mode synthesizes admin) and a configured vault.
@@ -2607,6 +2636,15 @@ async fn vault_list(
         return Err((StatusCode::FORBIDDEN, "Access to dot-directory denied".into()));
     }
     let base_path = std::path::Path::new(base);
+    // Physical guard: a symlink component (e.g. `pub -> ../.obsidian`) has no dot in the
+    // request string but canonicalizes into a dot-dir. Resolve first and reject before
+    // enumerating, so `?path=notes/pub` can't list `.obsidian`'s contents.
+    if !rel.is_empty() {
+        let real = resolve_and_verify(base_path, rel)?;
+        if vault_real_hits_dot_component(base_path, &real) {
+            return Err((StatusCode::FORBIDDEN, "Access to dot-directory denied".into()));
+        }
+    }
     let (entries, truncated) = list_dir_entries(base_path, rel)?;
     // Never enumerate dot-entries (.obsidian/.git/.trash/.zeromux). list_dir_entries is
     // shared with the session file browser and does not filter them; the vault index
@@ -2640,7 +2678,9 @@ async fn vault_file(
     }
     let base_path = std::path::Path::new(base);
     let real = resolve_and_verify(base_path, &q.path)?;
-    if descends_into_sensitive_dir(base_path, &real) {
+    if descends_into_sensitive_dir(base_path, &real)
+        || vault_real_hits_dot_component(base_path, &real)
+    {
         return Err((StatusCode::FORBIDDEN, "Access to sensitive directory denied".into()));
     }
     if let Some(n) = real.file_name().and_then(|s| s.to_str()) {
@@ -2680,7 +2720,9 @@ async fn vault_file_raw(
     }
     let base_path = std::path::Path::new(base);
     let real = resolve_and_verify(base_path, &q.path)?;
-    if descends_into_sensitive_dir(base_path, &real) {
+    if descends_into_sensitive_dir(base_path, &real)
+        || vault_real_hits_dot_component(base_path, &real)
+    {
         return Err((StatusCode::FORBIDDEN, "Forbidden".into()));
     }
     let fname = real.file_name().and_then(|s| s.to_str()).unwrap_or("download");
@@ -2729,7 +2771,11 @@ async fn vault_search(
         .as_ref()
         .map(|idx| idx.all_paths.clone())
         .unwrap_or_default();
-    let results: Vec<serde_json::Value> = vault_search_filter(&paths, &query.q)
+    let hits = vault_search_filter(&paths, &query.q);
+    // Surface the 100-result cap so the UI can say "results truncated" instead of
+    // silently implying a note past #100 doesn't exist (mirrors the 1MB file banner).
+    let truncated = hits.len() >= 100;
+    let results: Vec<serde_json::Value> = hits
         .into_iter()
         .map(|p| {
             let name = std::path::Path::new(&p)
@@ -2739,7 +2785,7 @@ async fn vault_search(
             serde_json::json!({ "path": p, "name": name })
         })
         .collect();
-    Ok(Json(serde_json::json!({ "results": results })))
+    Ok(Json(serde_json::json!({ "results": results, "truncated": truncated })))
 }
 
 #[derive(serde::Deserialize)]
@@ -2793,6 +2839,47 @@ mod path_safety_tests {
         assert!(!vault_path_has_dot_component(""));
         assert!(!vault_path_has_dot_component("knowledge/aws/note.md"));
         assert!(!vault_path_has_dot_component("a/b.c.md")); // dot in filename, not a dot-dir
+    }
+
+    #[test]
+    fn vault_real_hits_dot_component_catches_symlinked_dot_dir() {
+        use std::os::unix::fs::symlink;
+        // A symlink whose NAME is innocuous but that resolves into a dot-dir must be
+        // caught on the canonical path — the lexical guard (vault_path_has_dot_component)
+        // sees no dot in "notes/pub/data.json" and would let it through.
+        let dir = std::env::temp_dir().join(format!("zmx_vdot_{}", std::process::id()));
+        std::fs::create_dir_all(dir.join("notes")).unwrap();
+        std::fs::create_dir_all(dir.join(".obsidian")).unwrap();
+        std::fs::write(dir.join(".obsidian/data.json"), b"{\"token\":\"secret\"}").unwrap();
+        let _ = symlink("../.obsidian", dir.join("notes/pub"));
+        let base = dir.canonicalize().unwrap();
+
+        // Lexical guard is blind to the symlink; the physical guard must catch it.
+        assert!(!vault_path_has_dot_component("notes/pub/data.json"));
+        let real = resolve_and_verify(&base, "notes/pub/data.json").unwrap();
+        assert!(vault_real_hits_dot_component(&base, &real),
+                "symlink into .obsidian must be rejected on the canonical path");
+
+        // A normal note is not flagged.
+        std::fs::write(dir.join("notes/ok.md"), b"x").unwrap();
+        let ok = resolve_and_verify(&base, "notes/ok.md").unwrap();
+        assert!(!vault_real_hits_dot_component(&base, &ok));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn build_vault_index_mixed_case_md_extension_basename() {
+        // ends_with(".md") is case-insensitive, so Weird.Md is indexed — but the old
+        // literal trim_end_matches left ".Md" on the key, breaking [[Weird]] lookup.
+        let dir = std::env::temp_dir().join(format!("zmx_vmc_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("Weird.Md"), b"x").unwrap();
+        std::fs::write(dir.join("Other.mD"), b"y").unwrap();
+        let idx = build_vault_index(&dir);
+        // case-insensitive resolve must find them by bare stem
+        assert_eq!(resolve_wikilink(&idx, "weird"), Some("Weird.Md".to_string()));
+        assert_eq!(resolve_wikilink(&idx, "other"), Some("Other.mD".to_string()));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -3341,7 +3428,16 @@ index 5..6 100644
     }
 
     fn wikilink_idx() -> VaultIndex {
-        let dir = std::env::temp_dir().join(format!("zmx_wl_{}", std::process::id()));
+        // Unique dir per call: all six resolve_wikilink_* tests call this helper, and a
+        // shared pid-only path made them race (one test's remove_dir_all nuked another's
+        // freshly-written files → intermittent NotFound). A per-call counter isolates them.
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        static SEQ: AtomicUsize = AtomicUsize::new(0);
+        let dir = std::env::temp_dir().join(format!(
+            "zmx_wl_{}_{}",
+            std::process::id(),
+            SEQ.fetch_add(1, Ordering::Relaxed)
+        ));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(dir.join("knowledge/aws")).unwrap();
         std::fs::create_dir_all(dir.join("a")).unwrap();

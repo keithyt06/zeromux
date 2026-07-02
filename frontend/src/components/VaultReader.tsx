@@ -1,7 +1,7 @@
 import { useState, useEffect, useCallback } from 'react'
 import { X, ChevronLeft, Search, FileText, Folder } from 'lucide-react'
 import { listVault, getVaultFile, getVaultSearch, resolveWikiLink } from '../lib/api'
-import { filterVaultEntries, resolveVaultImageSrc, getRecentNotes, pushRecentNote } from '../lib/vault'
+import { filterVaultEntries, resolveVaultImageSrc, getRecentNotes, pushRecentNote, removeRecentNote } from '../lib/vault'
 import MarkdownContent from './markdown/MarkdownContent'
 import type { DirListEntry } from '../lib/api'
 
@@ -11,6 +11,7 @@ export default function VaultReader({ onClose }: { onClose: () => void }) {
   const [entries, setEntries] = useState<DirListEntry[]>([])
   const [query, setQuery] = useState('')
   const [results, setResults] = useState<{ path: string; name: string }[]>([])
+  const [searchTruncated, setSearchTruncated] = useState(false)
   const [openPath, setOpenPath] = useState('')
   const [content, setContent] = useState('')
   const [truncated, setTruncated] = useState(false)
@@ -23,8 +24,10 @@ export default function VaultReader({ onClose }: { onClose: () => void }) {
 
   useEffect(() => {
     const t = setTimeout(() => {
-      if (!query.trim()) { setResults([]); return }
-      getVaultSearch(query).then(r => setResults(r.results)).catch(() => setResults([]))
+      if (!query.trim()) { setResults([]); setSearchTruncated(false); return }
+      getVaultSearch(query)
+        .then(r => { setResults(r.results); setSearchTruncated(!!r.truncated) })
+        .catch(() => { setResults([]); setSearchTruncated(false) })
     }, 200)
     return () => clearTimeout(t)
   }, [query])
@@ -33,7 +36,13 @@ export default function VaultReader({ onClose }: { onClose: () => void }) {
     getVaultFile(path).then(r => {
       setContent(r.content); setTruncated(r.truncated); setOpenPath(path); setMode('read')
       pushRecentNote(path); setRecent(getRecentNotes())
-    }).catch(() => {})
+    }).catch(() => {
+      // A stale "最近打开" entry (note deleted/renamed in Obsidian) 404s here. Don't
+      // swallow it silently — tell the user and prune the dead entry, matching the
+      // onWikiLink sibling which already alerts on a missing target.
+      alert('无法打开笔记(可能已被删除或移动):' + path)
+      removeRecentNote(path); setRecent(getRecentNotes())
+    })
   }, [])
 
   const onWikiLink = useCallback((name: string) => {
@@ -80,7 +89,7 @@ export default function VaultReader({ onClose }: { onClose: () => void }) {
         {query.trim() ? (
           <ul>{results.map(r => (
             <li key={r.path}><button onClick={() => openNote(r.path)} className="flex items-center gap-2 w-full px-3 py-2 text-sm text-left hover:bg-[var(--bg-tertiary)]"><FileText size={14} />{r.name}<span className="text-xs text-[var(--text-secondary)] truncate">{r.path}</span></button></li>
-          ))}{results.length === 0 && <li className="px-3 py-2 text-xs text-[var(--text-secondary)]">无匹配</li>}</ul>
+          ))}{results.length === 0 && <li className="px-3 py-2 text-xs text-[var(--text-secondary)]">无匹配</li>}{searchTruncated && <li className="px-3 py-2 text-xs text-[var(--accent-yellow)]">仅显示前 100 条结果,请细化搜索</li>}</ul>
         ) : (
           <>
             {recent.length > 0 && cwd === '' && (

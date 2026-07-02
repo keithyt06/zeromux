@@ -373,7 +373,7 @@ export async function getVaultFile(path: string): Promise<{ content: string; tru
   const d = await res.json()
   return { content: d.content, truncated: d.truncated }
 }
-export async function getVaultSearch(q: string): Promise<{ results: { path: string; name: string }[] }> {
+export async function getVaultSearch(q: string): Promise<{ results: { path: string; name: string }[]; truncated?: boolean }> {
   const res = await api(`/api/vault/search?q=${encodeURIComponent(q)}`)
   if (!res.ok) throw new Error(await res.text())
   return res.json()

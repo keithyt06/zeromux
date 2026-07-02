@@ -1,5 +1,5 @@
 import { describe, it, expect, beforeEach } from 'vitest'
-import { shouldShowVault, filterVaultEntries, resolveVaultImageSrc, getRecentNotes, pushRecentNote } from '../vault'
+import { shouldShowVault, filterVaultEntries, resolveVaultImageSrc, getRecentNotes, pushRecentNote, removeRecentNote } from '../vault'
 import type { DirListEntry } from '../api'
 
 describe('shouldShowVault', () => {
@@ -37,5 +37,17 @@ describe('recent notes', () => {
   it('pushes most-recent-first, dedupes, caps 10', () => {
     pushRecentNote('a.md'); pushRecentNote('b.md'); pushRecentNote('a.md')
     expect(getRecentNotes()).toEqual(['a.md', 'b.md'])
+  })
+  it('removeRecentNote drops a stale entry', () => {
+    pushRecentNote('a.md'); pushRecentNote('b.md')
+    removeRecentNote('a.md')
+    expect(getRecentNotes()).toEqual(['b.md'])
+  })
+  it('tolerates a valid-JSON non-array in storage (no throw)', () => {
+    localStorage.setItem('zmx-vault-recent', '5')
+    expect(getRecentNotes()).toEqual([])
+    // and pushRecentNote after corruption still works
+    pushRecentNote('a.md')
+    expect(getRecentNotes()).toEqual(['a.md'])
   })
 })

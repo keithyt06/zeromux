@@ -90,6 +90,14 @@ describe('MarkdownContent enableRawHtml prop', () => {
     expect(td.getAttribute('colspan')).toBe('2')
   })
 
+  it('forwards width/height on inline <img> under enableRawHtml (Obsidian sizing)', () => {
+    render(<MarkdownContent text={'<img src="pic.png" width="300">'} isComplete enableRawHtml
+      resolveSrc={(s) => `RAW:${s}`} />)
+    const img = document.querySelector('img') as HTMLImageElement
+    expect(img.getAttribute('src')).toBe('RAW:pic.png')
+    expect(img.getAttribute('width')).toBe('300')
+  })
+
   it('keeps math marker class so katex can process $x$ under enableRawHtml', () => {
     render(<MarkdownContent text={'inline $a+b$ math'} isComplete enableRawHtml />)
     // remark-math emits <code class="math-inline">; sanitize must not strip the class.

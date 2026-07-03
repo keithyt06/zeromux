@@ -85,14 +85,14 @@ export default function MarkdownContent({ text, isComplete, className, resolveSr
     // td/th (the sanitize schema allows all of these). The default markdownStyles components
     // destructure only { children } and drop the rest; forward them via rest-spread.
     ...(enableRawHtml ? {
-      td: ({ children, ...rest }: React.ComponentPropsWithoutRef<'td'>) =>
+      td: ({ node: _n, children, ...rest }: React.ComponentPropsWithoutRef<'td'> & ExtraProps) =>
         <td className="border border-[var(--border)] px-2 py-1" {...rest}>{children}</td>,
-      th: ({ children, ...rest }: React.ComponentPropsWithoutRef<'th'>) =>
+      th: ({ node: _n, children, ...rest }: React.ComponentPropsWithoutRef<'th'> & ExtraProps) =>
         <th className="border border-[var(--border)] px-2 py-1 bg-[var(--bg-secondary)] text-left font-semibold" {...rest}>{children}</th>,
     } : {}),
     ...(resolveSrc ? {
-      img: ({ src, alt, title }: React.ComponentPropsWithoutRef<'img'> & ExtraProps) =>
-        <img src={resolveSrc(src || '')} alt={alt} title={title} />,
+      img: ({ node: _n, src, ...rest }: React.ComponentPropsWithoutRef<'img'> & ExtraProps) =>
+        <img src={resolveSrc(src || '')} {...rest} />,
     } : {}),
     ...(onWikiLink ? {
       a: ({ href, children }: React.ComponentPropsWithoutRef<'a'> & ExtraProps) => {

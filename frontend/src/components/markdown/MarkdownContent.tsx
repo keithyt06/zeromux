@@ -81,13 +81,14 @@ export default function MarkdownContent({ text, isComplete, className, resolveSr
   const vaultComponents: Components = {
     ...markdownComponents,
     code: CodeBlock,
-    // When enableRawHtml, vault notes may carry inline style on td/th (e.g. column widths,
-    // background). The default markdownStyles components drop style; override to forward it.
+    // When enableRawHtml, vault notes may carry inline style + colSpan/rowSpan/align on
+    // td/th (the sanitize schema allows all of these). The default markdownStyles components
+    // destructure only { children } and drop the rest; forward them via rest-spread.
     ...(enableRawHtml ? {
-      td: ({ children, style }: React.ComponentPropsWithoutRef<'td'>) =>
-        <td className="border border-[var(--border)] px-2 py-1" style={style}>{children}</td>,
-      th: ({ children, style }: React.ComponentPropsWithoutRef<'th'>) =>
-        <th className="border border-[var(--border)] px-2 py-1 bg-[var(--bg-secondary)] text-left font-semibold" style={style}>{children}</th>,
+      td: ({ children, ...rest }: React.ComponentPropsWithoutRef<'td'>) =>
+        <td className="border border-[var(--border)] px-2 py-1" {...rest}>{children}</td>,
+      th: ({ children, ...rest }: React.ComponentPropsWithoutRef<'th'>) =>
+        <th className="border border-[var(--border)] px-2 py-1 bg-[var(--bg-secondary)] text-left font-semibold" {...rest}>{children}</th>,
     } : {}),
     ...(resolveSrc ? {
       img: ({ src, alt, title }: React.ComponentPropsWithoutRef<'img'> & ExtraProps) =>

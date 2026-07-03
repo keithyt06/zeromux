@@ -83,4 +83,10 @@ describe('MarkdownContent enableRawHtml prop', () => {
     const td = document.querySelector('td') as HTMLElement
     expect(td.getAttribute('style')).toContain('background')
   })
+
+  it('preserves colspan on td under enableRawHtml (real vault tables use it)', () => {
+    render(<MarkdownContent text={'<table><tr><td colspan="2">wide</td></tr></table>'} isComplete enableRawHtml />)
+    const td = document.querySelector('td') as HTMLElement
+    expect(td.getAttribute('colspan')).toBe('2')
+  })
 })

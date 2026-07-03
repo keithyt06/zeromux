@@ -66,6 +66,8 @@ pub struct Subscription {
     pub endpoint: String,
     pub p256dh: String,
     pub auth: String,
+    pub lvl_important: bool,
+    pub lvl_routine: bool,
 }
 
 pub struct PushStore {
@@ -74,11 +76,13 @@ pub struct PushStore {
 
 const CREATE_SQL: &str = "
 CREATE TABLE IF NOT EXISTS push_subscriptions (
-    endpoint   TEXT PRIMARY KEY,
-    user_id    TEXT NOT NULL,
-    p256dh     TEXT NOT NULL,
-    auth       TEXT NOT NULL,
-    created_ms INTEGER NOT NULL
+    endpoint      TEXT PRIMARY KEY,
+    user_id       TEXT NOT NULL,
+    p256dh        TEXT NOT NULL,
+    auth          TEXT NOT NULL,
+    created_ms    INTEGER NOT NULL,
+    lvl_important INTEGER NOT NULL DEFAULT 1,
+    lvl_routine   INTEGER NOT NULL DEFAULT 0
 );
 CREATE INDEX IF NOT EXISTS idx_push_user ON push_subscriptions(user_id);
 ";
@@ -87,6 +91,9 @@ impl PushStore {
     fn init(conn: Connection) -> Result<Self, String> {
         conn.execute_batch(CREATE_SQL)
             .map_err(|e| format!("push_store init: {e}"))?;
+        // Migrate pre-levels DBs; ADD COLUMN fails if already present → ignore.
+        let _ = conn.execute("ALTER TABLE push_subscriptions ADD COLUMN lvl_important INTEGER NOT NULL DEFAULT 1", []);
+        let _ = conn.execute("ALTER TABLE push_subscriptions ADD COLUMN lvl_routine INTEGER NOT NULL DEFAULT 0", []);
         Ok(PushStore { conn: Mutex::new(conn) })
     }
 
@@ -103,39 +110,38 @@ impl PushStore {
         Self::init(conn)
     }
 
-    pub fn upsert(&self, user_id: &str, endpoint: &str, p256dh: &str, auth: &str) -> Result<(), String> {
+    pub fn upsert(&self, user_id: &str, endpoint: &str, p256dh: &str, auth: &str,
+                  lvl_important: bool, lvl_routine: bool) -> Result<(), String> {
         let now_ms = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_millis() as i64)
             .unwrap_or(0);
         let conn = self.conn.lock().unwrap();
         conn.execute(
-            "INSERT INTO push_subscriptions (endpoint, user_id, p256dh, auth, created_ms)
-             VALUES (?1, ?2, ?3, ?4, ?5)
+            "INSERT INTO push_subscriptions (endpoint, user_id, p256dh, auth, created_ms, lvl_important, lvl_routine)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
              ON CONFLICT(endpoint) DO UPDATE SET
-                 user_id    = excluded.user_id,
-                 p256dh     = excluded.p256dh,
-                 auth       = excluded.auth,
-                 created_ms = excluded.created_ms",
-            params![endpoint, user_id, p256dh, auth, now_ms],
-        )
-        .map_err(|e| format!("upsert: {e}"))?;
+                 user_id=excluded.user_id, p256dh=excluded.p256dh, auth=excluded.auth,
+                 created_ms=excluded.created_ms,
+                 lvl_important=excluded.lvl_important, lvl_routine=excluded.lvl_routine",
+            params![endpoint, user_id, p256dh, auth, now_ms, lvl_important as i64, lvl_routine as i64],
+        ).map_err(|e| format!("upsert: {e}"))?;
         Ok(())
     }
 
     pub fn list_for_user(&self, user_id: &str) -> Vec<Subscription> {
         let conn = self.conn.lock().unwrap();
         let mut stmt = match conn.prepare(
-            "SELECT endpoint, p256dh, auth FROM push_subscriptions WHERE user_id = ?1",
-        ) {
-            Ok(s) => s,
-            Err(_) => return vec![],
-        };
+            "SELECT endpoint, p256dh, auth, lvl_important, lvl_routine
+             FROM push_subscriptions WHERE user_id = ?1",
+        ) { Ok(s) => s, Err(_) => return vec![] };
         stmt.query_map(params![user_id], |row| {
             Ok(Subscription {
                 endpoint: row.get(0)?,
                 p256dh: row.get(1)?,
                 auth: row.get(2)?,
+                lvl_important: row.get::<_, i64>(3)? != 0,
+                lvl_routine:   row.get::<_, i64>(4)? != 0,
             })
         })
         .map(|rows| rows.flatten().collect())
@@ -531,10 +537,10 @@ mod tests {
     #[test]
     fn gone_outcome_removes_subscription() {
         let store = PushStore::open_in_memory().unwrap();
-        store.upsert("u1", "https://ep/gone", "p", "a").unwrap();
+        store.upsert("u1", "https://ep/gone", "p", "a", true, false).unwrap();
         handle_delivery_outcome(&store, "https://ep/gone", DeliveryOutcome::Gone);
         assert_eq!(store.list_for_user("u1").len(), 0);
-        store.upsert("u1", "https://ep/ok", "p", "a").unwrap();
+        store.upsert("u1", "https://ep/ok", "p", "a", true, false).unwrap();
         handle_delivery_outcome(&store, "https://ep/ok", DeliveryOutcome::TransientErr);
         assert_eq!(store.list_for_user("u1").len(), 1); // 非 Gone 不删
     }
@@ -565,10 +571,10 @@ mod tests {
     #[test]
     fn push_store_upsert_list_delete() {
         let store = PushStore::open_in_memory().unwrap();
-        store.upsert("u1", "https://ep/a", "p1", "a1").unwrap();
-        store.upsert("u1", "https://ep/b", "p2", "a2").unwrap();
-        store.upsert("u1", "https://ep/a", "p1b", "a1b").unwrap(); // 同 endpoint upsert
-        store.upsert("u2", "https://ep/c", "p3", "a3").unwrap();
+        store.upsert("u1", "https://ep/a", "p1", "a1", true, false).unwrap();
+        store.upsert("u1", "https://ep/b", "p2", "a2", true, false).unwrap();
+        store.upsert("u1", "https://ep/a", "p1b", "a1b", true, false).unwrap(); // 同 endpoint upsert
+        store.upsert("u2", "https://ep/c", "p3", "a3", true, false).unwrap();
         let mut u1 = store.list_for_user("u1");
         u1.sort_by(|a, b| a.endpoint.cmp(&b.endpoint));
         assert_eq!(u1.len(), 2);                       // a(更新后) + b,不重复
@@ -581,8 +587,8 @@ mod tests {
     fn delete_for_user_scopes_to_owner() {
         let store = PushStore::open_in_memory().unwrap();
         // Two users, each with their own distinct endpoint
-        store.upsert("u1", "https://ep/u1", "p1", "a1").unwrap();
-        store.upsert("u2", "https://ep/u2", "p2", "a2").unwrap();
+        store.upsert("u1", "https://ep/u1", "p1", "a1", true, false).unwrap();
+        store.upsert("u2", "https://ep/u2", "p2", "a2", true, false).unwrap();
 
         // u2 tries to delete u1's endpoint — must be a no-op
         store.delete_for_user("https://ep/u1", "u2");
@@ -652,6 +658,20 @@ mod tests {
         assert_eq!(svc.last_stuck_push(u2, s2), None, "turn_done mark must not appear in stuck map");
 
         fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn upsert_persists_and_updates_levels() {
+        let store = PushStore::open_in_memory().unwrap();
+        store.upsert("u1", "https://ep/a", "p", "a", true, false).unwrap();
+        let subs = store.list_for_user("u1");
+        assert_eq!(subs.len(), 1);
+        assert!(subs[0].lvl_important && !subs[0].lvl_routine);
+        // upsert same endpoint flips routine on
+        store.upsert("u1", "https://ep/a", "p", "a", true, true).unwrap();
+        let subs = store.list_for_user("u1");
+        assert_eq!(subs.len(), 1);
+        assert!(subs[0].lvl_routine, "routine must update on re-upsert");
     }
 
     #[test]

@@ -3642,7 +3642,7 @@ async fn push_subscribe(
         return Err(StatusCode::BAD_REQUEST);
     }
     p.store()
-        .upsert(&user.id, &req.endpoint, &req.keys.p256dh, &req.keys.auth)
+        .upsert(&user.id, &req.endpoint, &req.keys.p256dh, &req.keys.auth, true, false)
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
     Ok(Json(serde_json::json!({ "ok": true })))
 }

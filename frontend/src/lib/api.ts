@@ -71,7 +71,7 @@ export function clearAuth() {
   document.cookie = 'zeromux_jwt=;path=/;expires=Thu, 01 Jan 1970 00:00:00 GMT'
 }
 
-async function api(path: string, opts: RequestInit = {}): Promise<Response> {
+export async function api(path: string, opts: RequestInit = {}): Promise<Response> {
   const token = getToken()
   const headers: Record<string, string> = {
     'Content-Type': 'application/json',

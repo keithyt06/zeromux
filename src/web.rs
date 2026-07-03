@@ -66,6 +66,7 @@ pub fn build_router(state: Arc<AppState>) -> Router {
         .route("/api/push/vapid-key", get(push_vapid_key))
         .route("/api/push/subscribe", post(push_subscribe))
         .route("/api/push/unsubscribe", post(push_unsubscribe))
+        .route("/api/push/test", post(push_test))
         .route("/api/tmux/sessions", get(list_tmux_sessions))
         .route("/api/admin/users", get(crate::admin::list_users))
         .route(
@@ -3624,12 +3625,19 @@ async fn push_vapid_key(
 struct SubscribeReq {
     endpoint: String,
     keys: SubKeys,
+    levels: Option<LevelsReq>,
 }
 
 #[derive(serde::Deserialize)]
 struct SubKeys {
     p256dh: String,
     auth: String,
+}
+
+#[derive(serde::Deserialize)]
+struct LevelsReq {
+    important: bool,
+    routine: bool,
 }
 
 async fn push_subscribe(
@@ -3641,9 +3649,20 @@ async fn push_subscribe(
     if !crate::push::endpoint_is_safe(&req.endpoint) {
         return Err(StatusCode::BAD_REQUEST);
     }
+    let (imp, rout) = req.levels.map(|l| (l.important, l.routine)).unwrap_or((true, false));
     p.store()
-        .upsert(&user.id, &req.endpoint, &req.keys.p256dh, &req.keys.auth)
+        .upsert(&user.id, &req.endpoint, &req.keys.p256dh, &req.keys.auth, imp, rout)
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    Ok(Json(serde_json::json!({ "ok": true })))
+}
+
+async fn push_test(
+    State(state): State<Arc<AppState>>,
+    user: axum::Extension<CurrentUser>,
+) -> Result<Json<serde_json::Value>, StatusCode> {
+    let p = state.push.as_ref().ok_or(StatusCode::SERVICE_UNAVAILABLE)?;
+    let payload = crate::push::payload_for("test", "ZeroMux", "", None);
+    p.send_to_user(&user.id, &payload).await;
     Ok(Json(serde_json::json!({ "ok": true })))
 }
 

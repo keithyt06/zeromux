@@ -62,10 +62,14 @@ pub fn load_or_generate_vapid(dir: &Path) -> Result<Vapid, String> {
 
 // ── Push subscriptions ────────────────────────────────────────────────────────
 
+pub const PUSH_MAX_SUBS_PER_USER: usize = 5;
+
 pub struct Subscription {
     pub endpoint: String,
     pub p256dh: String,
     pub auth: String,
+    pub lvl_important: bool,
+    pub lvl_routine: bool,
 }
 
 pub struct PushStore {
@@ -74,11 +78,13 @@ pub struct PushStore {
 
 const CREATE_SQL: &str = "
 CREATE TABLE IF NOT EXISTS push_subscriptions (
-    endpoint   TEXT PRIMARY KEY,
-    user_id    TEXT NOT NULL,
-    p256dh     TEXT NOT NULL,
-    auth       TEXT NOT NULL,
-    created_ms INTEGER NOT NULL
+    endpoint      TEXT PRIMARY KEY,
+    user_id       TEXT NOT NULL,
+    p256dh        TEXT NOT NULL,
+    auth          TEXT NOT NULL,
+    created_ms    INTEGER NOT NULL,
+    lvl_important INTEGER NOT NULL DEFAULT 1,
+    lvl_routine   INTEGER NOT NULL DEFAULT 0
 );
 CREATE INDEX IF NOT EXISTS idx_push_user ON push_subscriptions(user_id);
 ";
@@ -87,6 +93,13 @@ impl PushStore {
     fn init(conn: Connection) -> Result<Self, String> {
         conn.execute_batch(CREATE_SQL)
             .map_err(|e| format!("push_store init: {e}"))?;
+        // Migrate pre-levels DBs; ADD COLUMN fails with "duplicate column" if already present → ignore that case only.
+        if let Err(e) = conn.execute("ALTER TABLE push_subscriptions ADD COLUMN lvl_important INTEGER NOT NULL DEFAULT 1", []) {
+            if !e.to_string().contains("duplicate column") { tracing::warn!("push_store migrate lvl_important: {e}"); }
+        }
+        if let Err(e) = conn.execute("ALTER TABLE push_subscriptions ADD COLUMN lvl_routine INTEGER NOT NULL DEFAULT 0", []) {
+            if !e.to_string().contains("duplicate column") { tracing::warn!("push_store migrate lvl_routine: {e}"); }
+        }
         Ok(PushStore { conn: Mutex::new(conn) })
     }
 
@@ -103,39 +116,49 @@ impl PushStore {
         Self::init(conn)
     }
 
-    pub fn upsert(&self, user_id: &str, endpoint: &str, p256dh: &str, auth: &str) -> Result<(), String> {
+    pub fn upsert(&self, user_id: &str, endpoint: &str, p256dh: &str, auth: &str,
+                  lvl_important: bool, lvl_routine: bool) -> Result<(), String> {
         let now_ms = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_millis() as i64)
             .unwrap_or(0);
         let conn = self.conn.lock().unwrap();
         conn.execute(
-            "INSERT INTO push_subscriptions (endpoint, user_id, p256dh, auth, created_ms)
-             VALUES (?1, ?2, ?3, ?4, ?5)
+            "INSERT INTO push_subscriptions (endpoint, user_id, p256dh, auth, created_ms, lvl_important, lvl_routine)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
              ON CONFLICT(endpoint) DO UPDATE SET
-                 user_id    = excluded.user_id,
-                 p256dh     = excluded.p256dh,
-                 auth       = excluded.auth,
-                 created_ms = excluded.created_ms",
-            params![endpoint, user_id, p256dh, auth, now_ms],
-        )
-        .map_err(|e| format!("upsert: {e}"))?;
+                 user_id=excluded.user_id, p256dh=excluded.p256dh, auth=excluded.auth,
+                 created_ms=excluded.created_ms,
+                 lvl_important=excluded.lvl_important, lvl_routine=excluded.lvl_routine",
+            params![endpoint, user_id, p256dh, auth, now_ms, lvl_important as i64, lvl_routine as i64],
+        ).map_err(|e| format!("upsert: {e}"))?;
+        // Prune stale subscriptions: keep newest PUSH_MAX_SUBS_PER_USER per user.
+        // created_ms is refreshed by resyncPush() on each app foreground, so a
+        // low-frequency-but-active device (e.g. rarely-opened iPad) is not wrongly evicted.
+        conn.execute(
+            "DELETE FROM push_subscriptions
+             WHERE user_id = ?1 AND endpoint NOT IN (
+                 SELECT endpoint FROM push_subscriptions WHERE user_id = ?1
+                 ORDER BY created_ms DESC, endpoint DESC LIMIT ?2
+             )",
+            params![user_id, PUSH_MAX_SUBS_PER_USER as i64],
+        ).ok();
         Ok(())
     }
 
     pub fn list_for_user(&self, user_id: &str) -> Vec<Subscription> {
         let conn = self.conn.lock().unwrap();
         let mut stmt = match conn.prepare(
-            "SELECT endpoint, p256dh, auth FROM push_subscriptions WHERE user_id = ?1",
-        ) {
-            Ok(s) => s,
-            Err(_) => return vec![],
-        };
+            "SELECT endpoint, p256dh, auth, lvl_important, lvl_routine
+             FROM push_subscriptions WHERE user_id = ?1",
+        ) { Ok(s) => s, Err(_) => return vec![] };
         stmt.query_map(params![user_id], |row| {
             Ok(Subscription {
                 endpoint: row.get(0)?,
                 p256dh: row.get(1)?,
                 auth: row.get(2)?,
+                lvl_important: row.get::<_, i64>(3)? != 0,
+                lvl_routine:   row.get::<_, i64>(4)? != 0,
             })
         })
         .map(|rows| rows.flatten().collect())
@@ -275,6 +298,10 @@ pub fn payload_for(kind: &str, name: &str, session_id: &str, fk: Option<&str>) -
             format!("⚠️ {name} 可能卡住"),
             "已静默约 10 分钟无输出".to_string(),
         ),
+        "test" => (
+            "🔔 测试推送".to_string(),
+            "如果你看到这条,推送链路正常".to_string(),
+        ),
         _ => (name.to_string(), String::new()),
     };
     PushPayload {
@@ -282,6 +309,16 @@ pub fn payload_for(kind: &str, name: &str, session_id: &str, fk: Option<&str>) -
         session_id: session_id.to_string(),
         title,
         body,
+    }
+}
+
+/// Single source of truth for level→kind gating (mirrors spec's mapping).
+/// `test` always sends (self-test must reach the device to be meaningful).
+pub fn kind_allowed_by_levels(kind: &str, lvl_important: bool, lvl_routine: bool) -> bool {
+    match kind {
+        "test" => true,
+        "turn_done" => lvl_routine,
+        _ => lvl_important, // run_failed / confirm / stuck
     }
 }
 
@@ -397,6 +434,9 @@ impl PushService {
         let urgency = if payload.kind == "turn_done" { "low" } else { "high" };
 
         for sub in subs {
+            if !kind_allowed_by_levels(&payload.kind, sub.lvl_important, sub.lvl_routine) {
+                continue; // never send a push the device would not display → no iOS 3-strike revoke
+            }
             if !endpoint_is_safe(&sub.endpoint) {
                 tracing::warn!("push: skipping unsafe endpoint: {}", sub.endpoint);
                 continue;
@@ -531,10 +571,10 @@ mod tests {
     #[test]
     fn gone_outcome_removes_subscription() {
         let store = PushStore::open_in_memory().unwrap();
-        store.upsert("u1", "https://ep/gone", "p", "a").unwrap();
+        store.upsert("u1", "https://ep/gone", "p", "a", true, false).unwrap();
         handle_delivery_outcome(&store, "https://ep/gone", DeliveryOutcome::Gone);
         assert_eq!(store.list_for_user("u1").len(), 0);
-        store.upsert("u1", "https://ep/ok", "p", "a").unwrap();
+        store.upsert("u1", "https://ep/ok", "p", "a", true, false).unwrap();
         handle_delivery_outcome(&store, "https://ep/ok", DeliveryOutcome::TransientErr);
         assert_eq!(store.list_for_user("u1").len(), 1); // 非 Gone 不删
     }
@@ -565,10 +605,10 @@ mod tests {
     #[test]
     fn push_store_upsert_list_delete() {
         let store = PushStore::open_in_memory().unwrap();
-        store.upsert("u1", "https://ep/a", "p1", "a1").unwrap();
-        store.upsert("u1", "https://ep/b", "p2", "a2").unwrap();
-        store.upsert("u1", "https://ep/a", "p1b", "a1b").unwrap(); // 同 endpoint upsert
-        store.upsert("u2", "https://ep/c", "p3", "a3").unwrap();
+        store.upsert("u1", "https://ep/a", "p1", "a1", true, false).unwrap();
+        store.upsert("u1", "https://ep/b", "p2", "a2", true, false).unwrap();
+        store.upsert("u1", "https://ep/a", "p1b", "a1b", true, false).unwrap(); // 同 endpoint upsert
+        store.upsert("u2", "https://ep/c", "p3", "a3", true, false).unwrap();
         let mut u1 = store.list_for_user("u1");
         u1.sort_by(|a, b| a.endpoint.cmp(&b.endpoint));
         assert_eq!(u1.len(), 2);                       // a(更新后) + b,不重复
@@ -581,8 +621,8 @@ mod tests {
     fn delete_for_user_scopes_to_owner() {
         let store = PushStore::open_in_memory().unwrap();
         // Two users, each with their own distinct endpoint
-        store.upsert("u1", "https://ep/u1", "p1", "a1").unwrap();
-        store.upsert("u2", "https://ep/u2", "p2", "a2").unwrap();
+        store.upsert("u1", "https://ep/u1", "p1", "a1", true, false).unwrap();
+        store.upsert("u2", "https://ep/u2", "p2", "a2", true, false).unwrap();
 
         // u2 tries to delete u1's endpoint — must be a no-op
         store.delete_for_user("https://ep/u1", "u2");
@@ -652,6 +692,56 @@ mod tests {
         assert_eq!(svc.last_stuck_push(u2, s2), None, "turn_done mark must not appear in stuck map");
 
         fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn upsert_persists_and_updates_levels() {
+        let store = PushStore::open_in_memory().unwrap();
+        store.upsert("u1", "https://ep/a", "p", "a", true, false).unwrap();
+        let subs = store.list_for_user("u1");
+        assert_eq!(subs.len(), 1);
+        assert!(subs[0].lvl_important && !subs[0].lvl_routine);
+        // upsert same endpoint flips routine on
+        store.upsert("u1", "https://ep/a", "p", "a", true, true).unwrap();
+        let subs = store.list_for_user("u1");
+        assert_eq!(subs.len(), 1);
+        assert!(subs[0].lvl_routine, "routine must update on re-upsert");
+    }
+
+    #[test]
+    fn kind_level_gating() {
+        // turn_done needs routine
+        assert!(!kind_allowed_by_levels("turn_done", true, false));
+        assert!(kind_allowed_by_levels("turn_done", false, true));
+        // important-class needs important
+        assert!(kind_allowed_by_levels("run_failed", true, false));
+        assert!(!kind_allowed_by_levels("run_failed", false, false));
+        assert!(kind_allowed_by_levels("confirm", true, false));
+        assert!(kind_allowed_by_levels("stuck", true, false));
+        // test always sends
+        assert!(kind_allowed_by_levels("test", false, false));
+    }
+
+    #[test]
+    fn upsert_caps_subscriptions_per_user() {
+        let store = PushStore::open_in_memory().unwrap();
+        for i in 0..7 {
+            // distinct endpoints; created_ms is set inside upsert (monotonic enough per call)
+            store.upsert("u1", &format!("https://ep/{i}"), "p", "a", true, false).unwrap();
+        }
+        assert!(store.list_for_user("u1").len() <= 5, "must cap at PUSH_MAX_SUBS_PER_USER");
+        // other users unaffected
+        store.upsert("u2", "https://ep/u2", "p", "a", true, false).unwrap();
+        assert_eq!(store.list_for_user("u2").len(), 1);
+    }
+
+    #[test]
+    fn test_payload_shape() {
+        let p = payload_for("test", "ZeroMux", "", None);
+        assert_eq!(p.kind, "test");
+        // Must produce the dedicated test-push title, not the generic _ => name fallback
+        assert_eq!(p.title, "🔔 测试推送");
+        assert!(!p.body.is_empty());
     }
 
     #[test]

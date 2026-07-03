@@ -2,6 +2,7 @@ import { useState, useEffect, useCallback, useMemo, useRef } from 'react'
 import type { SessionInfo, SessionType, UserInfo } from './lib/api'
 import { listSessions, createSession, deleteSession, checkAuth, legacyLogin, clearAuth, renameSession, listConfirmations, getSessionStatus } from './lib/api'
 import { deepLinkView } from './lib/deeplink'
+import { resyncPush, shouldResyncNow } from './lib/push'
 import { useTheme } from './lib/theme'
 import Sidebar from './components/Sidebar'
 import TerminalView from './components/TerminalView'
@@ -108,6 +109,19 @@ export default function App() {
     document.addEventListener('visibilitychange', onVis)
     return () => document.removeEventListener('visibilitychange', onVis)
   }, [activeId])
+  // Push: resync subscription on return to foreground, throttled to ≤ once/hour
+  useEffect(() => {
+    let last: number | null = null
+    const onVis = () => {
+      if (document.visibilityState !== 'visible') return
+      const now = Date.now()
+      if (!shouldResyncNow(last, now)) return
+      last = now
+      resyncPush().catch(() => {})
+    }
+    document.addEventListener('visibilitychange', onVis)
+    return () => document.removeEventListener('visibilitychange', onVis)
+  }, [])
   // SW: listen for notification click → deep-link to session
   useEffect(() => {
     const onMsg = (e: MessageEvent) => {

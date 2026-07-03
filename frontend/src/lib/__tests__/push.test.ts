@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest'
-import { vapidKeyToUint8Array, levelAllows, shouldSuppress, pickApplicationServerKey } from '../push'
+import { vapidKeyToUint8Array, levelAllows, shouldSuppress, pickApplicationServerKey, shouldResyncNow } from '../push'
 
 describe('push pure fns', () => {
   it('vapidKeyToUint8Array decodes base64url to 65-byte P-256 point', () => {
@@ -19,6 +19,14 @@ describe('push pure fns', () => {
     expect(shouldSuppress(['s1','s2'], 's1')).toBe(true)
     expect(shouldSuppress(['s2'], 's1')).toBe(false)
     expect(shouldSuppress([], 's1')).toBe(false)
+  })
+})
+
+describe('shouldResyncNow', () => {
+  it('allows first resync and after 1h, blocks within 1h', () => {
+    expect(shouldResyncNow(null, 1_000_000)).toBe(true)
+    expect(shouldResyncNow(1_000_000, 1_000_000 + 59*60_000)).toBe(false)
+    expect(shouldResyncNow(1_000_000, 1_000_000 + 61*60_000)).toBe(true)
   })
 })
 

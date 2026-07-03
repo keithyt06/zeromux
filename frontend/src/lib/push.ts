@@ -88,6 +88,11 @@ export async function resyncPush(): Promise<void> {
   }
 }
 
+export function shouldResyncNow(lastMs: number | null, nowMs: number): boolean {
+  if (lastMs === null) return true
+  return nowMs - lastMs >= 60 * 60_000
+}
+
 export async function sendTestPush(): Promise<void> {
   await api('/api/push/test', { method: 'POST' })
 }

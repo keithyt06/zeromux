@@ -294,6 +294,10 @@ pub fn payload_for(kind: &str, name: &str, session_id: &str, fk: Option<&str>) -
             format!("⚠️ {name} 可能卡住"),
             "已静默约 10 分钟无输出".to_string(),
         ),
+        "test" => (
+            "🔔 测试推送".to_string(),
+            "如果你看到这条,推送链路正常".to_string(),
+        ),
         _ => (name.to_string(), String::new()),
     };
     PushPayload {
@@ -725,6 +729,15 @@ mod tests {
         // other users unaffected
         store.upsert("u2", "https://ep/u2", "p", "a", true, false).unwrap();
         assert_eq!(store.list_for_user("u2").len(), 1);
+    }
+
+    #[test]
+    fn test_payload_shape() {
+        let p = payload_for("test", "ZeroMux", "", None);
+        assert_eq!(p.kind, "test");
+        // Must produce the dedicated test-push title, not the generic _ => name fallback
+        assert_eq!(p.title, "🔔 测试推送");
+        assert!(!p.body.is_empty());
     }
 
     #[test]

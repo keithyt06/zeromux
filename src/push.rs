@@ -62,6 +62,8 @@ pub fn load_or_generate_vapid(dir: &Path) -> Result<Vapid, String> {
 
 // ── Push subscriptions ────────────────────────────────────────────────────────
 
+pub const PUSH_MAX_SUBS_PER_USER: usize = 5;
+
 pub struct Subscription {
     pub endpoint: String,
     pub p256dh: String,
@@ -126,6 +128,17 @@ impl PushStore {
                  lvl_important=excluded.lvl_important, lvl_routine=excluded.lvl_routine",
             params![endpoint, user_id, p256dh, auth, now_ms, lvl_important as i64, lvl_routine as i64],
         ).map_err(|e| format!("upsert: {e}"))?;
+        // Prune stale subscriptions: keep newest PUSH_MAX_SUBS_PER_USER per user.
+        // created_ms is refreshed by resyncPush() on each app foreground, so a
+        // low-frequency-but-active device (e.g. rarely-opened iPad) is not wrongly evicted.
+        conn.execute(
+            "DELETE FROM push_subscriptions
+             WHERE user_id = ?1 AND endpoint NOT IN (
+                 SELECT endpoint FROM push_subscriptions WHERE user_id = ?1
+                 ORDER BY created_ms DESC, endpoint DESC LIMIT ?2
+             )",
+            params![user_id, PUSH_MAX_SUBS_PER_USER as i64],
+        ).ok();
         Ok(())
     }
 
@@ -699,6 +712,19 @@ mod tests {
         assert!(kind_allowed_by_levels("stuck", true, false));
         // test always sends
         assert!(kind_allowed_by_levels("test", false, false));
+    }
+
+    #[test]
+    fn upsert_caps_subscriptions_per_user() {
+        let store = PushStore::open_in_memory().unwrap();
+        for i in 0..7 {
+            // distinct endpoints; created_ms is set inside upsert (monotonic enough per call)
+            store.upsert("u1", &format!("https://ep/{i}"), "p", "a", true, false).unwrap();
+        }
+        assert!(store.list_for_user("u1").len() <= 5, "must cap at PUSH_MAX_SUBS_PER_USER");
+        // other users unaffected
+        store.upsert("u2", "https://ep/u2", "p", "a", true, false).unwrap();
+        assert_eq!(store.list_for_user("u2").len(), 1);
     }
 
     #[test]

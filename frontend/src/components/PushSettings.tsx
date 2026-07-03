@@ -1,6 +1,6 @@
 import { useState, useEffect } from 'react'
 import { X, Bell, BellOff, BellRing } from 'lucide-react'
-import { getPushState, enablePush, disablePush, getLevels, setLevels } from '../lib/push'
+import { getPushState, enablePush, disablePush, getLevels, setLevels, sendTestPush } from '../lib/push'
 import type { PushState, PushLevels } from '../lib/push'
 
 interface Props {
@@ -124,6 +124,13 @@ export default function PushSettings({ onClose }: Props) {
           </div>
         )}
 
+        {/* Test push button — only shown when enabled */}
+        {state === 'enabled' && (
+          <div className="border-t border-[var(--border)] pt-3">
+            <TestPushButton />
+          </div>
+        )}
+
         {/* iOS install hint */}
         {showIOSHint && (
           <div className="border border-[var(--border)] rounded-lg p-3 flex flex-col gap-1.5 bg-[var(--bg-tertiary)]">
@@ -167,5 +174,17 @@ function LevelRow({ label, hint, checked, onChange }: {
         }`} />
       </button>
     </div>
+  )
+}
+
+function TestPushButton() {
+  const [sent, setSent] = useState(false)
+  return (
+    <button
+      onClick={async () => { try { await sendTestPush(); setSent(true); setTimeout(() => setSent(false), 2000) } catch { /* noop */ } }}
+      className="text-xs px-2 py-1 rounded bg-[var(--bg-tertiary)] text-[var(--text-primary)] hover:opacity-80"
+    >
+      {sent ? '已发送 ✓' : '发送测试推送'}
+    </button>
   )
 }

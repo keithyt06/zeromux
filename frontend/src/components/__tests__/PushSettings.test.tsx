@@ -1,6 +1,7 @@
-import { render, screen } from '@testing-library/react'
+import { render, screen, fireEvent } from '@testing-library/react'
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
 import PushSettings from '../PushSettings'
+import * as pushLib from '../../lib/push'
 
 // Mock push.ts
 vi.mock('../../lib/push', () => ({
@@ -9,6 +10,7 @@ vi.mock('../../lib/push', () => ({
   disablePush: vi.fn().mockResolvedValue(undefined),
   getLevels: vi.fn().mockReturnValue({ important: true, routine: false }),
   setLevels: vi.fn().mockResolvedValue(undefined),
+  sendTestPush: vi.fn().mockResolvedValue(undefined),
 }))
 
 describe('PushSettings', () => {
@@ -56,5 +58,15 @@ describe('PushSettings', () => {
 
     render(<PushSettings onClose={() => {}} />)
     expect(screen.queryByText(/Safari/i)).toBeNull()
+  })
+
+  it('shows test-push button when enabled and calls sendTestPush', async () => {
+    const sendTestPushMock = vi.mocked(pushLib.sendTestPush)
+    vi.mocked(pushLib.getPushState).mockResolvedValue('enabled')
+
+    render(<PushSettings onClose={() => {}} />)
+    const btn = await screen.findByRole('button', { name: /测试推送/ })
+    fireEvent.click(btn)
+    expect(sendTestPushMock).toHaveBeenCalled()
   })
 })

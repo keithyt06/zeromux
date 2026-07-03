@@ -89,4 +89,15 @@ describe('MarkdownContent enableRawHtml prop', () => {
     const td = document.querySelector('td') as HTMLElement
     expect(td.getAttribute('colspan')).toBe('2')
   })
+
+  it('keeps math marker class so katex can process $x$ under enableRawHtml', () => {
+    render(<MarkdownContent text={'inline $a+b$ math'} isComplete enableRawHtml />)
+    // remark-math emits <code class="math-inline">; sanitize must not strip the class.
+    const el = document.querySelector('code.math-inline, .katex')
+    expect(el).not.toBeNull()
+  })
+  it('keeps language-* so mermaid/highlight class survives sanitize', () => {
+    render(<MarkdownContent text={'```rust\nfn main(){}\n```'} isComplete enableRawHtml />)
+    expect(document.querySelector('code.language-rust, code.hljs')).not.toBeNull()
+  })
 })

@@ -291,6 +291,16 @@ pub fn payload_for(kind: &str, name: &str, session_id: &str, fk: Option<&str>) -
     }
 }
 
+/// Single source of truth for level→kind gating (mirrors spec's mapping).
+/// `test` always sends (self-test must reach the device to be meaningful).
+pub fn kind_allowed_by_levels(kind: &str, lvl_important: bool, lvl_routine: bool) -> bool {
+    match kind {
+        "test" => true,
+        "turn_done" => lvl_routine,
+        _ => lvl_important, // run_failed / confirm / stuck
+    }
+}
+
 pub fn confirm_batch_payload(n: usize) -> PushPayload {
     PushPayload {
         kind: "confirm".into(),
@@ -403,6 +413,9 @@ impl PushService {
         let urgency = if payload.kind == "turn_done" { "low" } else { "high" };
 
         for sub in subs {
+            if !kind_allowed_by_levels(&payload.kind, sub.lvl_important, sub.lvl_routine) {
+                continue; // never send a push the device would not display → no iOS 3-strike revoke
+            }
             if !endpoint_is_safe(&sub.endpoint) {
                 tracing::warn!("push: skipping unsafe endpoint: {}", sub.endpoint);
                 continue;
@@ -672,6 +685,20 @@ mod tests {
         let subs = store.list_for_user("u1");
         assert_eq!(subs.len(), 1);
         assert!(subs[0].lvl_routine, "routine must update on re-upsert");
+    }
+
+    #[test]
+    fn kind_level_gating() {
+        // turn_done needs routine
+        assert!(!kind_allowed_by_levels("turn_done", true, false));
+        assert!(kind_allowed_by_levels("turn_done", false, true));
+        // important-class needs important
+        assert!(kind_allowed_by_levels("run_failed", true, false));
+        assert!(!kind_allowed_by_levels("run_failed", false, false));
+        assert!(kind_allowed_by_levels("confirm", true, false));
+        assert!(kind_allowed_by_levels("stuck", true, false));
+        // test always sends
+        assert!(kind_allowed_by_levels("test", false, false));
     }
 
     #[test]

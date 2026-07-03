@@ -9,6 +9,7 @@ self.addEventListener('message', (e) => {
 })
 
 function levelAllows(kind, levels) {
+  if (kind === 'test') return true
   if (kind === 'turn_done') return !!(levels && levels.routine)
   return !levels || levels.important !== false  // 默认 important 开
 }

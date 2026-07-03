@@ -109,13 +109,16 @@ export default function App() {
     document.addEventListener('visibilitychange', onVis)
     return () => document.removeEventListener('visibilitychange', onVis)
   }, [activeId])
-  // Push: resync subscription on return to foreground, throttled to ≤ once/hour
+  // Push: resync subscription on return to foreground, throttled to ≤ once/hour.
+  // Bypass the throttle if the SW wrote a resync-needed marker (e.g. subscribe failed).
   useEffect(() => {
     let last: number | null = null
-    const onVis = () => {
+    const onVis = async () => {
       if (document.visibilityState !== 'visible') return
+      let forced = false
+      try { const c = await caches.open('zmx-push'); const m = await c.match('resync-needed'); if (m) { forced = true; await c.delete('resync-needed') } } catch { /* ignore */ }
       const now = Date.now()
-      if (!shouldResyncNow(last, now)) return
+      if (!forced && !shouldResyncNow(last, now)) return
       last = now
       resyncPush().catch(() => {})
     }

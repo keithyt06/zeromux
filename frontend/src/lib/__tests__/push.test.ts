@@ -15,6 +15,12 @@ describe('push pure fns', () => {
     expect(levelAllows('run_failed', { important: true, routine: false })).toBe(true)
     expect(levelAllows('confirm', { important: false, routine: false })).toBe(false) // important 控 confirm
   })
+  it('levelAllows: test always allowed regardless of levels', () => {
+    // test push must always display so iOS never counts it as a silent push
+    expect(levelAllows('test', { important: false, routine: false })).toBe(true)
+    expect(levelAllows('turn_done', { important: false, routine: false })).toBe(false)
+    expect(levelAllows('run_failed', { important: false, routine: false })).toBe(false)
+  })
   it('shouldSuppress: visible client on same session suppresses', () => {
     expect(shouldSuppress(['s1','s2'], 's1')).toBe(true)
     expect(shouldSuppress(['s2'], 's1')).toBe(false)

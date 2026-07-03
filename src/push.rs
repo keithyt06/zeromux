@@ -93,9 +93,13 @@ impl PushStore {
     fn init(conn: Connection) -> Result<Self, String> {
         conn.execute_batch(CREATE_SQL)
             .map_err(|e| format!("push_store init: {e}"))?;
-        // Migrate pre-levels DBs; ADD COLUMN fails if already present → ignore.
-        let _ = conn.execute("ALTER TABLE push_subscriptions ADD COLUMN lvl_important INTEGER NOT NULL DEFAULT 1", []);
-        let _ = conn.execute("ALTER TABLE push_subscriptions ADD COLUMN lvl_routine INTEGER NOT NULL DEFAULT 0", []);
+        // Migrate pre-levels DBs; ADD COLUMN fails with "duplicate column" if already present → ignore that case only.
+        if let Err(e) = conn.execute("ALTER TABLE push_subscriptions ADD COLUMN lvl_important INTEGER NOT NULL DEFAULT 1", []) {
+            if !e.to_string().contains("duplicate column") { tracing::warn!("push_store migrate lvl_important: {e}"); }
+        }
+        if let Err(e) = conn.execute("ALTER TABLE push_subscriptions ADD COLUMN lvl_routine INTEGER NOT NULL DEFAULT 0", []) {
+            if !e.to_string().contains("duplicate column") { tracing::warn!("push_store migrate lvl_routine: {e}"); }
+        }
         Ok(PushStore { conn: Mutex::new(conn) })
     }
 

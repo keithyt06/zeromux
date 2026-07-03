@@ -14,6 +14,7 @@ export function vapidKeyToUint8Array(b64url: string): Uint8Array<ArrayBuffer> {
 export type PushLevels = { important: boolean; routine: boolean }
 
 export function levelAllows(kind: string, levels: PushLevels): boolean {
+  if (kind === 'test') return true
   if (kind === 'turn_done') return levels.routine
   return levels.important  // run_failed / confirm
 }
@@ -76,6 +77,8 @@ export async function resyncPush(): Promise<void> {
   const reg = await navigator.serviceWorker.getRegistration()
   const sub = await reg?.pushManager.getSubscription()
   const levels = getLevels()
+  // Refresh the SW's level cache so it stays in sync even after cache eviction.
+  try { const cache = await caches.open('zmx-push'); await cache.put('levels', new Response(JSON.stringify(levels))) } catch {}
   if (sub) {
     const j = sub.toJSON()
     await api('/api/push/subscribe', {

@@ -4,10 +4,13 @@ import type { Components, ExtraProps } from 'react-markdown'
 import remarkGfm from 'remark-gfm'
 import remarkMath from 'remark-math'
 import rehypeHighlight from 'rehype-highlight'
+import rehypeRaw from 'rehype-raw'
+import rehypeSanitize from 'rehype-sanitize'
 import dockerfile from 'highlight.js/lib/languages/dockerfile'
 import { common } from 'lowlight'
 import 'highlight.js/styles/github-dark.css'
 import { markdownComponents } from '../markdownStyles'
+import { vaultSanitizeSchema } from './sanitizeSchema'
 import { MarkdownContext } from './context'
 import CodeBlock from './CodeBlock'
 import { sanitizeStreamingMarkdown, unwrapMarkdownFence } from './sanitize'
@@ -31,12 +34,13 @@ interface Props {
   className?: string
   resolveSrc?: (src: string) => string
   onWikiLink?: (basename: string) => void
+  enableRawHtml?: boolean
 }
 
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
 type RehypePlugin = any
 
-export default function MarkdownContent({ text, isComplete, className, resolveSrc, onWikiLink }: Props) {
+export default function MarkdownContent({ text, isComplete, className, resolveSrc, onWikiLink, enableRawHtml }: Props) {
   const deferredText = useDeferredValue(text)
   // Streaming: sanitize unclosed fences/tables/math. Complete: strip a whole-reply
   // ```markdown wrapper (kiro habit — nested fences mis-render) then use raw text.
@@ -57,6 +61,7 @@ export default function MarkdownContent({ text, isComplete, className, resolveSr
   }, [needsKatex, katexPlugin])
 
   const rehypePlugins: RehypePlugin[] = [
+    ...(enableRawHtml ? [rehypeRaw, [rehypeSanitize, vaultSanitizeSchema]] : []),
     [rehypeHighlight, {
       subset: HLJS_LANGS,
       detect: true,
@@ -76,6 +81,14 @@ export default function MarkdownContent({ text, isComplete, className, resolveSr
   const vaultComponents: Components = {
     ...markdownComponents,
     code: CodeBlock,
+    // When enableRawHtml, vault notes may carry inline style on td/th (e.g. column widths,
+    // background). The default markdownStyles components drop style; override to forward it.
+    ...(enableRawHtml ? {
+      td: ({ children, style }: React.ComponentPropsWithoutRef<'td'>) =>
+        <td className="border border-[var(--border)] px-2 py-1" style={style}>{children}</td>,
+      th: ({ children, style }: React.ComponentPropsWithoutRef<'th'>) =>
+        <th className="border border-[var(--border)] px-2 py-1 bg-[var(--bg-secondary)] text-left font-semibold" style={style}>{children}</th>,
+    } : {}),
     ...(resolveSrc ? {
       img: ({ src, alt, title }: React.ComponentPropsWithoutRef<'img'> & ExtraProps) =>
         <img src={resolveSrc(src || '')} alt={alt} title={title} />,

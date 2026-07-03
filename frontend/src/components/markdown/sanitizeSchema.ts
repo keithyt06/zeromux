@@ -1,5 +1,8 @@
 import { defaultSchema } from 'rehype-sanitize'
-import type { Schema } from 'rehype-sanitize'
+import type { Schema } from 'hast-util-sanitize'
+
+// PropertyDefinition is not re-exported at the package root; derive it locally.
+type PropertyDefinition = NonNullable<Schema['attributes']>[string][number]
 
 // Allowlist for vault (Obsidian) note HTML. Extends the safe defaultSchema.
 // SECURITY: `style` is allowed for the note's own layout (tables/spans). Its
@@ -27,7 +30,7 @@ export const vaultSanitizeSchema: Schema = {
     ],
     // span: allow style for inline layout from vault notes
     span: [
-      ...((defaultSchema.attributes?.span as unknown[]) ?? []),
+      ...((defaultSchema.attributes?.span as PropertyDefinition[]) ?? []),
       'style',
     ],
     // Table cell attrs (td/th not in defaultSchema, so start fresh)
@@ -36,7 +39,7 @@ export const vaultSanitizeSchema: Schema = {
     // Global attrs: extend defaultSchema's '*' with style
     // (defaultSchema already includes colSpan, rowSpan, align, etc.)
     '*': [
-      ...((defaultSchema.attributes?.['*'] as unknown[]) ?? []),
+      ...((defaultSchema.attributes?.['*'] as PropertyDefinition[]) ?? []),
       'style',
     ],
   },

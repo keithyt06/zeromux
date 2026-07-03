@@ -63,3 +63,24 @@ describe('MarkdownContent vault props', () => {
     expect(a?.getAttribute('href') || '').not.toContain('javascript:')
   })
 })
+
+describe('MarkdownContent enableRawHtml prop', () => {
+  it('renders inline HTML table when enableRawHtml (not raw source)', () => {
+    render(<MarkdownContent text={'<table><tr><td>Cell</td></tr></table>'} isComplete enableRawHtml />)
+    expect(document.querySelector('table td')?.textContent).toBe('Cell')
+  })
+  it('strips <script> under enableRawHtml', () => {
+    render(<MarkdownContent text={'<div>ok</div><script>window.__x=1</script>'} isComplete enableRawHtml />)
+    expect(document.querySelector('script')).toBeNull()
+    expect(document.body.textContent).toContain('ok')
+  })
+  it('without enableRawHtml, inline HTML stays as text (chat path unchanged)', () => {
+    render(<MarkdownContent text={'<table><tr><td>Cell</td></tr></table>'} isComplete />)
+    expect(document.querySelector('table')).toBeNull()
+  })
+  it('preserves table inline style under enableRawHtml', () => {
+    render(<MarkdownContent text={'<table><tr><td style="background:#fff">x</td></tr></table>'} isComplete enableRawHtml />)
+    const td = document.querySelector('td') as HTMLElement
+    expect(td.getAttribute('style')).toContain('background')
+  })
+})

@@ -8,22 +8,17 @@ self.addEventListener('message', (e) => {
   }
 })
 
-function levelAllows(kind, levels) {
-  if (kind === 'test') return true
-  if (kind === 'turn_done') return !!(levels && levels.routine)
-  return !levels || levels.important !== false  // 默认 important 开
-}
-
 self.addEventListener('push', (event) => {
   event.waitUntil((async () => {
     let payload = {}
     try { payload = event.data ? event.data.json() : {} } catch (_) {}
     const { kind, session_id, title, body } = payload
-    // 分级:读 IndexedDB/Cache 里前端写的 push_levels;读不到用默认(important 开 / routine 关)
-    const levels = await readLevels()  // { important:true, routine:false } 默认
-    // Level filtering is now enforced server-side (send_to_user) so iOS never
-    // receives an undisplayed push. This client check is only a Chrome backstop.
-    if (!levelAllows(kind, levels)) return
+    // Level filtering is authoritative on the server (send_to_user gates by the
+    // subscription's stored levels), so anything that arrives here is meant to be
+    // shown. We MUST NOT re-gate by the local level cache: that cache is evictable
+    // on iOS, and a cache miss would turn a server-approved routine push into a
+    // silent push (no showNotification) — the exact iOS "3-strike" revocation this
+    // feature exists to eliminate. Show every push; only foreground-suppress turn_done.
     // 前台抑制:仅 turn_done。实时问所有可见 client 的 active
     if (kind === 'turn_done') {
       const wins = await self.clients.matchAll({ type: 'window' })

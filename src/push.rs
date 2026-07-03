@@ -135,14 +135,20 @@ impl PushStore {
         // Prune stale subscriptions: keep newest PUSH_MAX_SUBS_PER_USER per user.
         // created_ms is refreshed by resyncPush() on each app foreground, so a
         // low-frequency-but-active device (e.g. rarely-opened iPad) is not wrongly evicted.
-        conn.execute(
+        // The `endpoint <> ?3` guard makes the row we just wrote un-prunable: without it,
+        // if 5+ existing rows share this insert's millisecond, the created_ms tie falls to
+        // `endpoint DESC` and a low-sorting new endpoint could be deleted the instant it
+        // subscribes. A device must never lose the subscription it just registered.
+        if let Err(e) = conn.execute(
             "DELETE FROM push_subscriptions
-             WHERE user_id = ?1 AND endpoint NOT IN (
+             WHERE user_id = ?1 AND endpoint <> ?3 AND endpoint NOT IN (
                  SELECT endpoint FROM push_subscriptions WHERE user_id = ?1
                  ORDER BY created_ms DESC, endpoint DESC LIMIT ?2
              )",
-            params![user_id, PUSH_MAX_SUBS_PER_USER as i64],
-        ).ok();
+            params![user_id, PUSH_MAX_SUBS_PER_USER as i64, endpoint],
+        ) {
+            tracing::warn!("push_store prune: {e}"); // mitigation failing shouldn't be silent
+        }
         Ok(())
     }
 
@@ -733,6 +739,31 @@ mod tests {
         // other users unaffected
         store.upsert("u2", "https://ep/u2", "p", "a", true, false).unwrap();
         assert_eq!(store.list_for_user("u2").len(), 1);
+    }
+
+    #[test]
+    fn upsert_never_prunes_the_just_written_row() {
+        // Repro for the created_ms-tie self-eviction: pre-seed 5 rows with a created_ms
+        // far in the future so a freshly-upserted row sorts LAST by created_ms. Without the
+        // `endpoint <> ?` guard the new subscription would be deleted the instant it registers.
+        let store = PushStore::open_in_memory().unwrap();
+        {
+            let conn = store.conn.lock().unwrap();
+            for i in 0..5 {
+                conn.execute(
+                    "INSERT INTO push_subscriptions (endpoint, user_id, p256dh, auth, created_ms, lvl_important, lvl_routine)
+                     VALUES (?1, 'u1', 'p', 'a', ?2, 1, 0)",
+                    params![format!("https://zzz/{i}"), i64::MAX],
+                ).unwrap();
+            }
+        }
+        // New endpoint sorts low on every tiebreak (created_ms=now < MAX; 'a' < 'z').
+        store.upsert("u1", "https://aaa/new", "p", "a", true, false).unwrap();
+        let subs = store.list_for_user("u1");
+        assert!(
+            subs.iter().any(|s| s.endpoint == "https://aaa/new"),
+            "the subscription just registered must survive the prune"
+        );
     }
 
     #[test]

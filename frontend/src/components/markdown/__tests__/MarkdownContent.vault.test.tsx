@@ -63,3 +63,49 @@ describe('MarkdownContent vault props', () => {
     expect(a?.getAttribute('href') || '').not.toContain('javascript:')
   })
 })
+
+describe('MarkdownContent enableRawHtml prop', () => {
+  it('renders inline HTML table when enableRawHtml (not raw source)', () => {
+    render(<MarkdownContent text={'<table><tr><td>Cell</td></tr></table>'} isComplete enableRawHtml />)
+    expect(document.querySelector('table td')?.textContent).toBe('Cell')
+  })
+  it('strips <script> under enableRawHtml', () => {
+    render(<MarkdownContent text={'<div>ok</div><script>window.__x=1</script>'} isComplete enableRawHtml />)
+    expect(document.querySelector('script')).toBeNull()
+    expect(document.body.textContent).toContain('ok')
+  })
+  it('without enableRawHtml, inline HTML stays as text (chat path unchanged)', () => {
+    render(<MarkdownContent text={'<table><tr><td>Cell</td></tr></table>'} isComplete />)
+    expect(document.querySelector('table')).toBeNull()
+  })
+  it('preserves table inline style under enableRawHtml', () => {
+    render(<MarkdownContent text={'<table><tr><td style="background:#fff">x</td></tr></table>'} isComplete enableRawHtml />)
+    const td = document.querySelector('td') as HTMLElement
+    expect(td.getAttribute('style')).toContain('background')
+  })
+
+  it('preserves colspan on td under enableRawHtml (real vault tables use it)', () => {
+    render(<MarkdownContent text={'<table><tr><td colspan="2">wide</td></tr></table>'} isComplete enableRawHtml />)
+    const td = document.querySelector('td') as HTMLElement
+    expect(td.getAttribute('colspan')).toBe('2')
+  })
+
+  it('forwards width/height on inline <img> under enableRawHtml (Obsidian sizing)', () => {
+    render(<MarkdownContent text={'<img src="pic.png" width="300">'} isComplete enableRawHtml
+      resolveSrc={(s) => `RAW:${s}`} />)
+    const img = document.querySelector('img') as HTMLImageElement
+    expect(img.getAttribute('src')).toBe('RAW:pic.png')
+    expect(img.getAttribute('width')).toBe('300')
+  })
+
+  it('keeps math marker class so katex can process $x$ under enableRawHtml', () => {
+    render(<MarkdownContent text={'inline $a+b$ math'} isComplete enableRawHtml />)
+    // remark-math emits <code class="math-inline">; sanitize must not strip the class.
+    const el = document.querySelector('code.math-inline, .katex')
+    expect(el).not.toBeNull()
+  })
+  it('keeps language-* so mermaid/highlight class survives sanitize', () => {
+    render(<MarkdownContent text={'```rust\nfn main(){}\n```'} isComplete enableRawHtml />)
+    expect(document.querySelector('code.language-rust, code.hljs')).not.toBeNull()
+  })
+})

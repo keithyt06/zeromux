@@ -59,6 +59,41 @@
   --accent-brand: #b08800;
 }
 
+/* Vault reading surface: notes are authored for a light theme (light cell
+   backgrounds, dark text). Force light-theme CSS vars inside the surface so
+   MarkdownContent's var(--text-bright)/var(--accent-blue)/etc. stay legible on
+   the white background even when the app is in dark mode. Mirrors :root.light. */
+.vault-reading-surface {
+  /* Paint containment: a note's inline `position:fixed;inset:0` survives sanitize
+     (CSP blocks exfil, not layout); containment makes this the containing block for
+     fixed descendants and clips their paint to the reading area, preventing a
+     full-viewport overlay (clickjacking) from an untrusted note. */
+  contain: paint;
+  --bg-primary:   #ffffff;
+  --bg-secondary: #f6f8fa;
+  --bg-tertiary:  #eaeef2;
+  --bg-hover:     #dce3ea;
+  --border:       #d0d7de;
+  --border-light: #e1e4e8;
+  --text-primary: #1f2328;
+  --text-bright:  #1f2328;
+  --text-secondary: #656d76;
+  --text-muted:   #8c959f;
+  --accent-blue:  #0969da;
+  --accent-blue-hover: #0550ae;
+  --accent-green: #1a7f37;
+  --accent-green-hover: #15803d;
+  --accent-green-text: #1a7f37;
+  --accent-purple: #8250df;
+  --accent-purple-dim: #6639ba;
+  --accent-purple-bg: #f3f0ff;
+  --accent-purple-text: #6e5494;
+  --accent-yellow: #9a6700;
+  --accent-red:   #cf222e;
+  --code-bg:      #f6f8fa;
+  --accent-brand: #b08800;
+}
+
 /* ── xterm ── */
 
 .xterm-container {

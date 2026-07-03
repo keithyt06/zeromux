@@ -58,13 +58,18 @@ export default function VaultReader({ onClose }: { onClose: () => void }) {
           <span className="text-sm truncate flex-1">{openPath}</span>
           <button onClick={onClose} className="p-1.5 text-[var(--text-secondary)] hover:text-[var(--accent-red)]"><X size={18} /></button>
         </div>
+        {/* vault-reading-surface: notes are authored for a light theme (dark text like #111, light
+            backgrounds without explicit color); a white surface makes all inline styles coherent
+            and legible. Code blocks keep their own github-dark.css background. */}
         <div className="flex-1 overflow-auto">
-          <article className="mx-auto max-w-[72ch] px-4 py-6 leading-relaxed text-[15px]">
-            {truncated && <div className="mb-3 px-3 py-2 text-xs rounded bg-[var(--bg-tertiary)] text-[var(--accent-yellow)]">内容过长,仅显示前 1MB</div>}
-            <MarkdownContent text={content} isComplete
-              resolveSrc={(s) => resolveVaultImageSrc(s, openPath)}
-              onWikiLink={onWikiLink} />
-          </article>
+          <div className="vault-reading-surface bg-white text-neutral-900 min-h-full">
+            <article className="mx-auto max-w-[72ch] px-4 py-6 leading-relaxed text-[15px]">
+              {truncated && <div className="mb-3 px-3 py-2 text-xs rounded bg-neutral-100 text-amber-700">内容过长,仅显示前 1MB</div>}
+              <MarkdownContent text={content} isComplete enableRawHtml
+                resolveSrc={(s) => resolveVaultImageSrc(s, openPath)}
+                onWikiLink={onWikiLink} />
+            </article>
+          </div>
         </div>
       </div>
     )

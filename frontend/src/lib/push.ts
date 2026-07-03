@@ -78,7 +78,7 @@ export async function resyncPush(): Promise<void> {
   const sub = await reg?.pushManager.getSubscription()
   const levels = getLevels()
   // Refresh the SW's level cache so it stays in sync even after cache eviction.
-  try { const cache = await caches.open('zmx-push'); await cache.put('levels', new Response(JSON.stringify(levels))) } catch {}
+  try { const cache = await caches.open('zmx-push'); await cache.put('levels', new Response(JSON.stringify(levels))) } catch { /* cache write is best-effort */ }
   if (sub) {
     const j = sub.toJSON()
     await api('/api/push/subscribe', {

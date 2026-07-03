@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest'
-import { vapidKeyToUint8Array, levelAllows, shouldSuppress } from '../push'
+import { vapidKeyToUint8Array, levelAllows, shouldSuppress, pickApplicationServerKey } from '../push'
 
 describe('push pure fns', () => {
   it('vapidKeyToUint8Array decodes base64url to 65-byte P-256 point', () => {
@@ -19,5 +19,17 @@ describe('push pure fns', () => {
     expect(shouldSuppress(['s1','s2'], 's1')).toBe(true)
     expect(shouldSuppress(['s2'], 's1')).toBe(false)
     expect(shouldSuppress([], 's1')).toBe(false)
+  })
+})
+
+describe('pickApplicationServerKey', () => {
+  it('prefers oldSubscription key when present', () => {
+    const old = new Uint8Array([1,2,3]).buffer
+    const out = pickApplicationServerKey(old, 'BQ') // fetched ignored
+    expect(Array.from(out)).toEqual([1,2,3])
+  })
+  it('falls back to fetched base64url when old key absent', () => {
+    const out = pickApplicationServerKey(null, 'AQID') // base64url AQID = [1,2,3]
+    expect(Array.from(out)).toEqual([1,2,3])
   })
 })

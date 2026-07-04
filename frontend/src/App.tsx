@@ -219,11 +219,11 @@ export default function App() {
     setDocTabs(prev => {
       const next = prev.filter(t => t.id !== id)
       setActiveId(cur => cur === id
-        ? (next[0]?.id ?? null)   // fall back within doc tabs; else null → sessions row shows
+        ? (next[0]?.id ?? sessions[0]?.id ?? null)   // fall back within doc tabs, else a real session, else null
         : cur)
       return next
     })
-  }, [])
+  }, [sessions])
 
   const handleDelete = useCallback(async (id: string) => {
     await deleteSession(id)

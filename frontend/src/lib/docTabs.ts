@@ -9,7 +9,7 @@ export const DEFAULT_DOC_TITLE = '文档'
 // Note title shown in the sidebar tab: basename without a trailing .md (case-insensitive).
 export function docTitleFromPath(path: string): string {
   const base = path.split('/').pop() || path
-  return base.replace(/\.md$/i, '')
+  return base.replace(/\.md$/i, '') || base
 }
 
 const uuid = () =>

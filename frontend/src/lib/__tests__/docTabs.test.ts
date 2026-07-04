@@ -28,6 +28,8 @@ describe('docTabs', () => {
     expect(docTitleFromPath('Top Level.md')).toBe('Top Level')
     expect(docTitleFromPath('folder/no-ext')).toBe('no-ext')
     expect(docTitleFromPath('folder/Weird.MD')).toBe('Weird')
+    // a basename that is only the extension must not strip down to '' (would show a blank tab)
+    expect(docTitleFromPath('folder/.md')).toBe('.md')
   })
 
   it('DEFAULT_DOC_TITLE is 文档', () => {

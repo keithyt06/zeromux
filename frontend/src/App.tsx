@@ -14,7 +14,7 @@ import FileBrowser from './components/FileBrowser'
 import GitViewer from './components/GitViewer'
 import AgentDashboard from './components/AgentDashboard'
 import VaultReader from './components/VaultReader'
-import { type DocTab, newDocTab, isDocTabId, loadDocTabs, saveDocTabs } from './lib/docTabs'
+import { type DocTab, newDocTab, isDocTabId, loadDocTabs, saveDocTabs, DEFAULT_DOC_TITLE } from './lib/docTabs'
 
 type AuthState = 'loading' | 'unauthenticated' | 'pending' | 'active'
 type OverlayView = 'none' | 'files' | 'git' | 'events'
@@ -197,7 +197,7 @@ export default function App() {
 
   const handleCreate = useCallback(async (type: SessionType | 'vault', workDir?: string, tmuxTarget?: string, initialPrompt?: string) => {
     if (type === 'vault') {
-      const tab = newDocTab('Obsidian')
+      const tab = newDocTab(DEFAULT_DOC_TITLE)
       setDocTabs(prev => [...prev, tab])
       setActiveId(tab.id)
       return
@@ -224,6 +224,10 @@ export default function App() {
       return next
     })
   }, [sessions])
+
+  const updateDocTabTitle = useCallback((id: string, title: string | null) => {
+    setDocTabs(prev => prev.map(t => t.id === id ? { ...t, title: title ?? DEFAULT_DOC_TITLE } : t))
+  }, [])
 
   const handleDelete = useCallback(async (id: string) => {
     await deleteSession(id)
@@ -347,7 +351,7 @@ export default function App() {
             const isActive = t.id === activeId
             return (
               <div key={t.id} className={`absolute inset-0 ${isActive ? '' : 'hidden'}`}>
-                <VaultReader />
+                <VaultReader onTitleChange={(title) => updateDocTabTitle(t.id, title)} />
               </div>
             )
           })}

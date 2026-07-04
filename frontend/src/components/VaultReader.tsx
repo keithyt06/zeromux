@@ -5,7 +5,7 @@ import { filterVaultEntries, resolveVaultImageSrc, getRecentNotes, pushRecentNot
 import MarkdownContent from './markdown/MarkdownContent'
 import type { DirListEntry } from '../lib/api'
 
-export default function VaultReader({ onClose }: { onClose: () => void }) {
+export default function VaultReader({ onClose }: { onClose?: () => void }) {
   const [mode, setMode] = useState<'list' | 'read'>('list')
   const [cwd, setCwd] = useState('')
   const [entries, setEntries] = useState<DirListEntry[]>([])
@@ -52,11 +52,11 @@ export default function VaultReader({ onClose }: { onClose: () => void }) {
   // READ MODE
   if (mode === 'read') {
     return (
-      <div className="absolute inset-0 bg-[var(--bg-primary)] z-50 flex flex-col">
+      <div className="h-full bg-[var(--bg-primary)] flex flex-col">
         <div className="flex items-center gap-2 p-2 border-b border-[var(--border)]">
           <button onClick={() => setMode('list')} className="p-1.5 text-[var(--text-secondary)] hover:text-[var(--text-primary)]"><ChevronLeft size={18} /></button>
           <span className="text-sm truncate flex-1">{openPath}</span>
-          <button onClick={onClose} className="p-1.5 text-[var(--text-secondary)] hover:text-[var(--accent-red)]"><X size={18} /></button>
+          {onClose && <button onClick={onClose} className="p-1.5 text-[var(--text-secondary)] hover:text-[var(--accent-red)]"><X size={18} /></button>}
         </div>
         {/* vault-reading-surface keeps the app's dark theme (per user preference). The class is
             retained for `contain: paint` (clickjacking containment). Notes carry their own inline
@@ -79,10 +79,10 @@ export default function VaultReader({ onClose }: { onClose: () => void }) {
   // LIST MODE
   const crumbs = cwd ? cwd.split('/') : []
   return (
-    <div className="absolute inset-0 bg-[var(--bg-primary)] z-50 flex flex-col">
+    <div className="h-full bg-[var(--bg-primary)] flex flex-col">
       <div className="flex items-center gap-2 p-2 border-b border-[var(--border)]">
         <span className="text-sm font-bold flex-1">📓 Obsidian</span>
-        <button onClick={onClose} className="p-1.5 text-[var(--text-secondary)] hover:text-[var(--accent-red)]"><X size={18} /></button>
+        {onClose && <button onClick={onClose} className="p-1.5 text-[var(--text-secondary)] hover:text-[var(--accent-red)]"><X size={18} /></button>}
       </div>
       <div className="p-2 border-b border-[var(--border)]">
         <div className="flex items-center gap-2 px-2 py-1 rounded bg-[var(--bg-tertiary)]">

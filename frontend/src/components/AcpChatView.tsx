@@ -12,6 +12,7 @@ import { SessionLifetimeBadge } from './SessionLifetimeBadge'
 import { foldTranscript, type WireEvent, type Block, type TurnGroup } from '../lib/transcript'
 import { partitionBlocks, type Density } from '../lib/density'
 import { STUCK_SILENCE_MS } from '../lib/stuck'
+import { shouldStickToBottom } from '../lib/scrollReplay'
 
 // ── Message types ──
 
@@ -119,6 +120,10 @@ export default function AcpChatView({ sessionId, agentType = 'claude', onRegiste
   const expandDensity = useCallback(() => setDensity('full'), [])
   const wsRef = useRef<WebSocket | null>(null)
   const scrollRef = useRef<HTMLDivElement>(null)
+  const replayingRef = useRef(false)
+  const userScrolledUpRef = useRef(false)
+  const roRef = useRef<ResizeObserver | null>(null)
+  const roTimerRef = useRef<ReturnType<typeof setTimeout> | undefined>(undefined)
 
   const scrollBottom = useCallback(() => {
     requestAnimationFrame(() => {
@@ -155,6 +160,10 @@ export default function AcpChatView({ sessionId, agentType = 'claude', onRegiste
         setNotices([])
         setBusy(false)
         setTurnStartedMs(null)
+        // Arm the replay window: auto bottom-stick is allowed until replay_done,
+        // and only while the user hasn't scrolled up to read history.
+        replayingRef.current = true
+        userScrolledUpRef.current = false
       }
 
       ws.onmessage = (evt) => {
@@ -275,6 +284,25 @@ export default function AcpChatView({ sessionId, agentType = 'claude', onRegiste
         // Reconnect replay finished — clear any stale queued hint (backend also
         // makes the queued event ephemeral; this is the frontend safety net).
         setQueuedCount(0)
+        // Stable bottom-stick: only inside the replay window and only if the user
+        // hasn't scrolled up (passive reconnect must not yank a reader to the end).
+        const el = scrollRef.current
+        if (el && shouldStickToBottom({ replaying: replayingRef.current, userScrolledUp: userScrolledUpRef.current })) {
+          el.scrollTop = el.scrollHeight
+          // Async content (markdown/mermaid/katex/images) grows height after this
+          // tick; follow those growths for a short window via ResizeObserver.
+          roRef.current?.disconnect()
+          const ro = new ResizeObserver(() => {
+            if (userScrolledUpRef.current) { ro.disconnect(); return }
+            el.scrollTop = el.scrollHeight
+          })
+          ro.observe(el)
+          roRef.current = ro
+          if (roTimerRef.current) clearTimeout(roTimerRef.current)
+          roTimerRef.current = setTimeout(() => { ro.disconnect(); roRef.current = null }, 2000)
+        }
+        // Replay window closes here — live output no longer auto-sticks.
+        replayingRef.current = false
         break
       }
     }
@@ -377,6 +405,12 @@ export default function AcpChatView({ sessionId, agentType = 'claude', onRegiste
   // Clear the pending metrics-refresh timer on unmount.
   useEffect(() => () => { if (metricsDebounce.current) clearTimeout(metricsDebounce.current) }, [])
 
+  // Disconnect the replay-follow ResizeObserver and its disarm timer on unmount.
+  useEffect(() => () => {
+    roRef.current?.disconnect()
+    if (roTimerRef.current) clearTimeout(roTimerRef.current)
+  }, [])
+
   return (
     <div className="flex flex-col h-full">
       {lifetime.turns > 0 && (
@@ -392,7 +426,19 @@ export default function AcpChatView({ sessionId, agentType = 'claude', onRegiste
           refreshKey={metricsRefresh}
         />
       )}
-      <div ref={scrollRef} className="flex-1 overflow-y-auto px-5 py-4 space-y-4">
+      <div
+        ref={scrollRef}
+        onScroll={() => {
+          const el = scrollRef.current
+          if (!el || !replayingRef.current) return
+          // `< 4` is a bottom-stick tolerance (scrollbar pixel jitter), not a
+          // "N px from bottom" heuristic: any departure from the bottom during
+          // replay means the user is reading history, so stop auto-sticking.
+          const atBottom = el.scrollHeight - el.scrollTop - el.clientHeight < 4
+          if (!atBottom) userScrolledUpRef.current = true
+        }}
+        className="flex-1 overflow-y-auto px-5 py-4 space-y-4"
+      >
         {showDensityHint && (
           <div className="flex items-center gap-2 text-[11px] text-[var(--text-muted)] bg-[var(--bg-secondary)] border border-[var(--border)] rounded px-2 py-1">
             <span className="flex-1">已为你精简显示，可切完整</span>

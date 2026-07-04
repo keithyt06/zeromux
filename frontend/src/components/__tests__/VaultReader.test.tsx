@@ -25,4 +25,15 @@ describe('VaultReader', () => {
     // light reading surface marker class must be present on the read container
     expect(document.querySelector('.vault-reading-surface')).not.toBeNull()
   })
+
+  it('renders embedded (no fixed/overlay wrapper) when onClose is omitted', async () => {
+    const { container } = render(<VaultReader />)
+    await waitFor(() => expect(screen.getByText('note.md')).toBeInTheDocument())
+    // no full-screen overlay wrapper
+    expect(container.querySelector('.z-50')).toBeNull()
+    // embedded root fills height instead
+    expect(container.querySelector('.h-full')).not.toBeNull()
+    // no close button when onClose omitted (close = delete the tab at list level)
+    expect(container.querySelector('button svg.lucide-x')).toBeNull()
+  })
 })

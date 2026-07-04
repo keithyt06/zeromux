@@ -13,6 +13,8 @@ import SessionInfoBar from './components/SessionInfoBar'
 import FileBrowser from './components/FileBrowser'
 import GitViewer from './components/GitViewer'
 import AgentDashboard from './components/AgentDashboard'
+import VaultReader from './components/VaultReader'
+import { type DocTab, newDocTab, isDocTabId, loadDocTabs, saveDocTabs } from './lib/docTabs'
 
 type AuthState = 'loading' | 'unauthenticated' | 'pending' | 'active'
 type OverlayView = 'none' | 'files' | 'git' | 'events'
@@ -21,6 +23,8 @@ export default function App() {
   const [authState, setAuthState] = useState<AuthState>('loading')
   const [user, setUser] = useState<UserInfo | null>(null)
   const [sessions, setSessions] = useState<SessionInfo[]>([])
+  const [docTabs, setDocTabs] = useState<DocTab[]>(() => loadDocTabs())
+  useEffect(() => { saveDocTabs(docTabs) }, [docTabs])
   const [activeId, setActiveId] = useState<string | null>(null)
   const [overlay, setOverlay] = useState<Record<string, OverlayView>>({})
   // session id → turns_completed already seen (red-dot read baseline)
@@ -63,7 +67,8 @@ export default function App() {
       const list = await listSessions()
       setSessions(list)
       if (list.length > 0) {
-        setActiveId(prev => prev && list.some(s => s.id === prev) ? prev : list[0].id)
+        setActiveId(prev =>
+          prev && (list.some(s => s.id === prev) || isDocTabId(prev)) ? prev : list[0].id)
       }
     } catch {
       setAuthState('unauthenticated')
@@ -190,7 +195,13 @@ export default function App() {
     }
   }, [])
 
-  const handleCreate = useCallback(async (type: SessionType, workDir?: string, tmuxTarget?: string, initialPrompt?: string) => {
+  const handleCreate = useCallback(async (type: SessionType | 'vault', workDir?: string, tmuxTarget?: string, initialPrompt?: string) => {
+    if (type === 'vault') {
+      const tab = newDocTab('Obsidian')
+      setDocTabs(prev => [...prev, tab])
+      setActiveId(tab.id)
+      return
+    }
     const s = await createSession(type, undefined, workDir, tmuxTarget, initialPrompt)
     setSessions(prev => [...prev, s])
     setActiveId(s.id)
@@ -204,16 +215,26 @@ export default function App() {
     setActiveId(null)
   }, [])
 
+  const handleDeleteDocTab = useCallback((id: string) => {
+    setDocTabs(prev => {
+      const next = prev.filter(t => t.id !== id)
+      setActiveId(cur => cur === id
+        ? (next[0]?.id ?? sessions[0]?.id ?? null)   // fall back within doc tabs, else a real session, else null
+        : cur)
+      return next
+    })
+  }, [sessions])
+
   const handleDelete = useCallback(async (id: string) => {
     await deleteSession(id)
     setSessions(prev => {
       const next = prev.filter(s => s.id !== id)
       if (activeId === id) {
-        setActiveId(next.length > 0 ? next[0].id : null)
+        setActiveId(next[0]?.id ?? docTabs[0]?.id ?? null)
       }
       return next
     })
-  }, [activeId])
+  }, [activeId, docTabs])
 
   const handleApproved = useCallback(() => {
     setAuthState('active')
@@ -250,10 +271,11 @@ export default function App() {
     <div className="h-full flex bg-[var(--bg-primary)] text-[var(--text-primary)]">
       <Sidebar
         sessions={sessions}
+        docTabs={docTabs}
         activeId={activeId}
         onSelect={setActiveId}
         onCreate={handleCreate}
-        onDelete={handleDelete}
+        onDelete={(id) => isDocTabId(id) ? handleDeleteDocTab(id) : handleDelete(id)}
         onRename={handleRename}
         hasUnread={hasUnread}
         onLogout={handleLogout}
@@ -321,7 +343,15 @@ export default function App() {
               </div>
             )
           })}
-          {sessions.length === 0 && (
+          {docTabs.map(t => {
+            const isActive = t.id === activeId
+            return (
+              <div key={t.id} className={`absolute inset-0 ${isActive ? '' : 'hidden'}`}>
+                <VaultReader />
+              </div>
+            )
+          })}
+          {sessions.length === 0 && docTabs.length === 0 && (
             <div className="flex items-center justify-center h-full text-[var(--text-muted)] text-sm">
               Create a session to get started
             </div>

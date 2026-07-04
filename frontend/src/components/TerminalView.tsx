@@ -10,6 +10,7 @@ import { GitBranch, Folder, Circle } from 'lucide-react'
 import MobileKeyBar, { type BarKey } from './MobileKeyBar'
 import Composer from './Composer'
 import { arrowSequence, rowHeight, linesFromDrag, bracketedPaste, submitSequence, controlSequence, launchSequence, type ArrowKey } from '../lib/terminalInput'
+import { shouldStickToBottom } from '../lib/scrollReplay'
 
 const FONT_SIZE = 14
 
@@ -72,6 +73,13 @@ export default function TerminalView({ sessionId, active, theme }: Props) {
   const fitRef = useRef<FitAddon | null>(null)
   const wsRef = useRef<WebSocket | null>(null)
   const initRef = useRef(false)
+  // Terminal has no replay_done marker: self-arm a replay window on (re)connect
+  // and disarm it after the first settled write burst (or on user scroll/input).
+  // Auto bottom-stick fires ONLY inside this window and only if the user hasn't
+  // scrolled up, so reading scrollback while live output arrives is never yanked.
+  const replayingRef = useRef(false)
+  const userScrolledUpRef = useRef(false)
+  const scrollDebounceRef = useRef<ReturnType<typeof setTimeout> | undefined>(undefined)
   const [status, setStatus] = useState<SessionStatus | null>(null)
   // 触摸设备检测：any-pointer:coarse 或 maxTouchPoints>0，少漏触屏笔记本/iPad。
   // 触摸能力在页面生命周期内不变，用惰性初始化在挂载时算一次即可（避免 effect 内 setState）。
@@ -164,7 +172,18 @@ export default function TerminalView({ sessionId, active, theme }: Props) {
     fitRef.current = fit
 
     term.onData(data => {
+      // User input closes the replay window (append to the existing sendInput
+      // registration — do NOT add a second onData or input would double-send).
+      replayingRef.current = false
       sendInput(data)
+    })
+
+    term.onScroll(() => {
+      // User scrolling up during replay (not pinned to bottom) → treat as reading
+      // history and stop auto bottom-stick.
+      const buf = term.buffer.active
+      const atBottom = buf.viewportY >= buf.baseY
+      if (replayingRef.current && !atBottom) userScrolledUpRef.current = true
     })
 
     term.onBinary(data => {
@@ -215,6 +234,7 @@ export default function TerminalView({ sessionId, active, theme }: Props) {
       container?.removeEventListener('touchmove', onTouchMove)
       container?.removeEventListener('touchend', onTouchEnd)
       container?.removeEventListener('touchcancel', onTouchEnd)
+      if (scrollDebounceRef.current) clearTimeout(scrollDebounceRef.current)
       wsRef.current?.close()
       term.dispose()
     }
@@ -250,6 +270,9 @@ export default function TerminalView({ sessionId, active, theme }: Props) {
         // The server replays full scrollback on (re)connect; reset the terminal
         // first so a reconnect doesn't double-paint the buffer.
         termRef.current?.reset()
+        // Arm the replay window: the server is about to replay full scrollback.
+        replayingRef.current = true
+        userScrolledUpRef.current = false
         const fit = fitRef.current
         if (fit) {
           const dims = fit.proposeDimensions()
@@ -264,7 +287,17 @@ export default function TerminalView({ sessionId, active, theme }: Props) {
         try {
           const msg = JSON.parse(evt.data)
           if (msg.type === 'output') {
-            termRef.current?.write(b64decode(msg.data))
+            termRef.current?.write(b64decode(msg.data), () => {
+              if (scrollDebounceRef.current) clearTimeout(scrollDebounceRef.current)
+              scrollDebounceRef.current = setTimeout(() => {
+                if (shouldStickToBottom({ replaying: replayingRef.current, userScrolledUp: userScrolledUpRef.current })) {
+                  termRef.current?.scrollToBottom()
+                }
+                // First settle after the replay burst closes the window: live
+                // output afterwards must not auto-scroll (user may read scrollback).
+                replayingRef.current = false
+              }, 120)
+            })
           }
         } catch { /* ignore */ }
       }

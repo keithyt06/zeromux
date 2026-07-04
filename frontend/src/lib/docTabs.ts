@@ -2,6 +2,16 @@ export type DocTab = { id: string; title: string; kind: 'vault' }
 
 const KEY = 'zeromux:doc-tabs'
 
+// Generic label a doc tab shows when no note is open (list mode) and what we persist —
+// live note names live only in memory, never on disk (refresh reopens in list mode).
+export const DEFAULT_DOC_TITLE = '文档'
+
+// Note title shown in the sidebar tab: basename without a trailing .md (case-insensitive).
+export function docTitleFromPath(path: string): string {
+  const base = path.split('/').pop() || path
+  return base.replace(/\.md$/i, '')
+}
+
 const uuid = () =>
   (typeof crypto !== 'undefined' && 'randomUUID' in crypto)
     ? crypto.randomUUID()
@@ -30,5 +40,7 @@ export function loadDocTabs(): DocTab[] {
 }
 
 export function saveDocTabs(tabs: DocTab[]): void {
-  localStorage.setItem(KEY, JSON.stringify(tabs.map(t => ({ id: t.id, title: t.title, kind: t.kind }))))
+  localStorage.setItem(KEY, JSON.stringify(
+    tabs.map(t => ({ id: t.id, title: t.kind === 'vault' ? DEFAULT_DOC_TITLE : t.title, kind: t.kind }))
+  ))
 }

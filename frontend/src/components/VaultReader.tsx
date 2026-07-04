@@ -4,8 +4,9 @@ import { listVault, getVaultFile, getVaultSearch, resolveWikiLink } from '../lib
 import { filterVaultEntries, resolveVaultImageSrc, getRecentNotes, pushRecentNote, removeRecentNote } from '../lib/vault'
 import MarkdownContent from './markdown/MarkdownContent'
 import type { DirListEntry } from '../lib/api'
+import { docTitleFromPath } from '../lib/docTabs'
 
-export default function VaultReader({ onClose }: { onClose?: () => void }) {
+export default function VaultReader({ onClose, onTitleChange }: { onClose?: () => void; onTitleChange?: (title: string | null) => void }) {
   const [mode, setMode] = useState<'list' | 'read'>('list')
   const [cwd, setCwd] = useState('')
   const [entries, setEntries] = useState<DirListEntry[]>([])
@@ -36,6 +37,7 @@ export default function VaultReader({ onClose }: { onClose?: () => void }) {
     getVaultFile(path).then(r => {
       setContent(r.content); setTruncated(r.truncated); setOpenPath(path); setMode('read')
       pushRecentNote(path); setRecent(getRecentNotes())
+      onTitleChange?.(docTitleFromPath(path))
     }).catch(() => {
       // A stale "最近打开" entry (note deleted/renamed in Obsidian) 404s here. Don't
       // swallow it silently — tell the user and prune the dead entry, matching the
@@ -43,7 +45,7 @@ export default function VaultReader({ onClose }: { onClose?: () => void }) {
       alert('无法打开笔记(可能已被删除或移动):' + path)
       removeRecentNote(path); setRecent(getRecentNotes())
     })
-  }, [])
+  }, [onTitleChange])
 
   const onWikiLink = useCallback((name: string) => {
     resolveWikiLink(name).then(p => { if (p) openNote(p); else alert('未找到对应笔记:' + name) })
@@ -54,7 +56,7 @@ export default function VaultReader({ onClose }: { onClose?: () => void }) {
     return (
       <div className="h-full bg-[var(--bg-primary)] flex flex-col">
         <div className="flex items-center gap-2 p-2 border-b border-[var(--border)]">
-          <button onClick={() => setMode('list')} className="p-1.5 text-[var(--text-secondary)] hover:text-[var(--text-primary)]"><ChevronLeft size={18} /></button>
+          <button onClick={() => { setMode('list'); onTitleChange?.(null) }} className="p-1.5 text-[var(--text-secondary)] hover:text-[var(--text-primary)]"><ChevronLeft size={18} /></button>
           <span className="text-sm truncate flex-1">{openPath}</span>
           {onClose && <button onClick={onClose} className="p-1.5 text-[var(--text-secondary)] hover:text-[var(--accent-red)]"><X size={18} /></button>}
         </div>

@@ -3,10 +3,10 @@ import type { SessionInfo, SessionType, DirEntry, UserInfo, TmuxSession } from '
 import { listDirectories, listTmuxSessions, getSchedulerHealth, getVaultMeta } from '../lib/api'
 import { shouldShowVault } from '../lib/vault'
 import type { Theme } from '../lib/theme'
-import { Terminal, Plus, X, PanelLeftClose, PanelLeft, Sun, Moon, Folder, FolderGit2, ChevronLeft, Home, LogOut, Users, MonitorUp, Link, Clock, Bell, BookOpen } from 'lucide-react'
+import { Terminal, Plus, X, PanelLeftClose, PanelLeft, Sun, Moon, Folder, FolderGit2, ChevronLeft, Home, LogOut, Users, MonitorUp, Link, Clock, Bell, BookOpen, Settings, Pencil } from 'lucide-react'
+import { type DocTab } from '../lib/docTabs'
 import AdminPanel from './AdminPanel'
 import ScheduledTasksPanel from './ScheduledTasksPanel'
-import VaultReader from './VaultReader'
 import PromptManager from './PromptManager'
 import PushSettings from './PushSettings'
 import { usePromptPresets } from '../lib/usePromptPresets'
@@ -16,9 +16,10 @@ import { ClaudeCodeIcon, KiroIcon, CodexIcon } from './BrandIcons'
 
 interface Props {
   sessions: SessionInfo[]
+  docTabs: DocTab[]
   activeId: string | null
   onSelect: (id: string) => void
-  onCreate: (type: SessionType, workDir?: string, tmuxTarget?: string, initialPrompt?: string) => void
+  onCreate: (type: SessionType | 'vault', workDir?: string, tmuxTarget?: string, initialPrompt?: string) => void
   onDelete: (id: string) => void
   onRename: (id: string, name: string) => void
   hasUnread: (s: SessionInfo) => boolean
@@ -74,7 +75,7 @@ function SessionTypeIcon({ type, size = 14, className }: { type: SessionType; si
   }
 }
 
-export default function Sidebar({ sessions, activeId, onSelect, onCreate, onDelete, onRename, hasUnread, onLogout, theme, onToggleTheme, user, open, onToggle, mobile, confirmCount = 0 }: Props) {
+export default function Sidebar({ sessions, docTabs, activeId, onSelect, onCreate, onDelete, onRename, hasUnread, onLogout, theme, onToggleTheme, user, open, onToggle, mobile, confirmCount = 0 }: Props) {
   const [step, setStep] = useState<NewSessionStep>('closed')
   const [pendingType, setPendingType] = useState<SessionType | null>(null)
   const [promptDraft, setPromptDraft] = useState('')
@@ -83,7 +84,8 @@ export default function Sidebar({ sessions, activeId, onSelect, onCreate, onDele
   const [showAdmin, setShowAdmin] = useState(false)
   const [showScheduled, setShowScheduled] = useState(false)
   const [showPushSettings, setShowPushSettings] = useState(false)
-  const [showVault, setShowVault] = useState(false)
+  const [showSettings, setShowSettings] = useState(false)
+  const [showPromptManager, setShowPromptManager] = useState(false)
   const [vaultEnabled, setVaultEnabled] = useState(false)
   const [schedulerHealthy, setSchedulerHealthy] = useState(true)
   const [editingId, setEditingId] = useState<string | null>(null)
@@ -258,6 +260,20 @@ export default function Sidebar({ sessions, activeId, onSelect, onCreate, onDele
             )}
           </button>
         ))}
+        {docTabs.map(t => (
+          <button
+            key={t.id}
+            onClick={() => handleSelect(t.id)}
+            className={`relative p-1.5 rounded transition-colors ${
+              t.id === activeId
+                ? 'bg-[var(--bg-tertiary)] text-[var(--text-bright)] shadow-[inset_2px_0_0_var(--accent-brand)]'
+                : 'text-[var(--text-secondary)] hover:text-[var(--text-primary)] hover:bg-[var(--bg-tertiary)]'
+            }`}
+            title={t.title}
+          >
+            <BookOpen size={14} />
+          </button>
+        ))}
         <div className="mt-auto flex flex-col items-center gap-1">
           <button
             onClick={onToggleTheme}
@@ -307,22 +323,6 @@ export default function Sidebar({ sessions, activeId, onSelect, onCreate, onDele
         </div>
         <div className="flex items-center gap-0.5">
           <button
-            onClick={() => setShowPushSettings(true)}
-            className="p-1 text-[var(--text-secondary)] hover:text-[var(--accent-blue)] rounded transition-colors"
-            title="推送通知设置"
-          >
-            <Bell size={14} />
-          </button>
-          {vaultEnabled && (
-            <button
-              onClick={() => setShowVault(true)}
-              title="Obsidian 笔记库"
-              className="p-1 text-[var(--text-secondary)] hover:text-[var(--accent-blue)] rounded transition-colors"
-            >
-              <BookOpen size={18} />
-            </button>
-          )}
-          <button
             onClick={() => setShowScheduled(true)}
             className="relative p-1 text-[var(--text-secondary)] hover:text-[var(--accent-blue)] rounded transition-colors"
             title={schedulerHealthy ? '定时任务' : '调度器异常'}
@@ -339,22 +339,6 @@ export default function Sidebar({ sessions, activeId, onSelect, onCreate, onDele
                 {confirmCount}
               </span>
             )}
-          </button>
-          {isAdmin && (
-            <button
-              onClick={() => setShowAdmin(true)}
-              className="p-1 text-[var(--text-secondary)] hover:text-[var(--accent-purple)] rounded transition-colors"
-              title="User management"
-            >
-              <Users size={14} />
-            </button>
-          )}
-          <button
-            onClick={onToggleTheme}
-            className="p-1 text-[var(--text-secondary)] hover:text-[var(--text-primary)] rounded transition-colors"
-            title={theme === 'dark' ? 'Light mode' : 'Dark mode'}
-          >
-            <ThemeIcon size={14} />
           </button>
           <button
             onClick={onLogout}
@@ -381,9 +365,6 @@ export default function Sidebar({ sessions, activeId, onSelect, onCreate, onDele
 
       {/* Push Settings overlay */}
       {showPushSettings && <PushSettings onClose={() => setShowPushSettings(false)} />}
-
-      {/* Obsidian Vault reader overlay */}
-      {showVault && <VaultReader onClose={() => setShowVault(false)} />}
 
       {/* Sessions */}
       <div className="flex-1 overflow-y-auto py-1">
@@ -443,10 +424,97 @@ export default function Sidebar({ sessions, activeId, onSelect, onCreate, onDele
             </button>
           </div>
         ))}
+        {docTabs.map(t => (
+          <div
+            key={t.id}
+            onClick={() => handleSelect(t.id)}
+            className={`group flex items-center gap-2 px-3 py-1.5 mx-1 rounded cursor-pointer text-xs transition-colors ${
+              t.id === activeId
+                ? 'bg-[var(--bg-tertiary)] text-[var(--text-bright)] shadow-[inset_2px_0_0_var(--accent-brand)]'
+                : 'text-[var(--text-secondary)] hover:bg-[var(--bg-tertiary)] hover:text-[var(--text-primary)]'
+            }`}
+          >
+            <BookOpen size={13} className="shrink-0 text-[var(--accent-blue)]" />
+            <span className="flex-1 min-w-0 truncate">{t.title}</span>
+            <button
+              onClick={e => { e.stopPropagation(); onDelete(t.id) }}
+              className="p-0.5 opacity-0 group-hover:opacity-100 text-[var(--text-secondary)] hover:text-[var(--accent-red)] transition-all"
+              title="关闭文档"
+            >
+              <X size={12} />
+            </button>
+          </div>
+        ))}
       </div>
 
       {/* New session */}
       <div className="relative px-2 py-3 border-t border-[var(--border)]">
+        <button
+          onClick={() => setShowSettings(true)}
+          className="flex items-center gap-2 w-full px-3 py-2 text-sm text-[var(--text-secondary)] hover:text-[var(--text-primary)] hover:bg-[var(--bg-tertiary)] rounded-lg transition-colors min-h-[40px]"
+        >
+          <Settings size={14} />
+          <span>Settings</span>
+        </button>
+
+        {showSettings && (
+          <>
+            <div className="fixed inset-0 z-10" onClick={() => setShowSettings(false)} />
+            <div className="absolute bottom-full left-2 mb-1 bg-[var(--bg-tertiary)] border border-[var(--border)] rounded-lg py-1 w-56 z-20 shadow-xl">
+              <div className="px-3 py-1.5 text-[10px] font-semibold text-[var(--text-muted)] uppercase tracking-wider">Settings</div>
+              <button
+                onClick={onToggleTheme}
+                className="flex items-center gap-2.5 w-full px-3 py-2 text-xs text-[var(--text-primary)] hover:bg-[var(--bg-hover)] transition-colors"
+              >
+                <ThemeIcon size={14} className="shrink-0" />
+                <span className="flex-1 text-left">{theme === 'dark' ? '浅色模式' : '深色模式'}</span>
+              </button>
+              <button
+                onClick={() => { setShowSettings(false); setShowPushSettings(true) }}
+                className="flex items-center gap-2.5 w-full px-3 py-2 text-xs text-[var(--text-primary)] hover:bg-[var(--bg-hover)] transition-colors"
+              >
+                <Bell size={14} className="shrink-0" />
+                <span className="flex-1 text-left">推送通知</span>
+              </button>
+              <button
+                onClick={() => { setShowSettings(false); presetStore.reload(); setShowPromptManager(true) }}
+                className="flex items-center gap-2.5 w-full px-3 py-2 text-xs text-[var(--text-primary)] hover:bg-[var(--bg-hover)] transition-colors"
+              >
+                <Pencil size={14} className="shrink-0" />
+                <span className="flex-1 text-left">常用 prompt 管理</span>
+              </button>
+              {isAdmin && (
+                <button
+                  onClick={() => { setShowSettings(false); setShowAdmin(true) }}
+                  className="flex items-center gap-2.5 w-full px-3 py-2 text-xs text-[var(--text-primary)] hover:bg-[var(--bg-hover)] transition-colors"
+                >
+                  <Users size={14} className="shrink-0" />
+                  <span className="flex-1 text-left">用户管理</span>
+                </button>
+              )}
+            </div>
+          </>
+        )}
+
+        {showPromptManager && (
+          <>
+            <div className="fixed inset-0 z-10" onClick={() => setShowPromptManager(false)} />
+            <div className="absolute bottom-full left-2 mb-1 bg-[var(--bg-tertiary)] border border-[var(--border)] rounded-lg py-1 w-56 z-20 shadow-xl">
+              <div className="flex items-center gap-1 px-2 py-1.5 border-b border-[var(--border)]">
+                <span className="text-[10px] font-semibold text-[var(--text-muted)] uppercase tracking-wider flex-1">管理常用 prompt</span>
+              </div>
+              <PromptManager
+                presets={presetStore.presets}
+                error={presetStore.error}
+                onAdd={presetStore.add}
+                onEdit={presetStore.edit}
+                onRemove={presetStore.remove}
+                onClose={() => setShowPromptManager(false)}
+              />
+            </div>
+          </>
+        )}
+
         <button
           onClick={openTypePicker}
           className="flex items-center gap-2 w-full px-3 py-2 text-sm text-[var(--text-secondary)] hover:text-[var(--text-primary)] hover:bg-[var(--bg-tertiary)] rounded-lg transition-colors min-h-[40px]"
@@ -502,6 +570,18 @@ export default function Sidebar({ sessions, activeId, onSelect, onCreate, onDele
                       <div className="text-[10px] text-[var(--text-secondary)]">AI coding agent (MCP)</div>
                     </div>
                   </button>
+                  {vaultEnabled && (
+                    <button
+                      onClick={() => { onCreate('vault'); setStep('closed') }}
+                      className="flex items-center gap-2.5 w-full px-3 py-2 text-xs text-[var(--text-primary)] hover:bg-[var(--bg-hover)] transition-colors"
+                    >
+                      <BookOpen size={14} className="text-[var(--accent-blue)] shrink-0" />
+                      <div className="text-left">
+                        <div className="font-medium">Obsidian 文档</div>
+                        <div className="text-[10px] text-[var(--text-secondary)]">笔记库(与会话无缝切换)</div>
+                      </div>
+                    </button>
+                  )}
                 </>
               )}
 

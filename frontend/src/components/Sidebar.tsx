@@ -450,74 +450,8 @@ export default function Sidebar({ sessions, docTabs, activeId, onSelect, onCreat
       {/* New session */}
       <div className="relative px-2 py-3 border-t border-[var(--border)]">
         <button
-          onClick={() => setShowSettings(true)}
-          className="flex items-center gap-2 w-full px-3 py-2 text-sm text-[var(--text-secondary)] hover:text-[var(--text-primary)] hover:bg-[var(--bg-tertiary)] rounded-lg transition-colors min-h-[40px]"
-        >
-          <Settings size={14} />
-          <span>Settings</span>
-        </button>
-
-        {showSettings && (
-          <>
-            <div className="fixed inset-0 z-10" onClick={() => setShowSettings(false)} />
-            <div className="absolute bottom-full left-2 mb-1 bg-[var(--bg-tertiary)] border border-[var(--border)] rounded-lg py-1 w-56 z-20 shadow-xl">
-              <div className="px-3 py-1.5 text-[10px] font-semibold text-[var(--text-muted)] uppercase tracking-wider">Settings</div>
-              <button
-                onClick={onToggleTheme}
-                className="flex items-center gap-2.5 w-full px-3 py-2 text-xs text-[var(--text-primary)] hover:bg-[var(--bg-hover)] transition-colors"
-              >
-                <ThemeIcon size={14} className="shrink-0" />
-                <span className="flex-1 text-left">{theme === 'dark' ? '浅色模式' : '深色模式'}</span>
-              </button>
-              <button
-                onClick={() => { setShowSettings(false); setShowPushSettings(true) }}
-                className="flex items-center gap-2.5 w-full px-3 py-2 text-xs text-[var(--text-primary)] hover:bg-[var(--bg-hover)] transition-colors"
-              >
-                <Bell size={14} className="shrink-0" />
-                <span className="flex-1 text-left">推送通知</span>
-              </button>
-              <button
-                onClick={() => { setShowSettings(false); presetStore.reload(); setShowPromptManager(true) }}
-                className="flex items-center gap-2.5 w-full px-3 py-2 text-xs text-[var(--text-primary)] hover:bg-[var(--bg-hover)] transition-colors"
-              >
-                <Pencil size={14} className="shrink-0" />
-                <span className="flex-1 text-left">常用 prompt 管理</span>
-              </button>
-              {isAdmin && (
-                <button
-                  onClick={() => { setShowSettings(false); setShowAdmin(true) }}
-                  className="flex items-center gap-2.5 w-full px-3 py-2 text-xs text-[var(--text-primary)] hover:bg-[var(--bg-hover)] transition-colors"
-                >
-                  <Users size={14} className="shrink-0" />
-                  <span className="flex-1 text-left">用户管理</span>
-                </button>
-              )}
-            </div>
-          </>
-        )}
-
-        {showPromptManager && (
-          <>
-            <div className="fixed inset-0 z-10" onClick={() => setShowPromptManager(false)} />
-            <div className="absolute bottom-full left-2 mb-1 bg-[var(--bg-tertiary)] border border-[var(--border)] rounded-lg py-1 w-56 z-20 shadow-xl">
-              <div className="flex items-center gap-1 px-2 py-1.5 border-b border-[var(--border)]">
-                <span className="text-[10px] font-semibold text-[var(--text-muted)] uppercase tracking-wider flex-1">管理常用 prompt</span>
-              </div>
-              <PromptManager
-                presets={presetStore.presets}
-                error={presetStore.error}
-                onAdd={presetStore.add}
-                onEdit={presetStore.edit}
-                onRemove={presetStore.remove}
-                onClose={() => setShowPromptManager(false)}
-              />
-            </div>
-          </>
-        )}
-
-        <button
           onClick={openTypePicker}
-          className="flex items-center gap-2 w-full px-3 py-2 text-sm text-[var(--text-secondary)] hover:text-[var(--text-primary)] hover:bg-[var(--bg-tertiary)] rounded-lg transition-colors min-h-[40px]"
+          className="flex items-center gap-2 w-full px-3 py-2 text-sm font-medium text-[var(--accent-brand)] border border-[var(--accent-brand)]/40 hover:bg-[var(--accent-brand)]/10 rounded-lg transition-colors min-h-[40px]"
         >
           <Plus size={14} />
           <span>New session</span>
@@ -837,6 +771,72 @@ export default function Sidebar({ sessions, docTabs, activeId, onSelect, onCreat
                   />
                 </>
               )}
+            </div>
+          </>
+        )}
+
+        <button
+          onClick={() => setShowSettings(true)}
+          className="flex items-center gap-2 w-full px-3 py-2 text-sm text-[var(--text-secondary)] hover:text-[var(--text-primary)] hover:bg-[var(--bg-tertiary)] rounded-lg transition-colors min-h-[40px]"
+        >
+          <Settings size={14} />
+          <span>Settings</span>
+        </button>
+
+        {showSettings && (
+          <>
+            <div className="fixed inset-0 z-10" onClick={() => setShowSettings(false)} />
+            <div className="absolute bottom-full left-2 mb-1 bg-[var(--bg-tertiary)] border border-[var(--border)] rounded-lg py-1 w-56 z-20 shadow-xl">
+              <div className="px-3 py-1.5 text-[10px] font-semibold text-[var(--text-muted)] uppercase tracking-wider">Settings</div>
+              <button
+                onClick={onToggleTheme}
+                className="flex items-center gap-2.5 w-full px-3 py-2 text-xs text-[var(--text-primary)] hover:bg-[var(--bg-hover)] transition-colors"
+              >
+                <ThemeIcon size={14} className="shrink-0" />
+                <span className="flex-1 text-left">{theme === 'dark' ? '浅色模式' : '深色模式'}</span>
+              </button>
+              <button
+                onClick={() => { setShowSettings(false); setShowPushSettings(true) }}
+                className="flex items-center gap-2.5 w-full px-3 py-2 text-xs text-[var(--text-primary)] hover:bg-[var(--bg-hover)] transition-colors"
+              >
+                <Bell size={14} className="shrink-0" />
+                <span className="flex-1 text-left">推送通知</span>
+              </button>
+              <button
+                onClick={() => { setShowSettings(false); presetStore.reload(); setShowPromptManager(true) }}
+                className="flex items-center gap-2.5 w-full px-3 py-2 text-xs text-[var(--text-primary)] hover:bg-[var(--bg-hover)] transition-colors"
+              >
+                <Pencil size={14} className="shrink-0" />
+                <span className="flex-1 text-left">常用 prompt 管理</span>
+              </button>
+              {isAdmin && (
+                <button
+                  onClick={() => { setShowSettings(false); setShowAdmin(true) }}
+                  className="flex items-center gap-2.5 w-full px-3 py-2 text-xs text-[var(--text-primary)] hover:bg-[var(--bg-hover)] transition-colors"
+                >
+                  <Users size={14} className="shrink-0" />
+                  <span className="flex-1 text-left">用户管理</span>
+                </button>
+              )}
+            </div>
+          </>
+        )}
+
+        {showPromptManager && (
+          <>
+            <div className="fixed inset-0 z-10" onClick={() => setShowPromptManager(false)} />
+            <div className="absolute bottom-full left-2 mb-1 bg-[var(--bg-tertiary)] border border-[var(--border)] rounded-lg py-1 w-56 z-20 shadow-xl">
+              <div className="flex items-center gap-1 px-2 py-1.5 border-b border-[var(--border)]">
+                <span className="text-[10px] font-semibold text-[var(--text-muted)] uppercase tracking-wider flex-1">管理常用 prompt</span>
+              </div>
+              <PromptManager
+                presets={presetStore.presets}
+                error={presetStore.error}
+                onAdd={presetStore.add}
+                onEdit={presetStore.edit}
+                onRemove={presetStore.remove}
+                onClose={() => setShowPromptManager(false)}
+              />
             </div>
           </>
         )}

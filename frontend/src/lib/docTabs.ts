@@ -25,6 +25,20 @@ export function isDocTabId(id: string | null): boolean {
   return typeof id === 'string' && id.startsWith('doc-')
 }
 
+// Resolve which pane should be active given the current session + doc-tab ids.
+// Keeps the previous selection if it still resolves to a live pane; otherwise
+// falls back to the first session, then the first doc tab, then null. This is the
+// single invariant behind "activeId must always point at a rendered pane" — used
+// both when (re)loading the session list and to decide whether the empty state shows.
+export function resolveActivePane(
+  activeId: string | null,
+  sessionIds: string[],
+  docTabIds: string[],
+): string | null {
+  if (activeId && (sessionIds.includes(activeId) || docTabIds.includes(activeId))) return activeId
+  return sessionIds[0] ?? docTabIds[0] ?? null
+}
+
 function isValid(t: unknown): t is DocTab {
   return !!t && typeof t === 'object'
     && typeof (t as DocTab).id === 'string'

@@ -14,7 +14,7 @@ import FileBrowser from './components/FileBrowser'
 import GitViewer from './components/GitViewer'
 import AgentDashboard from './components/AgentDashboard'
 import VaultReader from './components/VaultReader'
-import { type DocTab, newDocTab, isDocTabId, loadDocTabs, saveDocTabs, DEFAULT_DOC_TITLE } from './lib/docTabs'
+import { type DocTab, newDocTab, isDocTabId, loadDocTabs, saveDocTabs, resolveActivePane, DEFAULT_DOC_TITLE } from './lib/docTabs'
 
 type AuthState = 'loading' | 'unauthenticated' | 'pending' | 'active'
 type OverlayView = 'none' | 'files' | 'git' | 'events'
@@ -24,7 +24,10 @@ export default function App() {
   const [user, setUser] = useState<UserInfo | null>(null)
   const [sessions, setSessions] = useState<SessionInfo[]>([])
   const [docTabs, setDocTabs] = useState<DocTab[]>(() => loadDocTabs())
-  useEffect(() => { saveDocTabs(docTabs) }, [docTabs])
+  // Ref mirror so loadSessions (captures a stale docTabs closure) can resolve the
+  // initial active pane against the live doc-tab list.
+  const docTabsRef = useRef(docTabs)
+  useEffect(() => { docTabsRef.current = docTabs; saveDocTabs(docTabs) }, [docTabs])
   const [activeId, setActiveId] = useState<string | null>(null)
   const [overlay, setOverlay] = useState<Record<string, OverlayView>>({})
   // session id → turns_completed already seen (red-dot read baseline)
@@ -66,18 +69,19 @@ export default function App() {
     try {
       const list = await listSessions()
       setSessions(list)
-      if (list.length > 0) {
-        setActiveId(prev =>
-          prev && (list.some(s => s.id === prev) || isDocTabId(prev)) ? prev : list[0].id)
-      }
+      // Keep the prior selection if it still resolves; otherwise pick a session,
+      // then a doc tab. Doc tabs alone (0 sessions) must still get a live pane.
+      setActiveId(prev => resolveActivePane(prev, list.map(s => s.id), docTabsRef.current.map(t => t.id)))
     } catch {
       setAuthState('unauthenticated')
     }
   }, [])
 
   // 3s polling: refresh session list so turn-state / activity fields stay live.
-  // Replaces the whole list each tick; activeId is independent state so it's
-  // unaffected. Transient failures are ignored (don't bounce to login).
+  // Replaces the whole list each tick; activeId is deliberately left untouched —
+  // a background poll must not move user focus (a stale-snapshot response arriving
+  // just after a local create would otherwise yank focus off the new session).
+  // Transient failures are ignored (don't bounce to login).
   useEffect(() => {
     if (authState !== 'active') return
     const tick = setInterval(async () => {

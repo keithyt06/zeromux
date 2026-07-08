@@ -12,7 +12,7 @@ import { SessionLifetimeBadge } from './SessionLifetimeBadge'
 import { foldTranscript, type WireEvent, type Block, type TurnGroup } from '../lib/transcript'
 import { partitionBlocks, type Density } from '../lib/density'
 import { STUCK_SILENCE_MS } from '../lib/stuck'
-import { shouldStickToBottom } from '../lib/scrollReplay'
+import { shouldStickToBottom, shouldAutoScrollOnAppend } from '../lib/scrollReplay'
 
 // ── Message types ──
 
@@ -125,7 +125,18 @@ export default function AcpChatView({ sessionId, agentType = 'claude', onRegiste
   const roRef = useRef<ResizeObserver | null>(null)
   const roTimerRef = useRef<ReturnType<typeof setTimeout> | undefined>(undefined)
 
-  const scrollBottom = useCallback(() => {
+  // Auto-scroll on a new event only if the user was already near the bottom
+  // (or force, for their own just-sent prompt). Measure distance-from-bottom
+  // SYNCHRONOUSLY here — this runs from the WS onmessage handler right after
+  // setEvents/setNotices, which is outside React's batch, so the DOM still holds
+  // the pre-append layout; the rAF then scrolls against the grown height. Keeping
+  // the measurement out of the rAF is what makes the gate meaningful (post-append
+  // height would always read as near-bottom and silently reintroduce the yank).
+  const scrollBottom = useCallback((force = false) => {
+    const el = scrollRef.current
+    if (!el) return
+    const distanceFromBottom = el.scrollHeight - el.scrollTop - el.clientHeight
+    if (!shouldAutoScrollOnAppend({ force, distanceFromBottom })) return
     requestAnimationFrame(() => {
       scrollRef.current?.scrollTo({ top: scrollRef.current.scrollHeight })
     })
@@ -136,9 +147,9 @@ export default function AcpChatView({ sessionId, agentType = 'claude', onRegiste
     scrollBottom()
   }, [scrollBottom])
 
-  const appendEvent = useCallback((evt: WireEvent) => {
+  const appendEvent = useCallback((evt: WireEvent, force = false) => {
     setEvents(prev => [...prev, evt])
-    scrollBottom()
+    scrollBottom(force)
   }, [scrollBottom])
 
   useEffect(() => {
@@ -346,7 +357,9 @@ export default function AcpChatView({ sessionId, agentType = 'claude', onRegiste
     // at which point we rewrite this entry's turn_id (deduped by client_id).
     const cid = newId()
     seenClientIds.current.add(cid)
-    appendEvent({ type: 'user_prompt', text: full, turn_id: Number.MAX_SAFE_INTEGER, client_id: cid })
+    // force: the user just hit send — always show their bubble and the reply,
+    // even if they had scrolled up to read history a moment before.
+    appendEvent({ type: 'user_prompt', text: full, turn_id: Number.MAX_SAFE_INTEGER, client_id: cid }, true)
     wsRef.current.send(JSON.stringify({ type: 'prompt', text: full, client_id: cid }))
     setInput('')
     setPending([])

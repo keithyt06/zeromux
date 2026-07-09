@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest'
-import { shouldStickToBottom, shouldAutoScrollOnAppend } from '../scrollReplay'
+import { shouldStickToBottom, shouldAutoScrollOnAppend, shouldTrackScrollUp } from '../scrollReplay'
 
 describe('shouldStickToBottom', () => {
   it('sticks during replay when user has not scrolled up', () => {
@@ -30,5 +30,21 @@ describe('shouldAutoScrollOnAppend', () => {
   })
   it('treats a jsdom zero-metrics container as near-bottom (gate stays transparent in tests)', () => {
     expect(shouldAutoScrollOnAppend({ force: false, distanceFromBottom: 0 })).toBe(true)
+  })
+})
+
+describe('shouldTrackScrollUp', () => {
+  // The scroll-up detector must be armed across BOTH the replay window and the
+  // post-replay_done follow window, so a scroll-up during the 2s ResizeObserver
+  // follow is still detected (otherwise the follow observer's own guard is dead
+  // and it yanks a scrolled-up reader).
+  it('tracks during the replay window', () => {
+    expect(shouldTrackScrollUp({ replaying: true, following: false })).toBe(true)
+  })
+  it('tracks during the post-replay_done follow window', () => {
+    expect(shouldTrackScrollUp({ replaying: false, following: true })).toBe(true)
+  })
+  it('does NOT track once both windows are closed (steady-state live output)', () => {
+    expect(shouldTrackScrollUp({ replaying: false, following: false })).toBe(false)
   })
 })

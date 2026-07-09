@@ -17,3 +17,17 @@ const NEAR_BOTTOM_PX = 80
 export function shouldAutoScrollOnAppend(state: { force: boolean; distanceFromBottom: number }): boolean {
   return state.force || state.distanceFromBottom < NEAR_BOTTOM_PX
 }
+
+// The scroll-up detector must stay armed for the ENTIRE span that auto-stick can
+// fire — the replay window AND the post-replay_done follow window. AcpChatView's
+// replay_done arms a ResizeObserver that force-scrolls to the bottom for ~2s
+// (to chase async markdown/katex/image growth), but it sets replaying=false in
+// the same tick. If the detector were armed only during replay (its original
+// form), nothing could flip `userScrolledUp` while that follow observer is live,
+// so its own scrolled-up guard would be dead-by-construction and it would yank a
+// reader who scrolled up right after replay_done. Arming across `following` too
+// keeps that guard meaningful, upholding the "never yank a scrolled-up reader"
+// invariant across both phases.
+export function shouldTrackScrollUp(state: { replaying: boolean; following: boolean }): boolean {
+  return state.replaying || state.following
+}

@@ -12,7 +12,7 @@ import { SessionLifetimeBadge } from './SessionLifetimeBadge'
 import { foldTranscript, type WireEvent, type Block, type TurnGroup } from '../lib/transcript'
 import { partitionBlocks, type Density } from '../lib/density'
 import { STUCK_SILENCE_MS } from '../lib/stuck'
-import { shouldStickToBottom, shouldAutoScrollOnAppend } from '../lib/scrollReplay'
+import { shouldStickToBottom, shouldAutoScrollOnAppend, shouldTrackScrollUp } from '../lib/scrollReplay'
 
 // ── Message types ──
 
@@ -121,6 +121,10 @@ export default function AcpChatView({ sessionId, agentType = 'claude', onRegiste
   const wsRef = useRef<WebSocket | null>(null)
   const scrollRef = useRef<HTMLDivElement>(null)
   const replayingRef = useRef(false)
+  // True only while the post-replay_done follow ResizeObserver is armed (~2s).
+  // Auto-stick spans replay AND this follow window, so the scroll-up detector
+  // must stay armed across both (see shouldTrackScrollUp).
+  const followingRef = useRef(false)
   const userScrolledUpRef = useRef(false)
   const roRef = useRef<ResizeObserver | null>(null)
   const roTimerRef = useRef<ReturnType<typeof setTimeout> | undefined>(undefined)
@@ -302,15 +306,20 @@ export default function AcpChatView({ sessionId, agentType = 'claude', onRegiste
           el.scrollTop = el.scrollHeight
           // Async content (markdown/mermaid/katex/images) grows height after this
           // tick; follow those growths for a short window via ResizeObserver.
+          // followingRef keeps onScroll's scroll-up detector armed for the whole
+          // follow window (replaying is about to flip false below), so a reader
+          // who scrolls up mid-follow flips userScrolledUpRef and the guard here
+          // actually fires — otherwise it would yank them back to the bottom.
           roRef.current?.disconnect()
+          followingRef.current = true
           const ro = new ResizeObserver(() => {
-            if (userScrolledUpRef.current) { ro.disconnect(); return }
+            if (userScrolledUpRef.current) { ro.disconnect(); roRef.current = null; followingRef.current = false; return }
             el.scrollTop = el.scrollHeight
           })
           ro.observe(el)
           roRef.current = ro
           if (roTimerRef.current) clearTimeout(roTimerRef.current)
-          roTimerRef.current = setTimeout(() => { ro.disconnect(); roRef.current = null }, 2000)
+          roTimerRef.current = setTimeout(() => { ro.disconnect(); roRef.current = null; followingRef.current = false }, 2000)
         }
         // Replay window closes here — live output no longer auto-sticks.
         replayingRef.current = false
@@ -421,6 +430,7 @@ export default function AcpChatView({ sessionId, agentType = 'claude', onRegiste
   // Disconnect the replay-follow ResizeObserver and its disarm timer on unmount.
   useEffect(() => () => {
     roRef.current?.disconnect()
+    followingRef.current = false
     if (roTimerRef.current) clearTimeout(roTimerRef.current)
   }, [])
 
@@ -443,7 +453,11 @@ export default function AcpChatView({ sessionId, agentType = 'claude', onRegiste
         ref={scrollRef}
         onScroll={() => {
           const el = scrollRef.current
-          if (!el || !replayingRef.current) return
+          // Armed across BOTH the replay window and the post-replay_done follow
+          // window — auto-stick can fire in either, so a scroll-up in either must
+          // be detected. (Steady-state live output uses the near-bottom gate in
+          // scrollBottom instead, which re-measures per append and needs no flag.)
+          if (!el || !shouldTrackScrollUp({ replaying: replayingRef.current, following: followingRef.current })) return
           // `< 4` is a bottom-stick tolerance (scrollbar pixel jitter), not a
           // "N px from bottom" heuristic: any departure from the bottom during
           // replay means the user is reading history, so stop auto-sticking.

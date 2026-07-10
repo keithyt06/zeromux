@@ -1,6 +1,6 @@
 use chrono::{DateTime, Utc};
 use chrono_tz::Asia::Shanghai;
-use rusqlite::{params, Connection};
+use rusqlite::{params, Connection, OptionalExtension};
 use std::path::Path;
 use std::str::FromStr;
 use std::sync::Mutex;
@@ -531,6 +531,35 @@ impl ScheduledStore {
         rows.collect::<Result<_,_>>().map_err(|e| e.to_string())
     }
 
+    /// Post-claim TOCTOU tie-break (SF1/SF3). The overlap pre-check and the
+    /// `claim_run` INSERT are two separate lock acquisitions, and manual/replay/
+    /// scheduler claimants each take a *distinct* `scheduled_for_ms` slot, so
+    /// `claim_run`'s UNIQUE constraint never dedups them — two near-simultaneous
+    /// callers can both read "no active run" and both claim, double-spawning a
+    /// side-effecting task (double PR/push).
+    ///
+    /// After a caller has claimed its own row it calls this: returns true iff
+    /// `run_id` is the earliest-inserted (min rowid) among ALL currently-active
+    /// (`claimed`/`running`) runs for the task. Because "min rowid" is a total
+    /// order, exactly ONE of any set of concurrent claimants wins — unlike a
+    /// bare `active.len() > 1` check, which makes BOTH claimants lose when
+    /// exactly two race (SF3). Losers must finalize their claimed row (skipped)
+    /// so the overlap guard doesn't wedge future fires.
+    pub fn claim_won(&self, task_id: &str, run_id: &str) -> Result<bool, String> {
+        let conn = self.conn.lock().unwrap();
+        let winner: Option<String> = conn
+            .query_row(
+                "SELECT id FROM agent_task_runs \
+                 WHERE task_id=?1 AND state IN ('claimed','running') \
+                 ORDER BY rowid ASC LIMIT 1",
+                params![task_id],
+                |r| r.get::<_, String>(0),
+            )
+            .optional()
+            .map_err(|e| e.to_string())?;
+        Ok(winner.as_deref() == Some(run_id))
+    }
+
     /// Startup + watchdog: mark claimed/running as aborted with a failure_kind.
     /// cutoff_ms=None at startup (all orphans → `orphaned_restart`);
     /// Some(cutoff) for the timeout watchdog (only runs whose started_ms is older
@@ -996,11 +1025,23 @@ pub fn spawn_scheduler(
                             };
                             match s.claim_run(&run) {
                                 Ok(true) => {
-                                    let nm = format!("{} · {}", task.name,
-                                        fire.with_timezone(&Shanghai).format("%H:%M"));
-                                    if let Err(err) = m.trigger_run(&run.id, nm, &task.work_dir, &task.owner_id, &task.id, task.prompt.clone()).await {
-                                        let _ = s.set_run_state(&run.id, "failed", None, None, Some("spawn_failed"), Some(now.timestamp_millis()));
-                                        tracing::warn!("trigger {} failed: {}", task.id, err);
+                                    // TOCTOU close (SF1): a manual run-now / replay can claim a
+                                    // different scheduled_for_ms slot between our overlap check
+                                    // and claim_run. Tie-break on min rowid so exactly one
+                                    // concurrent claimant spawns; a loser finalizes as skipped
+                                    // (never spawned → no side effect → not a queue candidate).
+                                    match s.claim_won(&task.id, &run.id) {
+                                        Ok(true) => {
+                                            let nm = format!("{} · {}", task.name,
+                                                fire.with_timezone(&Shanghai).format("%H:%M"));
+                                            if let Err(err) = m.trigger_run(&run.id, nm, &task.work_dir, &task.owner_id, &task.id, task.prompt.clone()).await {
+                                                let _ = s.set_run_state(&run.id, "failed", None, None, Some("spawn_failed"), Some(now.timestamp_millis()));
+                                                tracing::warn!("trigger {} failed: {}", task.id, err);
+                                            }
+                                        }
+                                        _ => {
+                                            let _ = s.set_run_state(&run.id, "skipped", None, None, Some("overlap"), Some(now.timestamp_millis()));
+                                        }
                                     }
                                 }
                                 _ => {} // not claimed (dup) or error — skip
@@ -1042,6 +1083,64 @@ mod store_tests {
         assert!(s.claim_run(&run).unwrap(), "first claim wins");
         let dup = TaskRun { id: "r2".into(), ..run.clone() };
         assert!(!s.claim_run(&dup).unwrap(), "same scheduled_for second claim ignored");
+    }
+
+    // SF1/SF3: manual run-now, replay, and the scheduler tick each claim a
+    // *distinct* slot (fresh uuid + a `now`/fire-point scheduled_for_ms), so
+    // claim_run's UNIQUE(task_id, scheduled_for_ms) does NOT dedup them — two
+    // near-simultaneous claimants both succeed. The overlap pre-check is a
+    // separate lock acquisition from the claim, so both can read "no active"
+    // and both spawn (double PR/push for a side-effecting task). The
+    // post-claim tie-break resolves it: among ALL active claimants for a task,
+    // exactly ONE wins (the earliest-inserted row, by rowid). This is
+    // deterministic, so it cannot "both-lose" the way a bare `len() > 1` check
+    // does when exactly two race.
+    #[test]
+    fn claim_won_is_a_deterministic_single_winner() {
+        let (s, _dir) = store();
+        let mk = |id: &str, sched: i64| TaskRun {
+            id: id.into(), task_id: "t1".into(), scheduled_for_ms: sched,
+            state: "claimed".into(), session_id: None, verdict: None, failure_kind: None,
+            started_ms: Some(sched), ended_ms: None, input_snapshot: None,
+            confirm_status: None, replay_of: None };
+        // Three distinct slots all claim successfully (the real TOCTOU: they do
+        // NOT collide on the UNIQUE constraint).
+        assert!(s.claim_run(&mk("r1", 1000)).unwrap());
+        assert!(s.claim_run(&mk("r2", 1002)).unwrap());
+        assert!(s.claim_run(&mk("r3", 1003)).unwrap());
+        // Exactly one wins, and it's the same one for every caller (no both-lose).
+        assert!(s.claim_won("t1", "r1").unwrap(), "earliest-inserted wins");
+        assert!(!s.claim_won("t1", "r2").unwrap(), "loser must skip");
+        assert!(!s.claim_won("t1", "r3").unwrap(), "loser must skip");
+        // A sole claimant always wins (steady-state: no race).
+        assert!(s.claim_run(&mk("solo", 2000)).unwrap());
+        // ...but not while other rivals are still active on the same task.
+        assert!(!s.claim_won("t1", "solo").unwrap(), "not sole while r1 active");
+    }
+
+    // Once the rivals finalize (skipped/failed/succeeded → no longer active),
+    // the surviving winner is the sole active row and still wins; and a run on
+    // a *different* task is never affected by another task's rivals.
+    #[test]
+    fn claim_won_ignores_finalized_and_other_tasks() {
+        let (s, _dir) = store();
+        let mk = |id: &str, task: &str, sched: i64| TaskRun {
+            id: id.into(), task_id: task.into(), scheduled_for_ms: sched,
+            state: "claimed".into(), session_id: None, verdict: None, failure_kind: None,
+            started_ms: Some(sched), ended_ms: None, input_snapshot: None,
+            confirm_status: None, replay_of: None };
+        assert!(s.claim_run(&mk("a1", "t1", 1)).unwrap());
+        assert!(s.claim_run(&mk("a2", "t1", 2)).unwrap());
+        assert!(s.claim_run(&mk("b1", "t2", 1)).unwrap());
+        // t2's b1 is a sole active row for t2 — unaffected by t1's contention.
+        assert!(s.claim_won("t2", "b1").unwrap(), "other task's run is independent");
+        // Loser a2 finalizes as skipped; a1 remains the sole active t1 row.
+        s.set_run_state("a2", "skipped", None, None, Some("overlap"), Some(9)).unwrap();
+        assert!(s.claim_won("t1", "a1").unwrap(), "sole survivor wins");
+        // A run_id that isn't active (finalized) never wins.
+        assert!(!s.claim_won("t1", "a2").unwrap(), "finalized run does not win");
+        // An unknown run_id never wins (no row → not the min).
+        assert!(!s.claim_won("t1", "ghost").unwrap(), "unknown run_id never wins");
     }
 
     #[test]

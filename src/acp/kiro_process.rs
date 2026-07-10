@@ -274,7 +274,7 @@ async fn run_event_loop(
                         let val: serde_json::Value = match serde_json::from_str(&line) {
                             Ok(v) => v,
                             Err(e) => {
-                                tracing::debug!("kiro: bad line: {e} — {}", &line[..line.len().min(200)]);
+                                tracing::debug!("kiro: bad line: {e} — {}", line.chars().take(200).collect::<String>());
                                 continue;
                             }
                         };

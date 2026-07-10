@@ -2242,6 +2242,24 @@ async fn run_scheduled_now(
     if !claimed {
         return Ok(Json(serde_json::json!({ "skipped": true, "reason": "already_claimed" })));
     }
+    // TOCTOU close (SF1): the overlap pre-check and claim_run are separate lock
+    // acquisitions, and a rival (double-click, another device, or a scheduler
+    // tick) claims a *different* scheduled_for_ms slot, so claim_run's UNIQUE
+    // constraint doesn't dedup us. After our own claim, tie-break on min rowid:
+    // exactly one concurrent claimant wins. A loser must finalize its claimed
+    // row (skipped, not aborted+unknown — it never spawned, so no side effect
+    // and it must NOT enter the confirmation queue).
+    if !state
+        .scheduled_tasks
+        .claim_won(&id, &run.id)
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?
+    {
+        let now = chrono::Utc::now().timestamp_millis();
+        let _ = state.scheduled_tasks.set_run_state(
+            &run.id, "skipped", None, None, Some("overlap"), Some(now),
+        );
+        return Ok(Json(serde_json::json!({ "skipped": true, "reason": "overlap" })));
+    }
     let sid = match state
         .sessions
         .trigger_run(
@@ -2374,21 +2392,19 @@ async fn replay_run_handler(
     // the UNIQUE(task_id, scheduled_for_ms) slot the scheduler relies on). Two
     // replay clicks a few ms apart could both pass the pre-check and both claim,
     // double-spawning a side-effecting task (double PR/push). After our own claim,
-    // re-read active runs: if anything other than our row is active, a rival won —
-    // finalize ours and skip rather than double-fire.
-    {
-        let active = state.scheduled_tasks.active_states_for_task(&cfg.id)
-            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
-        if active.len() > 1 {
-            // Finalize the loser as 'skipped', NOT aborted+unknown — it never
-            // spawned, so it produced no side effect and must NOT enter the
-            // confirmation queue (whose predicate is aborted + watchdog/orphaned).
-            let now = chrono::Utc::now().timestamp_millis();
-            let _ = state.scheduled_tasks.set_run_state(
-                &new_id, "skipped", None, None, Some("overlap"), Some(now),
-            );
-            return Ok(Json(serde_json::json!({ "skipped": true, "reason": "overlap" })));
-        }
+    // tie-break on min rowid (SF3): exactly one concurrent claimant wins. A bare
+    // `active.len() > 1` check made BOTH claimants lose when exactly two raced
+    // (each saw len()==2) — claim_won is a total order, so precisely one wins.
+    if !state.scheduled_tasks.claim_won(&cfg.id, &new_id)
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))? {
+        // Finalize the loser as 'skipped', NOT aborted+unknown — it never
+        // spawned, so it produced no side effect and must NOT enter the
+        // confirmation queue (whose predicate is aborted + watchdog/orphaned).
+        let now = chrono::Utc::now().timestamp_millis();
+        let _ = state.scheduled_tasks.set_run_state(
+            &new_id, "skipped", None, None, Some("overlap"), Some(now),
+        );
+        return Ok(Json(serde_json::json!({ "skipped": true, "reason": "overlap" })));
     }
     let name = format!("{} · replay", cfg.name);
     if let Err(e) = state.sessions.replay_run(&new_id, &cfg.id, &cfg.owner_id, name, &snap).await {

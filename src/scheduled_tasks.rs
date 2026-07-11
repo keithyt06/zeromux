@@ -623,11 +623,18 @@ impl ScheduledStore {
     /// 'watchdog_timeout'. Not a set-based UPDATE: SQLite can't stat files, so we
     /// query active runs, stat each events.ndjson mtime, judge via stale_verdict.
     /// Active scheduled runs are few + this ticks every 60s, so the loop is cheap.
-    pub fn reconcile_timeouts_per_task(&self, now_ms: i64) -> Result<usize, String> {
-        let candidates: Vec<(String, i64, Option<i64>, Option<i64>)> = {
+    ///
+    /// Returns the `session_id`s of the runs it just aborted that still have a
+    /// live session, so the caller can `send_timeout_kill` them. Flipping the DB
+    /// row alone leaves the agent process running: it keeps executing side effects
+    /// AND stays counted in `running_summary().scheduled`, which permanently blocks
+    /// background auto-update (the gate never force-upgrades past a scheduled run).
+    /// So the kill is not optional — the scheduler loop must act on this Vec.
+    pub fn reconcile_timeouts_per_task(&self, now_ms: i64) -> Result<Vec<String>, String> {
+        let candidates: Vec<(String, i64, Option<i64>, Option<i64>, Option<String>)> = {
             let conn = self.conn.lock().unwrap();
             let mut stmt = conn.prepare(
-                "SELECT r.id, r.started_ms, c.idle_timeout_min, c.max_runtime_min \
+                "SELECT r.id, r.started_ms, c.idle_timeout_min, c.max_runtime_min, r.session_id \
                  FROM agent_task_runs r JOIN agent_runs_config c ON c.id = r.task_id \
                  WHERE r.state IN ('claimed','running')").map_err(|e| e.to_string())?;
             let rows = stmt.query_map(params![], |r| Ok((
@@ -635,12 +642,13 @@ impl ScheduledStore {
                 r.get::<_, Option<i64>>(1)?.unwrap_or(now_ms),
                 r.get::<_, Option<i64>>(2)?,
                 r.get::<_, Option<i64>>(3)?,
+                r.get::<_, Option<String>>(4)?,
             ))).map_err(|e| e.to_string())?;
             rows.collect::<Result<_,_>>().map_err(|e| e.to_string())?
         };
-        let mut n = 0usize;
         let mut aborted_ids: Vec<String> = Vec::new();
-        for (id, started_ms, idle_cfg, max_cfg) in candidates {
+        let mut kill_sessions: Vec<String> = Vec::new();
+        for (id, started_ms, idle_cfg, max_cfg, session_id) in candidates {
             let last = events_mtime_ms(&id);
             if let Some(kind) = stale_verdict(
                 now_ms, started_ms, last,
@@ -650,7 +658,12 @@ impl ScheduledStore {
                 // 与 fanout 正常 finalize 不双写(spec §11 竞态:先到者赢)。
                 self.set_run_state(&id, "aborted", None, None, Some(kind), Some(now_ms))?;
                 aborted_ids.push(id);
-                n += 1;
+                // A run that reached "running" has a session_id; one still in
+                // "claimed" (spawn raced) has none → nothing to kill, but its row
+                // is still finalized above so the overlap guard doesn't wedge.
+                if let Some(sid) = session_id {
+                    kill_sessions.push(sid);
+                }
             }
         }
         // Push confirm notifications for newly-queued runs.
@@ -663,7 +676,7 @@ impl ScheduledStore {
                 }
             }
         }
-        Ok(n)
+        Ok(kill_sessions)
     }
 
     pub fn set_input_snapshot(&self, run_id: &str, snapshot: &str) -> Result<(), String> {
@@ -972,13 +985,23 @@ pub fn spawn_scheduler(
                     let now = chrono::Utc::now();
                     hb.store(now.timestamp_millis(), Ordering::Relaxed);
                     // watchdog: abort runs idle past idle_timeout_min (default 60) or
-                    // exceeding max_runtime_min total (default 300)
-                    let _ = s.reconcile_timeouts_per_task(now.timestamp_millis());
+                    // exceeding max_runtime_min total (default 300). This flips the DB
+                    // row AND hands back the session_ids whose agent process is still
+                    // live, which we must kill — otherwise the orphaned run keeps
+                    // executing side effects and stays counted in running_summary,
+                    // permanently blocking auto-update (SF2).
+                    match s.reconcile_timeouts_per_task(now.timestamp_millis()) {
+                        Ok(kill) => {
+                            for sid in kill {
+                                m.send_timeout_kill(&sid, None).await;
+                            }
+                        }
+                        Err(e) => tracing::warn!("reconcile_timeouts failed: {}", e),
+                    }
                     // interactive (non-scheduled) wedge protection (review high-leverage
                     // point): sessions silent past INTERACTIVE_IDLE_MS get a TimeoutKill,
                     // so run_metrics records a Timeout instead of the session hanging
-                    // forever. Scheduled runs are excluded — reconcile_timeouts_per_task
-                    // above already handles them.
+                    // forever. Scheduled runs are handled by the watchdog above.
                     let stale = m.running_idle_too_long(now.timestamp_millis(), INTERACTIVE_IDLE_MS);
                     for sid in stale {
                         m.send_timeout_kill(&sid, None).await;
@@ -1242,6 +1265,58 @@ mod store_tests {
         assert_eq!(patient.state, "running", "90min 静默 < idle 120min → 存活");
         assert_eq!(def.state, "aborted", "90min 静默 > idle 默认 60min → 中止");
         assert_eq!(def.failure_kind.as_deref(), Some("idle_timeout"));
+    }
+
+    // SF2: the watchdog must not only flip the DB row to aborted, it must hand
+    // back the session_ids of the runs it aborted so the scheduler can kill the
+    // still-live agent process. Otherwise a timed-out unattended run keeps
+    // executing side effects AND permanently blocks auto-update (its session is
+    // still counted in running_summary().scheduled). Only runs that got far
+    // enough to have a session (session_id set at trigger_run) contribute a kill.
+    #[test]
+    fn reconcile_timeouts_returns_aborted_session_ids_for_kill() {
+        let _guard = crate::session_manager::HOME_ENV_LOCK.lock().unwrap();
+        let prev = std::env::var("HOME").ok();
+        let home_tmp = tempfile::tempdir().unwrap();
+        std::env::set_var("HOME", home_tmp.path());
+        let dir = tempfile::tempdir().unwrap();
+        let s = ScheduledStore::open(dir.path()).unwrap();
+        let mk_cfg = |id: &str, idle: Option<i64>| TaskConfig {
+            id: id.into(), owner_id: "u".into(), name: "n".into(), trigger_type: "cron".into(),
+            trigger_spec: "0 0 * * * *".into(), tz: "Asia/Shanghai".into(), agent_type: "claude".into(),
+            work_dir: ".".into(), prompt: "p".into(), enabled: true, retention_n: 20, created_ms: 1,
+            side_effects: true, max_runtime_min: None, idle_timeout_min: idle };
+        s.upsert_config(&mk_cfg("t_dead", Some(60))).unwrap();
+        s.upsert_config(&mk_cfg("t_alive", Some(120))).unwrap();
+        s.upsert_config(&mk_cfg("t_presess", Some(60))).unwrap();
+        let now = 100_000_000i64;
+        let mk_run = |id: &str, task: &str, started: i64| TaskRun {
+            id: id.into(), task_id: task.into(), scheduled_for_ms: started, state: "running".into(),
+            session_id: None, verdict: None, failure_kind: None, started_ms: Some(started), ended_ms: None,
+            input_snapshot: None, confirm_status: None, replay_of: None };
+        // dead: 90min idle, has a session → must be returned for kill
+        s.claim_run(&mk_run("r_dead", "t_dead", now - 90*60*1000)).unwrap();
+        s.set_run_state("r_dead", "running", Some("sess_dead"), None, None, None).unwrap();
+        // alive: 90min idle < 120min → survives, not returned
+        s.claim_run(&mk_run("r_alive", "t_alive", now - 90*60*1000)).unwrap();
+        s.set_run_state("r_alive", "running", Some("sess_alive"), None, None, None).unwrap();
+        // pre-session: timed out but never got a session_id (spawn raced) →
+        // aborted in DB but contributes no kill target.
+        s.claim_run(&mk_run("r_presess", "t_presess", now - 90*60*1000)).unwrap();
+        s.set_run_state("r_presess", "running", None, None, None, None).unwrap();
+
+        let killed = s.reconcile_timeouts_per_task(now).unwrap();
+        match prev { Some(h) => std::env::set_var("HOME", h), None => std::env::remove_var("HOME") }
+
+        assert_eq!(killed, vec!["sess_dead".to_string()],
+            "只返回被中止且有存活会话的 session_id");
+        // DB rows still flipped as before
+        let dead = s.runs_for_task("t_dead", 10).unwrap().into_iter().find(|r| r.id=="r_dead").unwrap();
+        let alive = s.runs_for_task("t_alive", 10).unwrap().into_iter().find(|r| r.id=="r_alive").unwrap();
+        let presess = s.runs_for_task("t_presess", 10).unwrap().into_iter().find(|r| r.id=="r_presess").unwrap();
+        assert_eq!(dead.state, "aborted");
+        assert_eq!(alive.state, "running");
+        assert_eq!(presess.state, "aborted", "无 session 也应被中止(避免 overlap 楔死)");
     }
 
     #[test]

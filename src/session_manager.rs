@@ -1624,7 +1624,14 @@ impl SessionManager {
             let data_len = data.len();
             s.scrollback.push_back(data.clone());
             s.scrollback_bytes += data_len;
-            while s.scrollback_bytes > SCROLLBACK_MAX_BYTES && !s.scrollback.is_empty() {
+            // Evict from the front until under the cap, but NEVER evict the frame
+            // we just appended: `len() > 1` keeps the tail. A single frame larger
+            // than the cap (e.g. a multi-MB tool_result — only user prompts are
+            // pre-capped, agent content blocks are not) would otherwise pop itself
+            // too, leaving scrollback EMPTY → a reconnecting client replays nothing
+            // for that turn. Keeping the oversized tail means it still replays; the
+            // ring simply runs slightly over cap until the next frames push it out.
+            while s.scrollback_bytes > SCROLLBACK_MAX_BYTES && s.scrollback.len() > 1 {
                 if let Some(removed) = s.scrollback.pop_front() {
                     s.scrollback_bytes -= removed.len();
                 }
@@ -1832,7 +1839,9 @@ impl SessionManager {
             let data_len = data.len();
             s.scrollback.push_back(data);
             s.scrollback_bytes += data_len;
-            while s.scrollback_bytes > SCROLLBACK_MAX_BYTES && !s.scrollback.is_empty() {
+            // See record_and_broadcast: never evict the just-appended tail, so a
+            // single oversized frame can't wipe the whole buffer to empty.
+            while s.scrollback_bytes > SCROLLBACK_MAX_BYTES && s.scrollback.len() > 1 {
                 if let Some(removed) = s.scrollback.pop_front() {
                     s.scrollback_bytes -= removed.len();
                 }
@@ -3780,6 +3789,29 @@ mod running_summary_tests {
         let s = m.running_summary();
         assert_eq!(s.scheduled, 0);
         assert_eq!(s.interactive, 0);
+    }
+
+    // Scrollback eviction must never drop the just-appended frame, even when
+    // that single frame exceeds the byte cap. Otherwise a reconnecting client
+    // replays an EMPTY buffer for a turn that produced a large tool_result
+    // (agent content blocks are not pre-capped like user prompts are).
+    #[test]
+    fn oversized_single_frame_survives_eviction_for_replay() {
+        let (m, _tmp) = mgr_with(vec![running_session(
+            "s", SessionType::Codex, None, TurnState::Running,
+        )]);
+        // One frame strictly larger than the whole cap.
+        let big = "x".repeat(SCROLLBACK_MAX_BYTES + 1024);
+        m.push_scrollback("s", big.clone());
+        let history = m.get_scrollback("s");
+        // The oversized frame is retained (not self-evicted to empty).
+        assert_eq!(history, vec![big.clone()], "oversized tail must survive");
+
+        // A subsequent frame pushes the now-over-cap ring down: the OLD oversized
+        // frame is evicted, the NEW tail is kept — buffer is never wiped to empty.
+        m.push_scrollback("s", "next".to_string());
+        let history2 = m.get_scrollback("s");
+        assert_eq!(history2, vec!["next".to_string()], "new tail retained, old oversized evicted");
     }
 
     /// 像 running_session，但返回接收端供断言"发了什么"。

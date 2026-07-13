@@ -469,8 +469,15 @@ async fn delete_session(
 
 async fn session_status(
     State(state): State<Arc<AppState>>,
+    user: axum::Extension<CurrentUser>,
     axum::extract::Path(id): axum::extract::Path<String>,
 ) -> Result<Json<serde_json::Value>, StatusCode> {
+    // Owner-only: without this, any active user could read another session's
+    // work_dir (path), git branch, and dirty-file count by guessing its id
+    // (parity with every other session-scoped handler).
+    if !user.is_admin() && !state.sessions.is_owner(&id, &user.id) {
+        return Err(StatusCode::FORBIDDEN);
+    }
     let stored_dir = state.sessions.work_dir(&id).ok_or(StatusCode::NOT_FOUND)?;
 
     // Try to get live cwd from /proc/PID/cwd for PTY sessions
@@ -525,9 +532,17 @@ struct LogsQuery {
 
 async fn session_logs(
     State(state): State<Arc<AppState>>,
+    user: axum::Extension<CurrentUser>,
     axum::extract::Path(id): axum::extract::Path<String>,
     Query(query): Query<LogsQuery>,
 ) -> Result<Json<serde_json::Value>, StatusCode> {
+    // Owner-only: the log ring buffer holds the session's full PTY I/O and ACP
+    // conversation. Without this gate any active user could exfiltrate another
+    // user's terminal/agent transcript (the logger keys on an 8-char id prefix,
+    // making the lookup even easier). Parity with the file/git handlers.
+    if !user.is_admin() && !state.sessions.is_owner(&id, &user.id) {
+        return Err(StatusCode::FORBIDDEN);
+    }
     let logger = state.logger.as_ref().ok_or(StatusCode::NOT_FOUND)?;
     let limit = query.limit.unwrap_or(100).min(1000);
     let offset = query.offset.unwrap_or(0);
@@ -606,8 +621,10 @@ struct UpdatePromptReq {
 
 async fn list_notes(
     State(state): State<Arc<AppState>>,
+    user: axum::Extension<CurrentUser>,
     axum::extract::Path(id): axum::extract::Path<String>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    require_session_access(&state, &user, &id)?;
     let work_dir = state
         .sessions
         .work_dir(&id)
@@ -630,6 +647,7 @@ async fn create_note(
     axum::extract::Path(id): axum::extract::Path<String>,
     Json(req): Json<CreateNoteReq>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    require_session_access(&state, &user, &id)?;
     let work_dir = state
         .sessions
         .work_dir(&id)
@@ -645,9 +663,22 @@ async fn create_note(
 
 async fn delete_note(
     State(state): State<Arc<AppState>>,
-    axum::extract::Path((_session_id, note_id)): axum::extract::Path<(String, String)>,
+    user: axum::Extension<CurrentUser>,
+    axum::extract::Path((session_id, note_id)): axum::extract::Path<(String, String)>,
 ) -> StatusCode {
-    match state.notes.delete_note(&note_id) {
+    // Two-layer authz. (1) The caller must own the session in the route.
+    // (2) The delete is scoped to that session's work_dir, so even an owned
+    // session can only remove notes that legitimately belong to its work_dir —
+    // previously the handler discarded the session id and deleted by bare
+    // note_id, letting any note be removed regardless of session.
+    if require_session_access(&state, &user, &session_id).is_err() {
+        return StatusCode::FORBIDDEN;
+    }
+    let work_dir = match state.sessions.work_dir(&session_id) {
+        Some(d) => d,
+        None => return StatusCode::NOT_FOUND,
+    };
+    match state.notes.delete_note(&note_id, &work_dir) {
         Ok(true) => StatusCode::OK,
         Ok(false) => StatusCode::NOT_FOUND,
         Err(_) => StatusCode::INTERNAL_SERVER_ERROR,

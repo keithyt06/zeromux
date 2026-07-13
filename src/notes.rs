@@ -140,14 +140,20 @@ impl NotesStore {
         Ok(notes)
     }
 
-    pub fn delete_note(&self, note_id: &str) -> Result<bool, String> {
-        // Get file path before deleting from index
+    /// Delete a note, scoped to a work_dir. The delete only succeeds when the
+    /// note's stored `work_dir` matches — binding the operation to a session
+    /// that legitimately shares that work_dir. Without this scope the delete
+    /// keyed on `note_id` alone, so any authenticated user could remove any
+    /// note by id, ignoring the session in the route entirely (authz gap).
+    pub fn delete_note(&self, note_id: &str, work_dir: &str) -> Result<bool, String> {
+        // Get file path before deleting from index — only for the matching
+        // (id, work_dir) pair, so a mismatched work_dir touches nothing.
         let file_path = {
             let conn = self.conn.lock().unwrap();
             let path: Option<String> = conn
                 .query_row(
-                    "SELECT file_path FROM notes WHERE id = ?1",
-                    params![note_id],
+                    "SELECT file_path FROM notes WHERE id = ?1 AND work_dir = ?2",
+                    params![note_id, work_dir],
                     |row| row.get(0),
                 )
                 .ok();
@@ -160,13 +166,60 @@ impl NotesStore {
             let _ = std::fs::remove_file(&full_path);
         }
 
-        // Delete from index
+        // Delete from index (same scope)
         let conn = self.conn.lock().unwrap();
         let rows = conn
-            .execute("DELETE FROM notes WHERE id = ?1", params![note_id])
+            .execute(
+                "DELETE FROM notes WHERE id = ?1 AND work_dir = ?2",
+                params![note_id, work_dir],
+            )
             .map_err(|e| format!("Delete error: {}", e))?;
 
         Ok(rows > 0)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    // Unique temp dir per test invocation so parallel runs don't collide on the
+    // shared sqlite file (mirrors the resolve_wikilink_* test hygiene).
+    static SEQ: AtomicUsize = AtomicUsize::new(0);
+    fn tmp_store() -> NotesStore {
+        let n = SEQ.fetch_add(1, Ordering::Relaxed);
+        let dir = std::env::temp_dir().join(format!("zeromux_notes_test_{}_{}", std::process::id(), n));
+        let _ = std::fs::remove_dir_all(&dir);
+        NotesStore::open(&dir).unwrap()
+    }
+
+    #[test]
+    fn delete_note_scoped_to_work_dir() {
+        let store = tmp_store();
+        let note = store
+            .create_note("/home/u/repoA", "note text", &[], "sess-a", "alice")
+            .unwrap();
+
+        // Deleting with the WRONG work_dir must not remove the note (this is the
+        // authz gap: a note_id harvested from another session's work_dir).
+        assert_eq!(
+            store.delete_note(&note.id, "/home/u/repoB").unwrap(),
+            false,
+            "delete with mismatched work_dir must be a no-op"
+        );
+        assert_eq!(
+            store.list_notes("/home/u/repoA").unwrap().len(),
+            1,
+            "note must survive a mismatched-work_dir delete"
+        );
+
+        // Deleting with the CORRECT work_dir succeeds.
+        assert_eq!(
+            store.delete_note(&note.id, "/home/u/repoA").unwrap(),
+            true
+        );
+        assert_eq!(store.list_notes("/home/u/repoA").unwrap().len(), 0);
     }
 }
 

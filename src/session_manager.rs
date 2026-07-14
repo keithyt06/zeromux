@@ -1997,12 +1997,15 @@ fn spawn_acp_fanout(
         // 在所有后端降级为 collect(见 QueueMode::effective 注释,review 2026-06-11)。
         let mut queue_mode = QueueMode::Collect;
         // ── per-run metrics state ──
-        // `run_started_ms` is stamped at every turn-start site and consumed
-        // (`.take()`) at the boundary; `pending_outcome` carries INTENT
-        // (Cancel/Interrupt→Cancelled, TimeoutKill→Timeout) set on the input
-        // branch and overrides the terminal-event inference (classify_outcome).
+        // `turn_starts` is a FIFO of per-turn start stamps: a stamp is pushed
+        // at every turn-start site and `settle()`d (pop_front) at the boundary,
+        // pairing each FIFO-ordered boundary with its own turn (an interrupt-
+        // resend starts turn N+1 before turn N's aborted boundary arrives, so a
+        // single slot would mis-attribute both — see TurnStarts). `pending_outcome`
+        // carries INTENT (Cancel/Interrupt→Cancelled, TimeoutKill→Timeout) set on
+        // the input branch and overrides the terminal-event inference.
         let mut pending_outcome: Option<crate::run_metrics::RunOutcome> = None;
-        let mut run_started_ms: Option<i64> = None;
+        let mut turn_starts = TurnStarts::default();
         // ── cost 差分状态(仅 claude-code;见 cost-calibration spec)──
         // 冷启动:prev=Some(0.0)→首轮增量=total 本身;resume:prev=None→首轮记 0。
         let mut prev_cost: Option<f64> = if is_resumed { None } else { Some(0.0) };
@@ -2062,7 +2065,7 @@ fn spawn_acp_fanout(
                                     if let Some(m) = mgr.upgrade() {
                                         if let Some(p) = m.push_handle() {
                                             let now = now_millis();
-                                            let dur = run_started_ms.as_ref().map(|s| now - s).unwrap_or(0);
+                                            let dur = turn_starts.front().map(|s| now - s).unwrap_or(0);
                                             let name = m.session_name(&sid).unwrap_or_default();
                                             let uid = owner_id.clone();
                                             let sid2 = sid.clone();
@@ -2117,8 +2120,9 @@ fn spawn_acp_fanout(
                                 // records exactly one metric from this single exit. Intent
                                 // (pending_outcome) overrides the event-type inference; the
                                 // late boundaries of an interrupt-resend still each record a run
-                                // (they represent a real run that ended). Skipped only if this
-                                // boundary has no matching turn-start stamp (run_started_ms None).
+                                // (they represent a real run that ended) — the turn_starts FIFO
+                                // pairs each with its own turn's start. Skipped only if this
+                                // boundary has no pending turn-start (turn_starts empty).
                                 let term = match &evt {
                                     AcpEvent::Result { .. } => crate::run_metrics::TerminalEvt::Result,
                                     AcpEvent::Error { .. } => crate::run_metrics::TerminalEvt::Error,
@@ -2129,11 +2133,12 @@ fn spawn_acp_fanout(
                                     AcpEvent::Result { cost_usd, tokens_in, tokens_out, .. } => (*cost_usd, *tokens_in, *tokens_out),
                                     _ => (None, None, None),
                                 };
-                                // 本边界是否会落 metric:由单槽 run_started_ms 决定。被打断的
-                                // resend 旧 turn 会发来带累计 cost 的 Result,但其时间戳已被新 turn
-                                // 覆盖 → 不落 metric。此时**不能**推进 prev_cost,否则该轮增量凭空
-                                // 消失、lifetime_cost_usd 偏低(见 diff_cost_at_boundary 文档)。
-                                let will_record = run_started_ms.is_some();
+                                // 本边界是否会落 metric:由 FIFO 队首(最早未结算的 turn-start)
+                                // 决定。boundaries 严格 FIFO、每 turn 恰一个,故 front() 就是本
+                                // 边界所属 turn 的 start;若队列已空(罕见的多余边界)则不落 metric,
+                                // 且**不能**推进 prev_cost,否则该轮增量凭空消失、lifetime_cost_usd
+                                // 偏低(见 diff_cost_at_boundary 文档)。settle() 在下方消费同一队首。
+                                let will_record = turn_starts.front().is_some();
                                 let mc = if is_claude {
                                     let (delta, new_prev, new_seen) = crate::run_metrics::diff_cost_at_boundary(
                                         prev_cost, raw_cost, first_cost_seen, is_resumed, will_record);
@@ -2148,7 +2153,7 @@ fn spawn_acp_fanout(
                                         if matches!(evt, AcpEvent::Exit { .. }) { "cli_exited" } else { "cli_error" }.to_string()),
                                     _ => None,
                                 };
-                                if let Some(started) = run_started_ms.take() {
+                                if let Some(started) = turn_starts.settle() {
                                     if let Some(m) = mgr.upgrade() {
                                         let rid = crate::run_metrics::new_run_id();
                                         let metric = build_run_metric(&rid, &sid, &work_dir, agent_label, turn_seq,
@@ -2219,7 +2224,7 @@ fn spawn_acp_fanout(
                                 }
                                 turn_seq += 1;
                                 local_running = true;
-                                run_started_ms = Some(now_millis());
+                                turn_starts.start(now_millis());
                                 if let Some(m) = mgr.upgrade() {
                                     m.mark_turn(&sid, TurnState::Running, turn_seq);
                                 }
@@ -2238,7 +2243,7 @@ fn spawn_acp_fanout(
                                         active_run_id = None;
                                         turn_seq += 1;
                                         local_running = true;
-                                        run_started_ms = Some(now_millis());
+                                        turn_starts.start(now_millis());
                                         if let Some(m) = mgr.upgrade() {
                                             m.mark_turn(&sid, TurnState::Running, turn_seq);
                                         }
@@ -2251,7 +2256,7 @@ fn spawn_acp_fanout(
                                         active_run_id = None;
                                         turn_seq += 1;
                                         local_running = true;
-                                        run_started_ms = Some(now_millis());
+                                        turn_starts.start(now_millis());
                                         if let Some(m) = mgr.upgrade() {
                                             m.mark_turn(&sid, TurnState::Running, turn_seq);
                                         }
@@ -2280,7 +2285,7 @@ fn spawn_acp_fanout(
                                             active_run_id = None;
                                             turn_seq += 1;
                                             local_running = true;
-                                            run_started_ms = Some(now_millis());
+                                            turn_starts.start(now_millis());
                                             if let Some(m) = mgr.upgrade() {
                                                 m.mark_turn(&sid, TurnState::Running, turn_seq);
                                             }
@@ -2339,7 +2344,7 @@ fn spawn_acp_fanout(
                         active_run_id = None; // 合并 turn 永不携带 run_id(C3)
                         turn_seq += 1;
                         local_running = true;
-                        run_started_ms = Some(now_millis());
+                        turn_starts.start(now_millis());
                         if let Some(m) = mgr.upgrade() {
                             m.mark_turn(&sid, TurnState::Running, turn_seq);
                         }
@@ -2360,6 +2365,55 @@ fn spawn_acp_fanout(
 struct PendingPrompt {
     text: String,
     ts_ms: i64,
+}
+
+/// FIFO of per-turn start timestamps for the run-metrics bookkeeping.
+///
+/// Replaces a single `Option<i64>` slot that conflated concurrently-live
+/// turns. In an interrupt-resend, turn N+1 starts (and stamps its start) BEFORE
+/// turn N's aborted terminal boundary arrives, so a single slot loses turn N's
+/// stamp: the aborted boundary then wrongly consumes turn N+1's stamp
+/// (duration≈0) and turn N+1's real boundary records nothing.
+///
+/// Boundaries arrive strictly FIFO — the same ordering `boundary_count`
+/// (Idle-settling) already relies on. So the start-stamp is pushed at each
+/// turn-start and `pop_front`'d at each boundary, pairing every boundary with
+/// its own turn's start. If a turn emits >1 boundary (Codex panic Error+Exit,
+/// or a mid-turn error followed by the call result), the extra boundary finds
+/// an empty queue → `settle()` returns None → no metric and no baseline
+/// advance, keeping the `will_record=false` guard load-bearing.
+///
+/// Load-bearing invariant: **every started turn eventually yields ≥1 boundary.**
+/// A turn that pushed a stamp but never boundaries would strand it and drift
+/// all later pairings. Holds because every start site is immediately followed
+/// by `send_prompt`, whose failure implies process death → an `Exit` boundary
+/// drains the stamp; and `Cancel`/`TimeoutKill` `kill()` the process (→ `Exit`).
+/// (An outcome-intent FIFO to label the aborted turn of a coupled interrupt-
+/// resend as Cancelled rather than Completed is a documented follow-up; the
+/// single `pending_outcome` slot still covers the standalone Cancel/Interrupt
+/// paths, and the aborted-turn label was already Completed before this fix.)
+#[derive(Default)]
+struct TurnStarts {
+    inner: VecDeque<i64>,
+}
+
+impl TurnStarts {
+    /// A turn started at `ms`; enqueue its start-stamp.
+    fn start(&mut self, ms: i64) {
+        self.inner.push_back(ms);
+    }
+
+    /// Peek the oldest pending start-stamp without consuming it (used for the
+    /// turn_done push duration, read before the metric block settles it).
+    fn front(&self) -> Option<i64> {
+        self.inner.front().copied()
+    }
+
+    /// A boundary arrived; consume and return the oldest pending start-stamp,
+    /// or None if this boundary has no matching turn-start (spurious extra).
+    fn settle(&mut self) -> Option<i64> {
+        self.inner.pop_front()
+    }
 }
 
 /// Shared collect-queue state for all three fan-outs (was duplicated ~3×).
@@ -2618,7 +2672,7 @@ fn spawn_kiro_fanout(
         let mut queue_mode = QueueMode::Collect;
         // ── per-run metrics state (mirrors spawn_acp_fanout) ──
         let mut pending_outcome: Option<crate::run_metrics::RunOutcome> = None;
-        let mut run_started_ms: Option<i64> = None;
+        let mut turn_starts = TurnStarts::default();
         loop {
             tokio::select! {
                 event = process.event_rx.recv() => {
@@ -2675,7 +2729,7 @@ fn spawn_kiro_fanout(
                                         if matches!(evt, AcpEvent::Exit { .. }) { "cli_exited" } else { "cli_error" }.to_string()),
                                     _ => None,
                                 };
-                                if let Some(started) = run_started_ms.take() {
+                                if let Some(started) = turn_starts.settle() {
                                     if let Some(m) = mgr.upgrade() {
                                         let rid = crate::run_metrics::new_run_id();
                                         let metric = build_run_metric(&rid, &sid, &work_dir, agent_label, turn_seq,
@@ -2720,7 +2774,7 @@ fn spawn_kiro_fanout(
                                 }
                                 turn_seq += 1;
                                 local_running = true;
-                                run_started_ms = Some(now_millis());
+                                turn_starts.start(now_millis());
                                 if let Some(m) = mgr.upgrade() {
                                     m.mark_turn(&sid, TurnState::Running, turn_seq);
                                 }
@@ -2738,7 +2792,7 @@ fn spawn_kiro_fanout(
                                         queue.clear();
                                         turn_seq += 1;
                                         local_running = true;
-                                        run_started_ms = Some(now_millis());
+                                        turn_starts.start(now_millis());
                                         if let Some(m) = mgr.upgrade() {
                                             m.mark_turn(&sid, TurnState::Running, turn_seq);
                                         }
@@ -2749,7 +2803,7 @@ fn spawn_kiro_fanout(
                                     QueueMode::Passthrough => {
                                         turn_seq += 1;
                                         local_running = true;
-                                        run_started_ms = Some(now_millis());
+                                        turn_starts.start(now_millis());
                                         if let Some(m) = mgr.upgrade() {
                                             m.mark_turn(&sid, TurnState::Running, turn_seq);
                                         }
@@ -2768,7 +2822,7 @@ fn spawn_kiro_fanout(
                                         } else {
                                             turn_seq += 1;
                                             local_running = true;
-                                            run_started_ms = Some(now_millis());
+                                            turn_starts.start(now_millis());
                                             if let Some(m) = mgr.upgrade() {
                                                 m.mark_turn(&sid, TurnState::Running, turn_seq);
                                             }
@@ -2824,7 +2878,7 @@ fn spawn_kiro_fanout(
                         let merged = queue.drain_merged();
                         turn_seq += 1;
                         local_running = true;
-                        run_started_ms = Some(now_millis());
+                        turn_starts.start(now_millis());
                         if let Some(m) = mgr.upgrade() {
                             m.mark_turn(&sid, TurnState::Running, turn_seq);
                         }
@@ -2864,7 +2918,7 @@ fn spawn_codex_fanout(
         let mut queue_mode = QueueMode::Collect;
         // ── per-run metrics state (mirrors spawn_acp_fanout) ──
         let mut pending_outcome: Option<crate::run_metrics::RunOutcome> = None;
-        let mut run_started_ms: Option<i64> = None;
+        let mut turn_starts = TurnStarts::default();
         loop {
             tokio::select! {
                 event = process.event_rx.recv() => {
@@ -2921,7 +2975,7 @@ fn spawn_codex_fanout(
                                         if matches!(evt, AcpEvent::Exit { .. }) { "cli_exited" } else { "cli_error" }.to_string()),
                                     _ => None,
                                 };
-                                if let Some(started) = run_started_ms.take() {
+                                if let Some(started) = turn_starts.settle() {
                                     if let Some(m) = mgr.upgrade() {
                                         let rid = crate::run_metrics::new_run_id();
                                         let metric = build_run_metric(&rid, &sid, &work_dir, agent_label, turn_seq,
@@ -2966,7 +3020,7 @@ fn spawn_codex_fanout(
                                 }
                                 turn_seq += 1;
                                 local_running = true;
-                                run_started_ms = Some(now_millis());
+                                turn_starts.start(now_millis());
                                 if let Some(m) = mgr.upgrade() {
                                     m.mark_turn(&sid, TurnState::Running, turn_seq);
                                 }
@@ -2983,7 +3037,7 @@ fn spawn_codex_fanout(
                                         queue.clear();
                                         turn_seq += 1;
                                         local_running = true;
-                                        run_started_ms = Some(now_millis());
+                                        turn_starts.start(now_millis());
                                         if let Some(m) = mgr.upgrade() {
                                             m.mark_turn(&sid, TurnState::Running, turn_seq);
                                         }
@@ -2994,7 +3048,7 @@ fn spawn_codex_fanout(
                                     QueueMode::Passthrough => {
                                         turn_seq += 1;
                                         local_running = true;
-                                        run_started_ms = Some(now_millis());
+                                        turn_starts.start(now_millis());
                                         if let Some(m) = mgr.upgrade() {
                                             m.mark_turn(&sid, TurnState::Running, turn_seq);
                                         }
@@ -3013,7 +3067,7 @@ fn spawn_codex_fanout(
                                         } else {
                                             turn_seq += 1;
                                             local_running = true;
-                                            run_started_ms = Some(now_millis());
+                                            turn_starts.start(now_millis());
                                             if let Some(m) = mgr.upgrade() {
                                                 m.mark_turn(&sid, TurnState::Running, turn_seq);
                                             }
@@ -3068,7 +3122,7 @@ fn spawn_codex_fanout(
                         let merged = queue.drain_merged();
                         turn_seq += 1;
                         local_running = true;
-                        run_started_ms = Some(now_millis());
+                        turn_starts.start(now_millis());
                         if let Some(m) = mgr.upgrade() {
                             m.mark_turn(&sid, TurnState::Running, turn_seq);
                         }
@@ -3591,6 +3645,32 @@ mod turn_state_tests {
         apply_turn(&mut s, TurnState::Idle, 2); // real boundary #2 (turn 2)
         assert_eq!(s.running.as_ref().unwrap().turn_state, TurnState::Idle);
         assert_eq!(s.turns_completed, 1);
+    }
+
+    #[test]
+    fn turn_starts_fifo_pairs_each_boundary_with_its_own_turn() {
+        // Metric-side counterpart of interrupt_resend_stale_boundary_*: the
+        // per-run start-stamp must be FIFO, not a single slot. In an
+        // interrupt-resend, turn 2 starts (stamps T2) BEFORE turn 1's aborted
+        // boundary arrives. A single Option<i64> would hold only T2 →
+        //   - boundary #1 (aborted turn 1) consumes T2 → started=T2, duration≈0
+        //   - boundary #2 (real turn 2) finds None → records NO metric
+        // The FIFO settles the OLDEST pending start at each boundary, so each
+        // boundary is paired with its own turn's start.
+        let mut ts = TurnStarts::default();
+        ts.start(1_000); // turn 1 start (T1)
+        ts.start(2_000); // turn 2 resend start (T2) — single slot would drop T1
+
+        // boundary #1 (aborted turn 1) → T1, not T2
+        assert_eq!(ts.front(), Some(1_000));
+        assert_eq!(ts.settle(), Some(1_000));
+        // boundary #2 (real answering turn) → T2, still recorded
+        assert_eq!(ts.front(), Some(2_000));
+        assert_eq!(ts.settle(), Some(2_000));
+        // a spurious extra boundary with no pending start → no metric,
+        // no baseline corruption (will_record=false path stays load-bearing)
+        assert_eq!(ts.front(), None);
+        assert_eq!(ts.settle(), None);
     }
 
     #[test]

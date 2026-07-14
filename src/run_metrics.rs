@@ -115,12 +115,13 @@ pub fn diff_cost(
 /// fan-out 接入处的"按边界"成本决策。`will_record` = 本边界是否带 turn-start
 /// 时间戳(即是否会落一条 RunMetric)。返回 `(本轮 cost, 新 prev, 新 first_seen)`。
 ///
-/// **不变量(修 interrupt-resend lifetime 漏算)**:`prev`/`first_seen` 只在
-/// 边界真正落 metric 时推进。被打断的 resend 旧 turn 会照常发来一个带累计 cost 的
-/// Result,但它没有 turn-start 时间戳(单槽 `run_started_ms` 已被新 turn 覆盖)→
-/// 其 metric 被丢弃。若此时仍推进 `prev`,该轮增量便凭空消失,`lifetime_cost_usd`
-/// 系统性偏低(spec §4.1 警示的"偏低更隐蔽")。故 `!will_record` 时不推进基线,
-/// 让该增量自然并入下一条被记录的 turn —— 累计 telescoping 保持精确。
+/// **不变量**:`prev`/`first_seen` 只在边界真正落 metric 时推进。turn-start 时间戳
+/// 现由 FIFO(`TurnStarts`)按边界结算,故 interrupt-resend 的两个边界(旧被打断
+/// turn + 新答复 turn)各配到自己的 start、各落一条 metric —— `will_record` 都为
+/// true。`!will_record` 只在一个 turn 发出**多余**边界(FIFO 已空)时出现:此时既
+/// 不落 metric,也**不能**推进 `prev`,否则该轮增量凭空消失、`lifetime_cost_usd`
+/// 系统性偏低(spec §4.1 警示的"偏低更隐蔽")。让该增量自然并入下一条被记录的
+/// turn —— 累计 telescoping 保持精确。
 pub fn diff_cost_at_boundary(
     prev: Option<f64>,
     cur: Option<f64>,
@@ -384,11 +385,10 @@ mod tests {
 
     #[test]
     fn boundary_dropped_does_not_advance_baseline_and_no_cost_lost() {
-        // interrupt-resend:turn N(被打断)与 resend N+1 各发来一个带累计 cost 的
-        // Result,FIFO 先到的是 N。单槽 run_started_ms 已被 N+1 覆盖 → 只有先到的
-        // 边界会落 metric。模拟:
+        // `!will_record` 路径(一个 turn 发出多余边界、TurnStarts FIFO 已空):该边界
+        // 不落 metric,且**不能**推进基线。模拟:
         //   边界1(will_record=true,total=0.10)→ 记 0.10,prev→0.10
-        //   边界2(will_record=false,total=0.18)→ 丢弃:cost None,prev 不动(仍 0.10)
+        //   多余边界(will_record=false,total=0.18)→ 丢弃:cost None,prev 不动(仍 0.10)
         //   下一条被记录的 turn(total=0.25)→ 增量 = 0.25-0.10 = 0.15,
         //     恰含被丢弃边界的 0.08 增量(telescoping 不丢钱)。
         let (d1, p1, f1) = diff_cost_at_boundary(Some(0.0), Some(0.10), false, false, true);

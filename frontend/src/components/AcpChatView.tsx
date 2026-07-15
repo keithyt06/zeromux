@@ -13,6 +13,7 @@ import { foldTranscript, type WireEvent, type Block, type TurnGroup } from '../l
 import { partitionBlocks, type Density } from '../lib/density'
 import { STUCK_SILENCE_MS } from '../lib/stuck'
 import { shouldStickToBottom, shouldAutoScrollOnAppend, shouldTrackScrollUp } from '../lib/scrollReplay'
+import { shouldClearQueuedHint } from '../lib/collectHint'
 
 // ── Message types ──
 
@@ -258,7 +259,7 @@ export default function AcpChatView({ sessionId, agentType = 'claude', onRegiste
       case 'content_block': {
         appendEvent(evt as unknown as WireEvent)
         // A brand-new assistant turn producing output clears any collect hint.
-        setQueuedCount(0)
+        if (shouldClearQueuedHint(evt.type)) setQueuedCount(0)
         setBusy(true)
         // Stamp turn start if not already running (e.g. a turn observed from
         // another tab via replay, where this client didn't call sendPrompt).
@@ -273,6 +274,9 @@ export default function AcpChatView({ sessionId, agentType = 'claude', onRegiste
         appendEvent(evt as unknown as WireEvent)
         setBusy(false)
         setTurnStartedMs(null)
+        // Turn ended — clear any collect hint (the merged turn, if any, already
+        // fired or was dropped; see shouldClearQueuedHint).
+        if (shouldClearQueuedHint(evt.type)) setQueuedCount(0)
         bumpMetrics()
         break
       }
@@ -281,6 +285,9 @@ export default function AcpChatView({ sessionId, agentType = 'claude', onRegiste
         pushNotice({ id: newId(), kind: 'error', text: evt.message || 'Unknown error' })
         setBusy(false)
         setTurnStartedMs(null)
+        // Error ends the turn AND the backend drops the collect queue, so the
+        // merged turn never fires — clear the hint or it sticks forever.
+        if (shouldClearQueuedHint(evt.type)) setQueuedCount(0)
         bumpMetrics()
         break
       }
@@ -289,6 +296,8 @@ export default function AcpChatView({ sessionId, agentType = 'claude', onRegiste
         pushNotice({ id: newId(), kind: 'system', text: `Process exited (code: ${evt.code || 0})` })
         setBusy(false)
         setTurnStartedMs(null)
+        // Same as error: process death drops the queue; clear the stale hint.
+        if (shouldClearQueuedHint(evt.type)) setQueuedCount(0)
         bumpMetrics()
         break
       }

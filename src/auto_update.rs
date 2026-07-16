@@ -50,6 +50,52 @@ enum GateDecision {
     WaitInteractive,
 }
 
+/// 稳定门(E5)的一步决策结果。纯数据,便于单测。
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum StabilityStep {
+    /// 本轮无可评估内容(文件从未成功哈希过),跳过。
+    Skip,
+    /// 内容刚变化,记下新 sha,等下一轮确认(anti half-write)。
+    WaitStable(String),
+    /// 内容已稳定,用此 sha 继续 self-compare + gate。
+    Proceed(String),
+}
+
+/// 纯函数:稳定门的一步决策(评审 E5)。
+///
+/// **修复的 bug:** 旧循环在 `stat` 未变时直接 `continue` 跳过,但稳定门要求
+/// "连续两轮相同 sha 才算写完"——而未变文件的 sha 恰恰相同却因 stat 短路永不
+/// 被复算,第二轮确认永远不发生 → 稳定门死锁 → 全自动更新对任何真实新 build
+/// 永不触发(build 落定后 stat 即静止)。修复:把"stat 未变"当作稳定信号本身,
+/// 复用缓存 sha 直接进入 self-compare/gate;而"stat 变化"仍走一轮 settle。
+///
+/// - `stat_changed`:本轮 (mtime,size) 是否与上轮不同。
+/// - `fresh_sha`:仅当 `stat_changed` 时调用方计算的新 sha;否则 `None`。
+/// - `last_seen_sha`:上一轮记录的 sha。
+fn stability_step(
+    stat_changed: bool,
+    fresh_sha: Option<String>,
+    last_seen_sha: Option<&str>,
+) -> StabilityStep {
+    match (stat_changed, fresh_sha) {
+        // 内容刚变:新 sha 与上轮不同 → 等一轮确认写完;相同(纯 touch)→ 直接继续。
+        (true, Some(sha)) => {
+            if last_seen_sha != Some(sha.as_str()) {
+                StabilityStep::WaitStable(sha)
+            } else {
+                StabilityStep::Proceed(sha)
+            }
+        }
+        // 哈希失败(调用方已 continue),防御性 Skip 保持全函数化。
+        (true, None) => StabilityStep::Skip,
+        // stat 未变 = 文件已稳定:复用缓存 sha 继续;还没哈希过则跳过。
+        (false, _) => match last_seen_sha {
+            Some(s) => StabilityStep::Proceed(s.to_string()),
+            None => StabilityStep::Skip,
+        },
+    }
+}
+
 /// 纯函数:给定运行摘要、已等待秒数、max_wait 秒数,决定能否升级(评审 E1)。
 fn gate_decision(summary: RunningSummary, waited_secs: u64, max_wait_secs: u64) -> GateDecision {
     if summary.scheduled > 0 {
@@ -122,33 +168,53 @@ pub fn spawn_auto_updater(cfg: AutoUpdateConfig, mgr: Weak<SessionManager>) {
         let mut pending_since: Option<Instant> = None;
         // 上一轮 stat 的 (mtime, size),用于跳过未变文件。
         let mut last_stat: Option<(std::time::SystemTime, u64)> = None;
+        // 已冒烟失败的 build sha:稳定文件现在每轮都会 Proceed(修复稳定门死锁的
+        // 代价),故记住坏 build 的 sha,避免每 30s 重跑 --help 冒烟 + 重复日志。
+        // 运维替换文件(sha 变)即解除。
+        let mut smoke_failed_sha: Option<String> = None;
         // swap 经 launch_swap().await 内联等待,单任务循环天然无法在 swap 中途重入;
         // 若进程从失败 swap 存活,下一轮 tick 经 pending_since 从头重新评估。
 
         loop {
             tick.tick().await;
 
-            // 1. stat:未变则跳过哈希
+            // 1. stat:变化才重算 sha,未变则复用缓存(未变即"已写完稳定"信号)。
             let meta = match std::fs::metadata(&cfg.watch_path) {
                 Ok(m) => m,
                 Err(_) => { tracing::debug!("auto-update: watch_path stat failed, skip"); continue; }
             };
             let stat = (meta.modified().unwrap_or(std::time::UNIX_EPOCH), meta.len());
-            if last_stat == Some(stat) {
-                continue; // 文件未变
-            }
+            let stat_changed = last_stat != Some(stat);
             last_stat = Some(stat);
 
-            // 2. 算 sha
-            let sha = match sha256_file(&cfg.watch_path) {
-                Ok(s) => s,
-                Err(_) => { continue; }
+            // 2. 仅在 stat 变化时算 sha(未变时哈希浪费且无信息)。
+            let fresh_sha = if stat_changed {
+                match sha256_file(&cfg.watch_path) {
+                    Ok(s) => Some(s),
+                    Err(_) => { continue; }
+                }
+            } else {
+                None
             };
 
-            // 3. sha 稳定门(E5):连续两轮相同才算写完
-            if last_seen_sha.as_deref() != Some(sha.as_str()) {
-                tracing::info!("auto-update: build sha changed, waiting for stable (anti half-write)");
-                last_seen_sha = Some(sha);
+            // 3. sha 稳定门(E5):见 stability_step 文档 —— 修复 stat 短路使稳定门
+            //    永不完成的死锁。stat 未变的稳定文件复用缓存 sha 直接进入 gate。
+            let sha = match stability_step(stat_changed, fresh_sha, last_seen_sha.as_deref()) {
+                StabilityStep::Skip => continue,
+                StabilityStep::WaitStable(s) => {
+                    tracing::info!("auto-update: build sha changed, waiting for stable (anti half-write)");
+                    last_seen_sha = Some(s);
+                    continue;
+                }
+                StabilityStep::Proceed(s) => {
+                    last_seen_sha = Some(s.clone());
+                    s
+                }
+            };
+
+            // 坏 build 已冒烟失败过:静默跳过,直到文件被换掉(sha 变)。避免稳定
+            // 文件每轮 Proceed 造成的重复冒烟 + 日志刷屏。
+            if smoke_failed_sha.as_deref() == Some(sha.as_str()) {
                 continue;
             }
 
@@ -193,8 +259,10 @@ pub fn spawn_auto_updater(cfg: AutoUpdateConfig, mgr: Weak<SessionManager>) {
                         .status();
                     if !matches!(smoke, Ok(st) if st.success()) {
                         tracing::warn!("auto-update: new build failed --help smoke, skipping swap (no service disruption)");
-                        // 清 pending:坏 build 不会自己变好;运维替换文件(stat 变)才重新触发。
+                        // 清 pending:坏 build 不会自己变好;运维替换文件(sha 变)才重新触发。
+                        // 记住此 sha,避免稳定坏 build 每轮重跑冒烟。
                         pending_since = None;
+                        smoke_failed_sha = Some(sha.clone());
                         continue;
                     }
                     tracing::info!("auto-update: upgradeable, launching swap via systemd-run");
@@ -260,6 +328,52 @@ mod tests {
         // 两者都在跑:scheduled 优先,永不强制
         let d = gate_decision(RunningSummary { interactive: 2, scheduled: 1 }, 99999, 600);
         assert_eq!(d, GateDecision::BlockedByScheduled);
+    }
+
+    #[test]
+    fn stability_new_build_confirms_after_settle_tick() {
+        // Regression for the stat-skip/stability-gate deadlock: a real build lands
+        // once (stat changes on tick 1, then stays stable). It must confirm on the
+        // NEXT tick (stat unchanged) and Proceed — the old loop `continue`d on the
+        // unchanged stat and never re-confirmed, so it never upgraded.
+        //
+        // Tick 1: stat changed, fresh sha differs from last(None) → wait one tick.
+        let s1 = stability_step(true, Some("aaaa".into()), None);
+        assert_eq!(s1, StabilityStep::WaitStable("aaaa".into()));
+        // Tick 2: file now stable → stat unchanged, no fresh sha. Must reuse the
+        // cached "aaaa" and Proceed (the bug made this Skip forever).
+        let s2 = stability_step(false, None, Some("aaaa"));
+        assert_eq!(s2, StabilityStep::Proceed("aaaa".into()));
+    }
+
+    #[test]
+    fn stability_half_write_still_gets_one_settle() {
+        // A file mid-write changes its stat every tick with a different sha → keeps
+        // resetting the confirmation, never Proceeds until it settles (anti
+        // half-write, E5 preserved).
+        let a = stability_step(true, Some("v1".into()), None);
+        assert_eq!(a, StabilityStep::WaitStable("v1".into()));
+        // Next tick still writing: stat changed again, new sha ≠ last → wait again.
+        let b = stability_step(true, Some("v2".into()), Some("v1"));
+        assert_eq!(b, StabilityStep::WaitStable("v2".into()));
+        // Now settled: stat unchanged → Proceed with v2.
+        let c = stability_step(false, None, Some("v2"));
+        assert_eq!(c, StabilityStep::Proceed("v2".into()));
+    }
+
+    #[test]
+    fn stability_never_hashed_skips() {
+        // First tick ever, stat unchanged (equal to the None baseline is impossible,
+        // but defensively) with nothing hashed yet → Skip, don't Proceed on empty.
+        assert_eq!(stability_step(false, None, None), StabilityStep::Skip);
+    }
+
+    #[test]
+    fn stability_touch_same_content_proceeds_immediately() {
+        // mtime bumped but bytes identical (e.g. `touch`): stat changed, fresh sha ==
+        // last seen → no need for another settle tick, Proceed.
+        let s = stability_step(true, Some("same".into()), Some("same"));
+        assert_eq!(s, StabilityStep::Proceed("same".into()));
     }
 
     #[test]

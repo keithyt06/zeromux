@@ -64,9 +64,11 @@ impl NotesStore {
         let dir_hash = dir_hash(work_dir);
         let tags_json = serde_json::to_string(tags).unwrap_or_else(|_| "[]".to_string());
 
-        // Title: first line, truncated
+        // Title: first line, truncated to 100 chars. Truncate by chars, not
+        // bytes — `&title[..100]` panics when byte 100 splits a multibyte
+        // codepoint (routine for CJK/emoji titles), so cap on char boundaries.
         let title = text.lines().next().unwrap_or(text);
-        let title = if title.len() > 100 { &title[..100] } else { title };
+        let title: String = title.chars().take(100).collect();
 
         // File name: YYYYMMDD_HHMMSS_id.md
         let date_part = created_at.replace('-', "").replace(':', "").replace('T', "_");
@@ -220,6 +222,37 @@ mod tests {
             true
         );
         assert_eq!(store.list_notes("/home/u/repoA").unwrap().len(), 0);
+    }
+
+    #[test]
+    fn create_note_long_multibyte_first_line_does_not_panic() {
+        // Regression: the title was `&title[..100]` — a BYTE slice on arbitrary
+        // user text. A first line of Chinese chars has 3 bytes each, so byte 100
+        // falls mid-codepoint (char 33 occupies bytes 99..102) → slice panics.
+        // This is ordinary input for a Chinese-primary app, not a crafted attack.
+        let store = tmp_store();
+        let first_line = "中".repeat(150); // 150 chars, 450 bytes (> 100-char cap)
+        let text = format!("{}\n正文", first_line);
+        let note = store
+            .create_note("/home/u/repo", &text, &[], "sess-x", "alice")
+            .expect("create_note must not panic on a long multibyte title");
+        // The note round-trips and the stored title is capped by characters.
+        let listed = store.list_notes("/home/u/repo").unwrap();
+        assert_eq!(listed.len(), 1);
+        let title: String = {
+            let conn = store.conn.lock().unwrap();
+            conn.query_row(
+                "SELECT title FROM notes WHERE id = ?1",
+                params![note.id],
+                |r| r.get(0),
+            )
+            .unwrap()
+        };
+        assert_eq!(title.chars().count(), 100, "title capped to 100 chars");
+        assert!(
+            first_line.starts_with(&title) || title == first_line,
+            "title is a prefix of the first line"
+        );
     }
 }
 

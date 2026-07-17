@@ -292,8 +292,16 @@ async fn main() {
                         None
                     }
                     Ok(store) => {
+                        // Bounded timeouts so a blackholed/half-open push endpoint can
+                        // never hang a delivery forever — reqwest has NO default timeout.
+                        // Defense-in-depth alongside the fire-and-forget spawn in the
+                        // scheduler tick: also bounds the spawned confirm/turn_done tasks
+                        // so they can't leak hung tasks. redirect::none() keeps the SSRF
+                        // guard unbypassable by a redirect.
                         let client = reqwest::Client::builder()
                             .redirect(reqwest::redirect::Policy::none())
+                            .connect_timeout(std::time::Duration::from_secs(5))
+                            .timeout(std::time::Duration::from_secs(15))
                             .build()
                             .unwrap_or_default();
                         match push::PushService::new(vapid, Arc::new(store), client) {

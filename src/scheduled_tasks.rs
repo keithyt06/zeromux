@@ -1018,7 +1018,14 @@ pub fn spawn_scheduler(
                             ) {
                                 push.mark_stuck_pushed(&owner, &sid, now.timestamp_millis());
                                 let payload = crate::push::payload_for("stuck", &name, &sid, None);
-                                push.send_to_user(&owner, &payload).await;
+                                // Fire-and-forget (mirror spawn_confirm_pushes): never .await a
+                                // push inside the scheduler tick. A single unresponsive push
+                                // endpoint (accepted TCP, no reply) would otherwise block this
+                                // await indefinitely, freezing the heartbeat, the timeout-kill
+                                // watchdog (SF2), and all task firing until process restart.
+                                // Debounce state is already committed above via mark_stuck_pushed.
+                                let p = push.clone();
+                                tokio::spawn(async move { p.send_to_user(&owner, &payload).await; });
                             }
                         }
                     }

@@ -333,6 +333,23 @@ fn translate_event(val: &serde_json::Value) -> Vec<AcpEvent> {
         }
 
         "result" => {
+            // Claude sends `is_error:true` with subtype error_max_turns /
+            // error_during_execution and (usually) NO `result` text. Emitting a
+            // Result{text:""} here renders as a normal blank *successful* turn — the
+            // user never learns the turn hit the cap or crashed, and run_metrics
+            // records it as `succeeded`. Route errors to Error, which ends the turn
+            // on the frontend (red notice) and maps to TerminalEvt::Error in metrics.
+            // session_id is still captured for resume from the `system init` event
+            // (claude_session_id), so a first-turn error doesn't break resume.
+            if val.get("is_error").and_then(|v| v.as_bool()).unwrap_or(false) {
+                let subtype = val.get("subtype").and_then(|v| v.as_str()).unwrap_or("error");
+                let detail = val.get("result").and_then(|v| v.as_str()).filter(|s| !s.is_empty());
+                let message = match detail {
+                    Some(d) => format!("Claude turn ended in error ({subtype}): {d}"),
+                    None => format!("Claude turn ended in error ({subtype})"),
+                };
+                return vec![AcpEvent::Error { message }];
+            }
             let usage = val.get("usage");
             vec![AcpEvent::Result {
                 text: val.get("result").and_then(|v| v.as_str()).unwrap_or("").to_string(),
@@ -384,5 +401,46 @@ mod tests {
             }
             _ => panic!("expected Result"),
         }
+    }
+
+    #[test]
+    fn error_result_routes_to_error_not_blank_success() {
+        // Regression: a result line with is_error:true and no `result` text used to
+        // emit Result{text:""} — a blank successful turn (user sees nothing, metrics
+        // record `succeeded`). It must become an Error carrying the subtype.
+        let raw = serde_json::json!({
+            "type": "result", "subtype": "error_max_turns", "is_error": true,
+            "session_id": "s1", "total_cost_usd": 0.03
+        });
+        let evts = translate_event(&raw);
+        match &evts[0] {
+            AcpEvent::Error { message } => assert!(message.contains("error_max_turns")),
+            other => panic!("expected Error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn error_result_includes_detail_text_when_present() {
+        let raw = serde_json::json!({
+            "type": "result", "subtype": "error_during_execution", "is_error": true,
+            "result": "boom", "session_id": "s1"
+        });
+        match &translate_event(&raw)[0] {
+            AcpEvent::Error { message } => {
+                assert!(message.contains("error_during_execution"));
+                assert!(message.contains("boom"));
+            }
+            other => panic!("expected Error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn success_result_unaffected_by_error_routing() {
+        // is_error absent / false → still a normal Result.
+        let raw = serde_json::json!({
+            "type": "result", "subtype": "success", "is_error": false,
+            "result": "done", "session_id": "s1"
+        });
+        assert!(matches!(&translate_event(&raw)[0], AcpEvent::Result { .. }));
     }
 }

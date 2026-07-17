@@ -258,8 +258,9 @@ export default function AcpChatView({ sessionId, agentType = 'claude', onRegiste
 
       case 'content_block': {
         appendEvent(evt as unknown as WireEvent)
-        // A brand-new assistant turn producing output clears any collect hint.
-        if (shouldClearQueuedHint(evt.type)) setQueuedCount(0)
+        // NB: do NOT clear the collect hint here — content_block belongs to the
+        // still-running turn (its own output), and the merged turn can only start
+        // AFTER this turn's result/error/exit (which clear it). See shouldClearQueuedHint.
         setBusy(true)
         // Stamp turn start if not already running (e.g. a turn observed from
         // another tab via replay, where this client didn't call sendPrompt).

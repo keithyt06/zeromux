@@ -2,8 +2,13 @@ import { describe, it, expect } from 'vitest'
 import { shouldClearQueuedHint } from '../collectHint'
 
 describe('shouldClearQueuedHint', () => {
-  it('clears when the merged turn starts producing output', () => {
-    expect(shouldClearQueuedHint('content_block')).toBe(true)
+  // Regression (opposite direction from the turn-end fix): content_block belongs
+  // to the STILL-RUNNING turn. Clearing on it wiped the hint mid-turn while the
+  // agent was visibly still working, falsely implying the queued prompt was
+  // sent/dropped. The merged turn can only start after this turn's result/error/
+  // exit, which already clear the hint — so content_block must NOT clear.
+  it('does NOT clear on content_block (the running turn\'s own output)', () => {
+    expect(shouldClearQueuedHint('content_block')).toBe(false)
   })
 
   it('clears on normal turn end (result)', () => {

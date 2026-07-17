@@ -1908,6 +1908,26 @@ fn log_result_event(
     }
 }
 
+/// Finalize an in-flight scheduled run as failed, then clear its id — used when an
+/// interactive prompt (Interrupt/Passthrough queue mode) supersedes a running
+/// scheduled turn. The scheduled run is finalized in exactly one place normally:
+/// the boundary block keyed on `active_run_id.take()`. Superseding the turn drops
+/// that handle before its boundary arrives, so without this the run row stays
+/// `"running"` forever and the task's overlap guard wedges every future fire.
+/// Sets `*active_run_id` to `None` (same end state the callers previously had), so
+/// the later stale boundary's `take()` correctly no-ops (no double finalize).
+fn finalize_active_run_if_scheduled(
+    mgr: &Weak<SessionManager>,
+    active_run_id: &mut Option<String>,
+    failure_kind: &str,
+) {
+    if let Some(rid) = active_run_id.take() {
+        if let Some(m) = mgr.upgrade() {
+            m.finalize_run(&rid, "failed", None, Some(failure_kind));
+        }
+    }
+}
+
 /// On fan-out exit, clear the session's running state (keep metadata) so it can
 /// be respawned from its resume_token (Task 5+). No-op if the manager or session
 /// is already gone (e.g. the session was removed, which is why the fan-out ended).
@@ -2240,7 +2260,12 @@ fn spawn_acp_fanout(
                                             tracing::warn!("interrupt (queue mode) failed for {}: {}", sid, e);
                                         }
                                         queue.clear();
-                                        active_run_id = None;
+                                        // 若被打断的是一个在跑的调度 turn,先落定它的 run,再丢 rid。
+                                        // 否则 active_run_id 被清后,该 turn 的 boundary 到来时
+                                        // finalize 块 `active_run_id.take()` 已是 None → 永不 finalize,
+                                        // run 行永久 "running",任务的 overlap 守卫从此挡住每一次后续触发。
+                                        // take() 后仍为 None,故后到的 stale boundary 正确 no-op(不双 finalize)。
+                                        finalize_active_run_if_scheduled(&mgr, &mut active_run_id, "interrupted");
                                         turn_seq += 1;
                                         local_running = true;
                                         turn_starts.start(now_millis());
@@ -2253,7 +2278,10 @@ fn spawn_acp_fanout(
                                     }
                                     QueueMode::Passthrough => {
                                         // 不打断,直接并发发出。
-                                        active_run_id = None;
+                                        // 同 Interrupt 分支:若有在跑的调度 run,先 finalize 再丢 rid,
+                                        // 否则该 run 永久 "running"。此处 turn 不被打断仍会各自出
+                                        // boundary,但 rid 已丢 → boundary 的 finalize 块拿不到 rid。
+                                        finalize_active_run_if_scheduled(&mgr, &mut active_run_id, "interrupted");
                                         turn_seq += 1;
                                         local_running = true;
                                         turn_starts.start(now_millis());

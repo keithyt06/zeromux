@@ -840,10 +840,20 @@ fn collect_files(
         // Skip hidden and noisy dirs
         if name.starts_with('.') { continue; }
         if matches!(name.as_str(), "node_modules" | "target" | "__pycache__" | ".git") { continue; }
+        // Never enumerate credential files (parity with list_dir_entries; the
+        // lexical dot-skip above misses `*.pem`/`id_rsa`/`*credentials`).
+        if is_credential_path(&name) { continue; }
 
-        if path.is_dir() {
+        // Use file_type() (does NOT follow symlinks, unlike is_dir/is_file) and
+        // skip symlinks outright: a non-dot symlink would otherwise escape `base`
+        // and $HOME (is_dir() follows it, and this recursion never re-canonicalizes
+        // against base). Parity with resolve_and_verify / build_vault_index.
+        let ft = match entry.file_type() { Ok(t) => t, Err(_) => continue };
+        if ft.is_symlink() { continue; }
+
+        if ft.is_dir() {
             collect_files(&path, base, pattern, out, max_depth - 1);
-        } else if path.is_file() {
+        } else if ft.is_file() {
             let matches = if let Some(ext) = ext_filter {
                 path.extension().map(|e| e == ext).unwrap_or(false)
             } else {
@@ -3071,6 +3081,44 @@ mod path_safety_tests {
         assert!(is_credential_path("server.pem"));
         assert!(is_credential_path(".aws"));
         assert!(!is_credential_path("README.md"));
+    }
+
+    #[test]
+    fn collect_files_skips_symlinks_and_credentials() {
+        // Regression: collect_files used is_dir()/is_file() (which FOLLOW symlinks)
+        // and only a lexical dot-skip, so a non-dot symlink escaped base/$HOME and
+        // `?pattern=*.pem`/`id_rsa` enumerated credential files list_dir refuses.
+        let tmp = std::env::temp_dir().join(format!("zmcf-{}", std::process::id()));
+        let base = tmp.join("work");
+        std::fs::create_dir_all(&base).unwrap();
+        // outside tree with a secret; a non-dot symlink into it from base.
+        let outside = tmp.join("outside");
+        std::fs::create_dir_all(&outside).unwrap();
+        std::fs::write(outside.join("passwd"), "root:x").unwrap();
+        let _ = symlink(&outside, base.join("mnt")); // base/mnt -> ../outside
+        // credential-named regular files directly under base (both .pem = creds).
+        std::fs::write(base.join("server.pem"), "KEY").unwrap();
+        std::fs::write(base.join("id_rsa"), "KEY").unwrap();
+        // a normal file that MUST still be found.
+        std::fs::write(base.join("notes.md"), "hi").unwrap();
+        let base_c = base.canonicalize().unwrap();
+
+        // symlink escape: `passwd` behind base/mnt must NOT be enumerated.
+        let mut hits = Vec::new();
+        collect_files(&base_c, &base_c, "passwd", &mut hits, 5);
+        assert!(hits.is_empty(), "symlinked-out file must not be enumerated: {hits:?}");
+
+        // credential filter: *.pem must surface nothing (server.pem/keep.pem are creds).
+        let mut pem = Vec::new();
+        collect_files(&base_c, &base_c, "*.pem", &mut pem, 5);
+        assert!(pem.is_empty(), "credential files must not be enumerated: {pem:?}");
+
+        // normal file still found.
+        let mut md = Vec::new();
+        collect_files(&base_c, &base_c, "*.md", &mut md, 5);
+        assert_eq!(md.len(), 1, "normal .md file must still be found");
+
+        std::fs::remove_dir_all(&tmp).ok();
     }
 
     #[test]

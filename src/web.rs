@@ -1802,9 +1802,17 @@ async fn git_show(
         .output()
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("git show failed: {}", e)))?;
 
-    let diff = String::from_utf8_lossy(&diff_output.stdout).to_string();
+    // Filter the diff body through the SAME predicate git_worktree uses, so a
+    // committed credential/sensitive-dir file (.env/*.pem/id_rsa/.ssh/.aws/...)
+    // can never leak its hunk through this endpoint. Ownership was never the
+    // boundary here: credential *contents* are refused even to the owner across
+    // the whole file-browser (get_file_raw/list_dir), and git_worktree's diff was
+    // hardened for exactly this (review 2026-06-28). git_show produces an
+    // equivalent full diff for any historical commit and was the one git/read
+    // path left unguarded.
+    let diff = filter_diff_excluded(&String::from_utf8_lossy(&diff_output.stdout));
 
-    // Changed files with line counts
+    // Changed files with line counts (drop excluded paths — same predicate).
     let files: Vec<serde_json::Value> = std::process::Command::new("git")
         .args(["show", "--format=", "--numstat", &query.commit])
         .current_dir(&work_dir)
@@ -1817,7 +1825,7 @@ async fn git_show(
                 .filter(|l| !l.trim().is_empty())
                 .filter_map(|line| {
                     let parts: Vec<&str> = line.split('\t').collect();
-                    if parts.len() >= 3 {
+                    if parts.len() >= 3 && !worktree_path_excluded(parts[2]) {
                         Some(serde_json::json!({
                             "additions": parts[0].parse::<i32>().unwrap_or(-1),
                             "deletions": parts[1].parse::<i32>().unwrap_or(-1),

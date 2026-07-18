@@ -70,11 +70,17 @@ impl NotesStore {
         let title = text.lines().next().unwrap_or(text);
         let title: String = title.chars().take(100).collect();
 
-        // File name: YYYYMMDD_HHMMSS_id.md
+        // File name: YYYYMMDD_HHMMSS_id.md. Use the FULL id, not a 4-char prefix:
+        // date_part is second-granularity, so two notes created in the same second
+        // in the same work_dir whose ids shared a 4-char prefix collided on one
+        // filename — the second fs::write clobbered the first's .md, both index
+        // rows stored the same file_path, and deleting either unlinked the other's
+        // backing file. The id is the table's unique PRIMARY KEY, so the full id
+        // makes the filename collision-free.
         let date_part = created_at.replace('-', "").replace(':', "").replace('T', "_");
         let date_part = date_part.split('.').next().unwrap_or(&date_part);
         let date_part = date_part.trim_end_matches('Z');
-        let file_name = format!("{}_{}.md", date_part, &id[..4.min(id.len())]);
+        let file_name = format!("{}_{}.md", date_part, id);
         let rel_path = format!("{}/{}", dir_hash, file_name);
 
         // Write markdown file
@@ -222,6 +228,31 @@ mod tests {
             true
         );
         assert_eq!(store.list_notes("/home/u/repoA").unwrap().len(), 0);
+    }
+
+    #[test]
+    fn two_notes_same_second_same_dir_have_independent_files() {
+        // Regression: the filename embedded only the first 4 hex chars of the
+        // 8-char id (`&id[..4]`) plus a second-granularity timestamp, so two
+        // notes created in the same second in the same work_dir whose ids shared
+        // a 4-char prefix collided on one .md file — the second write clobbered
+        // the first, both index rows stored the same file_path, and deleting one
+        // unlinked the other's backing file. The full id makes the path unique.
+        let store = tmp_store();
+        let a = store.create_note("/home/u/repo", "note A", &[], "s", "alice").unwrap();
+        let b = store.create_note("/home/u/repo", "note B", &[], "s", "alice").unwrap();
+        assert_ne!(a.file_path, b.file_path, "distinct notes must not share a file_path");
+        // Both backing files exist and hold their own content.
+        let root = store.data_dir.join("notes");
+        assert!(root.join(&a.file_path).exists());
+        assert!(root.join(&b.file_path).exists());
+        // Deleting A must leave B (and its file) fully intact.
+        assert!(store.delete_note(&a.id, "/home/u/repo").unwrap());
+        assert!(!root.join(&a.file_path).exists(), "A's file removed");
+        assert!(root.join(&b.file_path).exists(), "B's file must survive A's delete");
+        let listed = store.list_notes("/home/u/repo").unwrap();
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].id, b.id);
     }
 
     #[test]

@@ -1005,10 +1005,22 @@ impl SessionManager {
                 continue; // tmux 无 turn 概念,不阻塞升级
             }
             let Some(rp) = s.running.as_ref() else { continue };
-            if s.source_task_id.is_some() {
-                scheduled += 1; // 调度运行,无论 turn 状态都阻塞(保守超集)
-            } else if rp.turn_state == TurnState::Running {
-                interactive += 1;
+            // Gate on the LIVE turn, not mere session liveness. A completed
+            // scheduled Claude run leaves a persistent `claude -p` process alive
+            // and Idle — nothing reaps it (remove_session is only wired to the
+            // HTTP DELETE handler), so counting any running scheduled session
+            // would make `scheduled` stick at ≥1 for the process lifetime and
+            // BlockedByScheduled (auto_update E1: never force-punch-through)
+            // would kill background auto-update permanently after the first
+            // scheduled fire. Blocking only while the turn is actually Running
+            // still fully honors E1 (an in-flight scheduled run is never force-
+            // killed) and releases the gate once its single turn finalizes.
+            if rp.turn_state == TurnState::Running {
+                if s.source_task_id.is_some() {
+                    scheduled += 1;
+                } else {
+                    interactive += 1;
+                }
             }
         }
         RunningSummary { interactive, scheduled }
@@ -3876,16 +3888,30 @@ mod running_summary_tests {
     }
 
     #[test]
-    fn counts_scheduled_and_interactive_skipping_tmux() {
+    fn counts_only_running_turns_skipping_tmux() {
         let (m, _tmp) = mgr_with(vec![
-            running_session("a", SessionType::Claude, Some("task1".into()), TurnState::Idle),
+            running_session("a", SessionType::Claude, Some("task1".into()), TurnState::Running),
             running_session("b", SessionType::Codex, None, TurnState::Running),
             running_session("c", SessionType::Claude, None, TurnState::Idle),
             running_session("d", SessionType::Tmux, None, TurnState::Running),
         ]);
         let s = m.running_summary();
-        assert_eq!(s.scheduled, 1, "source_task session counts as scheduled regardless of turn");
-        assert_eq!(s.interactive, 1, "only non-source running agent counts as interactive");
+        assert_eq!(s.scheduled, 1, "scheduled session with an in-flight turn blocks");
+        assert_eq!(s.interactive, 1, "only non-source running-turn agent counts as interactive");
+    }
+
+    #[test]
+    fn idle_scheduled_session_does_not_block_auto_update() {
+        // A completed scheduled Claude run lingers Idle with running=Some (the
+        // persistent `claude -p` process isn't reaped). It must NOT keep
+        // `scheduled` pinned at ≥1 — that permanently blocked background
+        // auto-update (gate E1: scheduled>0 never force-punches through).
+        let (m, _tmp) = mgr_with(vec![
+            running_session("a", SessionType::Claude, Some("task1".into()), TurnState::Idle),
+        ]);
+        let s = m.running_summary();
+        assert_eq!(s.scheduled, 0, "finished (Idle) scheduled run must not block auto-update");
+        assert_eq!(s.interactive, 0);
     }
 
     #[test]

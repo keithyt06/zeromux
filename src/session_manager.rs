@@ -481,7 +481,12 @@ fn apply_turn(session: &mut Session, state: TurnState, seq: u64) {
                 rp.turn_seq = seq;
             }
             TurnState::Idle => {
-                if rp.turn_seq == seq {
+                // Idempotent: a single turn can emit two boundaries (Claude
+                // Error+Exit, Codex Error+Result), both of which now settle with
+                // the live turn_seq. Only the first (Running→Idle) transition
+                // counts a completed turn; a repeat Idle at the same seq must not
+                // double-increment turns_completed.
+                if rp.turn_seq == seq && rp.turn_state != TurnState::Idle {
                     rp.turn_state = TurnState::Idle;
                     rp.turn_started_ms = None;
                     session.turns_completed = session.turns_completed.wrapping_add(1);
@@ -2072,22 +2077,34 @@ fn spawn_acp_fanout(
                                 }
                             }
                             if is_boundary {
-                                // Each started turn emits exactly one boundary
-                                // (Result/Error/Exit), in FIFO order, so the
-                                // Nth boundary belongs to turn N. A boundary
-                                // only settles the session to Idle once we've
-                                // seen as many boundaries as turns started;
-                                // earlier boundaries belong to turns that were
-                                // already superseded by an interrupt-resend and
-                                // must NOT idle the live turn. We still pass the
-                                // boundary's own seq so apply_turn's seq guard
-                                // is exercised consistently.
+                                // Each started turn emits AT LEAST one boundary
+                                // (Result/Error/Exit) in FIFO order, but NOT
+                                // always exactly one: a single turn can emit two
+                                // — Claude `is_error` Result then the always-on
+                                // Exit at EOF (acp/process.rs), Codex an Error
+                                // notification then the resolving tools/call
+                                // Result, or a mid-turn Error before completion.
+                                // `boundary_count` counts boundaries; `turn_seq`
+                                // counts turns. Once caught up (>= turn_seq) this
+                                // boundary settles the live turn: CLAMP the count
+                                // back to turn_seq so a SECOND boundary of the
+                                // same turn can't push it permanently past
+                                // turn_seq — which would make every future turn's
+                                // Idle carry a seq that never equals rp.turn_seq,
+                                // wedging the session Running forever (→ the idle
+                                // watchdog kills a healthy session). Mark Idle
+                                // with turn_seq (== rp.turn_seq) so the guard
+                                // fires; apply_turn's Idle branch is idempotent so
+                                // the second boundary doesn't double-count. Stale
+                                // boundaries of a superseded interrupt-resend turn
+                                // (count < turn_seq) get no Idle mark at all.
                                 boundary_count += 1;
                                 if boundary_count >= turn_seq {
+                                    boundary_count = turn_seq;
                                     local_running = false;
-                                }
-                                if let Some(m) = mgr.upgrade() {
-                                    m.mark_turn(&sid, TurnState::Idle, boundary_count);
+                                    if let Some(m) = mgr.upgrade() {
+                                        m.mark_turn(&sid, TurnState::Idle, turn_seq);
+                                    }
                                 }
                                 // turn_done push: settling boundary of a non-scheduled
                                 // turn (active_run_id still None → human-interactive turn).
@@ -2421,7 +2438,11 @@ struct PendingPrompt {
 /// its own turn's start. If a turn emits >1 boundary (Codex panic Error+Exit,
 /// or a mid-turn error followed by the call result), the extra boundary finds
 /// an empty queue → `settle()` returns None → no metric and no baseline
-/// advance, keeping the `will_record=false` guard load-bearing.
+/// advance, keeping the `will_record=false` guard load-bearing. The Idle-state
+/// path tolerates the same >1-boundary case by clamping `boundary_count` to
+/// `turn_seq` on the settling boundary (fan-out blocks) + an idempotent
+/// `apply_turn` Idle branch, so a second boundary can neither push the count
+/// past `turn_seq` (wedging Running forever) nor double-count a turn.
 ///
 /// Load-bearing invariant: **every started turn eventually yields ≥1 boundary.**
 /// A turn that pushed a stamp but never boundaries would strand it and drift
@@ -2734,22 +2755,21 @@ fn spawn_kiro_fanout(
                             );
                             emit(&mgr, &sid, &event_tx, turn_seq, &evt);
                             if is_boundary {
-                                // Each started turn emits exactly one boundary
-                                // (Result/Error/Exit), in FIFO order, so the
-                                // Nth boundary belongs to turn N. A boundary
-                                // only settles the session to Idle once we've
-                                // seen as many boundaries as turns started;
-                                // earlier boundaries belong to turns that were
-                                // already superseded by an interrupt-resend and
-                                // must NOT idle the live turn. We still pass the
-                                // boundary's own seq so apply_turn's seq guard
-                                // is exercised consistently.
+                                // A turn can emit >1 boundary (Error+Exit /
+                                // Error+Result). Clamp boundary_count to turn_seq
+                                // on the settling boundary and mark Idle with
+                                // turn_seq (not boundary_count) so the count can't
+                                // run past turn_seq and wedge the session Running
+                                // forever. Stale interrupt-resend boundaries
+                                // (count < turn_seq) get no Idle mark. See the
+                                // detailed note in spawn_acp_fanout.
                                 boundary_count += 1;
                                 if boundary_count >= turn_seq {
+                                    boundary_count = turn_seq;
                                     local_running = false;
-                                }
-                                if let Some(m) = mgr.upgrade() {
-                                    m.mark_turn(&sid, TurnState::Idle, boundary_count);
+                                    if let Some(m) = mgr.upgrade() {
+                                        m.mark_turn(&sid, TurnState::Idle, turn_seq);
+                                    }
                                 }
                                 // per-run metrics: one metric per boundary, intent overrides
                                 // event type (mirrors spawn_acp_fanout). Skipped when this
@@ -2980,22 +3000,21 @@ fn spawn_codex_fanout(
                             );
                             emit(&mgr, &sid, &event_tx, turn_seq, &evt);
                             if is_boundary {
-                                // Each started turn emits exactly one boundary
-                                // (Result/Error/Exit), in FIFO order, so the
-                                // Nth boundary belongs to turn N. A boundary
-                                // only settles the session to Idle once we've
-                                // seen as many boundaries as turns started;
-                                // earlier boundaries belong to turns that were
-                                // already superseded by an interrupt-resend and
-                                // must NOT idle the live turn. We still pass the
-                                // boundary's own seq so apply_turn's seq guard
-                                // is exercised consistently.
+                                // A turn can emit >1 boundary (Error+Exit /
+                                // Error+Result). Clamp boundary_count to turn_seq
+                                // on the settling boundary and mark Idle with
+                                // turn_seq (not boundary_count) so the count can't
+                                // run past turn_seq and wedge the session Running
+                                // forever. Stale interrupt-resend boundaries
+                                // (count < turn_seq) get no Idle mark. See the
+                                // detailed note in spawn_acp_fanout.
                                 boundary_count += 1;
                                 if boundary_count >= turn_seq {
+                                    boundary_count = turn_seq;
                                     local_running = false;
-                                }
-                                if let Some(m) = mgr.upgrade() {
-                                    m.mark_turn(&sid, TurnState::Idle, boundary_count);
+                                    if let Some(m) = mgr.upgrade() {
+                                        m.mark_turn(&sid, TurnState::Idle, turn_seq);
+                                    }
                                 }
                                 // per-run metrics: one metric per boundary, intent overrides
                                 // event type (mirrors spawn_acp_fanout). Skipped when this
@@ -3685,6 +3704,61 @@ mod turn_state_tests {
         apply_turn(&mut s, TurnState::Idle, 2); // real boundary #2 (turn 2)
         assert_eq!(s.running.as_ref().unwrap().turn_state, TurnState::Idle);
         assert_eq!(s.turns_completed, 1);
+    }
+
+    #[test]
+    fn idle_is_idempotent_at_same_seq() {
+        // A single turn can emit two boundaries (Claude Error+Exit, Codex
+        // Error+Result). Both now settle with the same live turn_seq, so Idle
+        // must be idempotent: the second boundary must NOT count a second turn.
+        let mut s = running_session("s");
+        apply_turn(&mut s, TurnState::Running, 1);
+        apply_turn(&mut s, TurnState::Idle, 1); // boundary #1 (Error)
+        apply_turn(&mut s, TurnState::Idle, 1); // boundary #2 (Exit) — same turn
+        assert_eq!(s.turns_completed, 1, "two boundaries of one turn count once");
+        assert_eq!(s.running.as_ref().unwrap().turn_state, TurnState::Idle);
+    }
+
+    // Mirrors the fan-out boundary block's clamp: boundary_count counts
+    // boundaries, turn_seq counts turns; the settling boundary clamps the count
+    // to turn_seq and marks Idle with turn_seq. This drives apply_turn exactly
+    // as the three fan-outs do, so the test reproduces the real wedge.
+    fn settle_boundary(s: &mut Session, boundary_count: &mut u64, turn_seq: u64) {
+        *boundary_count += 1;
+        if *boundary_count >= turn_seq {
+            *boundary_count = turn_seq;
+            apply_turn(s, TurnState::Idle, turn_seq);
+        }
+    }
+
+    #[test]
+    fn two_boundary_turn_does_not_wedge_running_forever() {
+        // THE BUG: before the clamp, a turn that emitted TWO boundaries pushed
+        // boundary_count past turn_seq (Idle marked with boundary_count=2 while
+        // rp.turn_seq=1 → dropped), then EVERY future turn's Idle carried a seq
+        // that never equaled rp.turn_seq → session stuck Running forever → the
+        // idle-watchdog killed a healthy session. The clamp fixes it.
+        let mut s = running_session("s");
+        let mut bc: u64 = 0;
+        let mut turn_seq: u64 = 0;
+
+        // Turn 1: two boundaries (e.g. Error then Exit).
+        turn_seq += 1;
+        apply_turn(&mut s, TurnState::Running, turn_seq);
+        settle_boundary(&mut s, &mut bc, turn_seq); // boundary #1 settles turn 1
+        settle_boundary(&mut s, &mut bc, turn_seq); // boundary #2 (same turn), clamped
+        assert_eq!(s.running.as_ref().unwrap().turn_state, TurnState::Idle);
+        assert_eq!(s.turns_completed, 1);
+
+        // Turn 2: single normal boundary — MUST settle to Idle (the regression
+        // was that this Idle was silently dropped forever).
+        turn_seq += 1;
+        apply_turn(&mut s, TurnState::Running, turn_seq);
+        assert_eq!(s.running.as_ref().unwrap().turn_state, TurnState::Running);
+        settle_boundary(&mut s, &mut bc, turn_seq);
+        assert_eq!(s.running.as_ref().unwrap().turn_state, TurnState::Idle,
+            "turn 2 must idle even after turn 1 emitted two boundaries");
+        assert_eq!(s.turns_completed, 2);
     }
 
     #[test]

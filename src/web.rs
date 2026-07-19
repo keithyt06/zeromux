@@ -1917,22 +1917,26 @@ fn filter_sensitive_files(files: Vec<WorktreeFile>) -> Vec<WorktreeFile> {
         .collect()
 }
 
-/// Strip whole per-file sections from a `git diff` body whose path is excluded.
-/// The git-side pathspec already drops sensitive *dirs*; this second pass closes
-/// credential *leaf* files (.env/*.pem/id_*/...) that pathspec globs translate
-/// imperfectly, using the SAME predicate as the file list so the two can't drift.
-/// A section starts at a `diff --git a/<p> b/<p>` line and runs until the next one.
+/// Strip whole per-file sections from a `git diff`/`git show` body whose path is
+/// excluded. The git-side pathspec already drops sensitive *dirs*; this second
+/// pass closes credential *leaf* files (.env/*.pem/id_*/...) that pathspec globs
+/// translate imperfectly, using the SAME predicate as the file list so the two
+/// can't drift. A section starts at a per-file header line and runs until the
+/// next one.
+///
+/// Three header forms must be recognized, or the filter fails OPEN:
+/// - `diff --git a/<p> b/<p>` — normal two-way diffs (`git diff`, `git show` of a
+///   non-merge commit, renames).
+/// - `diff --cc <p>` — the COMBINED diff `git show` emits for a MERGE commit.
+/// - `diff --combined <p>` — the spelled-out combined form (`git show -c`).
+/// Merge commits that resolved a conflict in a credential file were the gap:
+/// their `diff --cc .env` header never matched `diff --git `, so the section
+/// (and both parents' secret contents) leaked through verbatim.
 fn filter_diff_excluded(diff: &str) -> String {
     let mut out = String::with_capacity(diff.len());
     let mut skipping = false;
     for line in diff.split_inclusive('\n') {
-        if let Some(rest) = line.strip_prefix("diff --git ") {
-            // `a/<path> b/<path>` — take the b/ side (new path); fall back to a/.
-            let path = rest
-                .rsplit_once(" b/")
-                .map(|(_, b)| b.trim_end_matches(['\n', '\r']))
-                .or_else(|| rest.strip_prefix("a/").map(|s| s.split(' ').next().unwrap_or(s)))
-                .unwrap_or("");
+        if let Some(path) = diff_header_path(line) {
             skipping = worktree_path_excluded(path);
         }
         if !skipping {
@@ -1940,6 +1944,29 @@ fn filter_diff_excluded(diff: &str) -> String {
         }
     }
     out
+}
+
+/// Extract the file path from a per-file diff header line, or None if the line
+/// is not a header. Handles `diff --git a/<p> b/<p>`, `diff --cc <p>`, and
+/// `diff --combined <p>`. Returns the new-side (`b/`) path for `--git`; combined
+/// forms carry a single unprefixed path.
+fn diff_header_path(line: &str) -> Option<&str> {
+    if let Some(rest) = line.strip_prefix("diff --git ") {
+        // `a/<path> b/<path>` — take the b/ side (new path); fall back to a/.
+        return Some(
+            rest.rsplit_once(" b/")
+                .map(|(_, b)| b.trim_end_matches(['\n', '\r']))
+                .or_else(|| rest.strip_prefix("a/").map(|s| s.split(' ').next().unwrap_or(s)))
+                .unwrap_or(""),
+        );
+    }
+    // Combined-diff headers (merge commits): the remainder is the bare path.
+    for prefix in ["diff --cc ", "diff --combined "] {
+        if let Some(rest) = line.strip_prefix(prefix) {
+            return Some(rest.trim_end_matches(['\n', '\r']));
+        }
+    }
+    None
 }
 
 async fn git_worktree(
@@ -3501,6 +3528,51 @@ index 5..6 100644
         assert!(out.contains("let x = 1;"), "main.rs hunk must survive");
         assert!(out.contains("diff --git a/src/main.rs"));
         assert!(!out.contains("diff --git a/.env"));
+    }
+
+    #[test]
+    fn filter_diff_excluded_strips_combined_merge_diff_of_credential() {
+        // Regression: `git show` on a MERGE commit emits a COMBINED diff whose
+        // per-file header is `diff --cc <path>` (or `diff --combined <path>`),
+        // NOT `diff --git a/.. b/..`. The header-prefix match must recognize
+        // these too, otherwise the credential section fails OPEN and leaks the
+        // resolved (and both parents') secret contents — exactly what a6d94bb
+        // set out to prevent. `--numstat` correctly hides `.env` from the file
+        // list, so the leak is stealthy: file list clean, diff body dirty.
+        let diff = "\
+diff --cc .env
+index 5492cf7,b01b085..91d8c81
+--- a/.env
++++ b/.env
+@@@ -1,1 -1,1 +1,1 @@@
+- A=from_main_SECRET
+ -A=from_feat_SECRET
+++A=MERGED_RESOLVED_SECRET
+diff --cc src/main.rs
+index 1..2,3..4 100644
+--- a/src/main.rs
++++ b/src/main.rs
+@@@ -1,1 -1,1 +1,1 @@@
+++let x = 1;
+";
+        let out = filter_diff_excluded(diff);
+        assert!(!out.contains("SECRET"), "combined-diff .env hunk must be stripped");
+        assert!(!out.contains("diff --cc .env"));
+        assert!(out.contains("let x = 1;"), "non-sensitive combined hunk survives");
+        assert!(out.contains("diff --cc src/main.rs"));
+    }
+
+    #[test]
+    fn filter_diff_excluded_strips_combined_keyword_form() {
+        // `git show -c/--combined` uses the spelled-out `diff --combined <path>`.
+        let diff = "\
+diff --combined deploy.pem
+--- a/deploy.pem
++++ b/deploy.pem
+++BEGIN RSA PRIVATE KEY
+";
+        let out = filter_diff_excluded(diff);
+        assert!(!out.contains("PRIVATE KEY"), "combined pem hunk must be stripped");
     }
 
     #[test]

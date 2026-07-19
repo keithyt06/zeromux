@@ -524,11 +524,46 @@ impl ScheduledStore {
         Ok(())
     }
 
+    /// Finalize any in-flight (`claimed`/`running`) run bound to this session as
+    /// `aborted`, keyed on `session_id`. Called when a session is removed at
+    /// runtime (HTTP DELETE) mid-turn: the fan-out then exits on channel-close
+    /// WITHOUT reaching its boundary block, so the normal `finalize_run` never
+    /// fires and the row would otherwise linger `running` until the next startup
+    /// `reconcile_orphans` — which, now that `running_summary().scheduled` counts
+    /// in-flight DB runs, would wedge auto-update in the meantime. Returns the
+    /// number of rows finalized (0 if the session had no in-flight run).
+    pub fn abort_active_run_for_session(&self, session_id: &str, failure_kind: &str, now_ms: i64) -> Result<usize, String> {
+        let conn = self.conn.lock().unwrap();
+        let n = conn.execute(
+            "UPDATE agent_task_runs SET state='aborted', failure_kind=COALESCE(failure_kind,?2), ended_ms=?3 \
+             WHERE session_id=?1 AND state IN ('claimed','running')",
+            params![session_id, failure_kind, now_ms],
+        ).map_err(|e| e.to_string())?;
+        Ok(n)
+    }
+
     pub fn active_states_for_task(&self, task_id: &str) -> Result<Vec<String>, String> {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare("SELECT state FROM agent_task_runs WHERE task_id=?1 AND state IN ('claimed','running')").map_err(|e| e.to_string())?;
         let rows = stmt.query_map(params![task_id], |r| r.get::<_,String>(0)).map_err(|e| e.to_string())?;
         rows.collect::<Result<_,_>>().map_err(|e| e.to_string())
+    }
+
+    /// Global count of scheduled runs that are in flight (`claimed` or `running`)
+    /// across all tasks. This is the authoritative "a scheduled agent is live"
+    /// signal for the auto-update gate: the row is set to `claimed` at claim time
+    /// — BEFORE the process is spawned — and drained to a terminal state on every
+    /// exit path (finalize on the turn boundary, watchdog/idle kill, or
+    /// startup reconcile), so it brackets the whole lifetime a `claude -p` child
+    /// is alive in the cgroup. Unlike gating on the in-memory `turn_state`, it has
+    /// no startup window where the process is alive but the turn isn't Running yet,
+    /// and unlike gating on session liveness it releases the moment the run ends
+    /// even though the persistent process lingers Idle (never reaped).
+    pub fn active_run_count(&self) -> Result<i64, String> {
+        let conn = self.conn.lock().unwrap();
+        conn.query_row(
+            "SELECT COUNT(*) FROM agent_task_runs WHERE state IN ('claimed','running')",
+            [], |row| row.get(0)).map_err(|e| e.to_string())
     }
 
     /// Post-claim TOCTOU tie-break (SF1/SF3). The overlap pre-check and the

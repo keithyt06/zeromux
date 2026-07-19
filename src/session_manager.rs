@@ -177,8 +177,9 @@ pub enum TurnState { Idle, Running }
 pub struct RunningSummary {
     /// 交互 agent 会话(无 source_task)当前 turn 为 Running 的数量。
     pub interactive: usize,
-    /// 调度运行会话(source_task_id 存在)且进程存活的数量(无论 turn 状态)。
-    /// 这是「run_id turn 在跑」的保守超集:绝不强制升级穿透它(评审 E1)。
+    /// in-flight 调度 run 计数(调度库 `claimed`/`running`)。这是「调度 agent 进程
+    /// 在 cgroup 内存活」的权威信号,前闭 spawn 窗口、后随 run 终态释放;绝不强制
+    /// 升级穿透它(评审 E1)。见 `running_summary`。
     pub scheduled: usize,
 }
 
@@ -1014,33 +1015,43 @@ impl SessionManager {
         self.sessions.lock().unwrap().contains_key(id)
     }
 
-    /// 统计正在运行的 agent 会话,按是否为调度运行分类(tmux 跳过)。
-    /// auto_update 的 idle-gate 据此决定能否升级(评审 E1:scheduled>0 → 永不强制穿透)。
+    /// 统计正在运行的 agent 会话,供 auto_update 的 idle-gate 决定能否升级
+    /// (评审 E1:scheduled>0 → 永不强制穿透)。
+    ///
+    /// - `interactive`: 内存中 turn_state==Running 的**非调度** agent 会话(tmux 跳过)。
+    /// - `scheduled`: 取自调度库的 in-flight run 计数(`claimed`/`running`),而非内存
+    ///   turn_state。这是权威信号且无竞态窗口:run 行在 spawn **之前** 就被 `claim_won`
+    ///   置为 `claimed`,并在每条退出路径(turn 边界 finalize / 看门狗 / 启动 reconcile)
+    ///   落终态。故它精确覆盖 `claude -p` 子进程在 cgroup 内存活的整段生命周期。
+    ///
+    ///   为何不再用内存 turn_state 判调度:调度会话在 `trigger_run` 中先以 turn_state=Idle
+    ///   插入 map + prompt 入队,fan-out 之后才 mark(Running) —— 这段 startup 窗口里
+    ///   进程已活但 turn 未 Running,若据 turn_state 判定 scheduled==0,auto-update 会
+    ///   `systemctl stop` 连 cgroup 一起杀掉刚起的调度子进程(违反 E1)。也不能退回
+    ///   "只要 source_task 会话存活就算":调度 run 结束后 `claude -p` 进程 Idle 常驻不
+    ///   回收,会让 scheduled 永久 ≥1 死锁 auto-update(8a5dc74 修的正是这个)。DB 计数
+    ///   两头都对:前闭窗口、后随 run 终态释放。
     pub fn running_summary(&self) -> RunningSummary {
+        let scheduled = {
+            let store = self.scheduled.lock().unwrap().clone();
+            store
+                .and_then(|s| s.active_run_count().ok())
+                .unwrap_or(0)
+                .max(0) as usize
+        };
         let map = self.sessions.lock().unwrap();
         let mut interactive = 0;
-        let mut scheduled = 0;
         for s in map.values() {
             if !matches!(s.session_type, SessionType::Claude | SessionType::Kiro | SessionType::Codex) {
                 continue; // tmux 无 turn 概念,不阻塞升级
             }
+            // 调度会话由上面的 DB 计数负责,这里只数交互式(非 source_task)运行 turn。
+            if s.source_task_id.is_some() {
+                continue;
+            }
             let Some(rp) = s.running.as_ref() else { continue };
-            // Gate on the LIVE turn, not mere session liveness. A completed
-            // scheduled Claude run leaves a persistent `claude -p` process alive
-            // and Idle — nothing reaps it (remove_session is only wired to the
-            // HTTP DELETE handler), so counting any running scheduled session
-            // would make `scheduled` stick at ≥1 for the process lifetime and
-            // BlockedByScheduled (auto_update E1: never force-punch-through)
-            // would kill background auto-update permanently after the first
-            // scheduled fire. Blocking only while the turn is actually Running
-            // still fully honors E1 (an in-flight scheduled run is never force-
-            // killed) and releases the gate once its single turn finalizes.
             if rp.turn_state == TurnState::Running {
-                if s.source_task_id.is_some() {
-                    scheduled += 1;
-                } else {
-                    interactive += 1;
-                }
+                interactive += 1;
             }
         }
         RunningSummary { interactive, scheduled }
@@ -1598,6 +1609,18 @@ impl SessionManager {
         let removed = self.sessions.lock().unwrap().remove(id);
         if let Some(session) = removed {
             let _ = self.store.delete(id);
+            // If this was a scheduled session removed mid-turn, finalize its
+            // in-flight DB run NOW. Dropping the session closes the input_tx so
+            // the fan-out exits on channel-close WITHOUT reaching its boundary
+            // block, so the normal `finalize_run` never fires. Since
+            // `running_summary().scheduled` now counts in-flight DB runs, a
+            // lingering `running` row would block auto-update until the next
+            // startup reconcile. Only touches scheduled sessions (source_task_id).
+            if session.source_task_id.is_some() {
+                if let Some(store) = self.scheduled.lock().unwrap().clone() {
+                    let _ = store.abort_active_run_for_session(id, "session_removed", now_millis());
+                }
+            }
             // Dropping session closes event_tx + input_tx → fan-out task exits
             if let Some(wt_path) = &session.worktree_path {
                 if let Some(worktrees_dir) = wt_path.parent() {
@@ -3969,6 +3992,11 @@ mod running_summary_tests {
             events, store,
             "claude".into(), "kiro-cli".into(), "codex".into(), "off".into(), "bash".into(), false,
         );
+        // Wire a scheduled store: `scheduled` in the summary is now sourced from
+        // the DB in-flight run count, so tests that exercise the scheduled gate
+        // seed runs into this store (see `seed_active_run`).
+        let sched = Arc::new(crate::scheduled_tasks::ScheduledStore::open(dir.path()).unwrap());
+        m.set_scheduled_store(sched);
         {
             let mut map = m.sessions.lock().unwrap();
             for s in sessions { map.insert(s.id.clone(), s); }
@@ -3976,35 +4004,96 @@ mod running_summary_tests {
         (m, dir)
     }
 
+    // Seed one scheduled run in the given non-terminal or terminal state, so
+    // `running_summary().scheduled` (a DB count of claimed/running) is exercised.
+    fn seed_active_run(m: &SessionManager, run_id: &str, task_id: &str, state: &str) {
+        seed_active_run_bound(m, run_id, task_id, state, None);
+    }
+
+    // Same, but binds the run to a session_id (for the remove-session finalize path).
+    fn seed_active_run_bound(m: &SessionManager, run_id: &str, task_id: &str, state: &str, session_id: Option<&str>) {
+        let store = m.scheduled.lock().unwrap().clone().unwrap();
+        let run = crate::scheduled_tasks::TaskRun {
+            id: run_id.into(), task_id: task_id.into(), scheduled_for_ms: 1, state: "claimed".into(),
+            session_id: None, verdict: None, failure_kind: None, started_ms: Some(1), ended_ms: None,
+            input_snapshot: None, confirm_status: None, replay_of: None,
+        };
+        store.claim_run(&run).unwrap(); // inserts as 'claimed'
+        // Bind session_id (backfilled via COALESCE) and move to the requested
+        // state. For 'claimed' we still call set_run_state so the session binding
+        // takes effect; claimed→claimed keeps the state, only backfilling the id.
+        store.set_run_state(run_id, state, session_id, None, None, Some(2)).unwrap();
+    }
+
     #[test]
-    fn counts_only_running_turns_skipping_tmux() {
+    fn counts_interactive_running_turns_skipping_tmux_and_scheduled() {
+        // interactive counts only non-source Running turns; the scheduled session
+        // is counted via the DB run below, not its in-memory turn_state.
         let (m, _tmp) = mgr_with(vec![
             running_session("a", SessionType::Claude, Some("task1".into()), TurnState::Running),
             running_session("b", SessionType::Codex, None, TurnState::Running),
             running_session("c", SessionType::Claude, None, TurnState::Idle),
             running_session("d", SessionType::Tmux, None, TurnState::Running),
         ]);
+        seed_active_run(&m, "r1", "task1", "running");
         let s = m.running_summary();
-        assert_eq!(s.scheduled, 1, "scheduled session with an in-flight turn blocks");
+        assert_eq!(s.scheduled, 1, "in-flight scheduled run blocks (DB count)");
         assert_eq!(s.interactive, 1, "only non-source running-turn agent counts as interactive");
     }
 
     #[test]
-    fn idle_scheduled_session_does_not_block_auto_update() {
+    fn idle_scheduled_session_does_not_block_after_run_finalized() {
         // A completed scheduled Claude run lingers Idle with running=Some (the
-        // persistent `claude -p` process isn't reaped). It must NOT keep
-        // `scheduled` pinned at ≥1 — that permanently blocked background
-        // auto-update (gate E1: scheduled>0 never force-punches through).
+        // persistent `claude -p` process isn't reaped). Once its DB run reaches a
+        // terminal state, it must NOT keep `scheduled` pinned at ≥1 — that
+        // permanently blocked background auto-update (gate E1: scheduled>0 never
+        // force-punches through). This is the 8a5dc74 fix, now DB-sourced.
         let (m, _tmp) = mgr_with(vec![
             running_session("a", SessionType::Claude, Some("task1".into()), TurnState::Idle),
         ]);
+        seed_active_run(&m, "r1", "task1", "succeeded"); // finalized
         let s = m.running_summary();
-        assert_eq!(s.scheduled, 0, "finished (Idle) scheduled run must not block auto-update");
+        assert_eq!(s.scheduled, 0, "finalized scheduled run must not block auto-update");
         assert_eq!(s.interactive, 0);
     }
 
     #[test]
-    fn all_idle_when_no_running_agents() {
+    fn scheduled_startup_window_blocks_before_turn_marks_running() {
+        // Regression (8a5dc74 opened this): a scheduled run's `claude -p` child is
+        // spawned and the session inserted with turn_state=Idle, and the DB row
+        // set to `claimed`/`running`, BEFORE the fan-out marks the turn Running.
+        // Gating on in-memory turn_state saw scheduled==0 in that window → auto-
+        // update could `systemctl stop` and cgroup-kill the live child. The DB
+        // count is set at claim time (pre-spawn), so it blocks across the window.
+        let (m, _tmp) = mgr_with(vec![
+            // process alive, session in map, but turn not yet Running:
+            running_session("a", SessionType::Claude, Some("task1".into()), TurnState::Idle),
+        ]);
+        seed_active_run(&m, "r1", "task1", "claimed"); // claimed, turn not started
+        let s = m.running_summary();
+        assert_eq!(s.scheduled, 1, "claimed run blocks even before the turn marks Running");
+    }
+
+    #[test]
+    fn removing_scheduled_session_midturn_finalizes_its_run() {
+        // Regression the DB-count fix would otherwise introduce: deleting a
+        // scheduled session mid-turn (HTTP DELETE → remove_session) closes the
+        // fan-out via channel-close WITHOUT hitting its boundary block, so the
+        // normal finalize_run never fires. With scheduled now counted from the DB,
+        // a lingering `running` row would block auto-update until the next restart.
+        // remove_session must finalize the in-flight run bound to the session.
+        let (m, _tmp) = mgr_with(vec![
+            running_session("sess1", SessionType::Claude, Some("task1".into()), TurnState::Running),
+        ]);
+        seed_active_run_bound(&m, "r1", "task1", "running", Some("sess1"));
+        assert_eq!(m.running_summary().scheduled, 1, "in-flight run blocks before removal");
+        assert!(m.remove_session("sess1"));
+        assert_eq!(m.running_summary().scheduled, 0,
+            "removing the scheduled session must finalize its run so auto-update isn't wedged");
+    }
+
+    #[test]
+    fn all_idle_when_no_running_agents_and_no_active_runs() {
         let (m, _tmp) = mgr_with(vec![
             running_session("c", SessionType::Claude, None, TurnState::Idle),
             running_session("d", SessionType::Tmux, None, TurnState::Running),

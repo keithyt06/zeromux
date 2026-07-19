@@ -596,6 +596,21 @@ impl SessionManager {
         self.sessions.lock().unwrap().get(id).map(|s| s.name.clone())
     }
 
+    /// True iff the session currently has an in-flight turn (turn_state ==
+    /// Running). Used by the ACP WS replay to tell a reconnecting client whether
+    /// the turn it's rejoining is still live, so the frontend doesn't clobber its
+    /// busy indicator (and the interrupt affordance) to false on `replay_done`
+    /// for a turn that is still running but momentarily silent.
+    pub fn turn_is_running(&self, id: &str) -> bool {
+        self.sessions
+            .lock()
+            .unwrap()
+            .get(id)
+            .and_then(|s| s.running.as_ref())
+            .map(|rp| rp.turn_state == TurnState::Running)
+            .unwrap_or(false)
+    }
+
     /// Finalize a scheduled run exactly once (called by the agent fan-out on the
     /// terminal event for that run). No-op if no scheduled store is wired.
     pub fn finalize_run(&self, run_id: &str, state: &str, verdict: Option<&str>, failure_kind: Option<&str>) {

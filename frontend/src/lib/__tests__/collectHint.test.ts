@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest'
-import { shouldClearQueuedHint } from '../collectHint'
+import { shouldClearQueuedHint, busyAfterReplay } from '../collectHint'
 
 describe('shouldClearQueuedHint', () => {
   // Regression (opposite direction from the turn-end fix): content_block belongs
@@ -31,5 +31,28 @@ describe('shouldClearQueuedHint', () => {
 
   it('does NOT clear on user_prompt echo', () => {
     expect(shouldClearQueuedHint('user_prompt')).toBe(false)
+  })
+})
+
+describe('busyAfterReplay', () => {
+  // The bug: `replay_done` unconditionally forced busy=false, so a mid-turn
+  // reconnect (idle-proxy drop during a silent tool call) hid the running
+  // indicator AND the interrupt button for a turn still Running server-side.
+  // The backend now sends the authoritative live turn state in the marker.
+  it('stays busy when the backend reports the turn is still running', () => {
+    expect(busyAfterReplay(true)).toBe(true)
+  })
+
+  it('clears busy when the backend reports the turn finished', () => {
+    expect(busyAfterReplay(false)).toBe(false)
+  })
+
+  // Back-compat: an older backend omits the flag → treat as not-running (old
+  // behavior), never accidentally stick busy on a missing/garbage value.
+  it('treats missing/non-boolean as not running (legacy back-compat)', () => {
+    expect(busyAfterReplay(undefined)).toBe(false)
+    expect(busyAfterReplay(null)).toBe(false)
+    expect(busyAfterReplay('true')).toBe(false)
+    expect(busyAfterReplay(1)).toBe(false)
   })
 })

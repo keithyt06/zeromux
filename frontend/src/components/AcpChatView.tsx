@@ -13,7 +13,7 @@ import { foldTranscript, type WireEvent, type Block, type TurnGroup } from '../l
 import { partitionBlocks, type Density } from '../lib/density'
 import { STUCK_SILENCE_MS } from '../lib/stuck'
 import { shouldStickToBottom, shouldAutoScrollOnAppend, shouldTrackScrollUp } from '../lib/scrollReplay'
-import { shouldClearQueuedHint } from '../lib/collectHint'
+import { shouldClearQueuedHint, busyAfterReplay } from '../lib/collectHint'
 
 // ── Message types ──
 
@@ -46,6 +46,7 @@ interface ServerEvent {
   count?: number
   turn_id?: number
   client_id?: string
+  running?: boolean
 }
 
 interface Props {
@@ -304,8 +305,29 @@ export default function AcpChatView({ sessionId, agentType = 'claude', onRegiste
       }
 
       case 'replay_done': {
-        setBusy(false)
-        setTurnStartedMs(null)
+        // Honor the backend's authoritative live turn state. On a mid-turn
+        // reconnect (idle-proxy drop during an output-silent tool call) the turn
+        // is still Running server-side; forcing busy=false here would hide the
+        // running indicator AND the interrupt button until the next live event —
+        // which for a hung turn never comes. When running, re-arm the elapsed +
+        // silence clocks from now (the original start isn't replayed, but the
+        // affordances must be live). When not running, reset as before.
+        const stillRunning = busyAfterReplay(evt.running)
+        setBusy(stillRunning)
+        if (stillRunning) {
+          const t = Date.now()
+          // Elapsed: keep a fresh content_block stamp from this replay if present
+          // (onopen reset it to null, so `?? t` only fills the no-output case).
+          setTurnStartedMs(prev => prev ?? t)
+          // Silence baseline: reset to now UNCONDITIONALLY. lastEventMs is NOT
+          // cleared in onopen, so `?? t` would keep a stale timestamp from a prior
+          // turn when this turn replayed no content_block → `stuck` would fire
+          // immediately on a false silence. The replay we just received is itself
+          // fresh proof the socket is alive, so now is the correct baseline.
+          setLastEventMs(t)
+        } else {
+          setTurnStartedMs(null)
+        }
         // Reconnect replay finished — clear any stale queued hint (backend also
         // makes the queued event ephemeral; this is the frontend safety net).
         setQueuedCount(0)

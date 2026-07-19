@@ -25,3 +25,17 @@ export function shouldClearQueuedHint(eventType: string): boolean {
       return false
   }
 }
+
+// 重连重放结束时(`replay_done`)是否应把 busy 置为「仍在运行」。
+//
+// 旧逻辑无条件 `setBusy(false)`:重放把历史 content_block 设 busy=true,末尾的
+// `replay_done` 又把它清成 false。若此刻后端 turn **仍在 Running**(mid-turn 重连,
+// 常见于经 idle-proxy 掉线的静默工具调用期),前端就误判 turn 已结束 —— 运行指示
+// 与**中断按钮**一并消失,直到下一条 live 事件才恢复;对真卡住的 turn 则永不恢复,
+// 用户再也无法从聊天视图中断它。
+//
+// 后端现在在 `replay_done` 里带上权威的 `running` 标志(取自 turn_state==Running),
+// 前端据此设 busy。缺失/非布尔值按 false 处理(旧行为),保证老后端兼容。
+export function busyAfterReplay(running: unknown): boolean {
+  return running === true
+}

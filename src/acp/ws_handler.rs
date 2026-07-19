@@ -103,9 +103,14 @@ async fn handle_acp_ws(socket: WebSocket, session_id: String, state: Arc<AppStat
             return;
         }
     }
-    // Signal that replay is done so the frontend can reset busy state
+    // Signal that replay is done so the frontend can reset busy state. Carry the
+    // LIVE turn state: if the turn being rejoined is still Running (common on a
+    // mid-turn reconnect through an idle-timeout proxy, especially during an
+    // output-silent tool call), the frontend must NOT clobber busy → false, or
+    // it hides the running indicator AND the interrupt button for a live turn.
     if has_history {
-        let done_msg = serde_json::json!({"type": "replay_done"});
+        let running = state.sessions.turn_is_running(&session_id);
+        let done_msg = serde_json::json!({"type": "replay_done", "running": running});
         let _ = ws_sink.send(Message::Text(done_msg.to_string().into())).await;
     }
 

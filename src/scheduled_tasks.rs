@@ -549,6 +549,26 @@ impl ScheduledStore {
         rows.collect::<Result<_,_>>().map_err(|e| e.to_string())
     }
 
+    /// Session ids of a task's in-flight (`claimed`/`running`) runs that have a
+    /// bound session. Used by delete_scheduled to KILL the live `claude -p` child
+    /// (via SessionManager::remove_session) BEFORE `delete_config` drops the run
+    /// rows: since `running_summary().scheduled` now counts in-flight DB rows,
+    /// deleting the row while the child is still alive in the zeromux.service
+    /// cgroup would make the auto-update gate read `scheduled==0` and
+    /// `systemctl stop` cgroup-kill the live scheduled run (E1 violation). A
+    /// `claimed` run that hasn't bound a session yet (spawn racing) has NULL
+    /// session_id and is excluded — nothing to kill, and its row is removed by
+    /// delete_config normally.
+    pub fn active_sessions_for_task(&self, task_id: &str) -> Result<Vec<String>, String> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT session_id FROM agent_task_runs \
+             WHERE task_id=?1 AND state IN ('claimed','running') AND session_id IS NOT NULL"
+        ).map_err(|e| e.to_string())?;
+        let rows = stmt.query_map(params![task_id], |r| r.get::<_, String>(0)).map_err(|e| e.to_string())?;
+        rows.collect::<Result<_,_>>().map_err(|e| e.to_string())
+    }
+
     /// Global count of scheduled runs that are in flight (`claimed` or `running`)
     /// across all tasks. This is the authoritative "a scheduled agent is live"
     /// signal for the auto-update gate: the row is set to `claimed` at claim time
@@ -1498,6 +1518,36 @@ mod store_tests {
         s.delete_config("t").unwrap();
         assert!(s.get_config("t").unwrap().is_none());
         assert_eq!(s.runs_for_task("t", 10).unwrap().len(), 0, "run rows must not outlive the deleted task");
+    }
+
+    #[test]
+    fn active_sessions_for_task_returns_only_bound_in_flight() {
+        // delete_scheduled must kill the live child of an in-flight run before
+        // dropping its row (E1). This getter feeds that kill list: only
+        // `claimed`/`running` runs with a bound session_id, never terminal runs
+        // and never a NULL-session `claimed` row (spawn still racing).
+        let (s, _dir) = store();
+        let cfg = TaskConfig { id: "t".into(), owner_id: "u".into(), name: "n".into(), trigger_type: "cron".into(),
+            trigger_spec: "0 0 * * * *".into(), tz: "Asia/Shanghai".into(), agent_type: "claude".into(),
+            work_dir: ".".into(), prompt: "p".into(), enabled: true, retention_n: 20, created_ms: 1,
+            side_effects: false, max_runtime_min: None, idle_timeout_min: None };
+        s.upsert_config(&cfg).unwrap();
+        // running run bound to a session → included
+        let mk = |id: &str, ms: i64| TaskRun { id: id.into(), task_id: "t".into(), scheduled_for_ms: ms,
+            state: "claimed".into(), session_id: None, verdict: None, failure_kind: None,
+            started_ms: Some(ms), ended_ms: None, input_snapshot: None, confirm_status: None, replay_of: None };
+        s.claim_run(&mk("r_run", 1)).unwrap();
+        s.set_run_state("r_run", "running", Some("sess-A"), None, None, None).unwrap();
+        // claimed but no session yet (spawn racing) → excluded
+        s.claim_run(&mk("r_claim", 2)).unwrap();
+        // terminal run that once had a session → excluded
+        s.claim_run(&mk("r_done", 3)).unwrap();
+        s.set_run_state("r_done", "succeeded", Some("sess-B"), None, None, Some(9)).unwrap();
+
+        let mut got = s.active_sessions_for_task("t").unwrap();
+        got.sort();
+        assert_eq!(got, vec!["sess-A".to_string()],
+            "only the bound in-flight run's session is returned");
     }
 
     #[test]

@@ -2308,6 +2308,23 @@ async fn delete_scheduled(
     if existing.owner_id != user.id {
         return Err((StatusCode::FORBIDDEN, "Forbidden".to_string()));
     }
+    // Kill any in-flight run's live child BEFORE delete_config drops its DB row.
+    // delete_config removes the `claimed`/`running` rows, and the auto-update gate
+    // now counts those rows (running_summary().scheduled); dropping the row while
+    // the `claude -p` child is still alive in the zeromux.service cgroup would let
+    // the gate read scheduled==0 and `systemctl stop` cgroup-kill the live run
+    // (E1: an in-flight scheduled run is never force-killed). remove_session drops
+    // the child (Drop) AND finalizes the row (abort_active_run_for_session), so the
+    // child dies before its gate signal disappears. NULL-session `claimed` rows
+    // (spawn racing) have nothing to kill and are cleared by delete_config.
+    if let Ok(sids) = state.scheduled_tasks.active_sessions_for_task(&id) {
+        for sid in sids {
+            state.sessions.remove_session(&sid);
+            if let Some(ref logger) = state.logger {
+                logger.remove_session(&sid);
+            }
+        }
+    }
     state
         .scheduled_tasks
         .delete_config(&id)

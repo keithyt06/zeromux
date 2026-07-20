@@ -1795,9 +1795,13 @@ async fn git_show(
         serde_json::json!({})
     };
 
-    // Diff content
+    // Diff content. `core.quotePath=false` forces literal UTF-8 paths in the
+    // per-file headers — git otherwise C-quotes any non-ASCII name (`"a/\345..."`),
+    // which the credential filter can't recognize, so a non-ASCII-named .env/*.pem
+    // would fail the exclusion OPEN and leak its hunk (filter_diff_excluded also
+    // fails closed on any residual quoted header git emits regardless of this flag).
     let diff_output = std::process::Command::new("git")
-        .args(["show", "--format=", "--patch", &query.commit])
+        .args(["-c", "core.quotePath=false", "show", "--format=", "--patch", &query.commit])
         .current_dir(&work_dir)
         .output()
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("git show failed: {}", e)))?;
@@ -1813,8 +1817,11 @@ async fn git_show(
     let diff = filter_diff_excluded(&String::from_utf8_lossy(&diff_output.stdout));
 
     // Changed files with line counts (drop excluded paths — same predicate).
+    // `core.quotePath=false` so a non-ASCII credential filename reaches
+    // `worktree_path_excluded` unquoted and is recognized/dropped (else the
+    // quoted `".env.\347..."` bypasses the leaf check and surfaces the name).
     let files: Vec<serde_json::Value> = std::process::Command::new("git")
-        .args(["show", "--format=", "--numstat", &query.commit])
+        .args(["-c", "core.quotePath=false", "show", "--format=", "--numstat", &query.commit])
         .current_dir(&work_dir)
         .output()
         .ok()
@@ -1936,8 +1943,19 @@ fn filter_diff_excluded(diff: &str) -> String {
     let mut out = String::with_capacity(diff.len());
     let mut skipping = false;
     for line in diff.split_inclusive('\n') {
-        if let Some(path) = diff_header_path(line) {
-            skipping = worktree_path_excluded(path);
+        match diff_header_path(line) {
+            // A per-file header we could parse: skip iff the path is excluded.
+            DiffHeader::Path(path) => skipping = worktree_path_excluded(path),
+            // A per-file header we could NOT parse to a clean path — most often
+            // a git C-quoted path (`"a/\345..."`), which git emits for any name
+            // with a non-ASCII byte, a `"`, a `\`, or a control char. We can't
+            // prove it's safe, so fail CLOSED: skip the whole section. Callers
+            // pass `core.quotePath=false` so credential leaves are normally
+            // unquoted and hit the Path arm; this is the belt-and-suspenders
+            // guard for the residual cases git quotes regardless (`"`/`\`).
+            DiffHeader::Unparseable => skipping = true,
+            // Not a header line — keep the current section's skip state.
+            DiffHeader::NotHeader => {}
         }
         if !skipping {
             out.push_str(line);
@@ -1946,27 +1964,49 @@ fn filter_diff_excluded(diff: &str) -> String {
     out
 }
 
-/// Extract the file path from a per-file diff header line, or None if the line
-/// is not a header. Handles `diff --git a/<p> b/<p>`, `diff --cc <p>`, and
+/// Classification of a single diff line as a per-file section header.
+enum DiffHeader<'a> {
+    /// A header whose path was extracted cleanly (unquoted).
+    Path(&'a str),
+    /// A header line (`diff --git`/`--cc`/`--combined`) whose path could not be
+    /// parsed to a clean value — treated as sensitive (fail closed).
+    Unparseable,
+    /// Not a per-file header line.
+    NotHeader,
+}
+
+/// Classify a diff line. Handles `diff --git a/<p> b/<p>`, `diff --cc <p>`, and
 /// `diff --combined <p>`. Returns the new-side (`b/`) path for `--git`; combined
-/// forms carry a single unprefixed path.
-fn diff_header_path(line: &str) -> Option<&str> {
+/// forms carry a single unprefixed path. A header whose remainder is quoted
+/// (git C-quoting) or otherwise unparseable is reported as `Unparseable` so the
+/// caller can fail closed rather than leak.
+fn diff_header_path(line: &str) -> DiffHeader<'_> {
     if let Some(rest) = line.strip_prefix("diff --git ") {
         // `a/<path> b/<path>` — take the b/ side (new path); fall back to a/.
-        return Some(
-            rest.rsplit_once(" b/")
-                .map(|(_, b)| b.trim_end_matches(['\n', '\r']))
-                .or_else(|| rest.strip_prefix("a/").map(|s| s.split(' ').next().unwrap_or(s)))
-                .unwrap_or(""),
-        );
+        // A quoted remainder (`"a/..." "b/..."`) matches neither ` b/` nor the
+        // `a/` prefix → Unparseable (fail closed).
+        return match rest
+            .rsplit_once(" b/")
+            .map(|(_, b)| b.trim_end_matches(['\n', '\r']))
+            .or_else(|| rest.strip_prefix("a/").map(|s| s.split(' ').next().unwrap_or(s)))
+        {
+            Some(p) if !p.is_empty() => DiffHeader::Path(p),
+            _ => DiffHeader::Unparseable,
+        };
     }
-    // Combined-diff headers (merge commits): the remainder is the bare path.
+    // Combined-diff headers (merge commits): the remainder is the bare path. A
+    // leading `"` means git quoted it → Unparseable (fail closed).
     for prefix in ["diff --cc ", "diff --combined "] {
         if let Some(rest) = line.strip_prefix(prefix) {
-            return Some(rest.trim_end_matches(['\n', '\r']));
+            let p = rest.trim_end_matches(['\n', '\r']);
+            return if p.is_empty() || p.starts_with('"') {
+                DiffHeader::Unparseable
+            } else {
+                DiffHeader::Path(p)
+            };
         }
     }
-    None
+    DiffHeader::NotHeader
 }
 
 async fn git_worktree(
@@ -2034,8 +2074,13 @@ async fn git_worktree(
         // never leak its hunk (the file LIST is already filtered, but the diff
         // text is whole-repo otherwise). Two pathspecs per name cover the dir at
         // repo root and at any depth.
-        let mut diff_args: Vec<String> =
-            vec!["diff".into(), "HEAD".into(), "--".into(), ".".into()];
+        // `core.quotePath=false`: emit literal UTF-8 paths so a non-ASCII-named
+        // credential leaf (e.g. `.env.生产`) reaches filter_diff_excluded's leaf
+        // predicate unquoted (the pathspecs below only exclude sensitive *dirs*).
+        let mut diff_args: Vec<String> = vec![
+            "-c".into(), "core.quotePath=false".into(),
+            "diff".into(), "HEAD".into(), "--".into(), ".".into(),
+        ];
         for name in SENSITIVE_DIR_NAMES {
             diff_args.push(format!(":(exclude,glob){}/**", name));
             diff_args.push(format!(":(exclude,glob)**/{}/**", name));
@@ -3573,6 +3618,51 @@ diff --combined deploy.pem
 ";
         let out = filter_diff_excluded(diff);
         assert!(!out.contains("PRIVATE KEY"), "combined pem hunk must be stripped");
+    }
+
+    #[test]
+    fn filter_diff_excluded_fails_closed_on_git_quoted_credential_header() {
+        // git's default `core.quotePath=true` C-quotes any path with a non-ASCII
+        // byte, so a committed non-ASCII-named credential file (`密钥.pem`,
+        // `.env.生产`, …) emits `diff --git "a/\\345..." "b/\\345..."`. The path
+        // is wrapped in quotes with octal escapes: the ` b/` split never matches
+        // and `is_credential_path` never sees a clean leaf, so the old parser
+        // returned an empty path and the section leaked OPEN. The git calls now
+        // pass `core.quotePath=false`, but the pure filter must ALSO fail CLOSED
+        // on a still-quoted header (git always quotes literal `"`/`\\`/control
+        // chars even with quotePath off) — defense in depth against the flag
+        // being dropped or an exotic name.
+        let diff = "\
+diff --git \"a/\\345\\257\\206.pem\" \"b/\\345\\257\\206.pem\"
+index 1..2 100644
+--- \"a/\\345\\257\\206.pem\"
++++ \"b/\\345\\257\\206.pem\"
++AWS_SECRET=leakme
+diff --git a/src/main.rs b/src/main.rs
++let x = 1;
+";
+        let out = filter_diff_excluded(diff);
+        assert!(!out.contains("leakme"), "git-quoted credential hunk must be stripped");
+        assert!(!out.contains("index 1..2"), "quoted credential section must be dropped whole");
+        assert!(out.contains("let x = 1;"), "following clean section must survive");
+    }
+
+    #[test]
+    fn filter_diff_excluded_fails_closed_on_combined_quoted_credential_header() {
+        // Same for the merge/combined form: `diff --cc "\\345..."`.
+        let diff = "\
+diff --cc \"\\345\\257\\206.pem\"
+index 5492cf7,b01b085..91d8c81
+--- \"a/\\345\\257\\206.pem\"
++++ \"b/\\345\\257\\206.pem\"
+@@@ -1,1 -1,1 +1,1 @@@
+++A=MERGED_RESOLVED_SECRET
+diff --cc src/main.rs
+++let x = 1;
+";
+        let out = filter_diff_excluded(diff);
+        assert!(!out.contains("SECRET"), "quoted combined credential hunk must be stripped");
+        assert!(out.contains("let x = 1;"), "following clean combined section survives");
     }
 
     #[test]

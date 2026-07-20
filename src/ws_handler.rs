@@ -112,9 +112,10 @@ async fn handle_ws(socket: WebSocket, session_id: String, state: Arc<AppState>) 
                             log.log_pty_output(&session_id, &b64);
                         }
 
-                        // Push to scrollback buffer
-                        state.sessions.push_scrollback(&session_id, b64.clone());
-
+                        // NOTE: scrollback is written ONCE by the PTY fan-out task
+                        // (session_manager::record_and_broadcast), NOT here — mirror
+                        // the ACP handler. Writing per connection duplicated scrollback
+                        // under multi-client and lost output entirely with zero clients.
                         let msg = serde_json::json!({"type": "output", "data": b64});
                         if ws_sink
                             .send(Message::Text(msg.to_string().into()))

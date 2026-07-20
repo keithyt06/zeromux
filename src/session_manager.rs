@@ -821,7 +821,21 @@ impl SessionManager {
                             Some(bytes) => {
                                 let b64 = base64::Engine::encode(
                                     &base64::engine::general_purpose::STANDARD, &bytes);
-                                let _ = event_tx_clone.send(b64);
+                                // Sole scrollback writer — mirror the ACP fan-out (emit →
+                                // record_and_broadcast). Persist ONCE here, independent of
+                                // subscribers, then broadcast under the same lock. The PTY WS
+                                // handler MUST NOT also push_scrollback: per-connection writes
+                                // duplicated scrollback N× under multi-client (evicting the 2MB
+                                // ring N× faster → corrupted replay) and lost output entirely
+                                // when zero clients were attached (broadcast Err dropped, nothing
+                                // persisted) — the D2 anti-pattern the ACP handler forbids.
+                                // Bumping last_activity_ms is benign: PTY sessions never enter
+                                // TurnState::Running, so both turn watchdogs skip them.
+                                if let Some(m) = mgr_weak.upgrade() {
+                                    m.record_and_broadcast(&sid, b64);
+                                } else {
+                                    let _ = event_tx_clone.send(b64); // manager gone: best-effort
+                                }
                             }
                             None => {
                                 tracing::info!("PTY output closed for session {}", sid);

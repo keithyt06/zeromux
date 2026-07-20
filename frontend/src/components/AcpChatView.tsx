@@ -13,7 +13,7 @@ import { foldTranscript, type WireEvent, type Block, type TurnGroup } from '../l
 import { partitionBlocks, type Density } from '../lib/density'
 import { STUCK_SILENCE_MS } from '../lib/stuck'
 import { shouldStickToBottom, shouldAutoScrollOnAppend, shouldTrackScrollUp } from '../lib/scrollReplay'
-import { shouldClearQueuedHint, busyAfterReplay } from '../lib/collectHint'
+import { shouldClearQueuedHint, busyAfterReplay, replaySilenceBaseline } from '../lib/collectHint'
 
 // ── Message types ──
 
@@ -47,6 +47,7 @@ interface ServerEvent {
   turn_id?: number
   client_id?: string
   running?: boolean
+  last_activity_ms?: number
 }
 
 interface Props {
@@ -319,12 +320,13 @@ export default function AcpChatView({ sessionId, agentType = 'claude', onRegiste
           // Elapsed: keep a fresh content_block stamp from this replay if present
           // (onopen reset it to null, so `?? t` only fills the no-output case).
           setTurnStartedMs(prev => prev ?? t)
-          // Silence baseline: reset to now UNCONDITIONALLY. lastEventMs is NOT
-          // cleared in onopen, so `?? t` would keep a stale timestamp from a prior
-          // turn when this turn replayed no content_block → `stuck` would fire
-          // immediately on a false silence. The replay we just received is itself
-          // fresh proof the socket is alive, so now is the correct baseline.
-          setLastEventMs(t)
+          // Silence baseline: seed from the backend's authoritative
+          // last_activity_ms (same clock as Date.now()) so `stuck` — and thus the
+          // `stuck`-gated 中断 button — reflects the REAL accumulated agent
+          // silence, not a fresh clock restarted on every reconnect. A hung turn
+          // is then interruptible immediately after reconnect. Missing value →
+          // now (old-backend / unknown session); future stamp → clamped to now.
+          setLastEventMs(replaySilenceBaseline(evt.last_activity_ms, t))
         } else {
           setTurnStartedMs(null)
         }

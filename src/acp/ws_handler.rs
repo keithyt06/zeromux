@@ -110,7 +110,16 @@ async fn handle_acp_ws(socket: WebSocket, session_id: String, state: Arc<AppStat
     // it hides the running indicator AND the interrupt button for a live turn.
     if has_history {
         let running = state.sessions.turn_is_running(&session_id);
-        let done_msg = serde_json::json!({"type": "replay_done", "running": running});
+        // Carry the authoritative last-activity timestamp so the client seeds its
+        // silence clock from real accumulated silence — otherwise a mid-turn
+        // reconnect resets the clock and the `stuck`-gated interrupt button stays
+        // hidden for a fresh 180s (and never appears if drops recur faster).
+        let last_activity_ms = state.sessions.last_activity_ms(&session_id);
+        let done_msg = serde_json::json!({
+            "type": "replay_done",
+            "running": running,
+            "last_activity_ms": last_activity_ms,
+        });
         let _ = ws_sink.send(Message::Text(done_msg.to_string().into())).await;
     }
 

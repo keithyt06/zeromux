@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest'
-import { shouldClearQueuedHint, busyAfterReplay } from '../collectHint'
+import { shouldClearQueuedHint, busyAfterReplay, replaySilenceBaseline } from '../collectHint'
 
 describe('shouldClearQueuedHint', () => {
   // Regression (opposite direction from the turn-end fix): content_block belongs
@@ -54,5 +54,34 @@ describe('busyAfterReplay', () => {
     expect(busyAfterReplay(null)).toBe(false)
     expect(busyAfterReplay('true')).toBe(false)
     expect(busyAfterReplay(1)).toBe(false)
+  })
+})
+
+describe('replaySilenceBaseline', () => {
+  const NOW = 1_000_000
+
+  // The bug: reconnect reset the silence clock to `now`, so a turn that had been
+  // silent (hung) for 10 min read as 0s silent → `stuck` false → the 中断 button
+  // (gated on `stuck`) stayed hidden a fresh 180s after every reconnect. Seeding
+  // from the backend's real last_activity_ms preserves the true silence so the
+  // button appears immediately for a genuinely hung turn.
+  it('preserves real accumulated silence from backend last_activity_ms', () => {
+    const tenMinAgo = NOW - 600_000
+    expect(replaySilenceBaseline(tenMinAgo, NOW)).toBe(tenMinAgo)
+  })
+
+  // Missing value (old backend / unknown session) → now, matching the prior
+  // conservative behavior (no false immediate "stuck").
+  it('falls back to now when the backend omits the value', () => {
+    expect(replaySilenceBaseline(undefined, NOW)).toBe(NOW)
+    expect(replaySilenceBaseline(null, NOW)).toBe(NOW)
+    expect(replaySilenceBaseline('123', NOW)).toBe(NOW)
+    expect(replaySilenceBaseline(NaN, NOW)).toBe(NOW)
+  })
+
+  // A future stamp (minor server/client clock skew) must not produce negative
+  // silence — clamp to now.
+  it('clamps a future timestamp to now', () => {
+    expect(replaySilenceBaseline(NOW + 5_000, NOW)).toBe(NOW)
   })
 })

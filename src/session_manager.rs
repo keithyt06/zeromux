@@ -612,6 +612,17 @@ impl SessionManager {
             .unwrap_or(false)
     }
 
+    /// Authoritative last-activity timestamp (epoch ms) for a session — the same
+    /// value the idle/stuck watchdogs use. Sent in `replay_done` so a reconnecting
+    /// client can seed its silence baseline from the REAL accumulated silence
+    /// rather than "now": the `stuck` heuristic (and thus the 中断 button, which is
+    /// gated on `stuck`) must reflect true agent silence immediately after a
+    /// mid-turn reconnect, not restart a fresh 180s window each time the socket
+    /// drops. `None` if the session is unknown.
+    pub fn last_activity_ms(&self, id: &str) -> Option<i64> {
+        self.sessions.lock().unwrap().get(id).map(|s| s.last_activity_ms)
+    }
+
     /// Finalize a scheduled run exactly once (called by the agent fan-out on the
     /// terminal event for that run). No-op if no scheduled store is wired.
     pub fn finalize_run(&self, run_id: &str, state: &str, verdict: Option<&str>, failure_kind: Option<&str>) {

@@ -39,3 +39,23 @@ export function shouldClearQueuedHint(eventType: string): boolean {
 export function busyAfterReplay(running: unknown): boolean {
   return running === true
 }
+
+// 重连重放结束时,`stuck`(静默超阈)判定所用的「上次活动时间」基线。
+//
+// `中断`(interrupt)按钮只在 `stuck` 为真时渲染(见 AcpChatView 底栏),而
+// `stuck = busy && now - lastEventMs > STUCK_SILENCE_MS`。若重连后把 lastEventMs
+// 直接置为 now,静默计时就被清零 —— 真正卡住的 turn 在重连后还要再等满一个
+// 180s 窗口按钮才出现;若静默 socket 被 idle-proxy 反复 <180s 掉线,每次重连都
+// 清零 → 按钮**永不出现**,用户再也无法中断(正是 e1d0514 想修却没修到的终态)。
+//
+// 后端在 `replay_done` 里带上权威的 `last_activity_ms`(epoch 毫秒,与
+// `Date.now()` 同一时钟口径,取自 watchdog 用的 Session.last_activity_ms)。据此
+// 播种基线,`stuck` 就反映**真实累计静默**,卡住的 turn 一重连即可中断。
+// 缺失/非有限数值 → 回退到 now(旧后端兼容);未来时间戳(轻微时钟偏移)被
+// 钳到 now,避免负静默。
+export function replaySilenceBaseline(lastActivityMs: unknown, now: number): number {
+  if (typeof lastActivityMs === 'number' && Number.isFinite(lastActivityMs)) {
+    return Math.min(lastActivityMs, now)
+  }
+  return now
+}

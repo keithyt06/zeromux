@@ -1832,7 +1832,7 @@ async fn git_show(
                 .filter(|l| !l.trim().is_empty())
                 .filter_map(|line| {
                     let parts: Vec<&str> = line.split('\t').collect();
-                    if parts.len() >= 3 && !worktree_path_excluded(parts[2]) {
+                    if parts.len() >= 3 && !numstat_path_excluded(parts[2]) {
                         Some(serde_json::json!({
                             "additions": parts[0].parse::<i32>().unwrap_or(-1),
                             "deletions": parts[1].parse::<i32>().unwrap_or(-1),
@@ -1915,6 +1915,36 @@ fn worktree_path_excluded(path: &str) -> bool {
     dir_hit || leaf_hit
 }
 
+/// Exclude a `git --numstat` path field, accounting for its rename tokens. For a
+/// rename numstat writes the path as `old => new` (or the common-prefix brace form
+/// `pre/{old => new}/post`), so a rename *away from* a credential name
+/// (`.env => config.txt`, `sub/{.env => config.txt}`) would surface the sensitive
+/// old name — and pairs with a diff section this same commit leaks. Expand both
+/// concrete paths and exclude if either is sensitive; a plain path (no `=>`)
+/// falls through to the normal predicate.
+fn numstat_path_excluded(field: &str) -> bool {
+    if !field.contains("=>") {
+        return worktree_path_excluded(field);
+    }
+    // Brace form: `pre/{old => new}/post` → pre/old/post and pre/new/post.
+    if let (Some(lb), Some(rb)) = (field.find('{'), field.find('}')) {
+        if lb < rb {
+            let (pre, rest) = field.split_at(lb);
+            let inner = &field[lb + 1..rb];
+            let post = &field[rb + 1..];
+            if let Some((old, new)) = inner.split_once("=>") {
+                let join = |mid: &str| format!("{}{}{}", pre, mid.trim(), post);
+                return worktree_path_excluded(&join(old)) || worktree_path_excluded(&join(new));
+            }
+        }
+    }
+    // Plain form: `old => new`.
+    if let Some((old, new)) = field.split_once("=>") {
+        return worktree_path_excluded(old.trim()) || worktree_path_excluded(new.trim());
+    }
+    worktree_path_excluded(field)
+}
+
 /// Drop files whose path is excluded (sensitive dir component or credential leaf),
 /// so a worktree diff can never surface .ssh/.aws/.env/*.pem contents.
 fn filter_sensitive_files(files: Vec<WorktreeFile>) -> Vec<WorktreeFile> {
@@ -1946,6 +1976,9 @@ fn filter_diff_excluded(diff: &str) -> String {
         match diff_header_path(line) {
             // A per-file header we could parse: skip iff the path is excluded.
             DiffHeader::Path(path) => skipping = worktree_path_excluded(path),
+            // A recognized header whose old- or new-side path is credential-
+            // sensitive (e.g. a rename `a/.env b/config.txt`) — always skip.
+            DiffHeader::Excluded => skipping = true,
             // A per-file header we could NOT parse to a clean path — most often
             // a git C-quoted path (`"a/\345..."`), which git emits for any name
             // with a non-ASCII byte, a `"`, a `\`, or a control char. We can't
@@ -1968,6 +2001,12 @@ fn filter_diff_excluded(diff: &str) -> String {
 enum DiffHeader<'a> {
     /// A header whose path was extracted cleanly (unquoted).
     Path(&'a str),
+    /// A recognized header whose path is credential-sensitive — skip the section
+    /// unconditionally. Used for the `diff --git a/<old> b/<new>` rename form,
+    /// where EITHER side being sensitive must exclude (a rename *away from* a
+    /// credential name — `a/.env b/config.txt` — still dumps the old file's
+    /// secret lines as removed/context hunks under the non-sensitive `b/` name).
+    Excluded,
     /// A header line (`diff --git`/`--cc`/`--combined`) whose path could not be
     /// parsed to a clean value — treated as sensitive (fail closed).
     Unparseable,
@@ -1976,21 +2015,41 @@ enum DiffHeader<'a> {
 }
 
 /// Classify a diff line. Handles `diff --git a/<p> b/<p>`, `diff --cc <p>`, and
-/// `diff --combined <p>`. Returns the new-side (`b/`) path for `--git`; combined
-/// forms carry a single unprefixed path. A header whose remainder is quoted
-/// (git C-quoting) or otherwise unparseable is reported as `Unparseable` so the
-/// caller can fail closed rather than leak.
+/// `diff --combined <p>`. For `--git` it inspects BOTH the `a/` (old) and `b/`
+/// (new) paths and returns `Excluded` if either is credential-sensitive (a rename
+/// leaks the old file's contents regardless of the new name); otherwise the `b/`
+/// path. Combined forms carry a single unprefixed path. A header whose remainder
+/// is quoted (git C-quoting) or otherwise unparseable is reported as `Unparseable`
+/// so the caller can fail closed rather than leak.
 fn diff_header_path(line: &str) -> DiffHeader<'_> {
     if let Some(rest) = line.strip_prefix("diff --git ") {
-        // `a/<path> b/<path>` — take the b/ side (new path); fall back to a/.
-        // A quoted remainder (`"a/..." "b/..."`) matches neither ` b/` nor the
+        // `a/<path> b/<path>` — split into the a/ (old) and b/ side (new). A
+        // quoted remainder (`"a/..." "b/..."`) matches neither ` b/` nor the
         // `a/` prefix → Unparseable (fail closed).
-        return match rest
+        let b_path = rest
             .rsplit_once(" b/")
-            .map(|(_, b)| b.trim_end_matches(['\n', '\r']))
-            .or_else(|| rest.strip_prefix("a/").map(|s| s.split(' ').next().unwrap_or(s)))
-        {
-            Some(p) if !p.is_empty() => DiffHeader::Path(p),
+            .map(|(_, b)| b.trim_end_matches(['\n', '\r']));
+        // Old side: `a/<old>` up to the ` b/` separator. Falls back to the whole
+        // remainder's `a/` prefix when there is no ` b/` (shouldn't happen for a
+        // well-formed --git header, but stays fail-safe).
+        let a_path = rest
+            .rsplit_once(" b/")
+            .map(|(a, _)| a)
+            .unwrap_or(rest)
+            .strip_prefix("a/")
+            .map(|s| s.trim_end_matches(['\n', '\r']));
+        return match b_path.or(a_path) {
+            Some(p) if !p.is_empty() => {
+                // Exclude if EITHER side is sensitive — a rename to/from a
+                // credential name leaks the credential file's contents.
+                if a_path.is_some_and(worktree_path_excluded)
+                    || worktree_path_excluded(p)
+                {
+                    DiffHeader::Excluded
+                } else {
+                    DiffHeader::Path(p)
+                }
+            }
             _ => DiffHeader::Unparseable,
         };
     }
@@ -3680,6 +3739,68 @@ diff --cc src/main.rs
         let out = filter_diff_excluded(diff);
         assert!(!out.contains("SECRET"), "quoted combined credential hunk must be stripped");
         assert!(out.contains("let x = 1;"), "following clean combined section survives");
+    }
+
+    #[test]
+    fn filter_diff_excluded_strips_rename_away_from_credential() {
+        // A rename `a/.env b/config.txt` WITH content change dumps the old .env's
+        // secret lines (as removed/context hunks) under the non-sensitive NEW
+        // name. The header path parser used to key only on the b/ side, so
+        // `config.txt` was deemed safe and the section leaked. It must exclude if
+        // EITHER the a/ (old) or b/ (new) side is credential-sensitive.
+        let diff = "\
+diff --git a/.env b/config.txt
+similarity index 82%
+rename from .env
+rename to config.txt
+--- a/.env
++++ b/config.txt
+@@ -1,3 +1,3 @@
+ SECRET_KEY=abc123deadbeef
+-DB_PASS=hunter2
++DB_PASS=hunter3
+ API_TOKEN=xyz789
+diff --git a/src/main.rs b/src/main.rs
++let x = 1;
+";
+        let out = filter_diff_excluded(diff);
+        assert!(!out.contains("SECRET_KEY"), "renamed-away .env context must be stripped");
+        assert!(!out.contains("hunter"), "renamed-away .env delta must be stripped");
+        assert!(!out.contains("rename from .env"));
+        assert!(out.contains("let x = 1;"), "following clean section survives");
+    }
+
+    #[test]
+    fn filter_diff_excluded_strips_rename_into_credential() {
+        // Symmetric: renaming a normal file INTO a credential name (b/ side
+        // sensitive) must also be stripped — the new .env's contents are secret.
+        let diff = "\
+diff --git a/notes.txt b/.env
+--- a/notes.txt
++++ b/.env
++SECRET=NOWSENSITIVE
+";
+        let out = filter_diff_excluded(diff);
+        assert!(!out.contains("NOWSENSITIVE"), "rename-into-.env hunk must be stripped");
+    }
+
+    #[test]
+    fn numstat_path_excluded_handles_rename_tokens() {
+        // `git --numstat` writes a rename as `old => new` or the common-prefix
+        // brace form `pre/{old => new}/post`. A rename away from a credential name
+        // must still be excluded from the file list so the sensitive OLD name
+        // doesn't surface (and to match the diff-body exclusion above).
+        assert!(numstat_path_excluded(".env => config.txt"), "plain rename away from .env");
+        assert!(numstat_path_excluded("config.txt => .env"), "plain rename into .env");
+        assert!(numstat_path_excluded("cfg/{.env => app.txt}"), "brace rename away from .env");
+        assert!(numstat_path_excluded("cfg/{app.txt => .env}"), "brace rename into .env");
+        assert!(numstat_path_excluded("secrets/{a => b}/deploy.pem"), "brace prefix, sensitive leaf");
+        // A non-credential rename must NOT be over-excluded.
+        assert!(!numstat_path_excluded("old.rs => new.rs"), "clean rename survives");
+        assert!(!numstat_path_excluded("src/{a.rs => b.rs}"), "clean brace rename survives");
+        // Plain (no rename token) path falls through to the normal predicate.
+        assert!(numstat_path_excluded(".env"));
+        assert!(!numstat_path_excluded("src/main.rs"));
     }
 
     #[test]

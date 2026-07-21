@@ -162,7 +162,17 @@ export default function TerminalView({ sessionId, active, theme }: Props) {
     term.open(containerRef.current)
 
     try {
-      term.loadAddon(new WebglAddon())
+      const webgl = new WebglAddon()
+      // Dispose on GPU context loss so xterm falls back to the canvas/DOM
+      // renderer. Views are kept mounted-but-hidden (display:none) rather than
+      // unmounted, so an offscreen terminal's WebGL context is routinely
+      // reclaimed under memory pressure (common on mobile). Without this the
+      // addon keeps rendering against a dead context → the terminal paints
+      // blank/frozen on return with no recovery short of a page reload, even
+      // though PTY data is still flowing. onContextLoss fires asynchronously,
+      // so the constructor try/catch alone cannot cover it.
+      webgl.onContextLoss(() => webgl.dispose())
+      term.loadAddon(webgl)
     } catch {
       // fallback to canvas
     }

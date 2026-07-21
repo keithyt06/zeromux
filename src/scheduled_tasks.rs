@@ -569,6 +569,24 @@ impl ScheduledStore {
         rows.collect::<Result<_,_>>().map_err(|e| e.to_string())
     }
 
+    /// Session ids of ALL in-flight (`claimed`/`running`) runs across every task
+    /// that have bound a session. Used by the scheduler panic-respawn arm to
+    /// reconcile only genuinely-orphaned runs: it aborts a row only when its bound
+    /// session is gone from the live SessionManager, never a run whose child is
+    /// still alive (that would drop the gate signal → E1 cgroup-kill). NULL-session
+    /// `claimed` rows (spawn racing, or a manual claimant mid-`trigger_run`) are
+    /// excluded — aborting them could race a concurrent bind; the startup
+    /// reconcile catches any that truly stranded.
+    pub fn inflight_bound_sessions(&self) -> Result<Vec<String>, String> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT session_id FROM agent_task_runs \
+             WHERE state IN ('claimed','running') AND session_id IS NOT NULL"
+        ).map_err(|e| e.to_string())?;
+        let rows = stmt.query_map(params![], |r| r.get::<_, String>(0)).map_err(|e| e.to_string())?;
+        rows.collect::<Result<_,_>>().map_err(|e| e.to_string())
+    }
+
     /// Global count of scheduled runs that are in flight (`claimed` or `running`)
     /// across all tasks. This is the authoritative "a scheduled agent is live"
     /// signal for the auto-update gate: the row is set to `claimed` at claim time
@@ -1139,8 +1157,27 @@ pub fn spawn_scheduler(
             match inner.await {
                 Ok(_) => break, // inner returned without panic (shouldn't happen); stop supervising
                 Err(_) => {
-                    tracing::error!("scheduler loop panicked; reconciling orphans + respawning");
-                    let _ = store.reconcile_orphans(None);
+                    // In-process respawn: a panic in the inner scheduler task does
+                    // NOT kill the independent session fan-out tasks, so their
+                    // `claude -p` children (and any in-flight scheduled run) stay
+                    // alive. The old blanket `reconcile_orphans(None)` here aborted
+                    // EVERY in-flight row while its child was live — dropping the
+                    // auto-update gate signal (running_summary counts these rows)
+                    // so `systemctl stop` cgroup-kills the live run (E1 violation),
+                    // and permanently mislabeling the row `aborted` (the late
+                    // finalize_run is a no-op past its terminal-state guard). Only
+                    // reconcile runs whose bound session is genuinely GONE; live
+                    // runs finalize themselves at their turn boundary, and true
+                    // process-death orphans are still swept at the next startup.
+                    tracing::error!("scheduler loop panicked; reconciling orphaned runs + respawning");
+                    if let Ok(bound) = store.inflight_bound_sessions() {
+                        let now = chrono::Utc::now().timestamp_millis();
+                        for sid in bound {
+                            if !mgr.session_exists(&sid) {
+                                let _ = store.abort_active_run_for_session(&sid, "orphaned_restart", now);
+                            }
+                        }
+                    }
                 }
             }
         }
@@ -1234,6 +1271,29 @@ mod store_tests {
         s.claim_run(&TaskRun { id:"r1".into(),task_id:"t1".into(),scheduled_for_ms:1,state:"claimed".into(),session_id:None,verdict:None,failure_kind:None,started_ms:Some(1),ended_ms:None,input_snapshot:None,confirm_status:None,replay_of:None }).unwrap();
         assert_eq!(s.reconcile_orphans(None).unwrap(), 1);
         assert!(s.active_states_for_task("t1").unwrap().is_empty());
+    }
+
+    #[test]
+    fn inflight_bound_sessions_only_lists_bound_active_runs() {
+        // Feeds the panic-respawn session-aware reconcile: it must return exactly
+        // the session_ids of in-flight runs that HAVE bound a session, so the
+        // caller can abort only those whose session is gone — never a NULL-session
+        // claimed slot (spawn racing) and never a terminal run.
+        let (s, _dir) = store();
+        let mk = |id: &str, sched: i64| TaskRun {
+            id: id.into(), task_id: "t1".into(), scheduled_for_ms: sched, state: "claimed".into(),
+            session_id: None, verdict: None, failure_kind: None, started_ms: Some(sched),
+            ended_ms: None, input_snapshot: None, confirm_status: None, replay_of: None };
+        // r_live: running with a bound session → listed.
+        s.claim_run(&mk("r_live", 1)).unwrap();
+        s.set_run_state("r_live", "running", Some("sess_live"), None, None, None).unwrap();
+        // r_racing: claimed, NULL session (spawn not done) → excluded.
+        s.claim_run(&mk("r_racing", 2)).unwrap();
+        // r_done: terminal, had a session → excluded (not in-flight).
+        s.claim_run(&mk("r_done", 3)).unwrap();
+        s.set_run_state("r_done", "succeeded", Some("sess_done"), None, None, Some(9)).unwrap();
+        let bound = s.inflight_bound_sessions().unwrap();
+        assert_eq!(bound, vec!["sess_live".to_string()], "only the live bound run is listed");
     }
 
     #[test]

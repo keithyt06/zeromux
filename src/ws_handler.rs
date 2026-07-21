@@ -61,9 +61,17 @@ async fn handle_ws(socket: WebSocket, session_id: String, state: Arc<AppState>) 
         tracing::error!("ensure_running failed for {}: {}", session_id, e);
         return;
     }
-    // Subscribe to broadcast (multi-client safe)
-    let mut event_rx = match state.sessions.subscribe(&session_id) {
-        Some(rx) => rx,
+    // Atomically snapshot scrollback AND subscribe under ONE lock. Since 19ab52b
+    // made the PTY fan-out the sole scrollback writer via `record_and_broadcast`
+    // (persist-before-broadcast under the sessions mutex), the old two-step
+    // `subscribe()` then `get_scrollback()` reopened the reconnect double-delivery
+    // race for terminals: a frame emitted between the two lock acquisitions landed
+    // in BOTH the replay snapshot and the live receiver → duplicated xterm bytes on
+    // reconnect-mid-stream. `subscribe_with_history` takes both under one lock, so
+    // every frame falls on exactly one side of the boundary — mirror the ACP handler
+    // (review 2026-06-11 / 2026-07-21).
+    let (scrollback, mut event_rx) = match state.sessions.subscribe_with_history(&session_id) {
+        Some(pair) => pair,
         None => {
             tracing::error!("Session {} not found", session_id);
             return;
@@ -77,8 +85,8 @@ async fn handle_ws(socket: WebSocket, session_id: String, state: Arc<AppState>) 
     let (mut ws_sink, mut ws_stream) = socket.split();
     let logger = state.logger.clone();
 
-    // Replay scrollback history first
-    let scrollback = state.sessions.get_scrollback(&session_id);
+    // Replay scrollback history first (snapshot taken above, atomically with the
+    // subscribe, so no frame is both replayed and delivered live).
     for b64 in scrollback {
         let msg = serde_json::json!({"type": "output", "data": b64});
         if ws_sink

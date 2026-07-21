@@ -4248,6 +4248,34 @@ mod running_summary_tests {
             "streaming session bumped last_activity_ms and must be spared; only the silent one is killed");
     }
 
+    #[test]
+    fn subscribe_with_history_no_double_delivery_for_pty_frames() {
+        // F-SM (2026-07-21): the PTY WS handler now reconnects via
+        // subscribe_with_history (atomic snapshot+subscribe), mirroring the ACP
+        // handler, because 19ab52b made the PTY fan-out persist-before-broadcast
+        // via record_and_broadcast. A frame emitted AFTER the atomic subscribe
+        // must appear in the live receiver and NOT also in the history snapshot —
+        // exactly one side of the boundary. (The old two-step subscribe() then
+        // get_scrollback() put a between-locks frame on BOTH sides → duplicate
+        // xterm bytes on reconnect-mid-stream.)
+        let (m, _tmp) = mgr_with(vec![running_session(
+            "p", SessionType::Tmux, None, TurnState::Idle,
+        )]);
+        // A pre-existing scrollback frame (already persisted before reconnect).
+        m.record_and_broadcast("p", "old".to_string());
+
+        // Reconnect: snapshot history AND subscribe under one lock.
+        let (history, mut rx) = m.subscribe_with_history("p").expect("session exists");
+        assert_eq!(history, vec!["old".to_string()], "history has only the pre-subscribe frame");
+
+        // A frame emitted AFTER the atomic subscribe: goes to the live receiver,
+        // and (being appended after the snapshot) is NOT in `history`.
+        m.record_and_broadcast("p", "live".to_string());
+        assert_eq!(rx.try_recv().unwrap(), "live", "post-subscribe frame delivered live");
+        assert!(rx.try_recv().is_err(), "no second copy of any frame on the live channel");
+        assert!(!history.contains(&"live".to_string()), "live frame is not also in the replay snapshot");
+    }
+
     #[tokio::test]
     async fn send_timeout_kill_emits_timeout_kill_run_id_none() {
         let (s, mut rx) = running_session_observable("sid", SessionType::Claude);

@@ -588,13 +588,39 @@ async fn run_event_loop(
                                             return;
                                         }
                                         Some(Cmd::Prompt(_)) => {
-                                            // The UI should disable Send while
-                                            // a turn is in flight; if a prompt
-                                            // arrives anyway, drop it and warn.
+                                            // A prompt arriving mid-turn is normally
+                                            // prevented by the UI disabling Send. But
+                                            // the collect-queue flush (session_manager
+                                            // PromptQueue) can also send here: it arms
+                                            // on ANY turn boundary — including a
+                                            // NON-terminal mid-turn `codex/event`
+                                            // error notification (see Notify::Error
+                                            // below, which does not break the loop) —
+                                            // and 500ms later flushes the merged queued
+                                            // follow-up while this `call_tool` is still
+                                            // in flight. We can't start it now (the
+                                            // reply must go through codex-reply after
+                                            // this turn resolves), so rather than drop
+                                            // it SILENTLY — which left the queued
+                                            // follow-up lost with the session looking
+                                            // idle/healthy — surface an error so the
+                                            // user knows to resend. (A full fix would
+                                            // stash + auto-redispatch after call_fut
+                                            // resolves; deferred pending real-machine
+                                            // confirmation of the retryable-error
+                                            // timing window.)
                                             tracing::warn!(
                                                 "codex: prompt received during \
-                                                 in-flight turn; dropping"
+                                                 in-flight turn; not delivered"
                                             );
+                                            let _ = event_tx
+                                                .send(AcpEvent::Error {
+                                                    message: "Codex was still finishing \
+                                                        the previous turn; your follow-up \
+                                                        was not delivered — please resend."
+                                                        .to_string(),
+                                                })
+                                                .await;
                                         }
                                     }
                                 }

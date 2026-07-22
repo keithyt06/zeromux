@@ -1070,10 +1070,18 @@ impl SessionManager {
             if !matches!(s.session_type, SessionType::Claude | SessionType::Kiro | SessionType::Codex) {
                 continue; // tmux 无 turn 概念,不阻塞升级
             }
-            // 调度会话由上面的 DB 计数负责,这里只数交互式(非 source_task)运行 turn。
-            if s.source_task_id.is_some() {
-                continue;
-            }
+            // 任何内存 turn_state==Running 的 agent 会话都算 interactive —— 包括对
+            // 已结束调度会话发起的交互式追问。此前这里 `source_task_id.is_some()` 直接
+            // continue,假设调度会话的活跃全由上面 DB 计数覆盖;但该假设只在调度 run
+            // *进行中* 成立:run 结束 finalize 后 `claude -p` 子进程 Idle 常驻不回收
+            // (从不 remove_session),用户可对这个残留会话发交互式追问(run_id:None →
+            // turn_state=Running 但**无** DB run 行)。那样 scheduled==0 且 interactive
+            // 也漏计 → gate 判全 idle → systemctl stop 连 cgroup 杀掉正在飞行的交互
+            // turn(E1,且比普通交互 turn 更糟:零 WaitInteractive 宽限)。改数 turn_state
+            // 不会重演 8a5dc74 死锁:那修的是"只要会话存活就算"(进程永不回收 → 永久
+            // 阻塞);turn 边界(见下方 fanout)对 source_task 会话也无条件 mark(Idle),
+            // 故残留 Idle 会话贡献 0;调度 run 进行中则 active_run_count≥1,gate 用
+            // scheduled>0 短路,双计无害。
             let Some(rp) = s.running.as_ref() else { continue };
             if rp.turn_state == TurnState::Running {
                 interactive += 1;
@@ -4051,9 +4059,12 @@ mod running_summary_tests {
     }
 
     #[test]
-    fn counts_interactive_running_turns_skipping_tmux_and_scheduled() {
-        // interactive counts only non-source Running turns; the scheduled session
-        // is counted via the DB run below, not its in-memory turn_state.
+    fn counts_interactive_running_turns_skipping_tmux() {
+        // interactive counts every Running agent turn (tmux excluded). During a
+        // live scheduled run the source_task session is BOTH Running in memory and
+        // counted via the DB run (scheduled=1); the gate short-circuits on
+        // scheduled>0 so the double count is harmless. Session "a" (Running,
+        // source_task, DB run in flight) therefore adds to interactive too.
         let (m, _tmp) = mgr_with(vec![
             running_session("a", SessionType::Claude, Some("task1".into()), TurnState::Running),
             running_session("b", SessionType::Codex, None, TurnState::Running),
@@ -4063,7 +4074,27 @@ mod running_summary_tests {
         seed_active_run(&m, "r1", "task1", "running");
         let s = m.running_summary();
         assert_eq!(s.scheduled, 1, "in-flight scheduled run blocks (DB count)");
-        assert_eq!(s.interactive, 1, "only non-source running-turn agent counts as interactive");
+        assert_eq!(s.interactive, 2, "both Running agent turns count (a is scheduled AND running)");
+    }
+
+    #[test]
+    fn interactive_followup_on_finished_scheduled_session_counts_as_interactive() {
+        // Regression (F-SCHED, 2026-07-22): after a scheduled run finalizes, its
+        // `claude -p` child lingers Idle and is never reaped. A user can reuse that
+        // session with an interactive follow-up (run_id:None → turn_state=Running,
+        // NO new DB run row). Previously running_summary skipped source_task sessions
+        // unconditionally → this live turn counted as neither scheduled (DB run
+        // finalized → 0) nor interactive → gate saw all-idle → systemctl stop
+        // cgroup-killed the live turn with ZERO grace (E1). Now it must count as
+        // interactive so the gate waits (WaitInteractive) instead of killing it.
+        let (m, _tmp) = mgr_with(vec![
+            running_session("sess1", SessionType::Claude, Some("task1".into()), TurnState::Running),
+        ]);
+        seed_active_run(&m, "r1", "task1", "succeeded"); // scheduled run already done
+        let s = m.running_summary();
+        assert_eq!(s.scheduled, 0, "the scheduled run is finalized");
+        assert_eq!(s.interactive, 1,
+            "an interactive follow-up on a finished scheduled session must block auto-update");
     }
 
     #[test]

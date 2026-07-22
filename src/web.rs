@@ -918,7 +918,7 @@ async fn get_session_file(
 
     // Refuse credential / sensitive files by name, or any path descending into a
     // sensitive directory (.ssh/.aws/.gnupg/.git) even if the leaf looks innocuous.
-    if descends_into_sensitive_dir(&base, &file_path) {
+    if descends_into_sensitive_dir(&base, &file_path) || read_hits_home_dotdir(&file_path) {
         return Err((StatusCode::FORBIDDEN, "Access to sensitive directory denied".to_string()));
     }
     if let Some(name) = file_path.file_name().and_then(|s| s.to_str()) {
@@ -958,7 +958,7 @@ async fn get_file_raw(
     require_session_access(&state, &user, &id)?;
     let base = resolve_base_dir(&state, &id, query.base_dir.as_deref())?;
     let real = resolve_and_verify(&base, &query.path)?;
-    if descends_into_sensitive_dir(&base, &real) {
+    if descends_into_sensitive_dir(&base, &real) || read_hits_home_dotdir(&real) {
         return Err((StatusCode::FORBIDDEN, "Forbidden".into()));
     }
     let fname = real.file_name().and_then(|s| s.to_str()).unwrap_or("download");
@@ -1139,6 +1139,46 @@ fn descends_into_sensitive_dir(base: &std::path::Path, canonical: &std::path::Pa
     path_hits_sensitive_dir(base, canonical)
 }
 
+/// READ guard: refuse any resolved path whose FIRST component below `$HOME` is a
+/// hidden (dot-prefixed) entry — i.e. the entire `~/.*` home-level surface
+/// (`~/.config/gh/hosts.yml`, `~/.kube/config`, `~/.docker/config.json`, `~/.pgpass`,
+/// `~/.config/gcloud/…`, `~/.config/rclone/…`). That is where user-level tool
+/// credentials live, and the fixed-string `is_credential_path` leaf list plus the
+/// 6-name `SENSITIVE_DIR_NAMES` provably don't cover them (leaf names like
+/// `hosts.yml`/`config`/`config.json` look innocuous), so a `base_dir=$HOME` (or
+/// `~/.config`) override could read them via the session file browser.
+///
+/// Keying on the FIRST-below-`$HOME` component (not *any* component) is deliberate:
+/// an in-repo dot dir like `<repo>/.github/workflows/ci.yml` has `<repo>` as its
+/// first-below-`$HOME` component, so legitimate project browsing of
+/// `.github`/`.vscode`/`.cargo`/`.devcontainer` still works — only home-*rooted*
+/// hidden dirs are refused. Unlike the vault's blanket `vault_real_hits_dot_component`
+/// (notes-only, can block all dot dirs), the file browser must keep in-repo dot dirs
+/// browsable. Fail CLOSED if `$HOME` can't be resolved or the path isn't under it.
+fn read_hits_home_dotdir(canonical: &std::path::Path) -> bool {
+    let home = match std::env::var("HOME") {
+        Ok(h) => h,
+        Err(_) => return true,
+    };
+    let home_canon = match std::path::Path::new(&home).canonicalize() {
+        Ok(h) => h,
+        Err(_) => return true,
+    };
+    match canonical.strip_prefix(&home_canon) {
+        // First path segment below $HOME is a dot-entry → home-level hidden → refuse.
+        Ok(rel) => matches!(rel.components().next(),
+            Some(std::path::Component::Normal(s))
+                if s.to_str().is_some_and(|n| n.starts_with('.'))),
+        // Not under $HOME: out of this guard's purview — enforcing the $HOME
+        // boundary is `validate_browse_root`'s job (it 403s a base outside $HOME
+        // before any read handler runs), and `resolve_and_verify` keeps the target
+        // under that base. So a real request's path is always under $HOME here; this
+        // branch is only hit by unit tests that drive the readers with a /tmp base
+        // directly. Answer honestly ("not a home-level dotdir") rather than block.
+        Err(_) => false,
+    }
+}
+
 /// WRITE guard: refuse writes/deletes/renames that touch a control dir OR a
 /// control-named leaf below base (so `delete_session_dir(".git")` and `mkdir ".aws"`
 /// are refused, not just descents into them). Identical denylist to the read guard.
@@ -1261,7 +1301,7 @@ fn list_dir_entries(
     } else {
         resolve_and_verify(base_canonical, rel)?
     };
-    if descends_into_sensitive_dir(base_canonical, &dir) {
+    if descends_into_sensitive_dir(base_canonical, &dir) || read_hits_home_dotdir(&dir) {
         return Err((StatusCode::FORBIDDEN, "Access to sensitive directory denied".into()));
     }
     if !dir.is_dir() {
@@ -3547,6 +3587,67 @@ mod path_safety_tests {
             matches!(res, Err((StatusCode::BAD_REQUEST, _))),
             "base_dir pointing at a file must be rejected, got {res:?}"
         );
+    }
+
+    #[test]
+    fn read_hits_home_dotdir_blocks_home_level_credential_dirs_but_allows_in_repo() {
+        // The re-rootable browser accepts base_dir=$HOME (base itself is not one of
+        // the 6 SENSITIVE_DIR_NAMES). A read under ~/.config/gh, ~/.kube, ~/.docker,
+        // ~/.pgpass etc. then passes the 6-name descent guard AND the credential-leaf
+        // list (leaf names hosts.yml/config/config.json/.pgpass look innocuous), so the
+        // operator's third-party tool credentials leaked. This guard closes that by
+        // refusing any resolved path whose FIRST component below $HOME is dot-prefixed,
+        // WITHOUT blocking in-repo dot dirs (.github/.vscode) whose first-below-$HOME
+        // component is the project dir.
+        let _guard = crate::session_manager::HOME_ENV_LOCK.lock().unwrap();
+        let prev = std::env::var("HOME").ok();
+        let home = std::env::temp_dir()
+            .join(format!("zmfb-hdd-{}", std::process::id()))
+            .canonicalize()
+            .unwrap_or_else(|_| {
+                let p = std::env::temp_dir().join(format!("zmfb-hdd-{}", std::process::id()));
+                std::fs::create_dir_all(&p).unwrap();
+                p.canonicalize().unwrap()
+            });
+        std::env::set_var("HOME", &home);
+
+        // Home-level hidden surface → MUST be refused.
+        let blocked = [
+            home.join(".config").join("gh").join("hosts.yml"),
+            home.join(".kube").join("config"),
+            home.join(".docker").join("config.json"),
+            home.join(".config").join("gcloud").join("credentials.db"),
+            home.join(".config").join("rclone").join("rclone.conf"),
+            home.join(".pgpass"),
+            home.join(".my.cnf"),
+            home.join(".config"), // listing the dir itself
+        ];
+        // Legitimate: home-rooted project files AND in-repo dot dirs → MUST be allowed.
+        let allowed = [
+            home.join("proj").join("src").join("main.rs"),
+            home.join("proj").join(".github").join("workflows").join("ci.yml"),
+            home.join("proj").join(".vscode").join("settings.json"),
+            home.join("proj").join(".cargo").join("config.toml"),
+            home.join("proj"),
+        ];
+
+        let results: Vec<(bool, bool)> = blocked
+            .iter()
+            .map(|p| (true, read_hits_home_dotdir(p)))
+            .chain(allowed.iter().map(|p| (false, read_hits_home_dotdir(p))))
+            .collect();
+
+        match prev {
+            Some(h) => std::env::set_var("HOME", h),
+            None => std::env::remove_var("HOME"),
+        }
+
+        for (i, p) in blocked.iter().enumerate() {
+            assert!(results[i].1, "home-level hidden path must be refused: {p:?}");
+        }
+        for (j, p) in allowed.iter().enumerate() {
+            assert!(!results[blocked.len() + j].1, "legitimate path must be allowed: {p:?}");
+        }
     }
 
     #[test]

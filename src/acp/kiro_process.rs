@@ -347,16 +347,44 @@ async fn dispatch_frame(
         RpcFrame::Response { error: Some((code, msg)), .. } => {
             vec![AcpEvent::Error { message: format!("RPC error {code}: {msg}") }]
         }
-        RpcFrame::Response { .. } => {
+        RpcFrame::Response { result, .. } => {
+            // The ACP `session/prompt` response carries a `stopReason` even on a
+            // NON-error turn end. `refusal` / `max_tokens` / `max_turn_requests`
+            // arrive here (JSON-RPC result, no `error` object), so emitting an
+            // unconditional Result rendered a refused or token/turn-capped turn as a
+            // clean success — blank bubble interactively, and finalize_run(succeeded)
+            // + RunOutcome::Completed for scheduled runs. This is the same class the
+            // Claude backend fixed in 323e8bc (is_error result → Error); Kiro was
+            // never given parity. Route the non-normal stops to Error. `cancelled`
+            // stays a Result: it's the user's own interrupt/cancel, not a failure,
+            // and routing it to Error would spuriously finalize a scheduled run as
+            // failed. Absent/`end_turn` → normal Result.
+            let stop = result
+                .as_ref()
+                .and_then(|r| r.get("stopReason"))
+                .and_then(|v| v.as_str())
+                .unwrap_or("end_turn");
             let text = std::mem::take(pending_text);
-            vec![AcpEvent::Result {
-                text,
-                turn_id: 0,
-                session_id: session_id.to_string(),
-                cost_usd: None,
-                tokens_in: None,
-                tokens_out: None,
-            }]
+            match stop {
+                "refusal" | "max_tokens" | "max_turn_requests" => {
+                    let detail = if text.is_empty() {
+                        String::new()
+                    } else {
+                        format!(" — {text}")
+                    };
+                    vec![AcpEvent::Error {
+                        message: format!("Kiro turn ended: {stop}{detail}"),
+                    }]
+                }
+                _ => vec![AcpEvent::Result {
+                    text,
+                    turn_id: 0,
+                    session_id: session_id.to_string(),
+                    cost_usd: None,
+                    tokens_in: None,
+                    tokens_out: None,
+                }],
+            }
         }
 
         // Permission request — auto-approve so the agent can run unattended

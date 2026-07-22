@@ -317,6 +317,10 @@ export default function AcpChatView({ sessionId, agentType = 'claude', onRegiste
         setBusy(stillRunning)
         if (stillRunning) {
           const t = Date.now()
+          // Refresh the display clock: nowMs may be frozen at a pre-reconnect value
+          // (busy-ticker only runs while busy), which would make `elapsed` negative
+          // and evaluate `stuck` against a stale clock right after reconnect.
+          setNowMs(t)
           // Elapsed: keep a fresh content_block stamp from this replay if present
           // (onopen reset it to null, so `?? t` only fills the no-output case).
           setTurnStartedMs(prev => prev ?? t)
@@ -409,6 +413,11 @@ export default function AcpChatView({ sessionId, agentType = 'claude', onRegiste
     setBusy(true)
     const sentAt = Date.now()
     setTurnStartedMs(sentAt)
+    // Seed the display clock to send time too. nowMs is otherwise only advanced by
+    // the 1s busy-ticker (no leading tick), so it stays frozen at its last value
+    // between turns; without this, `elapsed = (staleNow - sentAt)/1000` paints
+    // NEGATIVE ("已运行 -Ns…") until the first tick ~1s later.
+    setNowMs(sentAt)
     // Seed silence baseline from send time so a turn that never emits output is
     // still measured (otherwise lastEventMs stays null → never stuck).
     setLastEventMs(sentAt)

@@ -266,10 +266,19 @@ export default function AcpChatView({ sessionId, agentType = 'claude', onRegiste
         setBusy(true)
         // Stamp turn start if not already running (e.g. a turn observed from
         // another tab via replay, where this client didn't call sendPrompt).
-        setTurnStartedMs(prev => prev ?? Date.now())
+        const cbNow = Date.now()
+        setTurnStartedMs(prev => prev ?? cbNow)
+        // Seed the display clock too. On an OBSERVER tab (this client didn't
+        // sendPrompt and busy was false), the busy-ticker — which has no leading
+        // tick — hasn't run, so nowMs is frozen at a stale value. Without this the
+        // first render computes elapsed = (staleNow - freshStart) < 0 and paints
+        // "已运行 -Ns…" for up to a second. 95a7d1f seeded sendPrompt + replay_done
+        // but not this path; a turn first seen via a live content_block (no replay,
+        // e.g. a second tab opened mid-turn) hit the same negative-elapsed gap.
+        setNowMs(cbNow)
         // Streamed output is the freshest evidence of liveness — drives the
         // silence-based stuck heuristic below.
-        setLastEventMs(Date.now())
+        setLastEventMs(cbNow)
         break
       }
 

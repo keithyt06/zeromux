@@ -120,7 +120,7 @@ impl KiroProcess {
         }))
         .await?;
 
-        drain_until_response(&mut lines).await?;
+        drain_handshake_response(&mut lines).await?;
 
         // ── Handshake step 2: session/new (fresh) or session/load (resume) ──
         let cwd = if work_dir == "." {
@@ -144,7 +144,7 @@ impl KiroProcess {
 
         write_rpc(&mut stdin, 1, method, params).await?;
 
-        let resp = drain_until_response(&mut lines).await?;
+        let resp = drain_handshake_response(&mut lines).await?;
         let session_id = match sid_known {
             Some(s) => s, // session/load: reuse the id we loaded
             None => resp
@@ -228,6 +228,40 @@ async fn write_response(
     buf.push('\n');
     stdin.write_all(buf.as_bytes()).await?;
     stdin.flush().await
+}
+
+/// Upper bound on how long a single handshake step (`initialize`, `session/new`,
+/// `session/load`) may block waiting for the Kiro CLI's JSON-RPC response. Without
+/// it, a CLI that spawns but never answers (wedged subprocess, stuck on a prompt,
+/// stalled network) leaves `drain_until_response` awaiting `next_line()` FOREVER —
+/// and since stderr is `Stdio::null()` there is no diagnostic. The whole
+/// create-session await then hangs with no session ever appearing and no recovery.
+/// A timeout turns that into an ordinary spawn Err, which `spawn_kiro`'s
+/// `map_err("Failed to spawn Kiro: ...")` surfaces to the user like any other
+/// launch failure. 30s is generous for a local handshake yet bounds the hang.
+const HANDSHAKE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// Bound any handshake-step future; a timeout is a fatal handshake error. Generic
+/// over the future, and the bound is a parameter, so the timeout policy is
+/// unit-testable with a tiny real duration and no live subprocess / test-util clock.
+async fn with_handshake_timeout<T, F>(
+    dur: std::time::Duration,
+    fut: F,
+) -> Result<T, Box<dyn std::error::Error + Send + Sync>>
+where
+    F: std::future::Future<Output = Result<T, Box<dyn std::error::Error + Send + Sync>>>,
+{
+    match tokio::time::timeout(dur, fut).await {
+        Ok(r) => r,
+        Err(_) => Err("kiro handshake timed out (no response)".into()),
+    }
+}
+
+/// Await one handshake response with a bound; a timeout is a fatal handshake error.
+async fn drain_handshake_response(
+    lines: &mut tokio::io::Lines<BufReader<ChildStdout>>,
+) -> Result<Option<serde_json::Value>, Box<dyn std::error::Error + Send + Sync>> {
+    with_handshake_timeout(HANDSHAKE_TIMEOUT, drain_until_response(lines)).await
 }
 
 /// Read lines until we get a JSON-RPC response, skipping notifications.
@@ -335,6 +369,34 @@ async fn run_event_loop(
     }
 }
 
+/// Map a `session/prompt` response `stopReason` (+ the turn's accumulated text) to
+/// the browser event(s) that end the turn. Pure, so the af1e5c0 classification is
+/// unit-testable without a live JSON-RPC channel.
+///
+/// - `refusal` / `max_tokens` / `max_turn_requests` → Error (so a refused / capped
+///   turn is NOT reported as a clean success — the 323e8bc parity fix). The message
+///   carries ONLY the reason: the turn body already streamed live via
+///   `agent_message_chunk` ContentBlocks, so inlining `text` again duplicated the
+///   whole reply under a red banner.
+/// - `cancelled` and `end_turn` (and any absent/unknown value) → a normal Result
+///   carrying the text. `cancelled` is the user's own interrupt, not a failure, so
+///   routing it to Error would spuriously finalize a scheduled run as failed.
+fn stop_reason_events(stop: &str, text: String, session_id: &str) -> Vec<AcpEvent> {
+    match stop {
+        "refusal" | "max_tokens" | "max_turn_requests" => vec![AcpEvent::Error {
+            message: format!("Kiro turn ended: {stop}"),
+        }],
+        _ => vec![AcpEvent::Result {
+            text,
+            turn_id: 0,
+            session_id: session_id.to_string(),
+            cost_usd: None,
+            tokens_in: None,
+            tokens_out: None,
+        }],
+    }
+}
+
 /// Process a single classified JSON-RPC frame and return zero or more browser events.
 async fn dispatch_frame(
     frame: RpcFrame,
@@ -364,27 +426,9 @@ async fn dispatch_frame(
                 .and_then(|r| r.get("stopReason"))
                 .and_then(|v| v.as_str())
                 .unwrap_or("end_turn");
+            // take() clears pending_text for the NEXT turn regardless of arm.
             let text = std::mem::take(pending_text);
-            match stop {
-                "refusal" | "max_tokens" | "max_turn_requests" => {
-                    let detail = if text.is_empty() {
-                        String::new()
-                    } else {
-                        format!(" — {text}")
-                    };
-                    vec![AcpEvent::Error {
-                        message: format!("Kiro turn ended: {stop}{detail}"),
-                    }]
-                }
-                _ => vec![AcpEvent::Result {
-                    text,
-                    turn_id: 0,
-                    session_id: session_id.to_string(),
-                    cost_usd: None,
-                    tokens_in: None,
-                    tokens_out: None,
-                }],
-            }
+            stop_reason_events(stop, text, session_id)
         }
 
         // Permission request — auto-approve so the agent can run unattended
@@ -486,5 +530,79 @@ fn parse_session_update(
             tracing::debug!("kiro: unhandled session update kind: {kind}");
             vec![]
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn handshake_timeout_turns_a_silent_hang_into_an_error() {
+        // A Kiro CLI that spawns but never answers the handshake would otherwise
+        // leave drain_until_response awaiting next_line() forever. with_handshake_timeout
+        // must convert that into an Err after the bound so spawn_kiro can surface it
+        // as a normal launch failure. A never-completing future + a tiny real bound.
+        let never = std::future::pending::<
+            Result<Option<serde_json::Value>, Box<dyn std::error::Error + Send + Sync>>,
+        >();
+        let res = with_handshake_timeout(std::time::Duration::from_millis(10), never).await;
+        assert!(res.is_err(), "a hung handshake step must time out to an Err");
+        assert!(
+            res.unwrap_err().to_string().contains("timed out"),
+            "the error must identify the handshake timeout"
+        );
+    }
+
+    #[test]
+    fn stop_reason_refusal_and_caps_error_without_duplicating_streamed_body() {
+        // af1e5c0: refusal / token / turn caps must NOT read as a clean success.
+        for stop in ["refusal", "max_tokens", "max_turn_requests"] {
+            let ev = stop_reason_events(stop, "STREAMED BODY".to_string(), "s1");
+            assert_eq!(ev.len(), 1);
+            match &ev[0] {
+                AcpEvent::Error { message } => {
+                    assert!(message.contains(stop), "reason named: {message}");
+                    // The body already streamed live; it must NOT be inlined again.
+                    assert!(
+                        !message.contains("STREAMED BODY"),
+                        "error bubble must not duplicate the streamed turn body: {message}"
+                    );
+                }
+                other => panic!("expected Error for {stop}, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn stop_reason_end_turn_and_cancelled_are_results_with_text() {
+        // end_turn / cancelled / absent → normal Result carrying the reply text.
+        for stop in ["end_turn", "cancelled", "somethingelse"] {
+            let ev = stop_reason_events(stop, "hello".to_string(), "s1");
+            assert_eq!(ev.len(), 1);
+            match &ev[0] {
+                AcpEvent::Result { text, session_id, .. } => {
+                    assert_eq!(text, "hello");
+                    assert_eq!(session_id, "s1");
+                }
+                other => panic!("expected Result for {stop}, got {other:?}"),
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn handshake_timeout_passes_through_a_prompt_response() {
+        // The happy path must be untouched: a future that resolves before the
+        // (generous) bound returns its value verbatim.
+        let ok = async {
+            Ok::<_, Box<dyn std::error::Error + Send + Sync>>(Some(serde_json::json!({
+                "sessionId": "s-1"
+            })))
+        };
+        let res = with_handshake_timeout(std::time::Duration::from_secs(30), ok).await.unwrap();
+        assert_eq!(
+            res.and_then(|v| v.get("sessionId").and_then(|s| s.as_str().map(String::from))),
+            Some("s-1".to_string())
+        );
     }
 }

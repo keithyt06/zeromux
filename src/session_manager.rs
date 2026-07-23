@@ -711,32 +711,51 @@ impl SessionManager {
         false
     }
 
-    /// Watchdog: find *interactive* sessions (no `source_task_id`) that are
-    /// Running and have emitted no event for at least `idle_ms` — true silence
-    /// detection. `last_activity_ms` is bumped on every persisted event in
-    /// `record_and_broadcast`, so an actively-streaming long turn is NOT killed;
-    /// only a genuinely silent (wedged) one is.
-    /// Scheduled runs (`source_task_id.is_some()`) are excluded — they have their
-    /// own reconcile path in scheduled_tasks.rs and must not be double-handled.
+    /// Session IDs currently backed by an in-flight (`claimed`/`running`) scheduled
+    /// run — the DB truth for "a scheduled run owns this session's current turn".
+    /// The interactive watchdogs subtract this set so they reap an interactive
+    /// follow-up on a *finished* scheduled session (which has no such row) without
+    /// double-handling a session whose scheduled run is still live (owned by
+    /// `reconcile_timeouts_per_task`). Same DB source as `running_summary().scheduled`,
+    /// keeping the gate and the watchdogs consistent (d7cb58d parity).
+    fn inflight_scheduled_sessions(&self) -> std::collections::HashSet<String> {
+        let store = { self.scheduled.lock().unwrap().clone() };
+        store
+            .and_then(|s| s.inflight_bound_sessions().ok())
+            .map(|v| v.into_iter().collect())
+            .unwrap_or_default()
+    }
+
+    /// Watchdog: find sessions whose current turn is Running and silent for at least
+    /// `idle_ms` (true wedge detection) AND is NOT backed by an in-flight scheduled
+    /// run. `last_activity_ms` is bumped on every persisted event in
+    /// `record_and_broadcast`, so an actively-streaming long turn is NOT killed.
+    /// Keying on the DB in-flight set (not `source_task_id`) is deliberate: a
+    /// lingering finished-scheduled session accepts interactive follow-ups
+    /// (run_id:None, no DB row), and those must be reaped when they wedge — the gap
+    /// d7cb58d closed in the gate but left open here. A session with a LIVE scheduled
+    /// run is excluded — `reconcile_timeouts_per_task` owns it (no double-kill).
     /// Pure filter over the in-memory map; the caller sends TimeoutKill.
     pub fn running_idle_too_long(&self, now_ms: i64, idle_ms: i64) -> Vec<String> {
+        let scheduled = self.inflight_scheduled_sessions();
         let map = self.sessions.lock().unwrap();
         map.values()
-            .filter(|s| s.source_task_id.is_none())
+            .filter(|s| !scheduled.contains(&s.id))
             .filter(|s| s.running.as_ref().map(|rp| rp.turn_state == TurnState::Running).unwrap_or(false))
             .filter(|s| now_ms - s.last_activity_ms >= idle_ms)
             .map(|s| s.id.clone())
             .collect()
     }
 
-    /// Candidates for a stuck-push: interactive (non-scheduled) sessions whose
-    /// current turn is Running but silent for >= idle_ms. Returns
+    /// Candidates for a stuck-push: sessions whose current turn is Running but silent
+    /// for >= idle_ms and not backed by an in-flight scheduled run. Returns
     /// (session_id, owner_id, name) so the caller can push without re-locking.
     /// Mirrors running_idle_too_long's filter; that one kills, this one notifies.
     pub fn stuck_push_candidates(&self, now_ms: i64, idle_ms: i64) -> Vec<(String, String, String)> {
+        let scheduled = self.inflight_scheduled_sessions();
         let map = self.sessions.lock().unwrap();
         map.values()
-            .filter(|s| s.source_task_id.is_none())
+            .filter(|s| !scheduled.contains(&s.id))
             .filter(|s| s.running.as_ref().map(|rp| rp.turn_state == TurnState::Running).unwrap_or(false))
             .filter(|s| now_ms - s.last_activity_ms >= idle_ms)
             .map(|s| (s.id.clone(), s.owner_id.clone(), s.name.clone()))
@@ -4220,16 +4239,20 @@ mod running_summary_tests {
             aged_session("fresh", None, TurnState::Running, fresh_ts),
             // interactive + Idle + stale     → not in a turn, skip
             aged_session("idle_interactive", None, TurnState::Idle, stale_ts),
-            // scheduled + Running + stale     → has its own reconcile path, skip
+            // scheduled + Running + stale WITH a live in-flight run → owned by
+            // reconcile_timeouts_per_task, must be skipped here (no double-kill)
             aged_session("scheduled", Some("task1".into()), TurnState::Running, stale_ts),
             // exactly at threshold (>=)        → SHOULD be killed (boundary)
             aged_session("boundary", None, TurnState::Running, now - idle),
         ]);
+        // Bind a live in-flight run to "scheduled" so it's excluded by DB truth.
+        seed_active_run_bound(&m, "run_sched", "task1", "running", Some("scheduled"));
 
         let mut got = m.running_idle_too_long(now, idle);
         got.sort();
         assert_eq!(got, vec!["boundary".to_string(), "kill_me".to_string()],
-            "only interactive + Running + silent>=idle sessions; scheduled/idle/fresh excluded");
+            "Running + silent>=idle sessions not backed by a live scheduled run; \
+             live-scheduled/idle/fresh excluded");
     }
 
     #[test]
@@ -4245,9 +4268,10 @@ mod running_summary_tests {
             aged_session("fresh", None, TurnState::Running, fresh_ts),
             // interactive + Idle + stale     → not in a turn, skip
             aged_session("idle_interactive", None, TurnState::Idle, stale_ts),
-            // scheduled + Running + stale     → has its own reconcile path, skip
+            // scheduled + Running + stale WITH a live in-flight run → reconcile owns it
             aged_session("scheduled", Some("task1".into()), TurnState::Running, stale_ts),
         ]);
+        seed_active_run_bound(&m, "run_sched2", "task1", "running", Some("scheduled"));
 
         let out = m.stuck_push_candidates(now, idle);
         assert_eq!(out.len(), 1, "only the interactive + Running + silent>=idle session is a candidate");
@@ -4256,6 +4280,44 @@ mod running_summary_tests {
         assert_eq!(owner, "o", "owner_id carried out for push (running_session seeds \"o\")");
         assert_eq!(name, "n", "name carried out for push (running_session seeds \"n\")");
         assert!(out.iter().any(|(id, owner, _name)| !id.is_empty() && !owner.is_empty()));
+    }
+
+    #[test]
+    fn watchdogs_reap_interactive_followup_on_finished_scheduled_session() {
+        // d7cb58d taught running_summary to COUNT an interactive follow-up on a
+        // lingering finished-scheduled session (source_task_id=Some, run_id:None →
+        // turn_state=Running, NO in-flight DB run) so the auto-update gate won't
+        // cgroup-kill it. But the interactive watchdogs still keyed on
+        // source_task_id.is_none(), so if that same follow-up WEDGES, nothing reaps
+        // it: reconcile_timeouts_per_task only handles rows in ('claimed','running'),
+        // and this turn has no such row. It hangs forever, no TimeoutKill, no
+        // stuck-push. Fix: watch any Running+stale session NOT backed by an in-flight
+        // scheduled run — DB truth, same source as running_summary().scheduled.
+        let now = 1_000_000i64;
+        let idle = 30 * 60_000i64;
+        let stale_ts = now - idle - 1;
+        let (m, _tmp) = mgr_with(vec![
+            // finished-scheduled session, interactive follow-up wedged → MUST reap
+            aged_session("followup", Some("task1".into()), TurnState::Running, stale_ts),
+            // scheduled session WITH a live in-flight run → scheduled reconcile owns
+            // it; the interactive watchdog must NOT double-handle it
+            aged_session("live_sched", Some("task2".into()), TurnState::Running, stale_ts),
+            // plain interactive wedged → MUST reap (unchanged behavior)
+            aged_session("plain", None, TurnState::Running, stale_ts),
+        ]);
+        // Only live_sched has an in-flight DB run bound to it.
+        seed_active_run_bound(&m, "run_live", "task2", "running", Some("live_sched"));
+
+        let mut killed = m.running_idle_too_long(now, idle);
+        killed.sort();
+        assert_eq!(killed, vec!["followup".to_string(), "plain".to_string()],
+            "interactive follow-up on a finished scheduled session + plain interactive are reaped; \
+             a session with a live in-flight scheduled run is left to reconcile_timeouts");
+
+        let mut pushed: Vec<String> = m.stuck_push_candidates(now, idle).into_iter().map(|(id, _, _)| id).collect();
+        pushed.sort();
+        assert_eq!(pushed, vec!["followup".to_string(), "plain".to_string()],
+            "stuck-push mirrors the kill filter");
     }
 
     #[test]

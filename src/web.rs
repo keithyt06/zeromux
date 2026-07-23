@@ -1206,6 +1206,40 @@ fn base_dir_at_or_in_sensitive(home: &std::path::Path, base: &std::path::Path) -
     })
 }
 
+/// Refuse running `git diff`/`git show` when the repo ROOT is a place whose tracked
+/// contents would leak credentials wholesale. The git diff/show endpoints emit
+/// repo-*relative* paths, so a home-level credential such as `.config/gh/hosts.yml`
+/// only appears in a diff when the repo root is `$HOME` (path `.config/gh/hosts.yml`)
+/// or a home-level dotdir like `$HOME/.config` (path `gh/hosts.yml`). The per-section
+/// `worktree_path_excluded` filter can't catch those — their leaf names
+/// (`hosts.yml`/`config`/`config.json`) are innocuous and the containing dir
+/// (`gh`/`gcloud`) isn't one of the 6 `SENSITIVE_DIR_NAMES`. `git_worktree` already
+/// refused `$HOME` and sensitive bases; this consolidates that check AND adds the
+/// home-dotdir surface (parity with the file browser's `read_hits_home_dotdir`, review
+/// 2026-07-22), then wires the SAME predicate into `git_show`, which had NO root guard
+/// at all. Fail CLOSED: an unresolvable / non-`$HOME` / dot-rooted root is unsafe.
+fn git_diff_root_unsafe(work_dir: &str) -> bool {
+    let home = match std::env::var("HOME") {
+        Ok(h) => h,
+        Err(_) => return true,
+    };
+    let home_canon = match std::path::Path::new(&home).canonicalize() {
+        Ok(h) => h,
+        Err(_) => return true,
+    };
+    let canon = match std::fs::canonicalize(work_dir) {
+        Ok(c) => c,
+        Err(_) => return true,
+    };
+    // $HOME itself, or at/inside a SENSITIVE_DIR_NAMES dir → leak wholesale.
+    if canon == home_canon || base_dir_at_or_in_sensitive(&home_canon, &canon) {
+        return true;
+    }
+    // Home-level dotdir root (e.g. `$HOME/.config`): first component below $HOME is
+    // dot-prefixed. `read_hits_home_dotdir` answers exactly this for the dir itself.
+    read_hits_home_dotdir(&canon)
+}
+
 /// Unified resolve + verify: lexical `..` guard → `base.join(rel)` → canonicalize →
 /// `starts_with(base_canonical)` recheck. canonicalize failure (dangling / escaping
 /// symlink) → 403. canonicalize follows symlinks, so a symlink whose real target is
@@ -1807,6 +1841,15 @@ async fn git_show(
         return Err((StatusCode::BAD_REQUEST, "Invalid commit hash".to_string()));
     }
 
+    // Refuse if the repo root is $HOME / a sensitive dir / a home-level dotdir —
+    // `git show <commit>` would otherwise dump committed home-level credential files
+    // whose innocuous leaf names (`.config/gh/hosts.yml`, `.kube/config`, `.pgpass`)
+    // slip past worktree_path_excluded. git_worktree already had this guard; git_show
+    // was the one git/read path left without a root check. Fail CLOSED (see helper).
+    if git_diff_root_unsafe(&work_dir) {
+        return Err((StatusCode::FORBIDDEN, "Forbidden".to_string()));
+    }
+
     // Commit metadata
     let sep = "---FIELD---";
     let format_str = format!("%H{sep}%h{sep}%an{sep}%aI{sep}%s{sep}%b");
@@ -2126,21 +2169,16 @@ async fn git_worktree(
     });
     let work_dir = live_dir.unwrap_or(stored_dir);
 
-    // Safety: refuse if work_dir is $HOME itself or sits in a sensitive dir —
-    // `git diff` would otherwise leak .aws/.ssh/.env contents wholesale. Fail CLOSED:
-    // if the path can't be canonicalized (missing/escaping symlink), refuse rather
-    // than fall through to running git in an unverified dir.
-    let home = std::env::var("HOME").unwrap_or_default();
-    let home_path = std::path::Path::new(&home);
+    // Safety: refuse if work_dir is $HOME itself, sits in a sensitive dir, or is a
+    // home-level dotdir — `git diff` would otherwise leak .aws/.ssh/.env AND
+    // ~/.config/gh, ~/.kube etc. contents wholesale. Shared with git_show so the two
+    // git/read paths can't drift. Fail CLOSED: an unresolvable path is treated as
+    // unsafe (helper returns true), yielding the empty-but-safe response.
     let safe_empty = Json(serde_json::json!({
         "is_git": false, "files": [], "diff": "", "truncated": false
     }));
-    match std::fs::canonicalize(&work_dir) {
-        Ok(canon) if canon == home_path || base_dir_at_or_in_sensitive(home_path, &canon) => {
-            return Ok(safe_empty);
-        }
-        Ok(_) => {}
-        Err(_) => return Ok(safe_empty),
+    if git_diff_root_unsafe(&work_dir) {
+        return Ok(safe_empty);
     }
     let dir = std::path::Path::new(&work_dir);
 
@@ -3648,6 +3686,58 @@ mod path_safety_tests {
         for (j, p) in allowed.iter().enumerate() {
             assert!(!results[blocked.len() + j].1, "legitimate path must be allowed: {p:?}");
         }
+    }
+
+    #[test]
+    fn git_diff_root_unsafe_refuses_home_and_home_dotdir_roots_but_allows_projects() {
+        // git_show/git_worktree emit repo-RELATIVE paths, so a home-level credential
+        // (~/.config/gh/hosts.yml) only lands in a diff when the repo root is $HOME
+        // (path `.config/gh/hosts.yml`) or a home dotdir like $HOME/.config (path
+        // `gh/hosts.yml`). worktree_path_excluded can't catch those innocuous leaves,
+        // so the root itself must be refused. A real project root under $HOME is fine.
+        let _guard = crate::session_manager::HOME_ENV_LOCK.lock().unwrap();
+        let prev = std::env::var("HOME").ok();
+        let home = std::env::temp_dir()
+            .join(format!("zmgr-{}", std::process::id()))
+            .canonicalize()
+            .unwrap_or_else(|_| {
+                let p = std::env::temp_dir().join(format!("zmgr-{}", std::process::id()));
+                std::fs::create_dir_all(&p).unwrap();
+                p.canonicalize().unwrap()
+            });
+        std::env::set_var("HOME", &home);
+
+        // Materialize the dirs so canonicalize() succeeds (helper fails closed on a
+        // missing path, which would falsely "pass" the allowed cases).
+        let proj = home.join("proj");
+        let config = home.join(".config");
+        let ssh = home.join(".ssh");
+        let worktree = home.join("repo").join(".zeromux-worktrees").join("abcd1234");
+        for p in [&proj, &config, &ssh, &worktree] {
+            std::fs::create_dir_all(p).unwrap();
+        }
+
+        let unsafe_home = git_diff_root_unsafe(home.to_str().unwrap());
+        let unsafe_config = git_diff_root_unsafe(config.to_str().unwrap());
+        let unsafe_ssh = git_diff_root_unsafe(ssh.to_str().unwrap());
+        let unsafe_missing = git_diff_root_unsafe(home.join("nope").to_str().unwrap());
+        let safe_proj = git_diff_root_unsafe(proj.to_str().unwrap());
+        // A worktree-isolated agent root ($HOME/repo/.zeromux-worktrees/<id>) must
+        // stay usable — .zeromux-worktrees is the one sensitive name allowed as a base.
+        let safe_worktree = git_diff_root_unsafe(worktree.to_str().unwrap());
+
+        match prev {
+            Some(h) => std::env::set_var("HOME", h),
+            None => std::env::remove_var("HOME"),
+        }
+        let _ = std::fs::remove_dir_all(&home);
+
+        assert!(unsafe_home, "$HOME root must be refused");
+        assert!(unsafe_config, "$HOME/.config (home dotdir) root must be refused");
+        assert!(unsafe_ssh, "$HOME/.ssh (sensitive) root must be refused");
+        assert!(unsafe_missing, "unresolvable root must fail closed (unsafe)");
+        assert!(!safe_proj, "$HOME/proj (normal project) root must be allowed");
+        assert!(!safe_worktree, "worktree-isolated agent root must be allowed");
     }
 
     #[test]

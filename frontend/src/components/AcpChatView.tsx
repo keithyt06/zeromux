@@ -126,6 +126,10 @@ export default function AcpChatView({ sessionId, agentType = 'claude', onRegiste
   // (sendPrompt). Used to avoid re-seeding the turn/silence clocks when a send is
   // merely collect-queued onto an already-running turn — see sendPrompt.
   const busyRef = useRef(false)
+  // Current effective queue mode, mirrored from setQueueMode. sendPrompt reads it
+  // to decide whether a busy send is collect-queued (skip reseed) or starts a fresh
+  // turn (Interrupt → must reseed the clocks; see shouldSeedTurnClock / F-FE-1).
+  const queueModeRef = useRef('collect')
   const scrollRef = useRef<HTMLDivElement>(null)
   const replayingRef = useRef(false)
   // True only while the post-replay_done follow ResizeObserver is armed (~2s).
@@ -182,6 +186,13 @@ export default function AcpChatView({ sessionId, agentType = 'claude', onRegiste
         setNotices([])
         setBusy(false)
         setTurnStartedMs(null)
+        // The backend fan-out resets queue_mode to Collect on every (re)connect
+        // (session_manager.rs) and the frontend does not resend it, so the true
+        // backend mode after a reconnect is Collect until the user re-selects.
+        // Realign the ref or it stays stale at a pre-drop 'interrupt' and a busy
+        // send would wrongly reseed a collect-queued turn — reintroducing the
+        // 68ab4f5 bug (resetting a wedged turn's silence baseline, hiding 中断).
+        queueModeRef.current = 'collect'
         // Arm the replay window: auto bottom-stick is allowed until replay_done,
         // and only while the user hasn't scrolled up to read history.
         replayingRef.current = true
@@ -427,11 +438,14 @@ export default function AcpChatView({ sessionId, agentType = 'claude', onRegiste
     // merely enqueued server-side (no interrupt, no new turn) — re-seeding the clocks
     // here would reset the silence baseline of the RUNNING turn, resetting `stuck` and
     // HIDING the interrupt button on a turn that may be wedged (the one time the user
-    // most needs it). Only (re)seed the clocks when starting a fresh turn. setBusy is
-    // idempotent and always safe. (busyRef, not `busy`: this callback's deps omit busy.)
+    // most needs it). But in Interrupt mode a busy send is NOT enqueued: the backend
+    // interrupts and starts a genuinely fresh turn, which MUST reseed the clocks or it
+    // inherits the old turn's baseline (F-FE-1). shouldSeedTurnClock decides from both.
+    // setBusy is idempotent and always safe. (Refs, not state: this callback's deps
+    // omit busy/queueMode.)
     const wasBusy = busyRef.current
     setBusy(true)
-    if (shouldSeedTurnClock(wasBusy)) {
+    if (shouldSeedTurnClock(wasBusy, queueModeRef.current)) {
       const sentAt = Date.now()
       setTurnStartedMs(sentAt)
       // Seed the display clock to send time too. nowMs is otherwise only advanced by
@@ -475,6 +489,13 @@ export default function AcpChatView({ sessionId, agentType = 'claude', onRegiste
   const setQueueMode = useCallback((mode: string) => {
     if (wsRef.current?.readyState === WebSocket.OPEN) {
       wsRef.current.send(JSON.stringify({ type: 'set_queue_mode', mode }))
+      // Mirror locally ONLY on a delivered change so sendPrompt can tell a
+      // collect-queued send (skip clock reseed) from an Interrupt send that starts
+      // a fresh turn (must reseed). Updating the ref even when the socket is closed
+      // would diverge it from the backend's real mode (the message was dropped) —
+      // then a send could reseed a collect-queued turn (the 68ab4f5 bug) or skip a
+      // real Interrupt turn. Keeping the ref == last-delivered mode avoids that.
+      queueModeRef.current = mode
     }
   }, [])
 

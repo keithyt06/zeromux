@@ -183,6 +183,37 @@ pub struct RunningSummary {
     pub scheduled: usize,
 }
 
+/// Fail-CLOSED reduction of the scheduled in-flight run count for the E1 gate.
+/// `None` = no scheduler store wired → genuinely 0. `Some(Ok(n))` = the DB truth.
+/// `Some(Err(_))` = a store IS wired but its read failed (transient JuiceFS/SQLite
+/// error): we must NOT report 0, or the gate would treat "DB unreadable" as "no
+/// scheduled run" and cgroup-kill a scheduled agent in its startup window (before
+/// turn_state marks Running, when this count is the sole backstop). Report 1 to
+/// block the upgrade until the next tick can read the DB. (F-SCHED-FAILOPEN-1)
+fn scheduled_count_fail_closed(count: Option<Result<i64, String>>) -> usize {
+    match count {
+        None => 0,
+        Some(Ok(n)) => n.max(0) as usize,
+        Some(Err(_)) => 1,
+    }
+}
+
+/// Whether a session's current turn is owned by a live scheduled run and thus must
+/// be excluded from the interactive watchdogs (kill / stuck-push).
+/// `scheduled` is `inflight_scheduled_sessions()`'s output: `Some(set)` = authoritative
+/// DB truth (exclude iff in the set); `None` = the DB read FAILED, so we fail CLOSED
+/// and exclude EVERY scheduled session (`source_task_id.is_some()`) rather than reap
+/// one whose liveness we can't currently confirm. (F-SCHED-FAILOPEN-1)
+fn scheduled_owned(
+    scheduled: &Option<std::collections::HashSet<String>>,
+    s: &Session,
+) -> bool {
+    match scheduled {
+        Some(set) => set.contains(&s.id),
+        None => s.source_task_id.is_some(),
+    }
+}
+
 /// 一个会话的运行态：仅当进程存活时存在。fan-out 任务独占其中的进程句柄
 /// （通过 channel）。Drop 此结构 → channel 关闭 → fan-out 退出 → 进程死。
 struct RunningProcess {
@@ -718,12 +749,23 @@ impl SessionManager {
     /// double-handling a session whose scheduled run is still live (owned by
     /// `reconcile_timeouts_per_task`). Same DB source as `running_summary().scheduled`,
     /// keeping the gate and the watchdogs consistent (d7cb58d parity).
-    fn inflight_scheduled_sessions(&self) -> std::collections::HashSet<String> {
+    ///
+    /// Returns `None` when a store is wired but its read FAILED (transient
+    /// JuiceFS/SQLite error): the caller must then fail CLOSED and exclude every
+    /// scheduled session (`source_task_id.is_some()`) rather than reap one whose DB
+    /// truth is momentarily unavailable — a premature interactive TimeoutKill of a
+    /// genuinely-live scheduled turn would be an E1-adjacent kill. `Some(set)` is the
+    /// authoritative in-flight set (empty set = no scheduler wired OR none in flight).
+    /// (review 2026-07-25, F-SCHED-FAILOPEN-1)
+    fn inflight_scheduled_sessions(&self) -> Option<std::collections::HashSet<String>> {
         let store = { self.scheduled.lock().unwrap().clone() };
-        store
-            .and_then(|s| s.inflight_bound_sessions().ok())
-            .map(|v| v.into_iter().collect())
-            .unwrap_or_default()
+        match store {
+            None => Some(std::collections::HashSet::new()), // no scheduler wired
+            Some(s) => s
+                .inflight_bound_sessions()
+                .ok()
+                .map(|v| v.into_iter().collect()),
+        }
     }
 
     /// Watchdog: find sessions whose current turn is Running and silent for at least
@@ -740,7 +782,7 @@ impl SessionManager {
         let scheduled = self.inflight_scheduled_sessions();
         let map = self.sessions.lock().unwrap();
         map.values()
-            .filter(|s| !scheduled.contains(&s.id))
+            .filter(|s| !scheduled_owned(&scheduled, s))
             .filter(|s| s.running.as_ref().map(|rp| rp.turn_state == TurnState::Running).unwrap_or(false))
             .filter(|s| now_ms - s.last_activity_ms >= idle_ms)
             .map(|s| s.id.clone())
@@ -755,7 +797,7 @@ impl SessionManager {
         let scheduled = self.inflight_scheduled_sessions();
         let map = self.sessions.lock().unwrap();
         map.values()
-            .filter(|s| !scheduled.contains(&s.id))
+            .filter(|s| !scheduled_owned(&scheduled, s))
             .filter(|s| s.running.as_ref().map(|rp| rp.turn_state == TurnState::Running).unwrap_or(false))
             .filter(|s| now_ms - s.last_activity_ms >= idle_ms)
             .map(|s| (s.id.clone(), s.owner_id.clone(), s.name.clone()))
@@ -1078,10 +1120,14 @@ impl SessionManager {
     pub fn running_summary(&self) -> RunningSummary {
         let scheduled = {
             let store = self.scheduled.lock().unwrap().clone();
-            store
-                .and_then(|s| s.active_run_count().ok())
-                .unwrap_or(0)
-                .max(0) as usize
+            // Fail CLOSED on a DB read error: a store is wired but its count is
+            // unreadable (transient JuiceFS/SQLite IO error), so we must assume an
+            // in-flight scheduled run MAY exist and block the upgrade — never treat
+            // "DB unreadable" as "0 scheduled" (that would let the E1 gate cgroup-kill
+            // a scheduled agent in its startup window, when turn_state isn't Running
+            // yet and this DB count is the sole backstop). No store = no scheduler
+            // wired = genuinely 0. (review 2026-07-25, F-SCHED-FAILOPEN-1)
+            scheduled_count_fail_closed(store.map(|s| s.active_run_count()))
         };
         let map = self.sessions.lock().unwrap();
         let mut interactive = 0;
@@ -4324,6 +4370,44 @@ mod running_summary_tests {
         pushed.sort();
         assert_eq!(pushed, vec!["followup".to_string(), "plain".to_string()],
             "stuck-push mirrors the kill filter");
+    }
+
+    #[test]
+    fn scheduled_count_fails_closed_on_db_error() {
+        // F-SCHED-FAILOPEN-1: the E1 gate reads scheduled in-flight count from the DB.
+        // No store wired → 0. A good read passes through (clamped >=0). A FAILED read
+        // must NOT collapse to 0 (that would let the gate cgroup-kill a scheduled
+        // agent in its startup window, before turn_state marks Running); report >=1
+        // to block the upgrade until the DB is readable again.
+        assert_eq!(scheduled_count_fail_closed(None), 0, "no scheduler wired → 0");
+        assert_eq!(scheduled_count_fail_closed(Some(Ok(0))), 0, "good read of 0");
+        assert_eq!(scheduled_count_fail_closed(Some(Ok(3))), 3, "good read passes through");
+        assert_eq!(scheduled_count_fail_closed(Some(Ok(-1))), 0, "negative clamped to 0");
+        assert_eq!(
+            scheduled_count_fail_closed(Some(Err("io error".into()))),
+            1,
+            "DB read error must block the upgrade (fail closed), not report 0"
+        );
+    }
+
+    #[test]
+    fn scheduled_owned_fails_closed_on_unknown_db_set() {
+        // F-SCHED-FAILOPEN-1: the interactive watchdogs subtract the live-scheduled
+        // set. Some(set) is DB truth (exclude iff in the set). None means the DB read
+        // failed — fail CLOSED: exclude EVERY scheduled session (source_task_id.is_some())
+        // so a genuinely-live scheduled turn isn't reaped by a premature TimeoutKill.
+        let interactive = running_session("plain", SessionType::Claude, None, TurnState::Running);
+        let scheduled =
+            running_session("sched", SessionType::Claude, Some("t1".into()), TurnState::Running);
+
+        // Authoritative DB truth: only ids in the set are owned.
+        let set: std::collections::HashSet<String> = ["sched".to_string()].into_iter().collect();
+        assert!(scheduled_owned(&Some(set.clone()), &scheduled), "in-set scheduled owned");
+        assert!(!scheduled_owned(&Some(set), &interactive), "interactive not in set → reapable");
+
+        // DB read failed (None): all scheduled excluded, interactive still reapable.
+        assert!(scheduled_owned(&None, &scheduled), "DB unknown → any scheduled session excluded");
+        assert!(!scheduled_owned(&None, &interactive), "interactive follow-up still reapable when DB unknown");
     }
 
     #[test]

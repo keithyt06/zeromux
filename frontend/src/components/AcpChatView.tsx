@@ -11,7 +11,7 @@ import { RunMetricsPanel } from './RunMetricsPanel'
 import { SessionLifetimeBadge } from './SessionLifetimeBadge'
 import { foldTranscript, type WireEvent, type Block, type TurnGroup } from '../lib/transcript'
 import { partitionBlocks, type Density } from '../lib/density'
-import { STUCK_SILENCE_MS } from '../lib/stuck'
+import { STUCK_SILENCE_MS, shouldSeedTurnClock } from '../lib/stuck'
 import { shouldStickToBottom, shouldAutoScrollOnAppend, shouldTrackScrollUp } from '../lib/scrollReplay'
 import { shouldClearQueuedHint, busyAfterReplay, replaySilenceBaseline } from '../lib/collectHint'
 
@@ -122,6 +122,10 @@ export default function AcpChatView({ sessionId, agentType = 'claude', onRegiste
   }, [])
   const expandDensity = useCallback(() => setDensity('full'), [])
   const wsRef = useRef<WebSocket | null>(null)
+  // Mirror of `busy` readable from callbacks whose deps don't include busy
+  // (sendPrompt). Used to avoid re-seeding the turn/silence clocks when a send is
+  // merely collect-queued onto an already-running turn — see sendPrompt.
+  const busyRef = useRef(false)
   const scrollRef = useRef<HTMLDivElement>(null)
   const replayingRef = useRef(false)
   // True only while the post-replay_done follow ResizeObserver is armed (~2s).
@@ -419,18 +423,31 @@ export default function AcpChatView({ sessionId, agentType = 'claude', onRegiste
     wsRef.current.send(JSON.stringify({ type: 'prompt', text: full, client_id: cid }))
     setInput('')
     setPending([])
+    // If a turn is already in flight, a send in the default Collect queue mode is
+    // merely enqueued server-side (no interrupt, no new turn) — re-seeding the clocks
+    // here would reset the silence baseline of the RUNNING turn, resetting `stuck` and
+    // HIDING the interrupt button on a turn that may be wedged (the one time the user
+    // most needs it). Only (re)seed the clocks when starting a fresh turn. setBusy is
+    // idempotent and always safe. (busyRef, not `busy`: this callback's deps omit busy.)
+    const wasBusy = busyRef.current
     setBusy(true)
-    const sentAt = Date.now()
-    setTurnStartedMs(sentAt)
-    // Seed the display clock to send time too. nowMs is otherwise only advanced by
-    // the 1s busy-ticker (no leading tick), so it stays frozen at its last value
-    // between turns; without this, `elapsed = (staleNow - sentAt)/1000` paints
-    // NEGATIVE ("已运行 -Ns…") until the first tick ~1s later.
-    setNowMs(sentAt)
-    // Seed silence baseline from send time so a turn that never emits output is
-    // still measured (otherwise lastEventMs stays null → never stuck).
-    setLastEventMs(sentAt)
+    if (shouldSeedTurnClock(wasBusy)) {
+      const sentAt = Date.now()
+      setTurnStartedMs(sentAt)
+      // Seed the display clock to send time too. nowMs is otherwise only advanced by
+      // the 1s busy-ticker (no leading tick), so it stays frozen at its last value
+      // between turns; without this, `elapsed = (staleNow - sentAt)/1000` paints
+      // NEGATIVE ("已运行 -Ns…") until the first tick ~1s later.
+      setNowMs(sentAt)
+      // Seed silence baseline from send time so a turn that never emits output is
+      // still measured (otherwise lastEventMs stays null → never stuck).
+      setLastEventMs(sentAt)
+    }
   }, [appendEvent, pending])
+
+  // Keep busyRef in sync so sendPrompt (whose deps omit busy) can tell whether a
+  // send starts a fresh turn or is collect-queued onto a running one.
+  useEffect(() => { busyRef.current = busy }, [busy])
 
   // Stuck-turn timer: tick a 1s clock while busy so the elapsed display
   // updates. turnStartedMs is stamped in the event handlers (turn start) and

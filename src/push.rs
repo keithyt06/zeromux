@@ -422,6 +422,15 @@ impl PushService {
         map.insert((user_id.to_string(), session_id.to_string()), now_ms);
     }
 
+    /// Drop all debounce state for a session across every user. Both debounce maps
+    /// are insert-only (keyed by (user_id, session_id)); without this they grow one
+    /// permanent entry per session that ever pushed. Call from session teardown so a
+    /// long-lived process doesn't accumulate dead keys for gone sessions.
+    pub fn forget_session(&self, session_id: &str) {
+        self.debounce.lock().unwrap().retain(|(_, sid), _| sid != session_id);
+        self.stuck_debounce.lock().unwrap().retain(|(_, sid), _| sid != session_id);
+    }
+
     /// Fire-and-forget: call via tokio::spawn.
     /// Sends `payload` to every subscription of `user_id`.
     /// Each subscription is tried independently; errors are logged, not propagated.
@@ -572,6 +581,33 @@ mod tests {
         assert!(c.body.contains("中断")); // 含中断原因
         let batch = confirm_batch_payload(3);
         assert!(batch.title.contains("3") && batch.title.contains("确认"));
+    }
+
+    #[test]
+    fn forget_session_drops_debounce_keys_for_session() {
+        let dir = std::env::temp_dir().join(format!("zmx-push-{}", std::process::id()));
+        let _ = fs::create_dir_all(&dir);
+        let vapid = load_or_generate_vapid(&dir).unwrap();
+        let store = std::sync::Arc::new(PushStore::open_in_memory().unwrap());
+        let svc = PushService::new(vapid, store, reqwest::Client::new()).unwrap();
+
+        svc.mark_turn_pushed("u1", "sess-A", 100);
+        svc.mark_turn_pushed("u2", "sess-A", 101); // same session, other user
+        svc.mark_turn_pushed("u1", "sess-B", 102); // other session, must survive
+        svc.mark_stuck_pushed("u1", "sess-A", 200);
+        svc.mark_stuck_pushed("u1", "sess-B", 201);
+
+        svc.forget_session("sess-A");
+
+        // sess-A gone for every user, in both maps.
+        assert_eq!(svc.last_turn_push("u1", "sess-A"), None);
+        assert_eq!(svc.last_turn_push("u2", "sess-A"), None);
+        assert_eq!(svc.last_stuck_push("u1", "sess-A"), None);
+        // sess-B untouched.
+        assert_eq!(svc.last_turn_push("u1", "sess-B"), Some(102));
+        assert_eq!(svc.last_stuck_push("u1", "sess-B"), Some(201));
+
+        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]

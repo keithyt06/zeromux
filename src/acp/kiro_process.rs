@@ -102,6 +102,14 @@ impl KiroProcess {
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::null())
+            // Kill the CLI if this handle is dropped. Every handshake step below
+            // propagates errors via `?` (and the 30s handshake timeout) BEFORE
+            // `Ok(Self{..})` is built, so a handshake failure drops `child` without
+            // ever constructing Self — meaning `impl Drop for KiroProcess` never runs.
+            // Without kill_on_drop the spawned `kiro acp` process would be orphaned
+            // (stderr is null → invisible), and each failed resume-fallback spawns
+            // another. tokio defaults kill_on_drop=false, so set it explicitly.
+            .kill_on_drop(true)
             .spawn()?;
 
         let mut stdin = child.stdin.take().unwrap();

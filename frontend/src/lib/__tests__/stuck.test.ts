@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest'
-import { isStuck, STUCK_SILENCE_MS } from '../stuck'
+import { isStuck, shouldSeedTurnClock, STUCK_SILENCE_MS } from '../stuck'
 
 describe('isStuck', () => {
   const now = 10_000_000
@@ -14,5 +14,16 @@ describe('isStuck', () => {
   })
   it('false when no activity timestamp', () => {
     expect(isStuck('running', null, now)).toBe(false)
+  })
+})
+
+describe('shouldSeedTurnClock', () => {
+  it('seeds when starting a fresh turn (not busy)', () => {
+    expect(shouldSeedTurnClock(false)).toBe(true)
+  })
+  it('does NOT re-seed when a turn is already in flight (collect-queued send)', () => {
+    // Regression: re-seeding here reset the silence baseline of the running turn,
+    // resetting `stuck` and hiding the interrupt button on a wedged turn.
+    expect(shouldSeedTurnClock(true)).toBe(false)
   })
 })

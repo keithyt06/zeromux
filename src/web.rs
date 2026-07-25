@@ -1218,6 +1218,13 @@ fn base_dir_at_or_in_sensitive(home: &std::path::Path, base: &std::path::Path) -
 /// home-dotdir surface (parity with the file browser's `read_hits_home_dotdir`, review
 /// 2026-07-22), then wires the SAME predicate into `git_show`, which had NO root guard
 /// at all. Fail CLOSED: an unresolvable / non-`$HOME` / dot-rooted root is unsafe.
+///
+/// The check must be against the git REPO ROOT, not `work_dir`: `git show`/`git diff`
+/// emit paths relative to `git rev-parse --show-toplevel`, so a `work_dir` that is a
+/// perfectly innocuous non-dot subdir (e.g. `$HOME/projects`) of a repo whose root is
+/// `$HOME` (dotfiles-as-git) still produces a diff full of `.config/gh/hosts.yml` etc.
+/// (review 2026-07-25). We resolve the toplevel first and evaluate the existing checks
+/// against it; if the toplevel can't be resolved we fail CLOSED (unsafe).
 fn git_diff_root_unsafe(work_dir: &str) -> bool {
     let home = match std::env::var("HOME") {
         Ok(h) => h,
@@ -1227,7 +1234,20 @@ fn git_diff_root_unsafe(work_dir: &str) -> bool {
         Ok(h) => h,
         Err(_) => return true,
     };
-    let canon = match std::fs::canonicalize(work_dir) {
+    // Resolve the actual repo root — the diff/show output is relative to THIS, not
+    // work_dir. Non-git work_dir (rev-parse fails) → no diff is produced anyway; treat
+    // as unsafe (fail CLOSED) so we never emit git output from an unvetted root.
+    let toplevel = match std::process::Command::new("git")
+        .args(["-C", work_dir, "rev-parse", "--show-toplevel"])
+        .output()
+    {
+        Ok(o) if o.status.success() => match String::from_utf8(o.stdout) {
+            Ok(s) => s.trim_end().to_string(),
+            Err(_) => return true,
+        },
+        _ => return true,
+    };
+    let canon = match std::fs::canonicalize(&toplevel) {
         Ok(c) => c,
         Err(_) => return true,
     };
@@ -3689,41 +3709,61 @@ mod path_safety_tests {
     }
 
     #[test]
-    fn git_diff_root_unsafe_refuses_home_and_home_dotdir_roots_but_allows_projects() {
-        // git_show/git_worktree emit repo-RELATIVE paths, so a home-level credential
-        // (~/.config/gh/hosts.yml) only lands in a diff when the repo root is $HOME
-        // (path `.config/gh/hosts.yml`) or a home dotdir like $HOME/.config (path
-        // `gh/hosts.yml`). worktree_path_excluded can't catch those innocuous leaves,
-        // so the root itself must be refused. A real project root under $HOME is fine.
+    fn git_diff_root_unsafe_gates_on_repo_root_not_work_dir() {
+        // git_show/git_diff emit paths relative to `git rev-parse --show-toplevel`, so
+        // the guard must evaluate the REPO ROOT, not work_dir. The regression this
+        // pins (review 2026-07-25): a benign non-dot subdir (e.g. $HOME/projects) of a
+        // repo whose root is $HOME (dotfiles-as-git) must still be refused, because the
+        // diff would carry `.config/gh/hosts.yml` etc. that worktree_path_excluded's
+        // innocuous-leaf filter can't strip. A standalone project repo under $HOME is
+        // fine; a non-git dir fails CLOSED (no diff is emitted from an unvetted root).
         let _guard = crate::session_manager::HOME_ENV_LOCK.lock().unwrap();
         let prev = std::env::var("HOME").ok();
-        let home = std::env::temp_dir()
-            .join(format!("zmgr-{}", std::process::id()))
-            .canonicalize()
-            .unwrap_or_else(|_| {
-                let p = std::env::temp_dir().join(format!("zmgr-{}", std::process::id()));
-                std::fs::create_dir_all(&p).unwrap();
-                p.canonicalize().unwrap()
-            });
+        let home = std::env::temp_dir().join(format!("zmgr-git-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&home);
+        std::fs::create_dir_all(&home).unwrap();
+        let home = home.canonicalize().unwrap();
         std::env::set_var("HOME", &home);
 
-        // Materialize the dirs so canonicalize() succeeds (helper fails closed on a
-        // missing path, which would falsely "pass" the allowed cases).
-        let proj = home.join("proj");
+        let git_init = |dir: &std::path::Path| {
+            std::fs::create_dir_all(dir).unwrap();
+            let ok = std::process::Command::new("git")
+                .args(["-C", dir.to_str().unwrap(), "init", "-q"])
+                .status()
+                .map(|s| s.success())
+                .unwrap_or(false);
+            assert!(ok, "git init failed for {dir:?}");
+        };
+
+        // $HOME itself is a git repo (dotfiles-as-git).
+        git_init(&home);
+        // A benign non-dot subdir of that repo — NOT its own repo, so rev-parse walks
+        // up to $HOME. This is the exact case dcbcd5e's work_dir-only check missed.
+        let proj_in_home_repo = home.join("projects");
+        std::fs::create_dir_all(&proj_in_home_repo).unwrap();
+
+        // A standalone project repo below $HOME (nested repo → its own toplevel).
+        let standalone = home.join("myproject");
+        git_init(&standalone);
+
+        // Home-level dotdir repo and a sensitive-dir repo.
         let config = home.join(".config");
+        git_init(&config);
         let ssh = home.join(".ssh");
+        git_init(&ssh);
+
+        // A worktree-isolated agent root: repo root literally contains .zeromux-worktrees
+        // (the one sensitive name allowed as a base). Its own toplevel resolves to itself.
         let worktree = home.join("repo").join(".zeromux-worktrees").join("abcd1234");
-        for p in [&proj, &config, &ssh, &worktree] {
-            std::fs::create_dir_all(p).unwrap();
-        }
+        git_init(&worktree);
 
         let unsafe_home = git_diff_root_unsafe(home.to_str().unwrap());
+        let unsafe_subdir_of_home_repo =
+            git_diff_root_unsafe(proj_in_home_repo.to_str().unwrap());
         let unsafe_config = git_diff_root_unsafe(config.to_str().unwrap());
         let unsafe_ssh = git_diff_root_unsafe(ssh.to_str().unwrap());
-        let unsafe_missing = git_diff_root_unsafe(home.join("nope").to_str().unwrap());
-        let safe_proj = git_diff_root_unsafe(proj.to_str().unwrap());
-        // A worktree-isolated agent root ($HOME/repo/.zeromux-worktrees/<id>) must
-        // stay usable — .zeromux-worktrees is the one sensitive name allowed as a base.
+        let unsafe_nongit = git_diff_root_unsafe(home.join("nope").to_str().unwrap());
+        let safe_standalone = git_diff_root_unsafe(standalone.to_str().unwrap());
         let safe_worktree = git_diff_root_unsafe(worktree.to_str().unwrap());
 
         match prev {
@@ -3732,11 +3772,15 @@ mod path_safety_tests {
         }
         let _ = std::fs::remove_dir_all(&home);
 
-        assert!(unsafe_home, "$HOME root must be refused");
-        assert!(unsafe_config, "$HOME/.config (home dotdir) root must be refused");
-        assert!(unsafe_ssh, "$HOME/.ssh (sensitive) root must be refused");
-        assert!(unsafe_missing, "unresolvable root must fail closed (unsafe)");
-        assert!(!safe_proj, "$HOME/proj (normal project) root must be allowed");
+        assert!(unsafe_home, "$HOME repo root must be refused");
+        assert!(
+            unsafe_subdir_of_home_repo,
+            "a non-dot subdir of a $HOME-rooted repo must be refused (repo root is $HOME)"
+        );
+        assert!(unsafe_config, "$HOME/.config (home dotdir) repo root must be refused");
+        assert!(unsafe_ssh, "$HOME/.ssh (sensitive) repo root must be refused");
+        assert!(unsafe_nongit, "a non-git work_dir must fail closed (unsafe)");
+        assert!(!safe_standalone, "a standalone project repo under $HOME must be allowed");
         assert!(!safe_worktree, "worktree-isolated agent root must be allowed");
     }
 

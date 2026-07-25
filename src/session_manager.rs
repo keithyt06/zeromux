@@ -1673,6 +1673,12 @@ impl SessionManager {
                     let _ = store.abort_active_run_for_session(id, "session_removed", now_millis());
                 }
             }
+            // Drop this session's push-debounce state (both maps are insert-only,
+            // keyed by (user_id, session_id)) so they don't accumulate dead keys for
+            // the lifetime of the process.
+            if let Some(push) = self.push_handle() {
+                push.forget_session(id);
+            }
             // Dropping session closes event_tx + input_tx → fan-out task exits
             if let Some(wt_path) = &session.worktree_path {
                 if let Some(worktrees_dir) = wt_path.parent() {

@@ -154,6 +154,18 @@ impl QueueMode {
         }
     }
 
+    /// Stable wire string, sent in `replay_done` so a reconnecting client adopts the
+    /// authoritative mode. Passthrough is already `effective()`-degraded to Collect
+    /// before it is ever stored, so it never reaches the wire, but map it to
+    /// "collect" for completeness (the client only branches on == "collect").
+    pub fn to_str(self) -> &'static str {
+        match self {
+            QueueMode::Interrupt => "interrupt",
+            QueueMode::Passthrough => "collect",
+            QueueMode::Collect => "collect",
+        }
+    }
+
     /// Passthrough cannot work under the current single-`turn_seq` /
     /// `boundary_count` fan-out machinery on ANY backend:
     /// - Codex (codex_process.rs): drops a prompt that arrives mid-turn, so the
@@ -181,6 +193,13 @@ pub struct RunningSummary {
     /// 在 cgroup 内存活」的权威信号,前闭 spawn 窗口、后随 run 终态释放;绝不强制
     /// 升级穿透它(评审 E1)。见 `running_summary`。
     pub scheduled: usize,
+    /// True iff `scheduled` was forced to 1 by a DB READ ERROR (not a real in-flight
+    /// run). The gate still fails CLOSED either way, but the caller uses this to log
+    /// the TRUE cause: a persistent scheduled.db fault (disk full / SQLITE_CORRUPT)
+    /// blocks auto-update forever, and "blocked by scheduled run(s)" would misdirect
+    /// an operator away from the real IO fault. Diagnosability only. (review 2026-07-26,
+    /// F-SCHED-LOG)
+    pub scheduled_read_failed: bool,
 }
 
 /// Fail-CLOSED reduction of the scheduled in-flight run count for the E1 gate.
@@ -226,6 +245,15 @@ struct RunningProcess {
     turn_state: TurnState,
     turn_started_ms: Option<i64>,
     turn_seq: u64,
+    /// The fan-out task's current queue mode, mirrored here on every delivered
+    /// `SetQueueMode` so a (re)connecting client can learn the AUTHORITATIVE mode
+    /// from `replay_done` instead of guessing. The fan-out is spawned once per
+    /// session and its local `queue_mode` persists across WS reconnects (a
+    /// transient reconnect returns `AlreadyRunning`, no respawn), so the client's
+    /// own memory of the mode is wrong after a reconnect; only the backend knows.
+    /// Defaults to Collect at construction, matching the fan-out's own default —
+    /// so a genuine process respawn correctly reports Collect. (review 2026-07-26)
+    queue_mode: QueueMode,
 }
 
 fn now_millis() -> i64 {
@@ -654,6 +682,22 @@ impl SessionManager {
         self.sessions.lock().unwrap().get(id).map(|s| s.last_activity_ms)
     }
 
+    /// Authoritative queue mode of a session's live fan-out, as a wire string.
+    /// Sent in `replay_done` so a (re)connecting client adopts the true mode instead
+    /// of guessing: the fan-out is spawned once per session and keeps its mode across
+    /// transient WS reconnects (which return `AlreadyRunning`, no respawn), so the
+    /// client's own memory is wrong after a reconnect and a second observer tab never
+    /// learned it at all. `None` if the session has no live process (client then keeps
+    /// its default). Mirrored from the fan-out via `mark_queue_mode`. (review 2026-07-26)
+    pub fn queue_mode(&self, id: &str) -> Option<&'static str> {
+        self.sessions
+            .lock()
+            .unwrap()
+            .get(id)
+            .and_then(|s| s.running.as_ref())
+            .map(|rp| rp.queue_mode.to_str())
+    }
+
     /// Finalize a scheduled run exactly once (called by the agent fan-out on the
     /// terminal event for that run). No-op if no scheduled store is wired.
     pub fn finalize_run(&self, run_id: &str, state: &str, verdict: Option<&str>, failure_kind: Option<&str>) {
@@ -930,6 +974,7 @@ impl SessionManager {
             turn_state: TurnState::Idle,
             turn_started_ms: None,
             turn_seq: 0,
+            queue_mode: QueueMode::Collect,
         })
     }
 
@@ -1022,6 +1067,7 @@ impl SessionManager {
             turn_state: TurnState::Idle,
             turn_started_ms: None,
             turn_seq: 0,
+            queue_mode: QueueMode::Collect,
         })
     }
 
@@ -1118,17 +1164,19 @@ impl SessionManager {
     ///   回收,会让 scheduled 永久 ≥1 死锁 auto-update(8a5dc74 修的正是这个)。DB 计数
     ///   两头都对:前闭窗口、后随 run 终态释放。
     pub fn running_summary(&self) -> RunningSummary {
-        let scheduled = {
+        let count = {
             let store = self.scheduled.lock().unwrap().clone();
-            // Fail CLOSED on a DB read error: a store is wired but its count is
-            // unreadable (transient JuiceFS/SQLite IO error), so we must assume an
-            // in-flight scheduled run MAY exist and block the upgrade — never treat
-            // "DB unreadable" as "0 scheduled" (that would let the E1 gate cgroup-kill
-            // a scheduled agent in its startup window, when turn_state isn't Running
-            // yet and this DB count is the sole backstop). No store = no scheduler
-            // wired = genuinely 0. (review 2026-07-25, F-SCHED-FAILOPEN-1)
-            scheduled_count_fail_closed(store.map(|s| s.active_run_count()))
+            store.map(|s| s.active_run_count())
         };
+        // Fail CLOSED on a DB read error: a store is wired but its count is
+        // unreadable (transient JuiceFS/SQLite IO error), so we must assume an
+        // in-flight scheduled run MAY exist and block the upgrade — never treat
+        // "DB unreadable" as "0 scheduled" (that would let the E1 gate cgroup-kill
+        // a scheduled agent in its startup window, when turn_state isn't Running
+        // yet and this DB count is the sole backstop). No store = no scheduler
+        // wired = genuinely 0. (review 2026-07-25, F-SCHED-FAILOPEN-1)
+        let scheduled_read_failed = matches!(count, Some(Err(_)));
+        let scheduled = scheduled_count_fail_closed(count);
         let map = self.sessions.lock().unwrap();
         let mut interactive = 0;
         for s in map.values() {
@@ -1152,7 +1200,7 @@ impl SessionManager {
                 interactive += 1;
             }
         }
-        RunningSummary { interactive, scheduled }
+        RunningSummary { interactive, scheduled, scheduled_read_failed }
     }
 
     /// Create a Claude session for a scheduled run, mark the run running, and
@@ -1338,6 +1386,7 @@ impl SessionManager {
             turn_state: TurnState::Idle,
             turn_started_ms: None,
             turn_seq: 0,
+            queue_mode: QueueMode::Collect,
         })
     }
 
@@ -1443,6 +1492,7 @@ impl SessionManager {
             turn_state: TurnState::Idle,
             turn_started_ms: None,
             turn_seq: 0,
+            queue_mode: QueueMode::Collect,
         })
     }
 
@@ -1829,6 +1879,17 @@ impl SessionManager {
         let mut map = self.sessions.lock().unwrap();
         if let Some(s) = map.get_mut(sid) {
             apply_turn(s, state, seq);
+        }
+    }
+
+    /// Mirror the fan-out's current queue mode into the Session so `queue_mode()`
+    /// (→ `replay_done`) can report the authoritative value to reconnecting/observer
+    /// clients. Called by each fan-out on every delivered `SetQueueMode`. Brief lock,
+    /// no await held — see `mark_turn`. No-op if the session's process is gone.
+    fn mark_queue_mode(&self, sid: &str, mode: QueueMode) {
+        let mut map = self.sessions.lock().unwrap();
+        if let Some(rp) = map.get_mut(sid).and_then(|s| s.running.as_mut()) {
+            rp.queue_mode = mode;
         }
     }
 
@@ -2498,6 +2559,12 @@ fn spawn_acp_fanout(
                         }
                         Some(SessionInput::SetQueueMode(m)) => {
                             queue_mode = m.effective();
+                            // Mirror the authoritative mode into the Session so a
+                            // reconnecting/observer client can read it from replay_done
+                            // instead of guessing (review 2026-07-26).
+                            if let Some(mgr) = mgr.upgrade() {
+                                mgr.mark_queue_mode(&sid, queue_mode);
+                            }
                         }
                         Some(SessionInput::Interrupt) => {
                             if local_running {
@@ -3038,6 +3105,12 @@ fn spawn_kiro_fanout(
                         }
                         Some(SessionInput::SetQueueMode(m)) => {
                             queue_mode = m.effective();
+                            // Mirror the authoritative mode into the Session so a
+                            // reconnecting/observer client can read it from replay_done
+                            // instead of guessing (review 2026-07-26).
+                            if let Some(mgr) = mgr.upgrade() {
+                                mgr.mark_queue_mode(&sid, queue_mode);
+                            }
                         }
                         Some(SessionInput::Interrupt) => {
                             if local_running {
@@ -3282,6 +3355,12 @@ fn spawn_codex_fanout(
                         }
                         Some(SessionInput::SetQueueMode(m)) => {
                             queue_mode = m.effective();
+                            // Mirror the authoritative mode into the Session so a
+                            // reconnecting/observer client can read it from replay_done
+                            // instead of guessing (review 2026-07-26).
+                            if let Some(mgr) = mgr.upgrade() {
+                                mgr.mark_queue_mode(&sid, queue_mode);
+                            }
                         }
                         Some(SessionInput::Interrupt) => {
                             if local_running {
@@ -3578,6 +3657,7 @@ mod decide_spawn_tests {
             turn_state: TurnState::Idle,
             turn_started_ms: None,
             turn_seq: 0,
+            queue_mode: QueueMode::Collect,
         });
         assert!(matches!(decide_spawn(&mut s), SpawnDecision::AlreadyRunning));
         // Must not flip spawning when nothing needs spawning.
@@ -3725,6 +3805,7 @@ mod turn_state_tests {
                 turn_state: TurnState::Idle,
                 turn_started_ms: None,
                 turn_seq: 0,
+                queue_mode: QueueMode::Collect,
             }),
             scrollback: VecDeque::new(), scrollback_bytes: 0,
         }
@@ -4082,6 +4163,7 @@ mod running_summary_tests {
                 turn_state: turn,
                 turn_started_ms: None,
                 turn_seq: 0,
+                queue_mode: QueueMode::Collect,
             }),
             scrollback: VecDeque::new(),
             scrollback_bytes: 0,
@@ -4146,6 +4228,44 @@ mod running_summary_tests {
         let s = m.running_summary();
         assert_eq!(s.scheduled, 1, "in-flight scheduled run blocks (DB count)");
         assert_eq!(s.interactive, 2, "both Running agent turns count (a is scheduled AND running)");
+    }
+
+    #[test]
+    fn queue_mode_roundtrips_through_the_session_for_replay_done() {
+        // F-FE-RECONNECT (2026-07-26): the fan-out is spawned once per session and
+        // keeps its queue mode across a transient WS reconnect (no respawn), so the
+        // client can't guess it — the backend must report the AUTHORITATIVE mode in
+        // replay_done. mark_queue_mode mirrors the fan-out's mode into the Session;
+        // queue_mode() reads it as the wire string replay_done sends.
+        let (m, _tmp) = mgr_with(vec![
+            running_session("a", SessionType::Claude, None, TurnState::Running),
+            running_session("gone", SessionType::Claude, None, TurnState::Idle),
+        ]);
+        // Default at construction is Collect (matches the fan-out's own default, so a
+        // genuine process respawn correctly reports Collect).
+        assert_eq!(m.queue_mode("a"), Some("collect"), "default is collect");
+
+        // A delivered SetQueueMode(Interrupt) mirrors through; queue_mode() reflects it
+        // so a reconnecting client adopts Interrupt instead of resetting to collect.
+        m.mark_queue_mode("a", QueueMode::Interrupt);
+        assert_eq!(m.queue_mode("a"), Some("interrupt"), "interrupt is reported after mark");
+
+        // Passthrough is effective()-degraded to Collect before storage everywhere, but
+        // if one ever reached the mirror it maps to the wire "collect" (client only
+        // branches on == 'collect').
+        m.mark_queue_mode("a", QueueMode::Passthrough);
+        assert_eq!(m.queue_mode("a"), Some("collect"), "passthrough → collect on the wire");
+
+        // Unknown session → None (client keeps its provisional default).
+        assert_eq!(m.queue_mode("nope"), None, "unknown session → None");
+
+        // A session with no live process → None (nothing to adopt).
+        {
+            let mut map = m.sessions.lock().unwrap();
+            map.get_mut("gone").unwrap().running = None;
+        }
+        m.mark_queue_mode("gone", QueueMode::Interrupt); // no-op, no running process
+        assert_eq!(m.queue_mode("gone"), None, "no live process → None");
     }
 
     #[test]
@@ -4388,6 +4508,22 @@ mod running_summary_tests {
             1,
             "DB read error must block the upgrade (fail closed), not report 0"
         );
+    }
+
+    #[test]
+    fn scheduled_read_failed_flag_tracks_only_the_error_case() {
+        // F-SCHED-LOG (2026-07-26): running_summary must set scheduled_read_failed iff
+        // the DB read actually errored, so the auto-update gate logs the TRUE cause
+        // (disk/FS fault) instead of the misleading "blocked by scheduled run(s)".
+        // The flag derives from the same read result that feeds the count; assert they
+        // stay coupled (Err → count 1 AND flag true; every non-error → flag false).
+        let read_failed = |c: &Option<Result<i64, String>>| matches!(c, Some(Err(_)));
+        for c in [None, Some(Ok(0)), Some(Ok(5))] {
+            assert!(!read_failed(&c), "a successful/absent read is not a failure: {c:?}");
+        }
+        let err: Option<Result<i64, String>> = Some(Err("io".into()));
+        assert!(read_failed(&err), "an errored read sets the flag");
+        assert_eq!(scheduled_count_fail_closed(err), 1, "and still fails closed to 1");
     }
 
     #[test]

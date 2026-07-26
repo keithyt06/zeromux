@@ -242,7 +242,19 @@ pub fn spawn_auto_updater(cfg: AutoUpdateConfig, mgr: Weak<SessionManager>) {
             let waited = pending_since.map(|t| t.elapsed().as_secs()).unwrap_or(0);
             match gate_decision(summary, waited, cfg.max_wait_secs) {
                 GateDecision::BlockedByScheduled => {
-                    tracing::info!("auto-update: pending blocked by scheduled run(s), max_wait NOT applied");
+                    // Distinguish a REAL scheduled run from a scheduled.db READ ERROR
+                    // (both fail closed to scheduled>0). A persistent read error blocks
+                    // auto-update forever with no max_wait escape, so the operator must
+                    // see the true cause (disk full / SQLITE_CORRUPT) instead of the
+                    // misleading "blocked by scheduled run(s)" — auto-update is exactly
+                    // the channel you'd want when the box's storage is going wrong.
+                    // (review 2026-07-26, F-SCHED-LOG)
+                    if summary.scheduled_read_failed {
+                        tracing::warn!("auto-update: scheduled.db unreadable — blocking upgrade (fail-closed); check disk/FS, not scheduled runs");
+                    } else {
+                        tracing::info!("auto-update: pending blocked by {} scheduled run(s), max_wait NOT applied",
+                            summary.scheduled);
+                    }
                     continue;
                 }
                 GateDecision::WaitInteractive => {
@@ -298,14 +310,14 @@ mod tests {
 
     #[test]
     fn gate_all_idle_upgrades() {
-        let d = gate_decision(RunningSummary { interactive: 0, scheduled: 0 }, 0, 600);
+        let d = gate_decision(RunningSummary { interactive: 0, scheduled: 0, scheduled_read_failed: false }, 0, 600);
         assert_eq!(d, GateDecision::Upgrade);
     }
 
     #[test]
     fn gate_scheduled_never_forced_even_past_max_wait() {
         // 调度运行在跑,即使等了远超 max_wait,也绝不强制(E1)
-        let d = gate_decision(RunningSummary { interactive: 0, scheduled: 1 }, 99999, 600);
+        let d = gate_decision(RunningSummary { interactive: 0, scheduled: 1, scheduled_read_failed: false }, 99999, 600);
         assert_eq!(d, GateDecision::BlockedByScheduled);
     }
 
@@ -313,12 +325,12 @@ mod tests {
     fn gate_interactive_waits_then_forces() {
         // 交互 turn 在跑,未到 max_wait → 等
         assert_eq!(
-            gate_decision(RunningSummary { interactive: 1, scheduled: 0 }, 100, 600),
+            gate_decision(RunningSummary { interactive: 1, scheduled: 0, scheduled_read_failed: false }, 100, 600),
             GateDecision::WaitInteractive
         );
         // 到了 max_wait → 强制
         assert_eq!(
-            gate_decision(RunningSummary { interactive: 1, scheduled: 0 }, 600, 600),
+            gate_decision(RunningSummary { interactive: 1, scheduled: 0, scheduled_read_failed: false }, 600, 600),
             GateDecision::Upgrade
         );
     }
@@ -326,7 +338,7 @@ mod tests {
     #[test]
     fn gate_scheduled_takes_priority_over_interactive() {
         // 两者都在跑:scheduled 优先,永不强制
-        let d = gate_decision(RunningSummary { interactive: 2, scheduled: 1 }, 99999, 600);
+        let d = gate_decision(RunningSummary { interactive: 2, scheduled: 1, scheduled_read_failed: false }, 99999, 600);
         assert_eq!(d, GateDecision::BlockedByScheduled);
     }
 

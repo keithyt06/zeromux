@@ -115,10 +115,18 @@ async fn handle_acp_ws(socket: WebSocket, session_id: String, state: Arc<AppStat
         // reconnect resets the clock and the `stuck`-gated interrupt button stays
         // hidden for a fresh 180s (and never appears if drops recur faster).
         let last_activity_ms = state.sessions.last_activity_ms(&session_id);
+        // Carry the authoritative queue mode so the client adopts it rather than
+        // guessing 'collect' on every reconnect: the fan-out keeps its mode across a
+        // transient reconnect (no respawn), and a second observer tab never learned
+        // it — either way the client's own memory diverges from the backend, which
+        // reintroduces the F-FE-1 clock/stuck bug on a busy interrupt send. Backend
+        // is the single source of truth, same as running/last_activity_ms. (2026-07-26)
+        let queue_mode = state.sessions.queue_mode(&session_id);
         let done_msg = serde_json::json!({
             "type": "replay_done",
             "running": running,
             "last_activity_ms": last_activity_ms,
+            "queue_mode": queue_mode,
         });
         let _ = ws_sink.send(Message::Text(done_msg.to_string().into())).await;
     }

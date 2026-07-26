@@ -48,6 +48,7 @@ interface ServerEvent {
   client_id?: string
   running?: boolean
   last_activity_ms?: number
+  queue_mode?: string
 }
 
 interface Props {
@@ -186,12 +187,13 @@ export default function AcpChatView({ sessionId, agentType = 'claude', onRegiste
         setNotices([])
         setBusy(false)
         setTurnStartedMs(null)
-        // The backend fan-out resets queue_mode to Collect on every (re)connect
-        // (session_manager.rs) and the frontend does not resend it, so the true
-        // backend mode after a reconnect is Collect until the user re-selects.
-        // Realign the ref or it stays stale at a pre-drop 'interrupt' and a busy
-        // send would wrongly reseed a collect-queued turn — reintroducing the
-        // 68ab4f5 bug (resetting a wedged turn's silence baseline, hiding 中断).
+        // Pre-replay default: assume Collect until replay_done delivers the backend's
+        // AUTHORITATIVE queue_mode. We must NOT hard-assume Collect here (68ab4f5
+        // regression, review 2026-07-26): the fan-out is spawned once per session and
+        // keeps its mode across a transient reconnect (ensure_running → AlreadyRunning,
+        // no respawn), so the backend may still be Interrupt. A busy send in the gap
+        // before replay_done is not realistic (replay is near-instant), and replay_done
+        // corrects the ref either way — this is only a conservative floor.
         queueModeRef.current = 'collect'
         // Arm the replay window: auto bottom-stick is allowed until replay_done,
         // and only while the user hasn't scrolled up to read history.
@@ -330,6 +332,16 @@ export default function AcpChatView({ sessionId, agentType = 'claude', onRegiste
       }
 
       case 'replay_done': {
+        // Adopt the backend's AUTHORITATIVE queue mode (review 2026-07-26). The
+        // fan-out keeps its mode across a transient reconnect (no respawn) and a
+        // second observer tab never learned it, so onopen's provisional 'collect'
+        // may be wrong — a busy Interrupt send would then skip the clock reseed and
+        // paint an inflated elapsed + false 可能卡住 on the fresh interrupt turn
+        // (the F-FE-1 regression). Only adopt a delivered value; a missing field
+        // (old backend / session with no live process) leaves the provisional mode.
+        if (typeof evt.queue_mode === 'string') {
+          queueModeRef.current = evt.queue_mode
+        }
         // Honor the backend's authoritative live turn state. On a mid-turn
         // reconnect (idle-proxy drop during an output-silent tool call) the turn
         // is still Running server-side; forcing busy=false here would hide the

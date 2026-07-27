@@ -2565,6 +2565,10 @@ fn spawn_acp_fanout(
                             if let Some(mgr) = mgr.upgrade() {
                                 mgr.mark_queue_mode(&sid, queue_mode);
                             }
+                            // Also broadcast it LIVE so an already-connected tab adopts
+                            // the new mode without a reconnect (review 2026-07-27,
+                            // F-OBS-LIVE). replay_done only delivers it at connect time.
+                            emit_queue_mode(&event_tx, queue_mode);
                         }
                         Some(SessionInput::Interrupt) => {
                             if local_running {
@@ -2750,6 +2754,23 @@ fn emit_queued(event_tx: &broadcast::Sender<String>, count: usize) {
     }) {
         let _ = event_tx.send(json);
     }
+}
+
+/// Broadcast a live `queue_mode` change to all connected clients so an
+/// already-connected tab adopts the authoritative mode WITHOUT waiting for a
+/// reconnect. `replay_done` only carries `queue_mode` at (re)connect (ws_handler),
+/// so a second/observer tab that stays connected across another tab's mode flip
+/// would otherwise keep a stale `queueModeRef` — and a busy send in the wrong mode
+/// mis-seeds the turn clock (inflated 已运行 + false 可能卡住, the F-FE-1 symptom).
+/// Broadcast-only like `emit_queued` (never persisted): reconnect replay carries the
+/// mode authoritatively via `replay_done`, so scrollback needn't retain it.
+/// (review 2026-07-27, F-OBS-LIVE)
+fn emit_queue_mode(event_tx: &broadcast::Sender<String>, mode: QueueMode) {
+    let json = serde_json::json!({
+        "type": "queue_mode",
+        "queue_mode": mode.to_str(),
+    });
+    let _ = event_tx.send(json.to_string()); // Err == zero subscribers; ignore (T2)
 }
 
 /// True for events that are forwarded live but NOT persisted to scrollback.
@@ -3111,6 +3132,10 @@ fn spawn_kiro_fanout(
                             if let Some(mgr) = mgr.upgrade() {
                                 mgr.mark_queue_mode(&sid, queue_mode);
                             }
+                            // Also broadcast it LIVE so an already-connected tab adopts
+                            // the new mode without a reconnect (review 2026-07-27,
+                            // F-OBS-LIVE). replay_done only delivers it at connect time.
+                            emit_queue_mode(&event_tx, queue_mode);
                         }
                         Some(SessionInput::Interrupt) => {
                             if local_running {
@@ -3361,6 +3386,10 @@ fn spawn_codex_fanout(
                             if let Some(mgr) = mgr.upgrade() {
                                 mgr.mark_queue_mode(&sid, queue_mode);
                             }
+                            // Also broadcast it LIVE so an already-connected tab adopts
+                            // the new mode without a reconnect (review 2026-07-27,
+                            // F-OBS-LIVE). replay_done only delivers it at connect time.
+                            emit_queue_mode(&event_tx, queue_mode);
                         }
                         Some(SessionInput::Interrupt) => {
                             if local_running {
@@ -4658,6 +4687,55 @@ mod emit_tests {
         let out = truncate_prompt_for_scrollback(&big);
         assert!(out.len() < 70_000);
         assert!(out.contains("已截断"));
+    }
+
+    #[test]
+    fn emit_queue_mode_broadcasts_authoritative_wire_string() {
+        // F-OBS-LIVE (review 2026-07-27): a live SetQueueMode must broadcast the new
+        // mode to already-connected tabs (not only deliver it via replay_done at
+        // reconnect). Assert the wire shape + that Interrupt/Collect map to the same
+        // strings the client branches on, and Passthrough degrades to "collect".
+        let (tx, mut rx) = broadcast::channel::<String>(BROADCAST_CAPACITY);
+        emit_queue_mode(&tx, QueueMode::Interrupt);
+        let got = rx.try_recv().unwrap();
+        let v: serde_json::Value = serde_json::from_str(&got).unwrap();
+        assert_eq!(v["type"], "queue_mode");
+        assert_eq!(v["queue_mode"], "interrupt");
+
+        emit_queue_mode(&tx, QueueMode::Collect);
+        let v: serde_json::Value = serde_json::from_str(&rx.try_recv().unwrap()).unwrap();
+        assert_eq!(v["queue_mode"], "collect");
+
+        emit_queue_mode(&tx, QueueMode::Passthrough);
+        let v: serde_json::Value = serde_json::from_str(&rx.try_recv().unwrap()).unwrap();
+        assert_eq!(v["queue_mode"], "collect", "passthrough degrades to collect on the wire");
+    }
+
+    #[test]
+    fn mid_turn_error_content_block_is_not_a_turn_boundary() {
+        // F-CODEX-1 (review 2026-07-27): a transient mid-turn Codex error is now
+        // emitted as ContentBlock{block_type:"error"} instead of AcpEvent::Error, so
+        // the fan-out's `is_boundary` predicate (Result|Error|Exit) must NOT settle
+        // the still-running turn on it. Pin the exact predicate the three fan-outs use.
+        let is_boundary = |evt: &AcpEvent| {
+            matches!(
+                evt,
+                AcpEvent::Result { .. } | AcpEvent::Error { .. } | AcpEvent::Exit { .. }
+            )
+        };
+        let mid_turn_err = AcpEvent::ContentBlock {
+            block_type: std::borrow::Cow::Borrowed("error"),
+            turn_id: 0,
+            text: Some("Codex: stream retry".into()),
+            name: None,
+            input: None,
+            streaming: Some(false),
+            summary: None,
+        };
+        assert!(!is_boundary(&mid_turn_err), "mid-turn error block must NOT settle the turn");
+        // A genuine terminal error still settles it.
+        let terminal_err = AcpEvent::Error { message: "Codex error: fatal".into() };
+        assert!(is_boundary(&terminal_err), "a terminal Error still settles the turn");
     }
 
     // Regression for the reconnect double-delivery race (review 2026-06-11).

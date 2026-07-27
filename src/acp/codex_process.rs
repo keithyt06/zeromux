@@ -668,9 +668,31 @@ async fn run_event_loop(
                                                 .await;
                                         }
                                         Notify::Error(message) => {
+                                            // A mid-turn `codex/event` error notification is
+                                            // NON-terminal: `call_tool` (call_fut) keeps
+                                            // running and settles the turn on its own (below).
+                                            // Emitting AcpEvent::Error here would make the
+                                            // fan-out treat this as a turn boundary
+                                            // (session_manager: is_boundary), prematurely
+                                            // settling the live turn to Idle → it arms the
+                                            // collect-flush mid-flight (queued follow-ups get
+                                            // "not delivered — resend"), hides busy + the
+                                            // interrupt button on reconnect, and records the
+                                            // run Errored even though call_fut later succeeds.
+                                            // Surface it as an error-styled ContentBlock (a
+                                            // non-boundary event, turn-stamped and persisted)
+                                            // so the user still sees the transient error but the
+                                            // turn is only settled by call_fut's real terminal
+                                            // event. (review 2026-07-27, F-CODEX-1)
                                             let _ = event_tx
-                                                .send(AcpEvent::Error {
-                                                    message: format!("Codex: {message}"),
+                                                .send(AcpEvent::ContentBlock {
+                                                    block_type: std::borrow::Cow::Borrowed("error"),
+                                                    turn_id: 0,
+                                                    text: Some(format!("Codex: {message}")),
+                                                    name: None,
+                                                    input: None,
+                                                    streaming: Some(false),
+                                                    summary: None,
                                                 })
                                                 .await;
                                         }

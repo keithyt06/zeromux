@@ -239,6 +239,19 @@ export default function AcpChatView({ sessionId, agentType = 'claude', onRegiste
 
   const handleEvent = useCallback((evt: ServerEvent) => {
     switch (evt.type) {
+      case 'queue_mode': {
+        // Live, backend-authoritative queue-mode change (review 2026-07-27,
+        // F-OBS-LIVE). Another tab (or SessionInfoBar) flipped the mode; the backend
+        // broadcasts it so THIS already-connected tab adopts it without a reconnect.
+        // Without this, an observer tab keeps a stale queueModeRef and a busy send
+        // mis-seeds the turn clock (inflated 已运行 + false 可能卡住). replay_done
+        // still carries the same value for the connect-time path.
+        if (typeof evt.queue_mode === 'string') {
+          queueModeRef.current = evt.queue_mode
+        }
+        break
+      }
+
       case 'system': {
         // collect:排队提示是 ephemeral 状态行,不进消息气泡列表。
         if (evt.subtype === 'queued') {
@@ -792,6 +805,18 @@ function BlockView({ block, isComplete }: { block: ContentBlock; isComplete: boo
       return (
         <div className="text-sm text-[var(--text-primary)] leading-relaxed">
           <MarkdownContent text={block.text || ''} isComplete={isComplete} />
+        </div>
+      )
+
+    case 'error':
+      // A non-terminal, mid-turn agent error (e.g. a transient Codex codex/event
+      // error while the turn keeps running). Rendered inline as a red note so the
+      // user sees it, but it does NOT end the turn (F-CODEX-1). Terminal errors
+      // still arrive as the top-level 'error' event → NoticeBubble.
+      return (
+        <div className="flex items-start gap-1.5 text-[var(--accent-red)] text-xs">
+          <AlertCircle size={13} className="shrink-0 mt-0.5" />
+          <span className="whitespace-pre-wrap break-words">{block.text || 'Error'}</span>
         </div>
       )
 

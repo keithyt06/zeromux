@@ -18,7 +18,10 @@ export interface WireEvent {
 }
 
 export interface Block {
-  type: 'text' | 'thinking' | 'tool_use' | 'tool_result'
+  // 'error': a non-terminal mid-turn agent error (e.g. a transient Codex
+  // codex/event error while the turn keeps running). Rendered inline as a red
+  // note; unlike the top-level 'error' event it does NOT end the turn (F-CODEX-1).
+  type: 'text' | 'thinking' | 'tool_use' | 'tool_result' | 'error'
   text?: string
   name?: string
   input?: unknown

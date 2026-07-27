@@ -125,3 +125,38 @@ describe('foldTranscript — result reconcile (F1: lossy Codex stream)', () => {
     expect(g.assistantText()).toBe('Let me check. The answer is 42.')
   })
 })
+
+describe('foldTranscript — non-terminal error block (F-CODEX-1)', () => {
+  it('keeps a mid-turn error block as its own block without ending the turn', () => {
+    // F-CODEX-1 (review 2026-07-27): a transient mid-turn Codex codex/event error
+    // now arrives as a ContentBlock{block_type:'error'} (non-terminal), NOT the
+    // top-level 'error' event. It must render as its own block, not merge into
+    // text/thinking, and not mark the turn complete — the turn is only completed by
+    // the real 'result' (call_fut resolving).
+    const events: WireEvent[] = [
+      { type: 'content_block', block_type: 'text', text: 'Working on it. ', streaming: true, turn_id: 1 },
+      { type: 'content_block', block_type: 'error', text: 'Codex: stream retry', streaming: false, turn_id: 1 },
+      { type: 'content_block', block_type: 'text', text: 'Done.', streaming: true, turn_id: 1 },
+      { type: 'result', text: 'Working on it. Done.', turn_id: 1 },
+    ]
+    const g = foldTranscript(events).find(g => g.turnId === 1)!
+    // The error is its own block, distinct from the text blocks around it.
+    const errBlocks = g.blocks.filter(b => b.type === 'error')
+    expect(errBlocks.length).toBe(1)
+    expect(errBlocks[0].text).toBe('Codex: stream retry')
+    // It did not merge into the surrounding text; assistant text is intact.
+    expect(g.assistantText()).toBe('Working on it. Done.')
+    // The turn completes only via the result.
+    expect(g.complete).toBe(true)
+  })
+
+  it('an error block alone does not complete the turn (only result/error event does)', () => {
+    const events: WireEvent[] = [
+      { type: 'content_block', block_type: 'text', text: 'Thinking ', streaming: true, turn_id: 1 },
+      { type: 'content_block', block_type: 'error', text: 'Codex: transient', streaming: false, turn_id: 1 },
+    ]
+    const g = foldTranscript(events).find(g => g.turnId === 1)!
+    expect(g.complete).toBe(false)
+    expect(g.blocks.some(b => b.type === 'error')).toBe(true)
+  })
+})

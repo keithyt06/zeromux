@@ -1260,6 +1260,26 @@ fn git_diff_root_unsafe(work_dir: &str) -> bool {
     read_hits_home_dotdir(&canon)
 }
 
+/// True iff `git_ref` resolves to a COMMIT object in `work_dir`. `<ref>^{commit}`
+/// peels a commit-ish to its commit and FAILS for a blob/tree, so this rejects a
+/// blob/tree SHA (whose raw `git show` output carries no diff header and would leak
+/// a credential file's contents past filter_diff_excluded) while accepting a full or
+/// abbreviated commit hash. Fails CLOSED (false) if git can't run. (F-GIT-BLOB)
+fn git_ref_is_commit(work_dir: &str, git_ref: &str) -> bool {
+    std::process::Command::new("git")
+        .args([
+            "-C",
+            work_dir,
+            "rev-parse",
+            "--verify",
+            "-q",
+            &format!("{}^{{commit}}", git_ref),
+        ])
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false)
+}
+
 /// Unified resolve + verify: lexical `..` guard → `base.join(rel)` → canonicalize →
 /// `starts_with(base_canonical)` recheck. canonicalize failure (dangling / escaping
 /// symlink) → 403. canonicalize follows symlinks, so a symlink whose real target is
@@ -1858,6 +1878,17 @@ async fn git_show(
 
     // Only allow hex chars to prevent command injection
     if !query.commit.chars().all(|c| c.is_ascii_hexdigit()) {
+        return Err((StatusCode::BAD_REQUEST, "Invalid commit hash".to_string()));
+    }
+
+    // Constrain the ref to a COMMIT object. `git show <blobhash>` prints the blob's
+    // RAW bytes with NO `diff --git`/`--cc` header, so filter_diff_excluded (which
+    // only starts skipping at a recognized per-file header) copies the whole file
+    // through verbatim — a committed .env/*.pem/id_rsa would leak its raw contents,
+    // bypassing every credential filter this endpoint relies on. A blob/tree SHA is
+    // all-hex (passes the check above) and `git log -1 <blob>` exits 0 (so the
+    // "Commit not found" 404 never fires). Fail CLOSED. (review 2026-07-27, F-GIT-BLOB)
+    if !git_ref_is_commit(&work_dir, &query.commit) {
         return Err((StatusCode::BAD_REQUEST, "Invalid commit hash".to_string()));
     }
 
@@ -3782,6 +3813,61 @@ mod path_safety_tests {
         assert!(unsafe_nongit, "a non-git work_dir must fail closed (unsafe)");
         assert!(!safe_standalone, "a standalone project repo under $HOME must be allowed");
         assert!(!safe_worktree, "worktree-isolated agent root must be allowed");
+    }
+
+    #[test]
+    fn git_ref_is_commit_rejects_blob_and_tree_accepts_commit() {
+        // F-GIT-BLOB (review 2026-07-27): git_show must refuse a blob/tree SHA — its
+        // raw `git show` output has no diff header, so filter_diff_excluded copies a
+        // committed credential file's contents through verbatim. git_ref_is_commit
+        // gates on commit-ness via `<ref>^{commit}`, which peels a commit but fails
+        // for blobs/trees. Verify against a real repo with a committed .env.
+        let dir = std::env::temp_dir().join(format!("zmgr-refcommit-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let ds = dir.to_str().unwrap();
+        let run = |args: &[&str]| {
+            std::process::Command::new("git")
+                .args(["-C", ds])
+                .args(args)
+                .output()
+                .unwrap()
+        };
+        assert!(run(&["init", "-q"]).status.success(), "git init");
+        let _ = run(&["config", "user.email", "t@t"]);
+        let _ = run(&["config", "user.name", "t"]);
+        std::fs::write(dir.join(".env"), "AWS_SECRET=supersecret\n").unwrap();
+        assert!(run(&["add", ".env"]).status.success(), "git add");
+        assert!(run(&["commit", "-qm", "add env"]).status.success(), "git commit");
+
+        let commit = String::from_utf8(run(&["rev-parse", "HEAD"]).stdout)
+            .unwrap()
+            .trim()
+            .to_string();
+        let short = String::from_utf8(run(&["rev-parse", "--short", "HEAD"]).stdout)
+            .unwrap()
+            .trim()
+            .to_string();
+        let blob = String::from_utf8(run(&["rev-parse", "HEAD:.env"]).stdout)
+            .unwrap()
+            .trim()
+            .to_string();
+        let tree = String::from_utf8(run(&["rev-parse", "HEAD^{tree}"]).stdout)
+            .unwrap()
+            .trim()
+            .to_string();
+
+        assert!(git_ref_is_commit(ds, &commit), "full commit hash must be accepted");
+        assert!(git_ref_is_commit(ds, &short), "abbreviated commit hash must be accepted");
+        assert!(!git_ref_is_commit(ds, &blob), "a blob SHA (the leak vector) must be REFUSED");
+        assert!(!git_ref_is_commit(ds, &tree), "a tree SHA must be refused");
+        // A syntactically valid but nonexistent hash also fails closed.
+        assert!(
+            !git_ref_is_commit(ds, "0000000000000000000000000000000000000000"),
+            "an unknown object must be refused"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

@@ -14,6 +14,11 @@ interface Props {
   showEvents: boolean
   onOpenSidebar?: () => void
   onQueueMode?: (mode: string) => void
+  // Backend-authoritative queue mode (owned by App, reported up by AcpChatView).
+  // The dropdown is a CONTROLLED reflection of this — no local mirror — so an
+  // observer/reconnected tab can't show a stale mode that misleads the user into
+  // an unintended interrupt on send. (review 2026-07-28)
+  queueMode?: string
   // Inline run-metrics panel toggle (agent sessions only). Lives alongside the
   // chat (not a full-screen overlay), so it's a simple boolean rather than an
   // overlay mode.
@@ -33,9 +38,8 @@ export function StatusDot({ status }: { status: SessionMetaStatus }) {
   return <span className={`inline-block w-2 h-2 rounded-full ${opt?.color || 'bg-gray-400'} shrink-0`} />
 }
 
-export default function SessionInfoBar({ session, onUpdate, onToggleFiles, onToggleGit, onToggleEvents, showFiles, showGit, showEvents, onOpenSidebar, onQueueMode, onToggleMetrics, showMetrics }: Props) {
+export default function SessionInfoBar({ session, onUpdate, onToggleFiles, onToggleGit, onToggleEvents, showFiles, showGit, showEvents, onOpenSidebar, onQueueMode, queueMode = 'collect', onToggleMetrics, showMetrics }: Props) {
   const [expanded, setExpanded] = useState(false)
-  const [queueMode, setQueueMode] = useState('collect')
   const [desc, setDesc] = useState(session.description)
   const [notes, setNotes] = useState<NoteEntry[]>([])
   const [noteInput, setNoteInput] = useState('')
@@ -214,10 +218,7 @@ export default function SessionInfoBar({ session, onUpdate, onToggleFiles, onTog
               <span className="text-[10px] text-[var(--text-muted)] uppercase w-12">Queue</span>
               <select
                 value={queueMode}
-                onChange={e => {
-                  setQueueMode(e.target.value)
-                  onQueueMode(e.target.value)
-                }}
+                onChange={e => onQueueMode(e.target.value)}
                 className="text-[10px] bg-[var(--bg-primary)] border border-[var(--border)] rounded px-1.5 py-0.5 text-[var(--text-primary)] outline-none focus:border-[var(--accent-blue)]"
                 title="多条消息同时在途时如何处理"
               >

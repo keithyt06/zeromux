@@ -1100,6 +1100,24 @@ fn is_credential_path(name: &str) -> bool {
         || n == ".aws" || n == ".ssh" || n == ".netrc" || n == ".npmrc"
         || n.starts_with("id_")            // id_rsa / id_ed25519 ...
         || n.ends_with(".pem") || n.ends_with(".key") || n.ends_with(".p12")
+        // Additional unambiguous secret files (review 2026-07-28): private-key
+        // material — bundles (.pfx/.jks/.keystore — PKCS#12 / Java keystores carry
+        // the key, not just a public cert) and other private-key formats
+        // (.p8 = PKCS#8, .ppk = PuTTY) — plus plaintext credential dotfiles
+        // (.pgpass = a DB password in the clear, .htpasswd = credential hashes,
+        // .my.cnf/.pypirc/.s3cfg embed passwords/tokens). Every read path derives
+        // from this one predicate (git_show diff, git_worktree diff, list_dir,
+        // get_file_raw), so a committed one of these in a project repo would
+        // otherwise leak verbatim. A PUBLIC cert (.crt/.cert) is deliberately NOT
+        // listed — it's not a secret and hiding it would over-block legitimate
+        // browsing; its private key is caught above. Ambiguous generic names
+        // (config.json / credentials.json / kube config) are left out on purpose:
+        // over-block risk, and their home-level forms are already refused by
+        // read_hits_home_dotdir.
+        || n == ".pgpass" || n == ".htpasswd" || n == ".my.cnf"
+        || n == ".pypirc" || n == ".s3cfg"
+        || n.ends_with(".pfx") || n.ends_with(".jks") || n.ends_with(".keystore")
+        || n.ends_with(".p8") || n.ends_with(".ppk")
         || n.ends_with("credentials")
 }
 
@@ -3366,6 +3384,30 @@ mod path_safety_tests {
         assert!(is_credential_path("server.pem"));
         assert!(is_credential_path(".aws"));
         assert!(!is_credential_path("README.md"));
+    }
+
+    #[test]
+    fn credential_leaf_covers_keystore_and_password_files() {
+        // Coverage gap (review 2026-07-28): the leaf denylist missed several
+        // unambiguous secret files whose committed contents leaked through EVERY
+        // read path that derives from this one predicate — git_show,
+        // git_worktree's diff, list_dir, and get_file_raw — in any repo NOT rooted
+        // at $HOME (the ~/.* home surface is separately blocked by
+        // read_hits_home_dotdir). .pfx/.jks/.keystore bundle PRIVATE keys; .pgpass
+        // is a plaintext DB password; .htpasswd holds credential hashes.
+        for n in [
+            ".pgpass", ".htpasswd", "cert.pfx", "keystore.jks",
+            "release.keystore", "PROD.PFX", // case-insensitive
+            ".my.cnf", ".pypirc", ".s3cfg", "apns.p8", "session.ppk",
+        ] {
+            assert!(is_credential_path(n), "{n} must be flagged as a credential leaf");
+        }
+        // A PUBLIC certificate is intentionally NOT a credential: it carries no
+        // secret and hiding it would over-block legitimate file browsing/diffs.
+        // (The matching PRIVATE key is caught by .key/.pem/.p12/.pfx/.jks above.)
+        for n in ["server.crt", "ca.cert", "README.md"] {
+            assert!(!is_credential_path(n), "{n} must NOT be flagged (public/non-secret)");
+        }
     }
 
     #[test]

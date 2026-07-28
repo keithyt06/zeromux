@@ -58,6 +58,12 @@ interface Props {
   // Lets the parent (App→SessionInfoBar) drive WS-only controls that live in
   // this component. Registered on mount, cleared on unmount. (G2b queue mode.)
   onRegisterControls?: (sessionId: string, api: { setQueueMode: (mode: string) => void; sendPrompt: (text: string) => void } | null) => void
+  // Report the backend-authoritative queue mode UP to App so the sibling
+  // SessionInfoBar dropdown reflects the real mode (review 2026-07-28). The
+  // functional path uses queueModeRef; this only mirrors the same value into
+  // App state so the visible control can't lie (observer tab / reconnect showing
+  // 'Collect' while the backend is 'Interrupt' → an unintended interrupt on send).
+  onQueueModeChange?: (sessionId: string, mode: string) => void
   // Inline run-metrics panel visibility, owned by App (toggled from SessionInfoBar).
   showMetrics?: boolean
 }
@@ -65,7 +71,7 @@ interface Props {
 // `active` is accepted (App passes it for all session views) but no longer used:
 // the Composer owns its own textarea and we intentionally don't auto-focus it,
 // so switching to a chat session doesn't pop the mobile keyboard.
-export default function AcpChatView({ sessionId, agentType = 'claude', onRegisterControls, showMetrics }: Props) {
+export default function AcpChatView({ sessionId, agentType = 'claude', onRegisterControls, onQueueModeChange, showMetrics }: Props) {
   // Raw wire-event log; the rendered transcript is DERIVED from it by grouping
   // on turn_id (T1). This is what fixes "send while streaming" misalignment:
   // a new prompt carries the NEXT turn_id, so it folds into its own group
@@ -131,6 +137,16 @@ export default function AcpChatView({ sessionId, agentType = 'claude', onRegiste
   // to decide whether a busy send is collect-queued (skip reseed) or starts a fresh
   // turn (Interrupt → must reseed the clocks; see shouldSeedTurnClock / F-FE-1).
   const queueModeRef = useRef('collect')
+  // Stable ref to the (optional) up-report so handleEvent's deps needn't include a
+  // prop that could churn the WS effect. adoptQueueMode is the ONE place that sets
+  // queueModeRef to a backend-authoritative value AND mirrors it to App so the
+  // sibling SessionInfoBar dropdown reflects the real mode (review 2026-07-28).
+  const onQueueModeChangeRef = useRef(onQueueModeChange)
+  useEffect(() => { onQueueModeChangeRef.current = onQueueModeChange }, [onQueueModeChange])
+  const adoptQueueMode = useCallback((mode: string) => {
+    queueModeRef.current = mode
+    onQueueModeChangeRef.current?.(sessionId, mode)
+  }, [sessionId])
   const scrollRef = useRef<HTMLDivElement>(null)
   const replayingRef = useRef(false)
   // True only while the post-replay_done follow ResizeObserver is armed (~2s).
@@ -245,9 +261,10 @@ export default function AcpChatView({ sessionId, agentType = 'claude', onRegiste
         // broadcasts it so THIS already-connected tab adopts it without a reconnect.
         // Without this, an observer tab keeps a stale queueModeRef and a busy send
         // mis-seeds the turn clock (inflated 已运行 + false 可能卡住). replay_done
-        // still carries the same value for the connect-time path.
+        // still carries the same value for the connect-time path. adoptQueueMode
+        // also mirrors it to App so the SessionInfoBar dropdown reflects it (2026-07-28).
         if (typeof evt.queue_mode === 'string') {
-          queueModeRef.current = evt.queue_mode
+          adoptQueueMode(evt.queue_mode)
         }
         break
       }
@@ -353,7 +370,7 @@ export default function AcpChatView({ sessionId, agentType = 'claude', onRegiste
         // (the F-FE-1 regression). Only adopt a delivered value; a missing field
         // (old backend / session with no live process) leaves the provisional mode.
         if (typeof evt.queue_mode === 'string') {
-          queueModeRef.current = evt.queue_mode
+          adoptQueueMode(evt.queue_mode)
         }
         // Honor the backend's authoritative live turn state. On a mid-turn
         // reconnect (idle-proxy drop during an output-silent tool call) the turn
@@ -413,7 +430,7 @@ export default function AcpChatView({ sessionId, agentType = 'claude', onRegiste
         break
       }
     }
-  }, [pushNotice, appendEvent, bumpMetrics])
+  }, [pushNotice, appendEvent, bumpMetrics, adoptQueueMode])
 
   // Composer 已 trim 且非空才回调；后端 fan-out 会在重发前自动打断在途轮次，
   // 前端只需发 prompt。
@@ -520,9 +537,11 @@ export default function AcpChatView({ sessionId, agentType = 'claude', onRegiste
       // would diverge it from the backend's real mode (the message was dropped) —
       // then a send could reseed a collect-queued turn (the 68ab4f5 bug) or skip a
       // real Interrupt turn. Keeping the ref == last-delivered mode avoids that.
-      queueModeRef.current = mode
+      // adoptQueueMode also mirrors it to App so the dropdown that TRIGGERED this
+      // stays in sync (and every other tab learns it via the backend broadcast).
+      adoptQueueMode(mode)
     }
-  }, [])
+  }, [adoptQueueMode])
 
   // Register WS-only controls so SessionInfoBar (rendered by App, a sibling)
   // can drive them for the active session. Clear on unmount.

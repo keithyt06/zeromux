@@ -43,6 +43,17 @@ export default function App() {
     if (api) sessionControls.current[sid] = api
     else delete sessionControls.current[sid]
   }, [])
+  // Backend-authoritative queue mode per session, reported up by AcpChatView from
+  // replay_done / the live queue_mode broadcast / a delivered flip. Drives the
+  // SessionInfoBar dropdown so the VISIBLE control reflects the real mode — an
+  // observer tab or a reconnected tab must not show 'Collect' while the backend is
+  // 'Interrupt' (which would make a send silently interrupt the running turn).
+  // The functional path (clock seeding) still uses AcpChatView's own queueModeRef;
+  // this is display-truth only. (review 2026-07-28, F-OBS-LIVE follow-through)
+  const [queueModes, setQueueModes] = useState<Record<string, string>>({})
+  const handleQueueModeChange = useCallback((sid: string, mode: string) => {
+    setQueueModes(prev => (prev[sid] === mode ? prev : { ...prev, [sid]: mode }))
+  }, [])
   const themeCtx = useTheme()
   const isMobile = useMemo(() => window.innerWidth < 768, [])
   const [sidebarOpen, setSidebarOpen] = useState(!isMobile)
@@ -312,6 +323,7 @@ export default function App() {
             onQueueMode={activeSession.type !== 'tmux'
               ? (mode) => sessionControls.current[activeSession.id]?.setQueueMode(mode)
               : undefined}
+            queueMode={queueModes[activeSession.id] ?? 'collect'}
             onToggleMetrics={activeSession.type !== 'tmux'
               ? () => setMetricsOpen(m => ({ ...m, [activeSession.id]: !m[activeSession.id] }))
               : undefined}
@@ -342,7 +354,7 @@ export default function App() {
                   {s.type === 'tmux' ? (
                     <TerminalView sessionId={s.id} active={isActive && view === 'none'} theme={themeCtx.theme} />
                   ) : (
-                    <AcpChatView sessionId={s.id} active={isActive && view === 'none'} agentType={s.type} onRegisterControls={registerControls} showMetrics={!!metricsOpen[s.id]} />
+                    <AcpChatView sessionId={s.id} active={isActive && view === 'none'} agentType={s.type} onRegisterControls={registerControls} onQueueModeChange={handleQueueModeChange} showMetrics={!!metricsOpen[s.id]} />
                   )}
                 </div>
                 {view === 'files' && <FileBrowser sessionId={s.id} />}

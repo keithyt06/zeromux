@@ -1097,8 +1097,17 @@ fn resolve_session_path(
 fn is_credential_path(name: &str) -> bool {
     let n = name.to_ascii_lowercase();
     n.starts_with(".env")
+        || n.ends_with(".env")             // db.env / prod.env (Docker-Compose env_file: — review 2026-07-29)
         || n == ".aws" || n == ".ssh" || n == ".netrc" || n == ".npmrc"
-        || n.starts_with("id_")            // id_rsa / id_ed25519 ...
+        // OpenSSH private keys only — the actual key stems (with user suffixes like
+        // `id_ed25519_work` and FIDO `_sk` variants), NOT the broad `id_` prefix that
+        // hid ordinary `id_*.ts`/`id_*.py` source from list_dir AND stripped their
+        // diff sections. The `.pub` public halves are not secret. Keys under `.ssh/`
+        // are already blocked by SENSITIVE_DIR_NAMES; this only matters outside it.
+        // (review 2026-07-29)
+        || ((n.starts_with("id_rsa") || n.starts_with("id_dsa")
+             || n.starts_with("id_ecdsa") || n.starts_with("id_ed25519"))
+            && !n.ends_with(".pub"))
         || n.ends_with(".pem") || n.ends_with(".key") || n.ends_with(".p12")
         // Additional unambiguous secret files (review 2026-07-28): private-key
         // material — bundles (.pfx/.jks/.keystore — PKCS#12 / Java keystores carry
@@ -3407,6 +3416,51 @@ mod path_safety_tests {
         // (The matching PRIVATE key is caught by .key/.pem/.p12/.pfx/.jks above.)
         for n in ["server.crt", "ca.cert", "README.md"] {
             assert!(!is_credential_path(n), "{n} must NOT be flagged (public/non-secret)");
+        }
+    }
+
+    #[test]
+    fn credential_leaf_covers_bare_dot_env_suffix_files() {
+        // Coverage gap (review 2026-07-29): the predicate keyed on
+        // `starts_with(".env")`, which catches `.env`/`.env.local` but MISSES the
+        // equally common `*.env` suffix naming — Docker-Compose `env_file:` targets
+        // are routinely `db.env`/`postgres.env`/`prod.env` and hold
+        // `POSTGRES_PASSWORD=…` in the clear. Committed in a repo NOT rooted at
+        // $HOME, one leaked its raw contents through EVERY read path deriving from
+        // this predicate (git_show / git_worktree diff / list_dir / get_file_raw).
+        // `.env` as a file EXTENSION is exclusively an env/secrets file, so matching
+        // the suffix carries no over-block risk.
+        for n in ["prod.env", "db.env", "postgres.env", "STAGING.ENV"] {
+            assert!(is_credential_path(n), "{n} (a *.env suffix file) must be flagged");
+        }
+        // The leading-dot forms still work, and a non-`.env` name is untouched.
+        assert!(is_credential_path(".env.production"));
+        assert!(!is_credential_path("environment.md"));
+    }
+
+    #[test]
+    fn credential_id_prefix_flags_ssh_keys_not_arbitrary_id_sources() {
+        // Over-block fix (review 2026-07-29): the predicate keyed on the broad
+        // `starts_with("id_")` (meant for id_rsa/id_ed25519), which ALSO hid ordinary
+        // source files whose names begin `id_` — they vanished from list_dir AND had
+        // their diff sections silently stripped from git_show/GitViewer. Narrow it to
+        // the actual OpenSSH private-key stems (still catching user suffixes like
+        // `id_ed25519_work` and FIDO `_sk` variants), excluding the `.pub` public
+        // halves. SSH keys inside `.ssh/` are already blocked by SENSITIVE_DIR_NAMES,
+        // so this leaf check only matters for a key committed OUTSIDE `.ssh`.
+        for n in [
+            "id_rsa", "id_dsa", "id_ecdsa", "id_ed25519",
+            "id_ed25519_work", "id_ecdsa_sk", "id_ed25519_sk", "id_rsa_github",
+        ] {
+            assert!(is_credential_path(n), "{n} (an SSH private key) must be flagged");
+        }
+        // Public halves are NOT secret — don't over-block them.
+        for n in ["id_rsa.pub", "id_ed25519.pub"] {
+            assert!(!is_credential_path(n), "{n} is a public key, must NOT be flagged");
+        }
+        // Ordinary source files that merely begin `id_` must browse/diff normally.
+        for n in ["id_utils.ts", "id_generator.py", "id_map.json", "id_token.rs"] {
+            assert!(!is_credential_path(n), "{n} is a source file, must NOT be flagged");
         }
     }
 

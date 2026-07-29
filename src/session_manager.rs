@@ -937,7 +937,7 @@ impl SessionManager {
                                 // Bumping last_activity_ms is benign: PTY sessions never enter
                                 // TurnState::Running, so both turn watchdogs skip them.
                                 if let Some(m) = mgr_weak.upgrade() {
-                                    m.record_and_broadcast(&sid, b64);
+                                    m.record_and_broadcast(&sid, b64, true);
                                 } else {
                                     let _ = event_tx_clone.send(b64); // manager gone: best-effort
                                 }
@@ -1821,15 +1821,25 @@ impl SessionManager {
     /// synchronous, so holding the std mutex across it does not block on I/O.
     /// Returns the broadcast result (Err == zero live subscribers; persistence
     /// still happened — that is the whole point, see T2).
-    fn record_and_broadcast(&self, id: &str, data: String) {
+    fn record_and_broadcast(&self, id: &str, data: String, bump_activity: bool) {
         let mut map = self.sessions.lock().unwrap();
         if let Some(s) = map.get_mut(id) {
-            // Every persisted event (ContentBlock/Result/…) is real activity, so
-            // bump last_activity_ms here. This makes it a true silence timestamp
-            // (updated within a turn, not just at turn boundaries), which the
-            // interactive watchdog (running_idle_too_long) relies on to avoid
+            // Most persisted events (ContentBlock/Result/…) are real forward
+            // progress, so bump last_activity_ms here. This makes it a true silence
+            // timestamp (updated within a turn, not just at turn boundaries), which
+            // the interactive watchdog (running_idle_too_long) relies on to avoid
             // killing healthy long-running turns. Lock already held; no await/I/O.
-            s.last_activity_ms = now_millis();
+            //
+            // `bump_activity=false` is passed ONLY for a mid-turn error-styled
+            // ContentBlock (see emit): a repeated Codex `codex/event` error storm on
+            // a tools/call that never resolves is NOT agent progress — counting it as
+            // activity would keep resetting the 30-min silence clock so the watchdog
+            // never fires and the turn wedges Running forever (F-CODEX-1-CLOCK, review
+            // 2026-07-29). Still persisted + broadcast so the user sees the error; it
+            // just doesn't pretend the agent is making progress.
+            if bump_activity {
+                s.last_activity_ms = now_millis();
+            }
             let data_len = data.len();
             s.scrollback.push_back(data.clone());
             s.scrollback_bytes += data_len;
@@ -2809,6 +2819,17 @@ fn emit(
         }
         _ => evt,
     };
+    // A mid-turn error-styled ContentBlock is persisted + broadcast like any other
+    // block, but it is NOT agent forward-progress: it must not bump the silence
+    // clock, or a Codex error storm on a never-resolving tools/call would defeat the
+    // 30-min watchdog and wedge the turn Running forever (F-CODEX-1-CLOCK, review
+    // 2026-07-29). Every other event (text/thinking/tool_* blocks, Result, …) is
+    // real activity. Terminal AcpEvent::Error settles the turn via is_boundary, so it
+    // never reaches the wedge case regardless.
+    let bump_activity = !matches!(
+        evt,
+        AcpEvent::ContentBlock { block_type, .. } if block_type == "error"
+    );
     let json = match serde_json::to_string(evt) {
         Ok(j) => j,
         Err(_) => return,
@@ -2820,7 +2841,7 @@ fn emit(
         // Persist + broadcast atomically under one lock so a reconnecting
         // client never sees this event in BOTH replay and live stream
         // (review 2026-06-11; pairs with subscribe_with_history).
-        m.record_and_broadcast(sid, json);
+        m.record_and_broadcast(sid, json, bump_activity);
     } else {
         // SessionManager gone (shutting down): best-effort live broadcast.
         let _ = event_tx.send(json);
@@ -4589,11 +4610,34 @@ mod running_summary_tests {
         ]);
 
         // "streaming" receives a fresh event; "silent" does not.
-        m.record_and_broadcast("streaming", "some output".to_string());
+        m.record_and_broadcast("streaming", "some output".to_string(), true);
 
         let killed = m.running_idle_too_long(now_millis(), idle);
         assert_eq!(killed, vec!["silent".to_string()],
             "streaming session bumped last_activity_ms and must be spared; only the silent one is killed");
+    }
+
+    #[test]
+    fn record_and_broadcast_without_activity_bump_leaves_turn_reapable() {
+        // F-CODEX-1-CLOCK (review 2026-07-29): a mid-turn error-styled ContentBlock
+        // is persisted+broadcast (bump_activity=false) but must NOT reset the silence
+        // clock. Otherwise a repeated Codex `codex/event` error storm on a stuck
+        // tools/call would keep the turn "fresh" forever and the 30-min watchdog would
+        // never reap it. With bump_activity=false the aged, silent-of-real-progress
+        // turn stays reapable even though an error frame was just persisted.
+        let now = now_millis();
+        let idle = 30 * 60_000i64;
+        let long_ago = now - idle - 60_000;
+        let (m, _tmp) = mgr_with(vec![
+            aged_session("erroring", None, TurnState::Running, long_ago),
+        ]);
+
+        // An error frame arrives (persisted for the user to see) but is not progress.
+        m.record_and_broadcast("erroring", "Codex: transient".to_string(), false);
+
+        let killed = m.running_idle_too_long(now_millis(), idle);
+        assert_eq!(killed, vec!["erroring".to_string()],
+            "an error frame must not reset the silence clock; the wedged turn stays reapable");
     }
 
     #[test]
@@ -4610,7 +4654,7 @@ mod running_summary_tests {
             "p", SessionType::Tmux, None, TurnState::Idle,
         )]);
         // A pre-existing scrollback frame (already persisted before reconnect).
-        m.record_and_broadcast("p", "old".to_string());
+        m.record_and_broadcast("p", "old".to_string(), true);
 
         // Reconnect: snapshot history AND subscribe under one lock.
         let (history, mut rx) = m.subscribe_with_history("p").expect("session exists");
@@ -4618,7 +4662,7 @@ mod running_summary_tests {
 
         // A frame emitted AFTER the atomic subscribe: goes to the live receiver,
         // and (being appended after the snapshot) is NOT in `history`.
-        m.record_and_broadcast("p", "live".to_string());
+        m.record_and_broadcast("p", "live".to_string(), true);
         assert_eq!(rx.try_recv().unwrap(), "live", "post-subscribe frame delivered live");
         assert!(rx.try_recv().is_err(), "no second copy of any frame on the live channel");
         assert!(!history.contains(&"live".to_string()), "live frame is not also in the replay snapshot");
@@ -4736,6 +4780,34 @@ mod emit_tests {
         // A genuine terminal error still settles it.
         let terminal_err = AcpEvent::Error { message: "Codex error: fatal".into() };
         assert!(is_boundary(&terminal_err), "a terminal Error still settles the turn");
+    }
+
+    #[test]
+    fn mid_turn_error_block_does_not_bump_the_silence_clock() {
+        // F-CODEX-1-CLOCK (review 2026-07-29): since a mid-turn error block no longer
+        // settles the turn (test above), it must ALSO not be counted as agent activity
+        // — else a Codex error storm keeps resetting last_activity_ms and the 30-min
+        // watchdog never reaps a wedged turn. Pin the exact `bump_activity` predicate
+        // `emit` uses: false ONLY for a ContentBlock whose block_type is "error";
+        // true for every other event (text/thinking/tool blocks, Result, …).
+        let bump = |evt: &AcpEvent| {
+            !matches!(evt, AcpEvent::ContentBlock { block_type, .. } if block_type == "error")
+        };
+        let err_block = AcpEvent::ContentBlock {
+            block_type: std::borrow::Cow::Borrowed("error"),
+            turn_id: 0, text: Some("Codex: transient".into()),
+            name: None, input: None, streaming: Some(false), summary: None,
+        };
+        let text_block = AcpEvent::ContentBlock {
+            block_type: std::borrow::Cow::Borrowed("text"),
+            turn_id: 0, text: Some("real output".into()),
+            name: None, input: None, streaming: Some(true), summary: None,
+        };
+        assert!(!bump(&err_block), "an error block is not agent progress → must NOT bump the clock");
+        assert!(bump(&text_block), "a text block is real progress → must bump the clock");
+        assert!(bump(&AcpEvent::Result { text: "done".into(), turn_id: 0, session_id: String::new(),
+            cost_usd: None, tokens_in: None, tokens_out: None }),
+            "a Result is real progress → must bump the clock");
     }
 
     // Regression for the reconnect double-delivery race (review 2026-06-11).

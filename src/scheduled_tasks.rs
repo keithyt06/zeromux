@@ -1035,6 +1035,30 @@ fn spawn_confirm_pushes(
     }
 }
 
+/// Dispatch a watchdog TimeoutKill WITHOUT ever blocking the scheduler tick.
+///
+/// `send_timeout_kill` awaits a `.send()` on the fan-out's BOUNDED (cap 64) input
+/// mpsc. The kill target is by definition a wedged session, and a wedged fan-out
+/// blocked on its child (send_prompt/interrupt/kill) is exactly the one not
+/// draining inputs — so with a full queue that `.await` would block indefinitely,
+/// freezing the whole tick (heartbeat, watchdog, task firing). This is the SF2
+/// freeze that 7104588 removed from the push path but left here. Fire-and-forget in
+/// a spawned task (mirror `spawn_confirm_pushes`), and bound it with a timeout so a
+/// permanently-full queue can't accumulate lingering tasks either. `try_send` was
+/// rejected: it would DROP the kill precisely when the queue is full — leaving the
+/// wedge un-reaped — whereas the spawned send still delivers once a slot frees.
+/// (review 2026-07-29, F-SCHED-TIMEOUT-BLOCK)
+fn spawn_timeout_kill(mgr: &std::sync::Arc<crate::session_manager::SessionManager>, sid: String) {
+    let m = mgr.clone();
+    tokio::spawn(async move {
+        let _ = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            m.send_timeout_kill(&sid, None),
+        )
+        .await;
+    });
+}
+
 /// Spawn the supervised scheduler. The outer task respawns the inner loop if it
 /// panics (so a single bad tick can't silently kill scheduling), updates a
 /// heartbeat each tick (frontend health), runs a timeout watchdog, and triggers
@@ -1066,7 +1090,7 @@ pub fn spawn_scheduler(
                     match s.reconcile_timeouts_per_task(now.timestamp_millis()) {
                         Ok(kill) => {
                             for sid in kill {
-                                m.send_timeout_kill(&sid, None).await;
+                                spawn_timeout_kill(&m, sid);
                             }
                         }
                         Err(e) => tracing::warn!("reconcile_timeouts failed: {}", e),
@@ -1077,7 +1101,7 @@ pub fn spawn_scheduler(
                     // forever. Scheduled runs are handled by the watchdog above.
                     let stale = m.running_idle_too_long(now.timestamp_millis(), INTERACTIVE_IDLE_MS);
                     for sid in stale {
-                        m.send_timeout_kill(&sid, None).await;
+                        spawn_timeout_kill(&m, sid);
                     }
                     // stuck浮出推送:交互式会话 Running 且静默 >= 10min 推一次
                     // (侧栏琥珀点用 180s,纯前端;此处仅推送,阈值更高以压低误报)。

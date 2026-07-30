@@ -827,6 +827,21 @@ fn collect_files(
 ) {
     if max_depth == 0 { return; }
 
+    // Parity with `list_dir_entries` (the sibling enumeration path): refuse to
+    // descend into a sensitive/control dir OR the home-level `~/.*` surface. Without
+    // this, a `base_dir=$HOME/.config` override (which `validate_browse_root` accepts
+    // — `.config` ∉ SENSITIVE_DIR_NAMES) let this recursion enumerate the names/sizes/
+    // mtimes of `~/.config/gh`, `~/.config/gcloud`, `~/.docker`, `~/.kube`, … i.e. the
+    // structure of home-level credential dirs. Byte reads were already blocked
+    // (`get_file_raw`/`get_session_file` enforce these two guards), so the leak was
+    // metadata-only, but the enumeration path must derive from the same predicates as
+    // its siblings or it drifts (the recurring root cause here). `dir` is a real
+    // subdir of a `resolve_base_dir`-verified base and symlinks are skipped below, so
+    // it needs no separate canonicalization. (review 2026-07-30, F-FILES-COLLECT-GUARD)
+    if descends_into_sensitive_dir(base, dir) || read_hits_home_dotdir(dir) {
+        return;
+    }
+
     let ext_filter = pattern.strip_prefix("*.");
     let entries = match std::fs::read_dir(dir) {
         Ok(e) => e,
@@ -3500,6 +3515,56 @@ mod path_safety_tests {
         assert_eq!(md.len(), 1, "normal .md file must still be found");
 
         std::fs::remove_dir_all(&tmp).ok();
+    }
+
+    #[test]
+    fn collect_files_refuses_home_dotdir_and_sensitive_base() {
+        // Regression (F-FILES-COLLECT-GUARD): collect_files did not derive from the
+        // read_hits_home_dotdir / descends_into_sensitive_dir guards its sibling
+        // list_dir_entries enforces, so a base_dir=$HOME/.config override (accepted by
+        // validate_browse_root — `.config` ∉ SENSITIVE_DIR_NAMES) let it enumerate
+        // names/sizes/mtimes of home-level credential dirs (~/.config/gcloud, …).
+        // Matches the file-browser HOME-env test convention (unique per-PID dir,
+        // restore on exit); read_hits_home_dotdir reads $HOME at call time.
+        let prev_home = std::env::var("HOME").ok();
+        let home = std::env::temp_dir().join(format!("zmcf-home-{}", std::process::id()));
+        std::fs::create_dir_all(&home).unwrap();
+        std::env::set_var("HOME", home.canonicalize().unwrap());
+
+        // A home-level dotdir with a non-dot child holding a JSON "credential".
+        let cfg = home.join(".config").join("gcloud");
+        std::fs::create_dir_all(&cfg).unwrap();
+        std::fs::write(cfg.join("application_default_credentials.json"), "{\"token\":\"x\"}").unwrap();
+        let base_config = home.join(".config").canonicalize().unwrap();
+
+        // Base = $HOME/.config: the first-below-$HOME component is `.config` → refuse.
+        let mut hits = Vec::new();
+        collect_files(&base_config, &base_config, "*.json", &mut hits, 5);
+        assert!(hits.is_empty(), "home-level dotdir must not be enumerated: {hits:?}");
+
+        // A sensitive-dir base (.zeromux) must also be refused (parity with the read guard).
+        let zmx = home.join(".zeromux").join("runs");
+        std::fs::create_dir_all(&zmx).unwrap();
+        std::fs::write(zmx.join("events.ndjson"), "{}").unwrap();
+        let base_zmx = home.join(".zeromux").canonicalize().unwrap();
+        let mut z = Vec::new();
+        collect_files(&base_zmx, &base_zmx, "*.ndjson", &mut z, 5);
+        assert!(z.is_empty(), ".zeromux base must not be enumerated: {z:?}");
+
+        // Control: a normal (non-dot) project dir under $HOME still enumerates.
+        let proj = home.join("proj");
+        std::fs::create_dir_all(&proj).unwrap();
+        std::fs::write(proj.join("readme.md"), "hi").unwrap();
+        let base_proj = proj.canonicalize().unwrap();
+        let mut ok = Vec::new();
+        collect_files(&base_proj, &base_proj, "*.md", &mut ok, 5);
+        assert_eq!(ok.len(), 1, "normal project dir under $HOME must still enumerate");
+
+        match prev_home {
+            Some(h) => std::env::set_var("HOME", h),
+            None => std::env::remove_var("HOME"),
+        }
+        std::fs::remove_dir_all(&home).ok();
     }
 
     #[test]

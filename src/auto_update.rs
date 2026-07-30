@@ -277,6 +277,25 @@ pub fn spawn_auto_updater(cfg: AutoUpdateConfig, mgr: Weak<SessionManager>) {
                         smoke_failed_sha = Some(sha.clone());
                         continue;
                     }
+                    // Re-check the scheduled gate AFTER the (blocking, ~1-2s) smoke and
+                    // immediately before the destructive swap. The first summary was
+                    // sampled seconds ago (before the smoke); a scheduler tick can claim
+                    // + spawn a scheduled run into this service's cgroup in that window,
+                    // and `launch_swap`'s `systemctl stop` kills the whole cgroup — force-
+                    // killing a scheduled run mid-flight, exactly the E1 invariant this
+                    // gate exists to protect. Narrows (does not fully close) the race:
+                    // a claim landing between this read and `systemctl stop` is still
+                    // possible, but that window shrinks from seconds to microseconds.
+                    // Fail-closed on scheduled>0 OR a scheduled.db read error (same
+                    // policy as the gate). (review 2026-07-30, F-AUTOUPDATE-TOCTOU)
+                    let recheck = m.running_summary();
+                    if recheck.scheduled > 0 || recheck.scheduled_read_failed {
+                        tracing::info!(
+                            "auto-update: scheduled run appeared during smoke (scheduled={}, read_failed={}), deferring swap",
+                            recheck.scheduled, recheck.scheduled_read_failed
+                        );
+                        continue;
+                    }
                     tracing::info!("auto-update: upgradeable, launching swap via systemd-run");
                     let script = render_swap_script(&cfg);
                     launch_swap(&script).await;

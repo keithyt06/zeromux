@@ -496,6 +496,19 @@ async fn run_event_loop(
 
     loop {
         tokio::select! {
+            // Bias the CMD arm ahead of the between-turn NOTIFY arm (parity with the
+            // in-turn select at the bottom of this fn, which is already `biased`). When
+            // the previous turn's `call_tool` resolved, the inner loop broke WITHOUT
+            // draining `notify_rx`, so trailing notifications (an error storm buffers
+            // many) can still be queued. Without bias, a ready buffered `Notify::Error`
+            // could be picked OVER a ready `Cmd::Prompt` for the next turn and emitted as
+            // an `AcpEvent::Error` — which the fan-out counts as a turn boundary, settling
+            // the freshly-started follow-up turn to Idle before its call runs (wrong busy
+            // state, mis-counted turn, and a further prompt dropped with "not delivered").
+            // Biasing runs the Prompt arm's stale-notify drain (below) first, so those
+            // residual notifications are discarded before they can be misattributed.
+            // (review 2026-07-30, F-CODEX-BIASED)
+            biased;
             cmd = cmd_rx.recv() => {
                 match cmd {
                     Some(Cmd::Prompt(text)) => {
@@ -588,27 +601,26 @@ async fn run_event_loop(
                                             return;
                                         }
                                         Some(Cmd::Prompt(_)) => {
-                                            // A prompt arriving mid-turn is normally
-                                            // prevented by the UI disabling Send. But
-                                            // the collect-queue flush (session_manager
-                                            // PromptQueue) can also send here: it arms
-                                            // on ANY turn boundary — including a
-                                            // NON-terminal mid-turn `codex/event`
-                                            // error notification (see Notify::Error
-                                            // below, which does not break the loop) —
-                                            // and 500ms later flushes the merged queued
-                                            // follow-up while this `call_tool` is still
-                                            // in flight. We can't start it now (the
-                                            // reply must go through codex-reply after
-                                            // this turn resolves), so rather than drop
-                                            // it SILENTLY — which left the queued
-                                            // follow-up lost with the session looking
-                                            // idle/healthy — surface an error so the
-                                            // user knows to resend. (A full fix would
-                                            // stash + auto-redispatch after call_fut
-                                            // resolves; deferred pending real-machine
-                                            // confirmation of the retryable-error
-                                            // timing window.)
+                                            // A prompt reaching this IN-TURN select is
+                                            // an edge case: the UI disables Send while
+                                            // busy, the mid-turn `codex/event` error is
+                                            // now a NON-boundary ContentBlock (so it no
+                                            // longer arms the collect window — F-CODEX-1),
+                                            // and the collect-flush only fires when the
+                                            // fan-out sees `local_running==false` (Codex
+                                            // idle → outer select). The remaining path
+                                            // here is a spurious-boundary race that flips
+                                            // fan-out state to a new turn while this
+                                            // `call_tool` is still in flight (see
+                                            // F-CODEX-BIASED — now bias-hardened on the
+                                            // outer select). We can't start the prompt now
+                                            // (the reply must go through codex-reply after
+                                            // this turn resolves), so rather than drop it
+                                            // SILENTLY — which left the follow-up lost with
+                                            // the session looking idle/healthy — surface an
+                                            // error so the user knows to resend. (A full
+                                            // fix would stash + auto-redispatch after
+                                            // call_fut resolves; deferred.)
                                             tracing::warn!(
                                                 "codex: prompt received during \
                                                  in-flight turn; not delivered"

@@ -66,7 +66,33 @@ pub async fn auth_middleware(
     next: Next,
 ) -> Result<Response, StatusCode> {
     // Try JWT auth first (OAuth mode)
-    if let Some(user) = try_jwt_auth(&state, &query, &req) {
+    if let Some(mut user) = try_jwt_auth(&state, &query, &req) {
+        // A JWT freezes role+status at issue time (7–30 day TTL). A user who was
+        // `pending` when their token was minted keeps `status:"pending"` in every
+        // later request even after an admin approves them in the DB — so `/api/me`
+        // (which WaitingPage polls every 5s to detect approval) reported `pending`
+        // forever and the user was stranded on the waiting screen until a manual
+        // logout+login re-issued the token. Re-read the DB **only for a not-yet-active
+        // token** (active tokens short-circuit — no per-request DB hit on the hot
+        // path) and adopt the authoritative status/role. A deleted pending user
+        // (row gone) is rejected; a transient DB read error keeps the pending claim
+        // (no worse than before). NOTE: this does NOT revoke a *deleted/demoted
+        // active* user before their token expires — that would need an unconditional
+        // per-request DB read (serializing auth through the single SQLite mutex) or
+        // token versioning; tracked separately, out of scope for the single-user
+        // deployment. (review 2026-07-30, F-AUTH-APPROVAL)
+        if !user.is_active() {
+            if let Some(ref db) = state.db {
+                match reconcile_pending_user(db.get_user_by_id(&user.id)) {
+                    PendingRecheck::Adopt { status, role } => {
+                        user.status = status;
+                        user.role = role;
+                    }
+                    PendingRecheck::Reject => return Err(StatusCode::UNAUTHORIZED),
+                    PendingRecheck::KeepClaim => {}
+                }
+            }
+        }
         // For non-/api/me routes, require active status
         let path = req.uri().path();
         if !user.is_active() && !path.starts_with("/api/me") {
@@ -146,6 +172,27 @@ fn decode_jwt(token: &str, secret: &str) -> Option<CurrentUser> {
         })
 }
 
+/// Decision for a not-yet-active JWT re-checked against the DB (F-AUTH-APPROVAL).
+/// Pure so the fail-closed policy is unit-tested without an HTTP/AppState harness.
+#[derive(Debug, PartialEq, Eq)]
+enum PendingRecheck {
+    /// DB row found — adopt its authoritative status/role over the frozen claim.
+    Adopt { status: String, role: String },
+    /// DB row gone (user deleted) — reject the request (401).
+    Reject,
+    /// DB read failed — keep the token's claim (don't lock the user out on a
+    /// transient JuiceFS/SQLite error; no worse than the pre-fix behavior).
+    KeepClaim,
+}
+
+fn reconcile_pending_user(row: Result<Option<crate::db::User>, String>) -> PendingRecheck {
+    match row {
+        Ok(Some(u)) => PendingRecheck::Adopt { status: u.status, role: u.role },
+        Ok(None) => PendingRecheck::Reject,
+        Err(_) => PendingRecheck::KeepClaim,
+    }
+}
+
 /// Legacy password auth (token mode, no OAuth)
 fn try_legacy_auth(
     password_hash: &str,
@@ -190,7 +237,24 @@ fn try_legacy_auth(
 /// Verify a WebSocket token — returns CurrentUser if valid and active.
 pub fn verify_ws_token(state: &AppState, token: &str) -> Option<CurrentUser> {
     // Try JWT
-    if let Some(user) = decode_jwt(token, &state.jwt_secret) {
+    if let Some(mut user) = decode_jwt(token, &state.jwt_secret) {
+        // Parity with `auth_middleware`'s pending re-check (F-AUTH-APPROVAL): a
+        // just-approved user still holds a `pending` JWT (the frontend updates local
+        // state on approval but does NOT re-mint the cookie), so without this a
+        // freshly-approved user's `/api/me` would flip to active yet every terminal /
+        // agent WS still 403'd until manual re-login. Re-read the DB only for a
+        // not-yet-active claim; active tokens short-circuit. DB error → keep the
+        // (pending) claim → still refused, which is the safe direction for WS.
+        if !user.is_active() {
+            if let Some(ref db) = state.db {
+                if let PendingRecheck::Adopt { status, role } =
+                    reconcile_pending_user(db.get_user_by_id(&user.id))
+                {
+                    user.status = status;
+                    user.role = role;
+                }
+            }
+        }
         if user.is_active() {
             return Some(user);
         }
@@ -205,4 +269,59 @@ pub fn verify_ws_token(state: &AppState, token: &str) -> Option<CurrentUser> {
     }
 
     None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::db::User;
+
+    fn user_row(status: &str, role: &str) -> User {
+        User {
+            id: "u1".into(),
+            github_id: 1,
+            github_login: "u1".into(),
+            display_name: None,
+            avatar_url: None,
+            role: role.into(),
+            status: status.into(),
+            created_at: String::new(),
+            last_login: None,
+        }
+    }
+
+    #[test]
+    fn pending_user_approved_in_db_is_adopted() {
+        // The core F-AUTH-APPROVAL bug: a token minted while pending must pick up the
+        // DB's "active" once an admin approves, so /api/me flips and WaitingPage's poll
+        // actually detects approval instead of spinning until manual re-login.
+        assert_eq!(
+            reconcile_pending_user(Ok(Some(user_row("active", "member")))),
+            PendingRecheck::Adopt { status: "active".into(), role: "member".into() }
+        );
+    }
+
+    #[test]
+    fn still_pending_in_db_keeps_pending() {
+        assert_eq!(
+            reconcile_pending_user(Ok(Some(user_row("pending", "member")))),
+            PendingRecheck::Adopt { status: "pending".into(), role: "member".into() }
+        );
+    }
+
+    #[test]
+    fn deleted_user_is_rejected() {
+        // Row gone → the (pending) token must not keep authenticating.
+        assert_eq!(reconcile_pending_user(Ok(None)), PendingRecheck::Reject);
+    }
+
+    #[test]
+    fn db_error_keeps_claim_fail_open_for_availability() {
+        // Transient JuiceFS/SQLite read error must NOT lock out a legitimately-pending
+        // user (they were already gated by the pending route restriction); keep claim.
+        assert_eq!(
+            reconcile_pending_user(Err("disk".into())),
+            PendingRecheck::KeepClaim
+        );
+    }
 }

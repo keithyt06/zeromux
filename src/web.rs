@@ -1433,6 +1433,18 @@ fn list_dir_entries(
             break;
         }
         let name = entry.file_name().to_string_lossy().to_string();
+        // Skip dotfiles/dot-dirs — parity with the sibling enumerators collect_files
+        // (dot-skip) and vault_list (post-filter). Without this, a `base_dir=$HOME`
+        // listing enumerated the names/sizes/mtimes of home-level dot-dirs that
+        // `is_credential_path` misses (`.gnupg`, `.config`, `.kube`, `.docker`,
+        // `.gitconfig`, …) — the same metadata-enumeration class fixed for
+        // `collect_files` on 2026-07-30 (F-FILES-COLLECT-GUARD). Descent into them was
+        // already 403'd by `read_hits_home_dotdir` and byte reads blocked, so this
+        // closes the residual top-level-metadata leak and restores enumerator parity.
+        // (review 2026-07-31, F-LISTDIR-DOTFILES)
+        if name.starts_with('.') {
+            continue;
+        }
         if is_credential_path(&name) {
             continue; // never enumerate credentials
         }
@@ -3672,11 +3684,19 @@ mod path_safety_tests {
         let other = tmp.join("other-project");
         std::fs::create_dir_all(other.join("nested")).unwrap();
         std::fs::write(other.join("readme.md"), "hi").unwrap();
+        // Dot-entries must NOT be enumerated — parity with collect_files/vault_list.
+        // A `.gnupg`/`.config`-style dir under a re-rooted base ($HOME) would else leak
+        // its name+size+mtime even though descent + byte reads are blocked.
+        // (review 2026-07-31, F-LISTDIR-DOTFILES)
+        std::fs::create_dir_all(other.join(".gnupg")).unwrap();
+        std::fs::write(other.join(".gitconfig"), "[user]\n").unwrap();
         let base = other.canonicalize().unwrap();
         let (entries, _trunc) = list_dir_entries(&base, "").unwrap();
         let names: Vec<&str> = entries.iter().map(|e| e.name.as_str()).collect();
         assert!(names.contains(&"readme.md"));
         assert!(names.contains(&"nested"));
+        assert!(!names.contains(&".gnupg"), "dot-dir must not be enumerated");
+        assert!(!names.contains(&".gitconfig"), "dotfile must not be enumerated");
     }
 
     #[test]

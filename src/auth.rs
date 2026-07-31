@@ -1,6 +1,6 @@
 use axum::{
     extract::{Query, State},
-    http::{Request, StatusCode},
+    http::{HeaderMap, Request, StatusCode},
     middleware::Next,
     response::Response,
 };
@@ -271,6 +271,70 @@ pub fn verify_ws_token(state: &AppState, token: &str) -> Option<CurrentUser> {
     None
 }
 
+/// Extract the raw `zeromux_jwt` cookie value from a request's `Cookie` header.
+/// The OAuth callback sets this cookie `HttpOnly` (oauth.rs), so JS on the page
+/// can't read it into a `?token=` query param — but the browser DOES attach it to
+/// the WebSocket upgrade request automatically. This lets the WS handlers recover
+/// it server-side. (review 2026-07-31, F-WS-OAUTH-COOKIE)
+fn jwt_cookie_from_headers(headers: &HeaderMap) -> Option<&str> {
+    let cookie = headers.get("Cookie")?.to_str().ok()?;
+    for part in cookie.split(';') {
+        if let Some(val) = part.trim().strip_prefix("zeromux_jwt=") {
+            return Some(val);
+        }
+    }
+    None
+}
+
+/// Same-origin guard for the cookie-authenticated WS path (CSWSH defense).
+/// A `?token=` handshake is already CSRF-safe (an attacker page can't read the
+/// token), but authenticating a WS *by ambient cookie* is cross-site-forgeable, so
+/// we only accept the cookie when the `Origin` matches our own host. Requests with
+/// NO `Origin` header (native/CLI clients, same-origin non-browser callers) are
+/// allowed — browsers always send `Origin` on WS upgrades, so its absence means the
+/// caller isn't a browser being driven cross-site. An unparseable/ mismatched
+/// `Origin` is rejected. `SameSite=Lax` on the cookie is a second layer, not the
+/// only one. (review 2026-07-31, F-WS-OAUTH-COOKIE)
+fn ws_origin_allowed(headers: &HeaderMap, external_url: &str) -> bool {
+    let origin = match headers.get("Origin").and_then(|v| v.to_str().ok()) {
+        None => return true, // non-browser client: no ambient-cookie CSWSH risk
+        Some(o) => o,
+    };
+    match (url::Url::parse(origin), url::Url::parse(external_url)) {
+        (Ok(o), Ok(ext)) => {
+            // Compare scheme-agnostic host:port authority. external_url may be
+            // http(s)://host[:port]; the browser Origin is scheme://host[:port].
+            o.host_str() == ext.host_str() && o.port_or_known_default() == ext.port_or_known_default()
+        }
+        _ => false, // can't verify → refuse the cookie path (fail closed)
+    }
+}
+
+/// Authenticate a WebSocket upgrade. Tries the `?token=` query param first (the
+/// CSRF-safe path used by legacy password mode and by clients that can read their
+/// token), then — only if the request's `Origin` is same-origin — falls back to the
+/// `HttpOnly` `zeromux_jwt` cookie the browser attaches automatically. Without this
+/// fallback, OAuth-mode browsers (whose JWT cookie is HttpOnly and thus invisible to
+/// the `document.cookie`-based `wsUrl()` builder) got an empty `?token=` and every
+/// terminal/agent WS 401'd. (review 2026-07-31, F-WS-OAUTH-COOKIE)
+pub fn verify_ws_auth(
+    state: &AppState,
+    query_token: Option<&str>,
+    headers: &HeaderMap,
+) -> Option<CurrentUser> {
+    if let Some(t) = query_token {
+        if let Some(user) = verify_ws_token(state, t) {
+            return Some(user);
+        }
+    }
+    if ws_origin_allowed(headers, &state.external_url) {
+        if let Some(jwt) = jwt_cookie_from_headers(headers) {
+            return verify_ws_token(state, jwt);
+        }
+    }
+    None
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -323,5 +387,56 @@ mod tests {
             reconcile_pending_user(Err("disk".into())),
             PendingRecheck::KeepClaim
         );
+    }
+
+    // ── F-WS-OAUTH-COOKIE: cookie extraction + CSWSH origin guard ──
+
+    fn headers_with(pairs: &[(&str, &str)]) -> HeaderMap {
+        let mut h = HeaderMap::new();
+        for (k, v) in pairs {
+            h.insert(
+                axum::http::HeaderName::from_bytes(k.as_bytes()).unwrap(),
+                v.parse().unwrap(),
+            );
+        }
+        h
+    }
+
+    #[test]
+    fn jwt_cookie_extracted_among_other_cookies() {
+        let h = headers_with(&[("Cookie", "foo=1; zeromux_jwt=abc.def.ghi; bar=2")]);
+        assert_eq!(jwt_cookie_from_headers(&h), Some("abc.def.ghi"));
+    }
+
+    #[test]
+    fn jwt_cookie_absent_is_none() {
+        let h = headers_with(&[("Cookie", "foo=1; zeromux_token=legacy")]);
+        assert_eq!(jwt_cookie_from_headers(&h), None);
+        assert_eq!(jwt_cookie_from_headers(&HeaderMap::new()), None);
+    }
+
+    #[test]
+    fn ws_origin_missing_is_allowed_non_browser() {
+        // No Origin header → native/CLI client, no ambient-cookie CSWSH risk.
+        assert!(ws_origin_allowed(&HeaderMap::new(), "https://zeromux.example.com"));
+    }
+
+    #[test]
+    fn ws_origin_same_host_allowed_scheme_agnostic() {
+        let h = headers_with(&[("Origin", "https://zeromux.example.com")]);
+        // external_url stored without scheme parity shouldn't matter; host:port is compared.
+        assert!(ws_origin_allowed(&h, "https://zeromux.example.com"));
+    }
+
+    #[test]
+    fn ws_origin_cross_site_rejected() {
+        let h = headers_with(&[("Origin", "https://evil.example.com")]);
+        assert!(!ws_origin_allowed(&h, "https://zeromux.example.com"));
+    }
+
+    #[test]
+    fn ws_origin_unparseable_rejected_fail_closed() {
+        let h = headers_with(&[("Origin", "not-a-url")]);
+        assert!(!ws_origin_allowed(&h, "https://zeromux.example.com"));
     }
 }

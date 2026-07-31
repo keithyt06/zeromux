@@ -709,7 +709,11 @@ export async function postRunVerdict(
 export function wsUrl(path: string): string {
   const proto = location.protocol === 'https:' ? 'wss:' : 'ws:'
   const token = getToken()
-  // For OAuth mode, extract JWT from cookie
+  // Legacy mode: localStorage token → ?token=. OAuth mode: the zeromux_jwt cookie is
+  // HttpOnly (oauth.rs) so this document.cookie read is always empty — auth then falls
+  // through to the server reading that same cookie off the WS upgrade headers
+  // (auth::verify_ws_auth, F-WS-OAUTH-COOKIE). We still pass it for any non-HttpOnly
+  // deployment; the empty value is harmless.
   const jwt = document.cookie.split(';').map(c => c.trim()).find(c => c.startsWith('zeromux_jwt='))?.split('=')[1] || ''
   const authToken = token || jwt
   return `${proto}//${location.host}${path}?token=${encodeURIComponent(authToken)}`

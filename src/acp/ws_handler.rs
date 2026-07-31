@@ -3,6 +3,7 @@ use axum::{
         ws::{Message, WebSocket},
         Path, Query, State, WebSocketUpgrade,
     },
+    http::HeaderMap,
     response::Response,
 };
 use futures::{SinkExt, StreamExt};
@@ -34,9 +35,13 @@ pub async fn ws_acp(
     ws: WebSocketUpgrade,
     Path(session_id): Path<String>,
     Query(query): Query<WsQuery>,
+    headers: HeaderMap,
     State(state): State<Arc<AppState>>,
 ) -> Response {
-    let user = match query.token.as_ref().and_then(|t| auth::verify_ws_token(&state, t)) {
+    // `?token=` first (CSRF-safe), then the HttpOnly `zeromux_jwt` cookie the browser
+    // attaches to the upgrade — needed in OAuth mode where JS can't read that cookie
+    // into the query param (F-WS-OAUTH-COOKIE). Cookie path is Origin-gated (CSWSH).
+    let user = match auth::verify_ws_auth(&state, query.token.as_deref(), &headers) {
         Some(u) => u,
         None => {
             return Response::builder()

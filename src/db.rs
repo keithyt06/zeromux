@@ -1,4 +1,4 @@
-use rusqlite::{params, Connection};
+use rusqlite::{params, Connection, OptionalExtension};
 use std::path::Path;
 use std::sync::Mutex;
 
@@ -128,6 +128,13 @@ impl Database {
             .prepare("SELECT id, github_id, github_login, display_name, avatar_url, role, status, created_at, last_login FROM users WHERE id = ?1")
             .map_err(|e| format!("Query error: {}", e))?;
 
+        // `.optional()` — NOT `.ok()`: `.ok()` collapses BOTH "no such row" and a
+        // genuine read failure into `Ok(None)`. auth::reconcile_pending_user must tell
+        // those apart (row gone → Reject/401; read error → KeepClaim/fail-open); with
+        // `.ok()` a transient JuiceFS/SQLite blip looked like a deleted user and hard-401'd
+        // a legitimately-pending session, the OPPOSITE of the documented fail-open intent.
+        // `.optional()` maps only QueryReturnedNoRows → Ok(None) and propagates any other
+        // Err. (review 2026-07-31, F-DB-READ-ERR-SWALLOW)
         let user = stmt
             .query_row(params![id], |row| {
                 Ok(User {
@@ -142,7 +149,8 @@ impl Database {
                     last_login: row.get(8)?,
                 })
             })
-            .ok();
+            .optional()
+            .map_err(|e| format!("Query error: {}", e))?;
 
         Ok(user)
     }
@@ -156,6 +164,11 @@ impl Database {
             .prepare("SELECT id, github_id, github_login, display_name, avatar_url, role, status, created_at, last_login FROM users WHERE github_id = ?1")
             .map_err(|e| format!("Query error: {}", e))?;
 
+        // `.optional()` not `.ok()` — same rationale as get_user_by_id_inner: a genuine
+        // read error must propagate as Err rather than masquerade as "no existing user"
+        // (which sends upsert_github_user down the new-user INSERT path — the UNIQUE
+        // github_id then rejects it with a misleading "Failed to insert user" instead of
+        // surfacing the real read failure). (review 2026-07-31, F-DB-READ-ERR-SWALLOW)
         let user = stmt
             .query_row(params![github_id], |row| {
                 Ok(User {
@@ -170,7 +183,8 @@ impl Database {
                     last_login: row.get(8)?,
                 })
             })
-            .ok();
+            .optional()
+            .map_err(|e| format!("Query error: {}", e))?;
 
         Ok(user)
     }
@@ -266,4 +280,53 @@ fn now_iso() -> String {
 
 fn is_leap(y: i64) -> bool {
     (y % 4 == 0 && y % 100 != 0) || y % 400 == 0
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn open_tmp() -> (tempfile::TempDir, Database) {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Database::open(dir.path()).unwrap();
+        (dir, db)
+    }
+
+    #[test]
+    fn get_user_by_id_missing_row_is_ok_none() {
+        // A genuinely absent user must be Ok(None) (→ reconcile_pending_user Reject → 401),
+        // NOT an Err. This half must stay correct after the fix.
+        let (_d, db) = open_tmp();
+        assert!(matches!(db.get_user_by_id("nope"), Ok(None)));
+    }
+
+    #[test]
+    fn get_user_by_id_read_error_is_err_not_none() {
+        // REGRESSION GUARD (review 2026-07-31, F-DB-READ-ERR-SWALLOW): a genuine
+        // query_row error (here forced with a type-incompatible github_id so the
+        // i64 column map fails — a stand-in for any non-`QueryReturnedNoRows`
+        // failure, e.g. a transient JuiceFS/SQLite read error) must surface as
+        // Err, so auth's `reconcile_pending_user` can take its documented
+        // `Err(_) => KeepClaim` (fail-open) branch. With the old `.ok()` the error
+        // collapsed to `Ok(None)` → the row looked *deleted* → a pending user was
+        // hard-401'd on a transient blip, the OPPOSITE of the fail-open intent, and
+        // auth's `db_error_keeps_claim_fail_open_for_availability` test guarded a
+        // path the real wiring could never reach.
+        let (_d, db) = open_tmp();
+        {
+            let conn = db.conn.lock().unwrap();
+            // SQLite is dynamically typed by default, so a TEXT github_id inserts fine
+            // but breaks the `row.get::<_, i64>(1)` map at read time.
+            conn.execute(
+                "INSERT INTO users (id, github_id, github_login, role, status, created_at)
+                 VALUES ('u1', 'not-an-integer', 'u1', 'member', 'pending', '1970-01-01T00:00:00Z')",
+                [],
+            )
+            .unwrap();
+        }
+        assert!(
+            db.get_user_by_id("u1").is_err(),
+            "a non-NoRows query_row error must propagate as Err, not be swallowed to Ok(None)"
+        );
+    }
 }

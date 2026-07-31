@@ -284,10 +284,16 @@ pub fn spawn_auto_updater(cfg: AutoUpdateConfig, mgr: Weak<SessionManager>) {
                     // and `launch_swap`'s `systemctl stop` kills the whole cgroup — force-
                     // killing a scheduled run mid-flight, exactly the E1 invariant this
                     // gate exists to protect. Narrows (does not fully close) the race:
-                    // a claim landing between this read and `systemctl stop` is still
-                    // possible, but that window shrinks from seconds to microseconds.
-                    // Fail-closed on scheduled>0 OR a scheduled.db read error (same
-                    // policy as the gate). (review 2026-07-30, F-AUTOUPDATE-TOCTOU)
+                    // a claim can still land between this read and the `systemctl stop`
+                    // inside the swap script. That residual window is NOT "microseconds" —
+                    // it's the `sudo systemd-run --wait` transient-unit launch PLUS the
+                    // pre-stop `cp "$INSTALLED" "$backup"` in the script (a local-ext4 15MB
+                    // copy, ~tens of ms), i.e. tens-to-hundreds of ms. Small and rare at
+                    // the 60s scheduler cadence, but not zero; fully closing it needs a
+                    // scheduler/updater interlock (a claim-blocking "update in progress"
+                    // flag) rather than a re-sample. Fail-closed on scheduled>0 OR a
+                    // scheduled.db read error (same policy as the gate).
+                    // (review 2026-07-30 F-AUTOUPDATE-TOCTOU; window honesty 2026-07-31)
                     let recheck = m.running_summary();
                     if recheck.scheduled > 0 || recheck.scheduled_read_failed {
                         tracing::info!(

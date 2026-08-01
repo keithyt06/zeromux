@@ -415,6 +415,12 @@ async fn dispatch_frame(
     match frame {
         // Turn-complete response from session/prompt
         RpcFrame::Response { error: Some((code, msg)), .. } => {
+            // Clear any partial streamed text from THIS (failed) turn so it can't leak
+            // into the next turn's Result. The non-error arm below already takes it; this
+            // arm returned early without doing so, leaving `pending_text` populated. The
+            // next successful turn's `mem::take` would then prepend this dead turn's
+            // fragment to its reply. (review 2026-08-01)
+            let _ = std::mem::take(pending_text);
             vec![AcpEvent::Error { message: format!("RPC error {code}: {msg}") }]
         }
         RpcFrame::Response { result, .. } => {

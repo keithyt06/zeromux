@@ -71,6 +71,24 @@ export function clearAuth() {
   document.cookie = 'zeromux_jwt=;path=/;expires=Thu, 01 Jan 1970 00:00:00 GMT'
 }
 
+// Carries the HTTP status so callers can distinguish a genuine auth failure (401/403)
+// from a transient network error or 5xx. Used by the App's background poll to decide
+// logout-vs-retry: a WS client can't observe the 401 on a failed upgrade, so this REST
+// path is the one that reliably detects credential expiry / de-approval. (D-F1)
+export class ApiError extends Error {
+  status: number
+  constructor(status: number, message?: string) {
+    super(message || `HTTP ${status}`)
+    this.name = 'ApiError'
+    this.status = status
+  }
+}
+
+/** True for an auth failure that should force logout (not a transient network/5xx). */
+export function isAuthError(err: unknown): boolean {
+  return err instanceof ApiError && (err.status === 401 || err.status === 403)
+}
+
 export async function api(path: string, opts: RequestInit = {}): Promise<Response> {
   const token = getToken()
   const headers: Record<string, string> = {
@@ -109,7 +127,9 @@ export async function legacyLogin(password: string, remember?: boolean): Promise
 
 export async function listSessions(): Promise<SessionInfo[]> {
   const res = await api('/api/sessions')
-  if (!res.ok) throw new Error('Unauthorized')
+  // Throw a status-carrying error so the background poll can tell a real 401/403
+  // (→ logout) from a transient 5xx/network drop (→ keep retrying). (D-F1)
+  if (!res.ok) throw new ApiError(res.status, 'listSessions failed')
   const data = await res.json()
   return data.sessions || []
 }

@@ -236,15 +236,24 @@ async fn list_directories(
     let home = std::env::var("HOME").unwrap_or_else(|_| "/home/ubuntu".to_string());
     let base = query.path.unwrap_or_else(|| home.clone());
 
-    // Security: must be under home directory
-    let base_path = std::path::Path::new(&base).canonicalize()
-        .map_err(|e| (StatusCode::BAD_REQUEST, format!("Invalid path: {}", e)))?;
+    // Security: the directory PICKER is the one enumerator that historically did its
+    // own ad-hoc `canonicalize + starts_with($HOME)` check and never adopted the shared
+    // base guards its siblings use (`list_dir_entries`, `collect_files`, `vault_list`).
+    // That let any authed user enumerate the non-dot subdir NAMES + is_git flag inside
+    // home-level credential dirs (`?path=$HOME/.config` → gh/gcloud/rclone; `$HOME/.ssh`,
+    // `$HOME/.aws`, `$HOME/.gnupg`, `$HOME/.kube`, `$HOME/.docker`), a metadata leak of
+    // the same class as F-LISTDIR-DOTFILES (2026-07-31) / F-FILES-COLLECT-GUARD
+    // (2026-07-30). Route through the shared guards: `validate_browse_root` enforces
+    // canonicalize + under-$HOME + is-dir + reject at/inside a SENSITIVE_DIR_NAMES dir
+    // (.ssh/.aws/.gnupg/…), and `read_hits_home_dotdir` additionally refuses a
+    // home-level `~/.*` base (`.config`/`.kube`/`.docker` are NOT in SENSITIVE_DIR_NAMES).
+    // (review 2026-08-01, F-LISTDIRS-SENSITIVE-BASE)
+    let base_path = validate_browse_root(&base)?;
+    if read_hits_home_dotdir(&base_path) {
+        return Err((StatusCode::FORBIDDEN, "Access to sensitive directory denied".to_string()));
+    }
     let home_path = std::path::Path::new(&home).canonicalize()
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("Home dir error: {}", e)))?;
-
-    if !base_path.starts_with(&home_path) {
-        return Err((StatusCode::FORBIDDEN, "Access denied: path must be under home directory".to_string()));
-    }
 
     let mut entries = Vec::new();
     let read_dir = std::fs::read_dir(&base_path)
@@ -3917,6 +3926,53 @@ mod path_safety_tests {
         }
         for (j, p) in allowed.iter().enumerate() {
             assert!(!results[blocked.len() + j].1, "legitimate path must be allowed: {p:?}");
+        }
+    }
+
+    #[test]
+    fn directory_picker_base_guard_rejects_home_dotdirs_and_sensitive() {
+        // F-LISTDIRS-SENSITIVE-BASE (2026-08-01): the /api/directories picker must apply
+        // the SAME base guards its sibling enumerators do. `validate_browse_root` catches
+        // the 6 SENSITIVE_DIR_NAMES (.ssh/.aws/.gnupg/.git/.zeromux/.zeromux-worktrees),
+        // but home-level tool-credential dirs like ~/.config/~/.kube/~/.docker are NOT in
+        // that list — they are caught only by `read_hits_home_dotdir`. This pins the
+        // COMPOSITION (both guards) that `list_directories` now performs on its base.
+        let _guard = crate::session_manager::HOME_ENV_LOCK.lock().unwrap();
+        let prev = std::env::var("HOME").ok();
+        let home = std::env::temp_dir().join(format!("zmfb-dpb-{}", std::process::id()));
+        std::fs::create_dir_all(&home).unwrap();
+        let home = home.canonicalize().unwrap();
+        std::env::set_var("HOME", &home);
+
+        // Build the dirs the picker could be pointed at.
+        for d in [".config", ".ssh", ".aws", ".kube", ".docker", "proj"] {
+            std::fs::create_dir_all(home.join(d)).unwrap();
+        }
+
+        // Emulate the exact acceptance the handler performs: validate_browse_root(base)
+        // then reject a home-level dotdir base.
+        let accept = |base: &std::path::Path| -> bool {
+            match validate_browse_root(&base.to_string_lossy()) {
+                Ok(canon) => !read_hits_home_dotdir(&canon),
+                Err(_) => false,
+            }
+        };
+
+        // Sensitive (SENSITIVE_DIR_NAMES) → rejected by validate_browse_root.
+        assert!(!accept(&home.join(".ssh")), ".ssh base must be refused");
+        assert!(!accept(&home.join(".aws")), ".aws base must be refused");
+        // Home-level tool-credential dotdirs → NOT in SENSITIVE_DIR_NAMES, must be caught
+        // by read_hits_home_dotdir (this is the leg the picker previously missed).
+        assert!(!accept(&home.join(".config")), "~/.config base must be refused");
+        assert!(!accept(&home.join(".kube")), "~/.kube base must be refused");
+        assert!(!accept(&home.join(".docker")), "~/.docker base must be refused");
+        // Legitimate bases still accepted.
+        assert!(accept(&home), "$HOME base must be allowed");
+        assert!(accept(&home.join("proj")), "project dir base must be allowed");
+
+        match prev {
+            Some(h) => std::env::set_var("HOME", h),
+            None => std::env::remove_var("HOME"),
         }
     }
 

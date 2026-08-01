@@ -1,6 +1,6 @@
 import { useState, useEffect, useCallback, useMemo, useRef } from 'react'
 import type { SessionInfo, SessionType, UserInfo } from './lib/api'
-import { listSessions, createSession, deleteSession, checkAuth, legacyLogin, clearAuth, renameSession, listConfirmations, getSessionStatus } from './lib/api'
+import { listSessions, createSession, deleteSession, checkAuth, legacyLogin, clearAuth, renameSession, listConfirmations, getSessionStatus, isAuthError } from './lib/api'
 import { deepLinkView } from './lib/deeplink'
 import { resyncPush, shouldResyncNow } from './lib/push'
 import { useTheme } from './lib/theme'
@@ -83,8 +83,11 @@ export default function App() {
       // Keep the prior selection if it still resolves; otherwise pick a session,
       // then a doc tab. Doc tabs alone (0 sessions) must still get a live pane.
       setActiveId(prev => resolveActivePane(prev, list.map(s => s.id), docTabsRef.current.map(t => t.id)))
-    } catch {
-      setAuthState('unauthenticated')
+    } catch (err) {
+      // Only a real 401/403 means the session is gone — bounce to LoginPage. A
+      // transient 5xx/network error must NOT log the user out (pre-D-F1 this caught
+      // every error and could eject the user on a momentary blip). (D-F1)
+      if (isAuthError(err)) setAuthState('unauthenticated')
     }
   }, [])
 
@@ -98,7 +101,21 @@ export default function App() {
     const tick = setInterval(async () => {
       try {
         setSessions(await listSessions())
-      } catch { /* ignore transient */ }
+      } catch (err) {
+        // A WS client can't observe the 401 on a failed upgrade, so its onclose just
+        // reconnects forever. This REST poll is the reliable detector of credential
+        // expiry / de-approval: on a genuine 401/403, log out (→ LoginPage) instead of
+        // leaving every mounted pane in a silent reconnect loop against stale creds.
+        // A transient network drop / 5xx is NOT an auth failure — keep retrying. (D-F1)
+        if (isAuthError(err)) {
+          clearAuth()
+          setAuthState('unauthenticated')
+          setUser(null)
+          setSessions([])
+          setActiveId(null)
+        }
+        /* else: transient — ignore */
+      }
     }, 3000)
     return () => clearInterval(tick)
   }, [authState])

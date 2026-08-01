@@ -286,27 +286,70 @@ fn jwt_cookie_from_headers(headers: &HeaderMap) -> Option<&str> {
     None
 }
 
+/// Browser `Origin` → (lowercased host, effective port). `port_or_known_default`
+/// fills the scheme's default (https→443, http→80) when no explicit port is present.
+fn origin_authority(origin: &str) -> Option<(String, u16)> {
+    let u = url::Url::parse(origin).ok()?;
+    Some((u.host_str()?.to_ascii_lowercase(), u.port_or_known_default()?))
+}
+
+/// A `Host` header value (`host`, `host:port`, `[::1]`, `[::1]:port`) → (lowercased
+/// host, EXPLICIT port only). Parsed via a dummy `http://` URL so IPv6 brackets and
+/// ports are handled by the same normalizer as the Origin. `.port()` (not
+/// `port_or_known_default`) so a portless Host stays `None` — behind a TLS proxy the
+/// forwarded `Host` is just the public hostname and the port is implied by a scheme
+/// the backend can't observe.
+fn host_header_authority(host: &str) -> Option<(String, Option<u16>)> {
+    let u = url::Url::parse(&format!("http://{host}")).ok()?;
+    Some((u.host_str()?.to_ascii_lowercase(), u.port()))
+}
+
 /// Same-origin guard for the cookie-authenticated WS path (CSWSH defense).
 /// A `?token=` handshake is already CSRF-safe (an attacker page can't read the
 /// token), but authenticating a WS *by ambient cookie* is cross-site-forgeable, so
-/// we only accept the cookie when the `Origin` matches our own host. Requests with
-/// NO `Origin` header (native/CLI clients, same-origin non-browser callers) are
-/// allowed — browsers always send `Origin` on WS upgrades, so its absence means the
-/// caller isn't a browser being driven cross-site. An unparseable/ mismatched
-/// `Origin` is rejected. `SameSite=Lax` on the cookie is a second layer, not the
-/// only one. (review 2026-07-31, F-WS-OAUTH-COOKIE)
+/// we only accept the cookie when the browser `Origin` matches the authority the
+/// browser actually connected to. Requests with NO `Origin` header (native/CLI
+/// clients) are allowed — browsers always send `Origin` on WS upgrades, so its
+/// absence means the caller isn't a browser being driven cross-site.
+///
+/// The reference authority is the request's own `Host` header — NOT `external_url`.
+/// `external_url` defaults to the internal bind addr `http://{host}:{port}` (e.g.
+/// `http://0.0.0.0:8090`), so behind a TLS reverse proxy it never equals the browser
+/// Origin (`https://zeromux.example.com`) and every OAuth-mode WS would 401 — the
+/// exact reconnect loop F-WS-OAUTH-COOKIE set out to cure. `Host` is what the browser
+/// reached (set by the proxy), so comparing Origin↔Host is the real same-origin check
+/// and works regardless of how `external_url` is configured. Trusting `Host` here is
+/// CSWSH-safe: a cross-site page's Origin is its own host (≠ our Host), and a
+/// non-browser can forge both but carries no victim cookie. Host match is the security
+/// pivot; an explicit Host port must also match (a portless Host — the TLS-proxy case —
+/// accepts any Origin port since the public port is unobservable). `external_url` is
+/// kept ONLY as a fallback when the Host header is absent/unparseable.
+/// (review 2026-07-31 F-WS-OAUTH-COOKIE; Host-authority fix review 2026-08-01 A-F1)
 fn ws_origin_allowed(headers: &HeaderMap, external_url: &str) -> bool {
     let origin = match headers.get("Origin").and_then(|v| v.to_str().ok()) {
         None => return true, // non-browser client: no ambient-cookie CSWSH risk
         Some(o) => o,
     };
-    match (url::Url::parse(origin), url::Url::parse(external_url)) {
-        (Ok(o), Ok(ext)) => {
-            // Compare scheme-agnostic host:port authority. external_url may be
-            // http(s)://host[:port]; the browser Origin is scheme://host[:port].
-            o.host_str() == ext.host_str() && o.port_or_known_default() == ext.port_or_known_default()
+    let (o_host, o_port) = match origin_authority(origin) {
+        Some(a) => a,
+        None => return false, // unparseable Origin → refuse the cookie path (fail closed)
+    };
+    // Primary: match against the request's own Host header.
+    if let Some((h_host, h_port)) = headers
+        .get("Host")
+        .and_then(|v| v.to_str().ok())
+        .and_then(host_header_authority)
+    {
+        let port_ok = h_port.map_or(true, |p| p == o_port);
+        return o_host == h_host && port_ok;
+    }
+    // Fallback (no usable Host): compare against configured external_url.
+    match url::Url::parse(external_url) {
+        Ok(ext) => {
+            ext.host_str().map(|h| h.to_ascii_lowercase()) == Some(o_host)
+                && ext.port_or_known_default() == Some(o_port)
         }
-        _ => false, // can't verify → refuse the cookie path (fail closed)
+        _ => false, // can't verify → fail closed
     }
 }
 
@@ -438,5 +481,74 @@ mod tests {
     fn ws_origin_unparseable_rejected_fail_closed() {
         let h = headers_with(&[("Origin", "not-a-url")]);
         assert!(!ws_origin_allowed(&h, "https://zeromux.example.com"));
+    }
+
+    // ── A-F1: Host-header authority is the primary CSWSH oracle ──
+
+    #[test]
+    fn ws_origin_matches_host_behind_tls_proxy_ignoring_external_url_default() {
+        // THE regression this fixes: external_url is left at the internal bind default
+        // (`http://0.0.0.0:8090`), the site is TLS-fronted. The browser Origin is
+        // `https://zeromux.example.com` (implicit :443) and the proxy forwards
+        // `Host: zeromux.example.com` (no explicit port). Pre-fix this compared Origin
+        // to external_url → host+port mismatch → cookie refused → OAuth WS 401 loop.
+        // Post-fix: Origin host == Host host, portless Host accepts any Origin port.
+        let h = headers_with(&[
+            ("Origin", "https://zeromux.example.com"),
+            ("Host", "zeromux.example.com"),
+        ]);
+        assert!(ws_origin_allowed(&h, "http://0.0.0.0:8090"));
+    }
+
+    #[test]
+    fn ws_origin_host_mismatch_rejected() {
+        // Cross-site page: its Origin is its own host, but it connects to our Host.
+        let h = headers_with(&[
+            ("Origin", "https://evil.example.com"),
+            ("Host", "zeromux.example.com"),
+        ]);
+        assert!(!ws_origin_allowed(&h, "http://0.0.0.0:8090"));
+    }
+
+    #[test]
+    fn ws_origin_host_explicit_port_must_match() {
+        // A Host WITH an explicit port pins the port: same host, wrong Origin port → reject.
+        let matched = headers_with(&[
+            ("Origin", "http://localhost:8090"),
+            ("Host", "localhost:8090"),
+        ]);
+        assert!(ws_origin_allowed(&matched, "http://0.0.0.0:8090"));
+        let mismatched = headers_with(&[
+            ("Origin", "http://localhost:9999"),
+            ("Host", "localhost:8090"),
+        ]);
+        assert!(!ws_origin_allowed(&mismatched, "http://0.0.0.0:8090"));
+    }
+
+    #[test]
+    fn ws_origin_host_case_insensitive() {
+        let h = headers_with(&[
+            ("Origin", "https://ZeroMux.Example.COM"),
+            ("Host", "zeromux.example.com"),
+        ]);
+        assert!(ws_origin_allowed(&h, "http://0.0.0.0:8090"));
+    }
+
+    #[test]
+    fn ws_origin_ipv6_host_matches() {
+        let h = headers_with(&[
+            ("Origin", "http://[::1]:8090"),
+            ("Host", "[::1]:8090"),
+        ]);
+        assert!(ws_origin_allowed(&h, "http://0.0.0.0:8090"));
+    }
+
+    #[test]
+    fn ws_origin_falls_back_to_external_url_when_host_absent() {
+        // No Host header (unusual, but defensive): compare against external_url.
+        let ok = headers_with(&[("Origin", "https://zeromux.example.com")]);
+        assert!(ws_origin_allowed(&ok, "https://zeromux.example.com"));
+        let bad = headers_with(&[("Origin", "https://evil.example.com")]);
+        assert!(!ws_origin_allowed(&bad, "https://zeromux.example.com"));
     }
 }

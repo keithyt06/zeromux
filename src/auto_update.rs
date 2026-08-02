@@ -20,6 +20,31 @@ pub struct AutoUpdateConfig {
     pub health_url: String,      // http://127.0.0.1:<port>/
     pub max_wait_secs: u64,      // --auto-update-max-wait
     pub poll_secs: u64,          // 固定 POLL_SECS(非 flag,设计如此)
+    pub failed_marker_path: PathBuf, // 持久化的 health-fail 标记(见 F1 说明)
+}
+
+/// health-fail 标记的 TTL(秒)。标记过期后允许重试同一 sha(可能只是瞬时 FS
+/// 慢/网络抖动导致的健康检查失败,不该永久放弃)。6 小时:足够长以避免 reflap
+/// 风暴,又不至于把一个后来变好的环境永久挡住。
+const HEALTH_FAIL_TTL_SECS: u64 = 6 * 3600;
+
+/// 解析 swap 脚本写下的 health-fail 标记 `"<sha> <unix_ts>"`。格式不符 → None。
+fn parse_failed_marker(contents: &str) -> Option<(String, u64)> {
+    let mut it = contents.split_whitespace();
+    let sha = it.next()?.to_string();
+    let ts: u64 = it.next()?.parse().ok()?;
+    Some((sha, ts))
+}
+
+/// 纯函数:给定标记内容、候选 sha、当前时间、TTL,判断是否应跳过本候选。
+/// 仅当「标记的 sha == 候选 sha」且「标记未过期」才跳过。sha 不同(运维换了
+/// build)或标记过期都不跳过 —— 否则一个修好/换掉的 build 会被旧失败永久挡住
+/// (codex 强调的回归风险)。(F1, review 2026-08-02)
+fn health_failed_recently(marker: Option<&str>, candidate_sha: &str, now: u64, ttl: u64) -> bool {
+    match marker.and_then(parse_failed_marker) {
+        Some((sha, ts)) => sha == candidate_sha && now.saturating_sub(ts) < ttl,
+        None => false,
+    }
 }
 
 /// 轮询间隔(秒)。刻意非 flag:30s 延迟对升级场景无所谓,见 spec。
@@ -113,20 +138,33 @@ fn gate_decision(summary: RunningSummary, waited_secs: u64, max_wait_secs: u64) 
 
 /// 渲染内嵌 swap 脚本(评审 E3 backup 轮转 + 复刻 deploy.sh do_swap)。
 /// 经 `bash -c` 内联传入,不落临时文件(评审 E8)。
-fn render_swap_script(cfg: &AutoUpdateConfig) -> String {
+///
+/// F1 (review 2026-08-02) — 两处改动修「health-fail → 永久 reflap」:
+/// 1. 健康窗口从 10s 拉宽到 40s:此部署跑在 JuiceFS/S3 上,冷启动 ~24s(见
+///    juicefs-startup-slow-rootcause),旧的 10s 窗口连一个**好的**慢启动 build 都
+///    会 health-fail → rollback。40s 覆盖冷启动仍留余量。
+/// 2. rollback 路径把「失败的候选 sha + 当前时间戳」写进持久标记文件。swap 的
+///    `systemctl stop` 会连同 auto-updater 自身一起杀掉,rollback 拉起的旧实例
+///    带着**全新**内存态(smoke_failed_sha=None)重新上电,会对同一个失败 build
+///    再试一次 → 无限 stop/swap/health-fail/rollback 风暴。标记由脚本(而非被杀的
+///    Rust 进程)写下,故能跨自杀存活,重启后的循环读到它即跳过该 sha。TTL + sha
+///    变化都会让标记失效,故修好/换掉的 build 绝不被永久挡住(codex 的回归提醒)。
+fn render_swap_script(cfg: &AutoUpdateConfig, candidate_sha: &str) -> String {
     format!(
         r#"set -euo pipefail
 SERVICE="{service}"
 INSTALLED="{installed}"
 HEALTH="{health}"
 BUILT="{built}"
+MARKER="{marker}"
+FAILED_SHA="{sha}"
 backup="${{INSTALLED}}.bak-$(date +%Y%m%d-%H%M%S)"
 cp "$INSTALLED" "$backup"
 ls -1t "${{INSTALLED}}".bak-* 2>/dev/null | tail -n +4 | xargs -r rm -f
 systemctl stop "$SERVICE"
 cp "$BUILT" "$INSTALLED"
 systemctl start "$SERVICE"
-for _ in $(seq 1 10); do
+for _ in $(seq 1 40); do
   code="$(curl -s -o /dev/null -w '%{{http_code}}' "$HEALTH" || true)"
   [ "$code" = "200" ] && exit 0
   sleep 1
@@ -134,12 +172,16 @@ done
 systemctl stop "$SERVICE"
 cp "$backup" "$INSTALLED"
 systemctl start "$SERVICE"
+mkdir -p "$(dirname "$MARKER")" 2>/dev/null || true
+echo "$FAILED_SHA $(date +%s)" > "$MARKER" || true
 exit 1
 "#,
         service = cfg.service_name,
         installed = cfg.installed_path.display(),
         health = cfg.health_url,
         built = cfg.watch_path.display(),
+        marker = cfg.failed_marker_path.display(),
+        sha = candidate_sha,
     )
 }
 
@@ -215,6 +257,25 @@ pub fn spawn_auto_updater(cfg: AutoUpdateConfig, mgr: Weak<SessionManager>) {
             // 坏 build 已冒烟失败过:静默跳过,直到文件被换掉(sha 变)。避免稳定
             // 文件每轮 Proceed 造成的重复冒烟 + 日志刷屏。
             if smoke_failed_sha.as_deref() == Some(sha.as_str()) {
+                continue;
+            }
+
+            // 持久 health-fail 标记(F1, review 2026-08-02):swap 脚本在健康检查失败
+            // 回滚时写下「失败 sha + 时间戳」。这条 in-memory smoke_failed_sha 无法覆盖
+            // 的场景——swap 的 systemctl stop 杀掉本进程后,回滚拉起的实例内存态全新——
+            // 靠这个文件跨自杀存活。同一 sha 且未过 TTL 才跳过;sha 变(换了 build)或
+            // 标记过期都会重试,故修好的 build 不被永久挡住。
+            let now_secs = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs())
+                .unwrap_or(0);
+            let marker = std::fs::read_to_string(&cfg.failed_marker_path).ok();
+            if health_failed_recently(marker.as_deref(), &sha, now_secs, HEALTH_FAIL_TTL_SECS) {
+                tracing::warn!(
+                    "auto-update: build sha={} recently failed post-swap health check (within {}h TTL), skipping to avoid reflap; replace the build or wait out the TTL",
+                    &sha[..8.min(sha.len())], HEALTH_FAIL_TTL_SECS / 3600
+                );
+                pending_since = None;
                 continue;
             }
 
@@ -303,7 +364,7 @@ pub fn spawn_auto_updater(cfg: AutoUpdateConfig, mgr: Weak<SessionManager>) {
                         continue;
                     }
                     tracing::info!("auto-update: upgradeable, launching swap via systemd-run");
-                    let script = render_swap_script(&cfg);
+                    let script = render_swap_script(&cfg, &sha);
                     launch_swap(&script).await;
                     // 到这里通常本进程已被 systemctl stop;若 systemd-run 返回了(swap 失败
                     // 但服务被 rollback 拉起),下一轮 tick 从头重试。
@@ -441,8 +502,9 @@ mod tests {
             health_url: "http://127.0.0.1:8090/".into(),
             max_wait_secs: 600,
             poll_secs: 30,
+            failed_marker_path: "/home/ubuntu/.zeromux/autoupdate-failed".into(),
         };
-        let s = render_swap_script(&cfg);
+        let s = render_swap_script(&cfg, "testsha");
         assert!(s.contains("SERVICE=\"zeromux\""));
         assert!(s.contains("INSTALLED=\"/usr/local/bin/zeromux\""));
         assert!(s.contains("HEALTH=\"http://127.0.0.1:8090/\""));
@@ -451,7 +513,84 @@ mod tests {
         assert!(s.contains("tail -n +4"), "must keep only newest 3 backups");
         // rollback 路径存在
         assert!(s.contains("cp \"$backup\" \"$INSTALLED\""));
-        // health-check 重试循环
-        assert!(s.contains("seq 1 10"));
+        // health-check 重试循环:窗口必须 ≥ JuiceFS 冷启动(~24s),否则慢启动的
+        // 好 build 也会 health-fail → rollback → 永久 reflap(F1, review 2026-08-02)。
+        assert!(s.contains("seq 1 40"), "health window must cover ~24s JuiceFS cold start");
+    }
+
+    // ── F1 (review 2026-08-02): persisted per-sha health-fail marker ──
+    // The swap's `systemctl stop` kills the auto-updater itself, so the restarted
+    // (rolled-back) instance re-arms with FRESH in-memory state (smoke_failed_sha=None)
+    // and re-attempts the SAME failing build → perpetual stop/swap/health-fail/rollback
+    // flap. The fix persists a marker FROM THE SWAP SCRIPT (which survives the self-kill)
+    // and skips a candidate whose sha matches a recent failure. TTL + sha-change both
+    // clear it so a fixed/replaced build is never permanently stranded (codex's flag).
+
+    #[test]
+    fn parse_failed_marker_parses_sha_and_ts() {
+        assert_eq!(parse_failed_marker("deadbeef 1730000000\n"),
+            Some(("deadbeef".to_string(), 1730000000)));
+        assert_eq!(parse_failed_marker("  cafe  1700\n"), Some(("cafe".to_string(), 1700)));
+        assert_eq!(parse_failed_marker(""), None);
+        assert_eq!(parse_failed_marker("only-sha"), None);
+        assert_eq!(parse_failed_marker("sha not-a-number"), None);
+    }
+
+    #[test]
+    fn health_failed_recently_skips_same_sha_within_ttl() {
+        let ttl = 21600; // 6h
+        let now = 1_000_000u64;
+        // Same sha, marker 1h ago (< TTL) → skip (don't re-flap).
+        let recent = format!("abc {}", now - 3600);
+        assert!(health_failed_recently(Some(&recent), "abc", now, ttl));
+    }
+
+    #[test]
+    fn health_failed_recently_ignores_expired_marker() {
+        let ttl = 21600;
+        let now = 1_000_000u64;
+        // Same sha but marker 7h ago (> TTL) → don't skip (retry, maybe transient/FS).
+        let old = format!("abc {}", now - 7 * 3600);
+        assert!(!health_failed_recently(Some(&old), "abc", now, ttl));
+    }
+
+    #[test]
+    fn health_failed_recently_ignores_different_sha() {
+        let ttl = 21600;
+        let now = 1_000_000u64;
+        // Operator replaced the build (sha changed) → marker is stale, don't skip —
+        // else a fixed build would be permanently stranded behind the old failure.
+        let other = format!("OLD-sha {}", now - 60);
+        assert!(!health_failed_recently(Some(&other), "NEW-sha", now, ttl));
+    }
+
+    #[test]
+    fn health_failed_recently_no_marker_never_skips() {
+        assert!(!health_failed_recently(None, "abc", 1_000_000, 21600));
+        assert!(!health_failed_recently(Some("garbage"), "abc", 1_000_000, 21600));
+    }
+
+    #[test]
+    fn swap_script_writes_health_fail_marker_on_rollback() {
+        let cfg = AutoUpdateConfig {
+            watch_path: "/home/ubuntu/rel/zeromux".into(),
+            installed_path: "/usr/local/bin/zeromux".into(),
+            service_name: "zeromux".into(),
+            health_url: "http://127.0.0.1:8090/".into(),
+            max_wait_secs: 600,
+            poll_secs: 30,
+            failed_marker_path: "/home/ubuntu/.zeromux/autoupdate-failed".into(),
+        };
+        let s = render_swap_script(&cfg, "deadbeefsha");
+        // The candidate sha and marker path are interpolated…
+        assert!(s.contains("FAILED_SHA=\"deadbeefsha\""));
+        assert!(s.contains("MARKER=\"/home/ubuntu/.zeromux/autoupdate-failed\""));
+        // …and the marker is written ONLY on the rollback (health-fail) path, before
+        // `exit 1`, so the rolled-back-then-restarted updater can read it and not re-flap.
+        assert!(s.contains("$FAILED_SHA $(date +%s)"), "marker must record sha + timestamp");
+        // The success path (`exit 0`) must NOT write the marker.
+        let success_idx = s.find("exit 0").unwrap();
+        let marker_idx = s.find("> \"$MARKER\"").unwrap();
+        assert!(marker_idx > success_idx, "marker write must be on the post-health-loop rollback path");
     }
 }

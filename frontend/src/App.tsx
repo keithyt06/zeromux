@@ -60,17 +60,26 @@ export default function App() {
   const [confirmCount, setConfirmCount] = useState(0)
 
   const initAuth = useCallback(async () => {
-    const me = await checkAuth()
-    if (me) {
-      setUser(me)
-      if (me.status === 'active') {
-        setAuthState('active')
-        loadSessions()
+    try {
+      const me = await checkAuth()
+      if (me) {
+        setUser(me)
+        if (me.status === 'active') {
+          setAuthState('active')
+          loadSessions()
+        } else {
+          setAuthState('pending')
+        }
       } else {
-        setAuthState('pending')
+        // Genuine 401/403 → not authenticated.
+        setAuthState('unauthenticated')
       }
-    } else {
-      setAuthState('unauthenticated')
+    } catch {
+      // Transient (5xx / network drop) at startup — e.g. a reload during the deploy
+      // window (502/503) with a perfectly valid token. Do NOT eject to LoginPage;
+      // stay in 'loading' (blank splash) and retry shortly. Only a real 401/403 (the
+      // null branch above) means logged out. Mirrors the D-F1 fail-open poll. (F2)
+      setTimeout(() => { initAuth() }, 2000)
     }
   }, [])
 

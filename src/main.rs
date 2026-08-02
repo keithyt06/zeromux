@@ -431,6 +431,10 @@ async fn main() {
             health_url: format!("http://127.0.0.1:{}/", args.port),
             max_wait_secs: args.auto_update_max_wait,
             poll_secs: auto_update::POLL_SECS,
+            // Persisted health-fail marker under data_dir — written BY the swap script
+            // (which survives the swap's self-kill) so a rolled-back build isn't
+            // re-attempted every restart. (F1, review 2026-08-02)
+            failed_marker_path: std::path::Path::new(&data_dir_str).join("autoupdate-failed"),
         };
         auto_update::spawn_auto_updater(cfg, Arc::downgrade(&state.sessions));
     }

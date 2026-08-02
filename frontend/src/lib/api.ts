@@ -190,14 +190,17 @@ export async function deleteSession(id: string): Promise<void> {
   await api(`/api/sessions/${id}`, { method: 'DELETE' })
 }
 
+// Returns the user on 200, null on a genuine 401/403 (not authenticated), and THROWS
+// (ApiError for a 5xx, the original error for a network drop) on anything transient.
+// initAuth uses this to keep startup fail-OPEN: a reload during the deploy window
+// (502/503) or a momentary network blip must NOT eject a validly-authed user to the
+// login page — only a real 401/403 should. This mirrors the D-F1 hardening already
+// applied to the running poll (listSessions). (review 2026-08-02, F2)
 export async function checkAuth(): Promise<UserInfo | null> {
-  try {
-    const res = await api('/api/me')
-    if (!res.ok) return null
-    return res.json()
-  } catch {
-    return null
-  }
+  const res = await api('/api/me')
+  if (res.status === 401 || res.status === 403) return null
+  if (!res.ok) throw new ApiError(res.status, 'checkAuth failed')
+  return res.json()
 }
 
 // Admin APIs

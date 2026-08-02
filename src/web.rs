@@ -1152,6 +1152,14 @@ fn is_credential_path(name: &str) -> bool {
         || n.ends_with(".pfx") || n.ends_with(".jks") || n.ends_with(".keystore")
         || n.ends_with(".p8") || n.ends_with(".ppk")
         || n.ends_with("credentials")
+        // Terraform state/vars + Docker registry auth (review 2026-08-02, F3). These are
+        // non-`.env` NAMES that survive the dot-skip and carry RESOLVED plaintext secrets:
+        // *.tfstate(.backup) embeds provider DB passwords / cloud access keys; *.tfvars
+        // (+ .json) frequently hold the same; .dockercfg is a base64 registry token. The
+        // `.tf` SOURCE is deliberately NOT listed (it's infra code, not resolved secrets).
+        || n.ends_with(".tfstate") || n.ends_with(".tfstate.backup")
+        || n.ends_with(".tfvars") || n.ends_with(".tfvars.json")
+        || n == ".dockercfg"
 }
 
 /// The single denylist of control / credential directory names. READ and WRITE
@@ -1516,21 +1524,13 @@ async fn write_session_file(
     let base = resolve_base_dir(&state, &id, None)?;
 
     // The parent directory must already exist (we do not implicitly create
-    // client-named directory trees). Resolve + verify the real parent is under base,
-    // then write the leaf file inside it.
-    let rel = std::path::Path::new(&req.path);
-    let file_name = rel
-        .file_name()
-        .and_then(|s| s.to_str())
-        .ok_or((StatusCode::BAD_REQUEST, "Invalid file path".to_string()))?;
-    let parent_rel = rel.parent().map(|p| p.to_string_lossy().into_owned()).unwrap_or_default();
-    let real_parent = resolve_and_verify(&base, &parent_rel)?;
-
-    if is_write_blocked(&base, &real_parent) {
-        return Err((StatusCode::FORBIDDEN, "Writes to control directories denied".to_string()));
-    }
-
-    let file_path = real_parent.join(file_name);
+    // client-named directory trees). Route through the shared `resolve_write_target`
+    // (same as rename/mkdir/upload) so the write-block guard applies to the resolved
+    // TARGET, not just its parent. Pre-fix this checked `is_write_blocked` on the parent
+    // only, so `path=".git"` at the base root (parent == base, not blocked) wrote a
+    // regular file named `.git`/`.aws`/`.zeromux` — a parity gap vs the other write
+    // handlers. (review 2026-08-02, F4)
+    let file_path = resolve_write_target(&base, &req.path)?;
 
     // Refuse to follow an existing symlink leaf out of the workspace (the parent is
     // verified under base, but the leaf name itself could be a symlink). Reads use
@@ -3412,6 +3412,12 @@ mod path_safety_tests {
         // (e.g. rename a dir TO ".git", or mkdir ".aws").
         assert!(resolve_write_target(&base_c, "sub/.git").is_err());
         assert!(resolve_write_target(&base_c, ".aws").is_err());
+        // F4 (review 2026-08-02): a control-named leaf AT THE BASE ROOT (parent == base,
+        // the case write_session_file previously mis-handled by checking is_write_blocked
+        // on the parent only) must also be refused — resolve_write_target checks the
+        // resolved TARGET, so folding write_session_file onto it closes the parity gap.
+        assert!(resolve_write_target(&base_c, ".git").is_err());
+        assert!(resolve_write_target(&base_c, ".zeromux").is_err());
     }
 
     #[test]
@@ -3452,6 +3458,30 @@ mod path_safety_tests {
         // (The matching PRIVATE key is caught by .key/.pem/.p12/.pfx/.jks above.)
         for n in ["server.crt", "ca.cert", "README.md"] {
             assert!(!is_credential_path(n), "{n} must NOT be flagged (public/non-secret)");
+        }
+    }
+
+    #[test]
+    fn credential_leaf_covers_terraform_state_and_docker_cfg() {
+        // Coverage gap (review 2026-08-02, F3): the denylist missed Terraform state /
+        // vars and the Docker registry-auth dotfile — all non-`.env`-named files whose
+        // committed contents leak verbatim through EVERY read path that derives from
+        // this predicate (list_dir, get_file_raw, git_show, git_worktree). A
+        // `terraform.tfstate` stores RESOLVED provider secrets (DB passwords, cloud
+        // access keys) in cleartext, and `.dockercfg`/`config.json` under `.docker`
+        // holds a base64 registry token — the same "unambiguous plaintext secret"
+        // class the reviewers already accepted for `.env`.
+        for n in [
+            "terraform.tfstate", "terraform.tfstate.backup", "prod.tfstate",
+            "secrets.tfvars", "prod.auto.tfvars", "vars.tfvars.json",
+            ".dockercfg", "MAIN.TFSTATE", // case-insensitive
+        ] {
+            assert!(is_credential_path(n), "{n} must be flagged as a credential leaf");
+        }
+        // Terraform SOURCE (.tf) is config, not resolved secrets — must stay browsable
+        // (over-blocking it would hide ordinary infra code from list_dir/diffs).
+        for n in ["main.tf", "variables.tf", "outputs.tf"] {
+            assert!(!is_credential_path(n), "{n} is Terraform source, must NOT be flagged");
         }
     }
 

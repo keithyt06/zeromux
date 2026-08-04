@@ -9,7 +9,7 @@ import { applyPreset } from '../lib/applyPreset'
 import { buildPromptWithAttachments } from '../lib/attachments'
 import { RunMetricsPanel } from './RunMetricsPanel'
 import { SessionLifetimeBadge } from './SessionLifetimeBadge'
-import { foldTranscript, type WireEvent, type Block, type TurnGroup } from '../lib/transcript'
+import { foldTranscript, stabilizeGroups, type WireEvent, type Block, type TurnGroup } from '../lib/transcript'
 import { partitionBlocks, type Density } from '../lib/density'
 import { STUCK_SILENCE_MS, shouldSeedTurnClock } from '../lib/stuck'
 import { shouldStickToBottom, shouldAutoScrollOnAppend, shouldTrackScrollUp } from '../lib/scrollReplay'
@@ -81,7 +81,22 @@ export default function AcpChatView({ sessionId, agentType = 'claude', onRegiste
   // hide the local optimistic bubble). It's used only by the WS handler to
   // decide append-vs-replace for the server echo of a prompt we inserted.
   const seenClientIds = useRef<Set<string>>(new Set())
-  const groups = useMemo(() => foldTranscript(events), [events])
+  // Fold events → turn groups, then reconcile object identity against the previously
+  // rendered list so already-finished turns keep their identity and the TurnGroupView
+  // React.memo actually skips them. Without this, foldTranscript allocates fresh group
+  // objects every call, so every prior turn re-parsed its markdown on each streamed
+  // delta of the current turn — O(N²), visible lag on a long session. Reading + writing
+  // a ref inside this useMemo is React's documented memoization-cache exception ("it's
+  // fine to read or write a ref during render if you're implementing memoization"); the
+  // write is idempotent per distinct `events`. (review 2026-08-03, F-perf)
+  const prevGroupsRef = useRef<TurnGroup[]>([])
+  const groups = useMemo(() => {
+    // eslint-disable-next-line react-hooks/refs -- memoization cache (see note above)
+    const stable = stabilizeGroups(prevGroupsRef.current, foldTranscript(events))
+    // eslint-disable-next-line react-hooks/refs -- memoization cache (see note above)
+    prevGroupsRef.current = stable
+    return stable
+  }, [events])
   const [notices, setNotices] = useState<Notice[]>([])
   const [input, setInput] = useState('')
   const presetStore = usePromptPresets()
@@ -96,6 +111,12 @@ export default function AcpChatView({ sessionId, agentType = 'claude', onRegiste
   // 合并 turn 发出(下一个 Running)或 turn 结束时清零。
   const [queuedCount, setQueuedCount] = useState(0)
   const [turnStartedMs, setTurnStartedMs] = useState<number | null>(null)
+  // Latest turn_id observed on a user_prompt / content_block, so a terminal
+  // `error`/`exit` (which carry NO turn_id on the wire) can settle THAT turn's
+  // group to complete. Without it the last turn of an errored/exited run stays
+  // `complete:false` forever → streaming-markdown sanitizer appends a phantom
+  // closing fence and `thinking` blocks stay force-expanded. (review 2026-08-03, F4)
+  const activeTurnIdRef = useRef<number | null>(null)
   // Timestamp of the last streamed agent output. "Stuck" is silence-based:
   // a turn is stuck only when running AND no output has arrived for a while,
   // not merely when the turn has run long. Stamped on content_block.
@@ -184,6 +205,17 @@ export default function AcpChatView({ sessionId, agentType = 'claude', onRegiste
     scrollBottom(force)
   }, [scrollBottom])
 
+  // Mark the in-flight turn's group complete when a turn ends via error/exit rather
+  // than a clean `result`. Injects an empty synthetic `result` for the last observed
+  // turn_id (empty text → foldTranscript sets complete without appending). No-op if no
+  // turn is active or one already settled. (review 2026-08-03, F4)
+  const settleActiveTurn = useCallback(() => {
+    const tid = activeTurnIdRef.current
+    if (tid == null) return
+    activeTurnIdRef.current = null
+    setEvents(prev => [...prev, { type: 'result', turn_id: tid, text: '' }])
+  }, [])
+
   useEffect(() => {
     let disposed = false
     let retryTimer: ReturnType<typeof setTimeout> | undefined
@@ -200,6 +232,7 @@ export default function AcpChatView({ sessionId, agentType = 'claude', onRegiste
         // avoid duplicating already-rendered messages. Matches page-reload behavior.
         setEvents([])
         seenClientIds.current.clear()
+        activeTurnIdRef.current = null
         setNotices([])
         setBusy(false)
         setTurnStartedMs(null)
@@ -288,6 +321,11 @@ export default function AcpChatView({ sessionId, agentType = 'claude', onRegiste
       }
 
       case 'user_prompt': {
+        // Track the authoritative turn_id so an IMMEDIATE error/exit (before any
+        // content_block streams) can still settle this turn's group. (F4)
+        if (typeof evt.turn_id === 'number' && evt.turn_id !== Number.MAX_SAFE_INTEGER) {
+          activeTurnIdRef.current = evt.turn_id
+        }
         // 服务器回显。若 client_id 已是本端乐观插入(seen),不重复 append;改为把
         // 那条乐观事件的 turn_id 替换为权威值(乐观插入用 MAX_SAFE_INTEGER 让其
         // 暂排在最后,真实 turn_id 到达后归位,与对应助手 turn 对齐)。
@@ -306,6 +344,7 @@ export default function AcpChatView({ sessionId, agentType = 'claude', onRegiste
       }
 
       case 'content_block': {
+        if (typeof evt.turn_id === 'number') activeTurnIdRef.current = evt.turn_id
         appendEvent(evt as unknown as WireEvent)
         // NB: do NOT clear the collect hint here — content_block belongs to the
         // still-running turn (its own output), and the merged turn can only start
@@ -330,6 +369,7 @@ export default function AcpChatView({ sessionId, agentType = 'claude', onRegiste
       }
 
       case 'result': {
+        activeTurnIdRef.current = null
         appendEvent(evt as unknown as WireEvent)
         setBusy(false)
         setTurnStartedMs(null)
@@ -341,6 +381,12 @@ export default function AcpChatView({ sessionId, agentType = 'claude', onRegiste
       }
 
       case 'error': {
+        // Settle the in-flight turn's group to complete: a terminal error carries no
+        // turn_id, so synthesize an empty `result` for the last observed turn. Empty
+        // text means foldTranscript sets complete=true WITHOUT appending any block
+        // (its `if (finalText)` guard), so the group's markdown stops streaming-
+        // sanitizing (no phantom fence) and thinking blocks collapse. (review 2026-08-03, F4)
+        settleActiveTurn()
         pushNotice({ id: newId(), kind: 'error', text: evt.message || 'Unknown error' })
         setBusy(false)
         setTurnStartedMs(null)
@@ -352,6 +398,8 @@ export default function AcpChatView({ sessionId, agentType = 'claude', onRegiste
       }
 
       case 'exit': {
+        // Same as error: settle the in-flight turn before the process-exit notice.
+        settleActiveTurn()
         pushNotice({ id: newId(), kind: 'system', text: `Process exited (code: ${evt.code || 0})` })
         setBusy(false)
         setTurnStartedMs(null)
@@ -430,7 +478,7 @@ export default function AcpChatView({ sessionId, agentType = 'claude', onRegiste
         break
       }
     }
-  }, [pushNotice, appendEvent, bumpMetrics, adoptQueueMode])
+  }, [pushNotice, appendEvent, bumpMetrics, adoptQueueMode, settleActiveTurn])
 
   // Composer 已 trim 且非空才回调；后端 fan-out 会在重发前自动打断在途轮次，
   // 前端只需发 prompt。

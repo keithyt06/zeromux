@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useCallback } from 'react'
+import React, { useState, useEffect, useCallback, useRef } from 'react'
 import { getGitLog, getGitShow, getGitWorktree, getSessionStatus } from '../lib/api'
 import type { GitCommit, GitFileChange, GitGraphEntry, WorktreeFile } from '../lib/api'
 import { GitCommit as GitCommitIcon, RefreshCw, FileText, User, Calendar } from 'lucide-react'
@@ -32,6 +32,12 @@ export default function GitViewer({ sessionId, onForward }: Props) {
   const [error, setError] = useState<string | null>(null)
 
   const [selectedHash, setSelectedHash] = useState<string | null>(null)
+  // Mirror of selectedHash for loadLog to read WITHOUT taking it as a dep — adding it
+  // to loadLog's deps would re-fire the mount effect (and re-fetch the log) on every
+  // commit click. loadLog is [sessionId]-stable, so it captured the initial null and
+  // the auto-select guard `!selectedHash` was always true; clicking Refresh after
+  // selecting a commit jumped the diff back to the newest commit. (review 2026-08-03, F3)
+  const selectedHashRef = useRef<string | null>(null)
   const [diff, setDiff] = useState<string>('')
   const [files, setFiles] = useState<GitFileChange[]>([])
   const [commitMeta, setCommitMeta] = useState<GitCommit | null>(null)
@@ -48,9 +54,10 @@ export default function GitViewer({ sessionId, onForward }: Props) {
       const data = await getGitLog(sessionId, 200)
       setEntries(data.entries)
       setTotal(data.total)
-      // Auto-select first commit
+      // Auto-select first commit only when nothing is selected yet (read the live
+      // value via ref, not the stale captured `selectedHash`).
       const firstCommit = data.entries.find(e => e.commit)?.commit
-      if (firstCommit && !selectedHash) {
+      if (firstCommit && !selectedHashRef.current) {
         selectCommit(firstCommit.hash)
       }
     } catch (e: any) {
@@ -61,6 +68,7 @@ export default function GitViewer({ sessionId, onForward }: Props) {
 
   const selectCommit = async (hash: string) => {
     setSelectedHash(hash)
+    selectedHashRef.current = hash
     setLoadingDiff(true)
     try {
       const data = await getGitShow(sessionId, hash)

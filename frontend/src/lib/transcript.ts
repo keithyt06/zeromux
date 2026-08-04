@@ -122,3 +122,45 @@ export function foldTranscript(
   // raw event interleaving.
   return order.sort((a, b) => a - b).map(tid => byTurn.get(tid)!)
 }
+
+/// Shallow structural signature of a folded turn — cheap to compute, changes iff the
+/// rendered content of the turn changes. Used to preserve object identity across
+/// re-folds (see `stabilizeGroups`).
+function groupSignature(g: TurnGroup): string {
+  // blocks: type + text length (streaming appends grow the last block's text) +
+  // tool summary; userPrompts count/text; complete flag. Deliberately does NOT hash
+  // full text (a completed turn's blocks are frozen, so length+type is a faithful
+  // fingerprint and O(blocks) beats O(chars)).
+  const blocks = g.blocks
+    .map(b => `${b.type}:${(b.text ?? '').length}:${b.summary ?? ''}:${b.name ?? ''}`)
+    .join('|')
+  const prompts = g.userPrompts.map(p => p.text).join('')
+  return `${g.complete ? 1 : 0}#${g.cost ?? ''}#${prompts}#${blocks}`
+}
+
+/// Reconcile a freshly-folded group list against the previous render's list, REUSING
+/// the prior object identity for any turn whose structural signature is unchanged.
+///
+/// `foldTranscript` allocates brand-new `TurnGroup` objects on every call, so the
+/// `TurnGroupView` `React.memo` comparator (`prev.group === next.group`) was
+/// dead-by-construction: every already-finished turn re-rendered — and its
+/// `MarkdownContent` re-parsed — on every streamed delta of the CURRENT turn (O(N²)
+/// over a long streaming reply, felt as lag on a phone). Preserving identity for
+/// unchanged turns makes the memo effective: only the actively-streaming turn (whose
+/// signature changes) gets a new object and re-renders. Pure + order-preserving.
+/// (review 2026-08-03, F-perf)
+export function stabilizeGroups(prev: TurnGroup[], next: TurnGroup[]): TurnGroup[] {
+  const prevById = new Map<number, TurnGroup>()
+  const prevSig = new Map<number, string>()
+  for (const g of prev) {
+    prevById.set(g.turnId, g)
+    prevSig.set(g.turnId, groupSignature(g))
+  }
+  return next.map(g => {
+    const old = prevById.get(g.turnId)
+    if (old && prevSig.get(g.turnId) === groupSignature(g)) {
+      return old // unchanged turn → keep identity so React.memo skips it
+    }
+    return g
+  })
+}

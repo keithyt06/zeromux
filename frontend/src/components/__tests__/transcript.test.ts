@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest'
-import { foldTranscript, type WireEvent } from '../../lib/transcript'
+import { foldTranscript, stabilizeGroups, type WireEvent } from '../../lib/transcript'
 
 describe('foldTranscript — turn grouping (T1)', () => {
   it('keeps a streaming turn together when a new prompt arrives mid-stream', () => {
@@ -158,5 +158,68 @@ describe('foldTranscript — non-terminal error block (F-CODEX-1)', () => {
     const g = foldTranscript(events).find(g => g.turnId === 1)!
     expect(g.complete).toBe(false)
     expect(g.blocks.some(b => b.type === 'error')).toBe(true)
+  })
+
+  // F4 (review 2026-08-03): AcpChatView settles an errored/exited turn by injecting an
+  // EMPTY synthetic `result` (no turn_id on the wire error/exit). The fold must mark
+  // complete WITHOUT appending a phantom text block.
+  it('an empty synthetic result completes the turn without appending a block', () => {
+    const events: WireEvent[] = [
+      { type: 'content_block', block_type: 'text', text: 'partial answer', turn_id: 1 },
+      { type: 'result', text: '', turn_id: 1 }, // synthetic settle on error/exit
+    ]
+    const g = foldTranscript(events).find(g => g.turnId === 1)!
+    expect(g.complete).toBe(true)
+    // Exactly one text block (the streamed one), no phantom empty append.
+    expect(g.blocks.filter(b => b.type === 'text').length).toBe(1)
+    expect(g.assistantText()).toBe('partial answer')
+  })
+})
+
+describe('stabilizeGroups — object identity for React.memo (F-perf, 2026-08-03)', () => {
+  const fold = (evts: WireEvent[]) => foldTranscript(evts)
+
+  it('reuses prior identity for an unchanged (completed) turn', () => {
+    const turn1: WireEvent[] = [
+      { type: 'user_prompt', text: 'q1', turn_id: 1, client_id: 'c1' },
+      { type: 'content_block', block_type: 'text', text: 'a1', turn_id: 1 },
+      { type: 'result', text: '', turn_id: 1 },
+    ]
+    const first = fold(turn1)
+    const stable1 = stabilizeGroups([], first)
+    // A new delta arrives for turn 2; turn 1 is unchanged.
+    const withTurn2 = [...turn1,
+      { type: 'content_block', block_type: 'text', text: 'a2 ', turn_id: 2 } as WireEvent]
+    const second = fold(withTurn2)
+    const stable2 = stabilizeGroups(stable1, second)
+    const t1a = stable1.find(g => g.turnId === 1)!
+    const t1b = stable2.find(g => g.turnId === 1)!
+    // Same object identity → React.memo(prev.group === next.group) skips re-render.
+    expect(t1b).toBe(t1a)
+  })
+
+  it('gives a NEW identity to the actively-streaming turn', () => {
+    const base: WireEvent[] = [
+      { type: 'content_block', block_type: 'text', text: 'hello', turn_id: 1 },
+    ]
+    const stable1 = stabilizeGroups([], fold(base))
+    const grown = [...base,
+      { type: 'content_block', block_type: 'text', text: ' world', streaming: true, turn_id: 1 } as WireEvent]
+    const stable2 = stabilizeGroups(stable1, fold(grown))
+    const t1a = stable1.find(g => g.turnId === 1)!
+    const t1b = stable2.find(g => g.turnId === 1)!
+    // Content changed → new object so the memo re-renders it.
+    expect(t1b).not.toBe(t1a)
+    expect(t1b.assistantText()).toBe('hello world')
+  })
+
+  it('preserves order and turn set', () => {
+    const evts: WireEvent[] = [
+      { type: 'content_block', block_type: 'text', text: 'a1', turn_id: 1 },
+      { type: 'result', text: '', turn_id: 1 },
+      { type: 'content_block', block_type: 'text', text: 'a2', turn_id: 2 },
+    ]
+    const stable = stabilizeGroups([], fold(evts))
+    expect(stable.map(g => g.turnId)).toEqual([1, 2])
   })
 })

@@ -48,7 +48,21 @@ pub fn hash_password(password: &str) -> String {
 }
 
 pub fn verify_password(password: &str, hash: &str) -> bool {
-    hash_password(password) == hash
+    // Constant-time compare of the two hex SHA-256 strings, matching the posture of
+    // `oauth::constant_time_eq` used for the OAuth CSRF nonce. `==` on `String`
+    // short-circuits on the first differing byte, a (weak) timing oracle on the
+    // stored-hash prefix; equal-length hex strings compared byte-by-byte remove it.
+    // (review 2026-08-03, F5)
+    let a = hash_password(password);
+    let (a, b) = (a.as_bytes(), hash.as_bytes());
+    if a.len() != b.len() {
+        return false;
+    }
+    let mut diff = 0u8;
+    for (x, y) in a.iter().zip(b.iter()) {
+        diff |= x ^ y;
+    }
+    diff == 0
 }
 
 #[derive(serde::Deserialize, Default)]
@@ -93,9 +107,14 @@ pub async fn auth_middleware(
                 }
             }
         }
-        // For non-/api/me routes, require active status
+        // For non-/api/me routes, require active status. Exact-match `/api/me` (not a
+        // prefix): `starts_with` would also wave through a future sibling like
+        // `/api/members` or `/api/metrics` for a NOT-yet-approved (pending) user, since
+        // the only allow-listed route for pending users is the approval-poll `/api/me`.
+        // No such route exists today, but the prefix form is a latent authz footgun.
+        // (review 2026-08-03, F6)
         let path = req.uri().path();
-        if !user.is_active() && !path.starts_with("/api/me") {
+        if !user.is_active() && path != "/api/me" {
             return Err(StatusCode::FORBIDDEN);
         }
         req.extensions_mut().insert(user);
@@ -550,5 +569,31 @@ mod tests {
         assert!(ws_origin_allowed(&ok, "https://zeromux.example.com"));
         let bad = headers_with(&[("Origin", "https://evil.example.com")]);
         assert!(!ws_origin_allowed(&bad, "https://zeromux.example.com"));
+    }
+
+    // ── F5 (review 2026-08-03): legacy password compare is constant-time ──
+
+    #[test]
+    fn verify_password_matches_correct_and_rejects_wrong() {
+        let hash = hash_password("hunter2");
+        assert!(verify_password("hunter2", &hash));
+        assert!(!verify_password("hunter3", &hash));
+        // A hash of the wrong length (not a real SHA-256 hex) must fail, not panic.
+        assert!(!verify_password("hunter2", "deadbeef"));
+        assert!(!verify_password("hunter2", ""));
+    }
+
+    // ── F6 (review 2026-08-03): pending-user route gate is exact `/api/me`, not prefix ──
+
+    #[test]
+    fn pending_route_gate_is_exact_not_prefix() {
+        // The middleware allows a pending (unapproved) user through ONLY on `/api/me`.
+        // A prefix match would also admit a future sibling like `/api/members` or
+        // `/api/metrics`. This documents the exact-equality contract the fix enforces.
+        let allowed = |path: &str| path == "/api/me";
+        assert!(allowed("/api/me"));
+        assert!(!allowed("/api/members"));
+        assert!(!allowed("/api/metrics"));
+        assert!(!allowed("/api/me/extra"));
     }
 }

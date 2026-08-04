@@ -1245,6 +1245,29 @@ fn is_write_blocked(base: &std::path::Path, canonical: &std::path::Path) -> bool
     path_hits_sensitive_dir(base, canonical)
 }
 
+/// READ-FORBIDDEN predicate: exactly the triple `get_session_file`/`get_file_raw`
+/// apply before returning any bytes — a resolved path is read-forbidden if it
+/// descends into a sensitive dir, sits on the home-level `~/.*` surface, or has a
+/// credential leaf name (`*.pem`/`*.env`/`id_rsa`/`*.tfstate`/…). Factored out so the
+/// RENAME/MOVE handlers can refuse relocating a read-forbidden file to a readable
+/// name: `is_write_blocked` alone only covers the 6 control DIRS, so pre-fix a
+/// session owner could `rename deploy.pem → x.txt` (or move `~/.config` → `myconfig`
+/// when work_dir=$HOME) and then read the laundered path — full credential exfil that
+/// defeats every read guard. The leaf-name check catches file renames; the
+/// home-dotdir/sensitive-dir checks catch a DIRECTORY move whose new name would hide
+/// the `~/.*` origin (child leaf names are preserved by rename, so `is_credential_path`
+/// still guards `newdir/deploy.pem`, but `.config`→`myconfig` erases the dot-origin
+/// signal — this predicate keys on the SOURCE path, which still carries it).
+/// (review 2026-08-03, F1)
+fn read_forbidden(base: &std::path::Path, real: &std::path::Path) -> bool {
+    descends_into_sensitive_dir(base, real)
+        || read_hits_home_dotdir(real)
+        || real
+            .file_name()
+            .and_then(|s| s.to_str())
+            .is_some_and(is_credential_path)
+}
+
 /// BASE-ACCEPTANCE guard for `ensure_under_home`: refuse a browse *root* that is, or
 /// sits inside (between $HOME and itself), a sensitive dir. Same source list as the
 /// descent guard EXCEPT `.zeromux-worktrees`: a worktree-isolated agent session's
@@ -1607,6 +1630,13 @@ async fn rename_session_file(
         return Err((StatusCode::FORBIDDEN, "Writes to control directories denied".to_string()));
     }
 
+    // Refuse to relocate a READ-forbidden source to a readable name — otherwise
+    // `rename deploy.pem → x.txt` launders a credential past `is_credential_path`
+    // and the follow-up read returns its bytes. (review 2026-08-03, F1)
+    if read_forbidden(&base, &from_path) {
+        return Err((StatusCode::FORBIDDEN, "Refusing to move a protected file".to_string()));
+    }
+
     // Physical-layer resolve of the destination: parent must exist and stay under base
     // after symlink resolution, and the leaf may not be control-named. The destination
     // parent must already exist (no implicit tree creation across a symlink).
@@ -1708,7 +1738,13 @@ async fn upload_session_file(
         .unwrap_or_default();
     let real_target = resolve_and_verify(&base, &parent_rel)?;
 
-    if is_write_blocked(&base, &real_target) {
+    // Guard the resolved TARGET FILE, not just its parent dir: `sanitize_filename`
+    // keeps a leading dot, so `upload {path:".zeromux"}` (or `.git`/`.aws`) would
+    // otherwise create a control-named regular file at the target — the same
+    // parent-only parity gap the 2026-08-02 F4 fix closed for `write_session_file`.
+    // `create_new` can't clobber an existing control DIR, but the sibling write
+    // handlers all refuse a control-named leaf and upload must too. (review 2026-08-03, F2)
+    if is_write_blocked(&base, &real_target.join(&safe_name)) {
         return Err((StatusCode::FORBIDDEN, "Writes to control directories denied".to_string()));
     }
 
@@ -1807,6 +1843,15 @@ async fn rename_session_dir(
 
     if is_write_blocked(&base, &from_path) {
         return Err((StatusCode::FORBIDDEN, "Writes to control directories denied".to_string()));
+    }
+
+    // Refuse to relocate a READ-forbidden source directory. A rename preserves child
+    // leaf names (so `is_credential_path` still guards `newdir/deploy.pem`), but moving
+    // a home-level `~/.*` dir (e.g. `.config` → `myconfig` when work_dir=$HOME) would
+    // erase the dot-origin signal `read_hits_home_dotdir` keys on and expose
+    // `myconfig/gh/hosts.yml`. Keying on the SOURCE path closes that. (review 2026-08-03, F1)
+    if read_forbidden(&base, &from_path) {
+        return Err((StatusCode::FORBIDDEN, "Refusing to move a protected directory".to_string()));
     }
 
     if !from_path.is_dir() {
@@ -3418,6 +3463,35 @@ mod path_safety_tests {
         // resolved TARGET, so folding write_session_file onto it closes the parity gap.
         assert!(resolve_write_target(&base_c, ".git").is_err());
         assert!(resolve_write_target(&base_c, ".zeromux").is_err());
+    }
+
+    #[test]
+    fn read_forbidden_blocks_rename_launder_of_credential_and_control_paths() {
+        // F1 (review 2026-08-03): rename/move must refuse a READ-forbidden SOURCE, or a
+        // session owner could `rename deploy.pem → x.txt` and then read the laundered
+        // name (is_credential_path no longer matches). read_forbidden is exactly the
+        // read triple the file browser applies before returning bytes.
+        let tmp = std::env::temp_dir().join(format!("zmrf-{}", std::process::id()));
+        let base = tmp.join("work");
+        std::fs::create_dir_all(&base).unwrap();
+        let base_c = base.canonicalize().unwrap();
+
+        // Credential-named leaves under a normal parent → read-forbidden (the launder
+        // source). These files exist so the paths are real.
+        for name in ["deploy.pem", "id_rsa", "prod.tfstate", "db.env", ".npmrc"] {
+            let p = base_c.join(name);
+            std::fs::write(&p, "secret").unwrap();
+            assert!(read_forbidden(&base_c, &p), "{name} source must be read-forbidden");
+        }
+        // A descent into a control dir is read-forbidden too (rename `.git/config`).
+        std::fs::create_dir_all(base_c.join(".git")).unwrap();
+        std::fs::write(base_c.join(".git/config"), "x").unwrap();
+        assert!(read_forbidden(&base_c, &base_c.join(".git/config")));
+        // A plain source file is NOT read-forbidden — benign renames still work.
+        let ok = base_c.join("notes.txt");
+        std::fs::write(&ok, "hi").unwrap();
+        assert!(!read_forbidden(&base_c, &ok), "a normal file must remain movable");
+        let _ = std::fs::remove_dir_all(&tmp);
     }
 
     #[test]

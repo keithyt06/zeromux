@@ -219,6 +219,7 @@ export default function AcpChatView({ sessionId, agentType = 'claude', onRegiste
   useEffect(() => {
     let disposed = false
     let retryTimer: ReturnType<typeof setTimeout> | undefined
+    let stableTimer: ReturnType<typeof setTimeout> | undefined
     let attempt = 0
 
     const connect = () => {
@@ -227,7 +228,15 @@ export default function AcpChatView({ sessionId, agentType = 'claude', onRegiste
       wsRef.current = ws
 
       ws.onopen = () => {
-        attempt = 0
+        // Reset backoff only after the connection proves STABLE (~3s), not on the
+        // instant it opens. Otherwise an accept-then-immediately-close loop (app-level
+        // close after upgrade, a deleted/unavailable session, or a proxy that 1006s
+        // right after the handshake) resets attempt→0 every open, so `delay` is always
+        // 1000*2^0 = 1s and the 10s cap is never reached — a permanent ~1s reconnect
+        // hammer that drains battery/CPU and hammers the server. A genuinely healthy
+        // socket outlives the timer and correctly resets. (review 2026-08-05)
+        clearTimeout(stableTimer)
+        stableTimer = setTimeout(() => { attempt = 0 }, 3000)
         // The server replays full scrollback on (re)connect, so start clean to
         // avoid duplicating already-rendered messages. Matches page-reload behavior.
         setEvents([])
@@ -259,6 +268,9 @@ export default function AcpChatView({ sessionId, agentType = 'claude', onRegiste
 
       ws.onclose = () => {
         wsRef.current = null
+        // A close before the stability timer fires means this open did NOT prove
+        // stable — cancel the pending reset so `attempt` keeps escalating.
+        clearTimeout(stableTimer)
         // Transcript completeness is derived from `result` events in
         // foldTranscript; a dropped socket simply ends the busy state. On
         // reconnect the server replays full scrollback (incl. the result).
@@ -281,6 +293,7 @@ export default function AcpChatView({ sessionId, agentType = 'claude', onRegiste
     return () => {
       disposed = true
       if (retryTimer) clearTimeout(retryTimer)
+      if (stableTimer) clearTimeout(stableTimer)
       wsRef.current?.close()
     }
   // eslint-disable-next-line react-hooks/exhaustive-deps

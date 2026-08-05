@@ -268,6 +268,7 @@ export default function TerminalView({ sessionId, active, theme }: Props) {
 
     let disposed = false
     let retryTimer: ReturnType<typeof setTimeout> | undefined
+    let stableTimer: ReturnType<typeof setTimeout> | undefined
     let attempt = 0
 
     const connect = () => {
@@ -276,7 +277,12 @@ export default function TerminalView({ sessionId, active, theme }: Props) {
       wsRef.current = ws
 
       ws.onopen = () => {
-        attempt = 0
+        // Reset backoff only after the connection proves STABLE (~3s), not on the
+        // instant it opens — otherwise an accept-then-immediately-close loop resets
+        // attempt→0 every open and the 10s cap is never reached (permanent ~1s
+        // reconnect hammer). A healthy socket outlives the timer. (review 2026-08-05)
+        clearTimeout(stableTimer)
+        stableTimer = setTimeout(() => { attempt = 0 }, 3000)
         // The server replays full scrollback on (re)connect; reset the terminal
         // first so a reconnect doesn't double-paint the buffer.
         termRef.current?.reset()
@@ -314,6 +320,9 @@ export default function TerminalView({ sessionId, active, theme }: Props) {
 
       ws.onclose = () => {
         wsRef.current = null
+        // A close before the stability timer fires means this open did NOT prove
+        // stable — cancel the pending reset so `attempt` keeps escalating.
+        clearTimeout(stableTimer)
         // Auto-reconnect through idle-timeout proxy drops / transient closes so
         // the terminal never freezes silently. Exponential backoff, capped at 10s.
         if (!disposed) {
@@ -330,6 +339,7 @@ export default function TerminalView({ sessionId, active, theme }: Props) {
     return () => {
       disposed = true
       if (retryTimer) clearTimeout(retryTimer)
+      if (stableTimer) clearTimeout(stableTimer)
       wsRef.current?.close()
     }
   }, [sessionId])

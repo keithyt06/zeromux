@@ -2826,10 +2826,23 @@ fn emit(
     // 2026-07-29). Every other event (text/thinking/tool_* blocks, Result, …) is
     // real activity. Terminal AcpEvent::Error settles the turn via is_boundary, so it
     // never reaches the wedge case regardless.
+    //
+    // A `UserPrompt` echo is ALSO not agent progress and must not bump the clock. In
+    // collect mode (the default) a prompt sent while a turn is already Running is only
+    // ENQUEUED — never delivered to the agent — yet it flows through here first. Pre-fix
+    // its bump refreshed `last_activity_ms`, so a user poking a genuinely-wedged turn
+    // faster than every 30 min kept `running_idle_too_long`/`stuck_push_candidates`
+    // from ever firing: the wedge was never TimeoutKill'd, never pushed, and the queue
+    // grew unbounded. The same F-CODEX-1-CLOCK class: a signal that is not forward
+    // progress must not reset the watchdog it is supposed to be bounded by. The bump on
+    // the paths where a prompt actually STARTS or INTERRUPTS a turn is not lost — every
+    // such path calls `mark_turn(Running)` → `apply_turn`, which stamps
+    // `last_activity_ms` fresh (so an idle-then-prompted turn is still spared for the
+    // full idle window before the agent's first token). (review 2026-08-05)
     let bump_activity = !matches!(
         evt,
         AcpEvent::ContentBlock { block_type, .. } if block_type == "error"
-    );
+    ) && !matches!(evt, AcpEvent::UserPrompt { .. });
     let json = match serde_json::to_string(evt) {
         Ok(j) => j,
         Err(_) => return,
@@ -3864,11 +3877,18 @@ mod turn_state_tests {
     #[test]
     fn apply_running_sets_started_and_seq() {
         let mut s = running_session("s");
+        s.last_activity_ms = 0;
         apply_turn(&mut s, TurnState::Running, 1);
         let rp = s.running.as_ref().unwrap();
         assert_eq!(rp.turn_state, TurnState::Running);
         assert!(rp.turn_started_ms.is_some());
         assert_eq!(rp.turn_seq, 1);
+        // A real turn start stamps last_activity_ms fresh. This is the path the
+        // silence-clock fix (review 2026-08-05) relies on: since a queued-but-undelivered
+        // UserPrompt no longer bumps the clock in `emit`, the idle→Running transition
+        // here is what spares a freshly-prompted turn for the full idle window.
+        assert!(s.last_activity_ms > 0,
+            "apply_turn(Running) must stamp last_activity_ms so a real turn start freshens the silence clock");
     }
 
     #[test]
@@ -4810,6 +4830,34 @@ mod emit_tests {
             "a Result is real progress → must bump the clock");
     }
 
+    #[test]
+    fn user_prompt_echo_does_not_bump_the_silence_clock() {
+        // review 2026-08-05: a UserPrompt echo is not agent forward-progress. In the
+        // default collect mode a prompt sent while a turn is Running is only ENQUEUED,
+        // never delivered — yet it flows through `emit` first. If it bumped
+        // last_activity_ms, a user poking a genuinely-wedged turn faster than the
+        // 30-min idle window kept running_idle_too_long/stuck_push_candidates from ever
+        // firing (never killed, never pushed, queue grew unbounded). Same F-CODEX-1-CLOCK
+        // class as the error-block exemption above. Pin the exact `emit` predicate:
+        // bump is false for BOTH a mid-turn error ContentBlock AND a UserPrompt.
+        let bump = |evt: &AcpEvent| {
+            !matches!(evt, AcpEvent::ContentBlock { block_type, .. } if block_type == "error")
+                && !matches!(evt, AcpEvent::UserPrompt { .. })
+        };
+        let user_prompt = AcpEvent::UserPrompt {
+            text: "are you stuck?".into(),
+            turn_id: 5,
+            client_id: Some("c1".into()),
+        };
+        assert!(!bump(&user_prompt),
+            "a UserPrompt echo (queued, not delivered to the agent) must NOT bump the clock");
+        // The bump lost on the enqueue path is NOT lost on the paths where a prompt
+        // actually starts/interrupts a turn: those call mark_turn(Running) → apply_turn,
+        // which stamps last_activity_ms fresh (asserted in
+        // turn_state_tests::apply_running_sets_started_and_seq). So an idle-then-prompted
+        // turn is still spared for the full idle window.
+    }
+
     // Regression for the reconnect double-delivery race (review 2026-06-11).
     // The fix makes "snapshot scrollback + subscribe" atomic against "push
     // scrollback + broadcast". This test pins the boundary semantics directly
@@ -4908,6 +4956,53 @@ mod lifetime_tests {
             scrollback: VecDeque::new(),
             scrollback_bytes: 0,
         }
+    }
+
+    fn running_session_lt(id: &str, owner: &str) -> Session {
+        let (event_tx, _keep) = broadcast::channel(BROADCAST_CAPACITY);
+        let (input_tx, _rx) = mpsc::channel(8);
+        let mut s = make_session(id, owner);
+        s.status = SessionMeta::Running;
+        s.running = Some(RunningProcess {
+            event_tx, input_tx, pty_pid: None,
+            turn_state: TurnState::Running,
+            turn_started_ms: Some(0),
+            turn_seq: 1,
+            queue_mode: QueueMode::Collect,
+        });
+        s
+    }
+
+    #[test]
+    fn emit_userprompt_does_not_bump_clock_but_contentblock_does() {
+        // End-to-end guard (Codex-review 2026-08-05): drive the REAL `emit` chokepoint,
+        // not a reconstructed predicate. A UserPrompt echo (queued, not delivered in
+        // collect mode) must leave last_activity_ms untouched so the 30-min wedge
+        // watchdog can still fire; a text ContentBlock (real agent progress) must bump it.
+        let (mgr, _dir) = make_manager();
+        let sid = "s-clock";
+        let s = running_session_lt(sid, "owner1");
+        let tx = s.running.as_ref().unwrap().event_tx.clone();
+        mgr.sessions.lock().unwrap().insert(sid.into(), s);
+        // Force a stale clock so any bump is observable.
+        mgr.sessions.lock().unwrap().get_mut(sid).unwrap().last_activity_ms = 0;
+        let weak = Arc::downgrade(&mgr);
+
+        // UserPrompt echo → must NOT bump.
+        emit(&weak, sid, &tx, 2, &AcpEvent::UserPrompt {
+            text: "are you stuck?".into(), turn_id: 2, client_id: Some("c1".into()),
+        });
+        assert_eq!(mgr.last_activity_ms(sid), Some(0),
+            "UserPrompt echo must not bump last_activity_ms (wedge watchdog stays armed)");
+
+        // Text ContentBlock → real progress → must bump.
+        emit(&weak, sid, &tx, 2, &AcpEvent::ContentBlock {
+            block_type: std::borrow::Cow::Borrowed("text"),
+            turn_id: 2, text: Some("working on it".into()),
+            name: None, input: None, streaming: Some(true), summary: None,
+        });
+        assert!(mgr.last_activity_ms(sid).unwrap() > 0,
+            "a text ContentBlock is agent progress → must bump last_activity_ms");
     }
 
     #[test]

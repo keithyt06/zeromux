@@ -1240,9 +1240,23 @@ fn read_hits_home_dotdir(canonical: &std::path::Path) -> bool {
 
 /// WRITE guard: refuse writes/deletes/renames that touch a control dir OR a
 /// control-named leaf below base (so `delete_session_dir(".git")` and `mkdir ".aws"`
-/// are refused, not just descents into them). Identical denylist to the read guard.
+/// are refused, not just descents into them), AND any target on the home-level `~/.*`
+/// surface — full parity with the READ guard, which is `descends_into_sensitive_dir`
+/// **plus** `read_hits_home_dotdir`.
+///
+/// The home-dotdir arm closes a read/write asymmetry: the read handlers 403 viewing OR
+/// listing `~/.gitconfig`, `~/.config/gh/hosts.yml`, `~/.kube/config`, `~/.docker/…`
+/// etc. (they are outside the 6 SENSITIVE_DIR_NAMES but caught by `read_hits_home_dotdir`),
+/// yet the write guard checked only the 6 control dirs — so a session rooted at `$HOME`
+/// or `$HOME/.config` (both accepted as a base — `.config` ∉ the 6 names) could
+/// OVERWRITE or DELETE exactly the files reads forbid. Beyond the parity violation this
+/// had a server-side code-exec angle: tampering `~/.gitconfig` / `~/.config/git/config`
+/// (e.g. `core.fsmonitor=<cmd>`, alias, or `core.pager`) runs that command when the
+/// server itself later runs `git status`/diff on any repo. Since reads of this surface
+/// are already forbidden even to the owner, blocking writes there restricts no working
+/// flow — it only removes the launder/tamper path. (review 2026-08-05)
 fn is_write_blocked(base: &std::path::Path, canonical: &std::path::Path) -> bool {
-    path_hits_sensitive_dir(base, canonical)
+    path_hits_sensitive_dir(base, canonical) || read_hits_home_dotdir(canonical)
 }
 
 /// READ-FORBIDDEN predicate: exactly the triple `get_session_file`/`get_file_raw`
@@ -3771,6 +3785,100 @@ mod path_safety_tests {
         assert!(is_write_blocked(base, std::path::Path::new("/home/u/repo/.zeromux-worktrees/abc123/.git/config")));
         // A path outside base is refused defensively.
         assert!(is_write_blocked(base, std::path::Path::new("/home/u/other/x.md")));
+    }
+
+    #[test]
+    fn write_blocked_on_home_dotdir_surface_matches_read_guard() {
+        // review 2026-08-05: the WRITE guard must have full parity with the READ guard,
+        // which is descends_into_sensitive_dir + read_hits_home_dotdir. Pre-fix
+        // is_write_blocked only checked the 6 SENSITIVE_DIR_NAMES, so a session rooted
+        // at $HOME or $HOME/.config could OVERWRITE/DELETE ~/.gitconfig,
+        // ~/.config/gh/hosts.yml, ~/.kube/config etc. — exactly the files reads 403.
+        // (Also a server-side code-exec vector: tampering ~/.gitconfig core.fsmonitor
+        // runs a command when the server later runs `git status`.)
+        let _guard = crate::session_manager::HOME_ENV_LOCK.lock().unwrap();
+        let prev = std::env::var("HOME").ok();
+        let home = std::env::temp_dir().join(format!("zmwb-hdd-{}", std::process::id()));
+        std::fs::create_dir_all(&home).unwrap();
+        let home = home.canonicalize().unwrap();
+        std::env::set_var("HOME", &home);
+
+        // With work_dir = $HOME, a write to any home-level ~/.* target must be blocked,
+        // and — for every candidate — the write guard must agree with the read guard.
+        let base = home.clone();
+        let home_dotdir_targets = [
+            home.join(".gitconfig"),
+            home.join(".netrc"),
+            home.join(".config").join("gh").join("hosts.yml"),
+            home.join(".kube").join("config"),
+            home.join(".docker").join("config.json"),
+            home.join(".config"), // the dir node itself (delete/rename vector)
+        ];
+        // Legitimate in-repo targets under $HOME must stay writable (no over-block):
+        // their first-below-$HOME component is the project dir, not a dot-entry.
+        let allowed_targets = [
+            home.join("proj").join("src").join("main.rs"),
+            home.join("proj").join(".github").join("workflows").join("ci.yml"),
+            home.join("proj").join(".vscode").join("settings.json"),
+        ];
+
+        let blocked: Vec<bool> = home_dotdir_targets.iter().map(|p| is_write_blocked(&base, p)).collect();
+        let read_blocked: Vec<bool> = home_dotdir_targets
+            .iter()
+            .map(|p| descends_into_sensitive_dir(&base, p) || read_hits_home_dotdir(p))
+            .collect();
+        let allowed: Vec<bool> = allowed_targets.iter().map(|p| is_write_blocked(&base, p)).collect();
+
+        match prev {
+            Some(h) => std::env::set_var("HOME", h),
+            None => std::env::remove_var("HOME"),
+        }
+
+        for (i, p) in home_dotdir_targets.iter().enumerate() {
+            assert!(blocked[i], "home-level ~/.* write target must be blocked: {p:?}");
+            assert_eq!(blocked[i], read_blocked[i], "write/read guard disagree on {p:?}");
+        }
+        for (j, p) in allowed_targets.iter().enumerate() {
+            assert!(!allowed[j], "legitimate in-repo write target must stay writable: {p:?}");
+        }
+    }
+
+    #[test]
+    fn write_not_blocked_for_agent_worktree_base_under_home() {
+        // Codex-review concern (2026-08-05): folding read_hits_home_dotdir into
+        // is_write_blocked must NOT break agent worktree sessions, whose base is
+        // <repo>/.zeromux-worktrees/<id>. read_hits_home_dotdir keys on the FIRST
+        // component below $HOME, so for a realistic worktree at
+        // $HOME/myrepo/.zeromux-worktrees/<id>/notes.md that component is `myrepo`
+        // (not a dot-entry) → not blocked. This proves the fix reuses a guard already
+        // applied to worktree READS (get_session_file/list_dir) without newly blocking
+        // worktree WRITES. Driven under a temp $HOME so the strip_prefix arm is live.
+        let _guard = crate::session_manager::HOME_ENV_LOCK.lock().unwrap();
+        let prev = std::env::var("HOME").ok();
+        let home = std::env::temp_dir().join(format!("zmwb-wt-{}", std::process::id()));
+        std::fs::create_dir_all(&home).unwrap();
+        let home = home.canonicalize().unwrap();
+        std::env::set_var("HOME", &home);
+
+        let base = home.join("myrepo").join(".zeromux-worktrees").join("abc123");
+        let inside = [
+            base.join("notes.md"),
+            base.join("src").join("main.rs"),
+            base.join(".github").join("workflows").join("ci.yml"), // in-worktree dot dir OK
+        ];
+        let results: Vec<bool> = inside.iter().map(|p| is_write_blocked(&base, p)).collect();
+        // A real .git INSIDE the worktree is still blocked (control dir parity).
+        let git_inside = is_write_blocked(&base, &base.join(".git").join("config"));
+
+        match prev {
+            Some(h) => std::env::set_var("HOME", h),
+            None => std::env::remove_var("HOME"),
+        }
+
+        for (i, p) in inside.iter().enumerate() {
+            assert!(!results[i], "worktree write target must stay writable: {p:?}");
+        }
+        assert!(git_inside, ".git inside the worktree must still be write-blocked");
     }
 
     #[test]

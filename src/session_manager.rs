@@ -2224,7 +2224,30 @@ fn build_run_metric(
 /// turn duration (read from the FIFO front BEFORE `settle()` consumes it). The
 /// debounce/away-gate (`should_push_turn_done`) and the actual send run inside a
 /// spawned task — never await in the fan-out select loop.
-fn maybe_push_turn_done(mgr: &Weak<SessionManager>, sid: &str, owner_id: &str, dur_ms: i64) {
+///
+/// `outcome` is the turn's INTENT (`pending_outcome`, still `Some` for a turn the
+/// user explicitly Cancelled/Interrupted or the watchdog Timeout-killed). The
+/// turn_done payload is worded "✅ 完成 / 本轮已结束" (success), so firing it for a
+/// cancelled or timed-out turn tells the user their aborted turn *completed
+/// successfully* — a lie. Suppress the push for those outcomes; a Completed turn
+/// or a plain agent-side Error (which still "finished") is a legitimate turn_done.
+/// (review 2026-08-07, F3). Same suppression across all three fan-outs.
+fn maybe_push_turn_done(
+    mgr: &Weak<SessionManager>,
+    sid: &str,
+    owner_id: &str,
+    dur_ms: i64,
+    outcome: Option<crate::run_metrics::RunOutcome>,
+) {
+    // A turn the user aborted (Cancel/Interrupt → Cancelled) or the watchdog
+    // killed (Timeout) did NOT complete — never tell the user "✅ 完成".
+    if matches!(
+        outcome,
+        Some(crate::run_metrics::RunOutcome::Cancelled)
+            | Some(crate::run_metrics::RunOutcome::Timeout)
+    ) {
+        return;
+    }
     if let Some(m) = mgr.upgrade() {
         if let Some(p) = m.push_handle() {
             let now = now_millis();
@@ -2350,7 +2373,10 @@ fn spawn_acp_fanout(
                                 // dur read from the FIFO front BEFORE settle() consumes it.
                                 if boundary_count >= turn_seq && active_run_id.is_none() {
                                     let dur = turn_starts.front().map(|s| now_millis() - s).unwrap_or(0);
-                                    maybe_push_turn_done(&mgr, &sid, &owner_id, dur);
+                                    // pending_outcome is Copy — read (don't take) it here so a
+                                    // Cancelled/Timeout turn is suppressed; the metrics block
+                                    // below still .take()s it. (review 2026-08-07, F3)
+                                    maybe_push_turn_done(&mgr, &sid, &owner_id, dur, pending_outcome);
                                 }
                                 // Finalize a scheduled run exactly once, keyed
                                 // on active_run_id, mapped by terminal event type.
@@ -3050,8 +3076,9 @@ fn spawn_kiro_fanout(
                                     // Kiro/Codex run no scheduled tasks, so every settling
                                     // turn here is interactive (no active_run_id gate needed).
                                     // dur read BEFORE settle() consumes the FIFO front.
+                                    // pending_outcome (Copy) suppresses Cancelled/Timeout — F3.
                                     let dur = turn_starts.front().map(|s| now_millis() - s).unwrap_or(0);
-                                    maybe_push_turn_done(&mgr, &sid, &owner_id, dur);
+                                    maybe_push_turn_done(&mgr, &sid, &owner_id, dur, pending_outcome);
                                 }
                                 // per-run metrics: one metric per boundary, intent overrides
                                 // event type (mirrors spawn_acp_fanout). Skipped when this
@@ -3311,8 +3338,9 @@ fn spawn_codex_fanout(
                                     // Kiro/Codex run no scheduled tasks, so every settling
                                     // turn here is interactive (no active_run_id gate needed).
                                     // dur read BEFORE settle() consumes the FIFO front.
+                                    // pending_outcome (Copy) suppresses Cancelled/Timeout — F3.
                                     let dur = turn_starts.front().map(|s| now_millis() - s).unwrap_or(0);
-                                    maybe_push_turn_done(&mgr, &sid, &owner_id, dur);
+                                    maybe_push_turn_done(&mgr, &sid, &owner_id, dur, pending_outcome);
                                 }
                                 // per-run metrics: one metric per boundary, intent overrides
                                 // event type (mirrors spawn_acp_fanout). Skipped when this
@@ -5042,11 +5070,34 @@ mod lifetime_tests {
         mgr.sessions.lock().unwrap().insert(sid.into(), s);
         let weak = Arc::downgrade(&mgr);
         // Call it exactly as the fan-outs do; must not panic with push disabled.
-        maybe_push_turn_done(&weak, sid, "owner1", 120_000);
+        maybe_push_turn_done(&weak, sid, "owner1", 120_000, None);
         // A dropped manager (Weak::upgrade → None) is also a safe no-op.
-        maybe_push_turn_done(&Weak::new(), sid, "owner1", 120_000);
+        maybe_push_turn_done(&Weak::new(), sid, "owner1", 120_000, None);
+        // Cancelled/Timeout outcomes are suppressed BEFORE the upgrade — also no-op.
+        maybe_push_turn_done(&weak, sid, "owner1", 120_000, Some(crate::run_metrics::RunOutcome::Cancelled));
+        maybe_push_turn_done(&weak, sid, "owner1", 120_000, Some(crate::run_metrics::RunOutcome::Timeout));
         tokio::task::yield_now().await; // let any (here: none) spawned task run
         assert!(mgr.session_name(sid).is_some(), "session state untouched by the no-op push");
+    }
+
+    #[test]
+    fn turn_done_push_suppressed_for_cancelled_and_timeout_only() {
+        // F3 (review 2026-08-07): the turn_done push payload says "✅ 完成 / 本轮已结束"
+        // (success). A turn the user Cancelled/Interrupted (→ RunOutcome::Cancelled)
+        // or the watchdog Timeout-killed did NOT complete, so firing it lies to the
+        // user. `maybe_push_turn_done` now suppresses those two outcomes and fires for
+        // Completed / plain agent-side Error / no-intent turns. This asserts the exact
+        // suppression predicate the helper's guard uses, so the classification can't
+        // silently drift (the helper's send path needs a live PushService + async
+        // runtime; the guard itself is a pure match tested directly here).
+        use crate::run_metrics::RunOutcome;
+        let suppressed = |o: Option<RunOutcome>| matches!(o,
+            Some(RunOutcome::Cancelled) | Some(RunOutcome::Timeout));
+        assert!(suppressed(Some(RunOutcome::Cancelled)), "cancelled turn must not push ✅完成");
+        assert!(suppressed(Some(RunOutcome::Timeout)), "timeout-killed turn must not push ✅完成");
+        assert!(!suppressed(Some(RunOutcome::Completed)), "a completed turn is a real turn_done");
+        assert!(!suppressed(Some(RunOutcome::Errored)), "an agent-side error still finished the turn");
+        assert!(!suppressed(None), "no recorded intent (normal Result boundary) pushes");
     }
 
     #[test]

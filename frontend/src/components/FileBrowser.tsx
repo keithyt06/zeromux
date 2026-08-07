@@ -273,7 +273,10 @@ export function FileBrowser({ sessionId }: Props) {
     try {
       if (entry.type === 'dir') await renameSessionDir(sessionId, from, to)
       else await renameSessionFile(sessionId, from, to)
-      if (preview && preview.path === from) setPreview(null)
+      // clearPreview (not bare setPreview(null)) so an in-flight openFile read of
+      // the just-renamed path can't repopulate the pane after it resolves — bumps
+      // openReqRef, invalidating the stale read (review 2026-08-07, F2 parity).
+      if (preview && preview.path === from) clearPreview()
       reload()
     } catch (e) {
       alert(`重命名失败: ${errMsg(e)}`)
@@ -288,7 +291,10 @@ export function FileBrowser({ sessionId }: Props) {
     try {
       if (entry.type === 'dir') await deleteSessionDir(sessionId, path)
       else await deleteSessionFile(sessionId, path)
-      if (preview && preview.path === path) setPreview(null)
+      // clearPreview (not bare setPreview(null)) so a slow in-flight read of the
+      // just-deleted file can't land in the pane after it resolves — bumps
+      // openReqRef, invalidating the stale read (review 2026-08-07, F2 parity).
+      if (preview && preview.path === path) clearPreview()
       reload()
     } catch (e) {
       alert(`删除失败: ${errMsg(e)}`)

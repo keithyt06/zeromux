@@ -122,6 +122,42 @@ describe('FileBrowser', () => {
     expect(screen.getByText('BBB-content')).toBeInTheDocument()
   })
 
+  it('deleting the previewed file while its read is in flight cannot repopulate the pane (F2 parity)', async () => {
+    // handleDelete used a bare setPreview(null), which cleared the pane but did NOT
+    // bump openReqRef — so a slow openFile read of the just-deleted file, resolving
+    // afterward, passed its `openReqRef.current !== req` guard and re-rendered the
+    // deleted file's contents. The fix routes both write handlers through
+    // clearPreview() (bumps the token). This drives that exact race.
+    vi.spyOn(api, 'listDir').mockResolvedValue({
+      entries: [{ name: 'a.txt', type: 'file', size: 3, mtime: 0, writable: true }],
+      truncated: false,
+    })
+    let resolveRead: (v: string) => void = () => {}
+    vi.spyOn(api, 'getSessionFile').mockImplementation(
+      () => new Promise<string>(r => { resolveRead = r }),
+    )
+    vi.spyOn(api, 'deleteSessionFile').mockResolvedValue(undefined)
+    const confirmSpy = vi.spyOn(window, 'confirm').mockReturnValue(true)
+
+    render(<FileBrowser sessionId="s1" />)
+    const a = await screen.findByText('a.txt')
+    a.click()                                    // open A (read pending)
+    expect(await screen.findByText(/loading/i)).toBeInTheDocument()
+    // Delete A via its row menu while the read is still in flight.
+    screen.getByTitle('更多').click()
+    const del = await screen.findByText('删除')  // menu render is async (state flush)
+    del.click()
+    await waitFor(() => expect(api.deleteSessionFile).toHaveBeenCalled())
+    // The slow read now resolves — it must NOT repopulate the pane for the file
+    // that no longer exists. Flush the resolved promise's microtasks + any React
+    // state update (a bare `await waitFor(...not present)` would pass spuriously by
+    // checking BEFORE the stale setState lands), then assert the content is absent.
+    resolveRead('SECRET-CONTENT-OF-DELETED-FILE')
+    await new Promise(r => setTimeout(r, 50))
+    expect(screen.queryByText('SECRET-CONTENT-OF-DELETED-FILE')).not.toBeInTheDocument()
+    confirmSpy.mockRestore()
+  })
+
   it('reset returns to work_dir root (default base, write controls back)', async () => {
     localStorage.setItem('zeromux:fb-root:s1', '/home/ubuntu/other')
     const spy = vi.spyOn(api, 'listDir').mockResolvedValue({ entries: [], truncated: false })

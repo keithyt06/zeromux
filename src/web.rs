@@ -2064,8 +2064,17 @@ async fn git_show(
     // emits the paired `diff --git a/.aws/credentials b/public.txt` header, whose
     // `a/` side `diff_header_path`'s Excluded arm strips. `-M` overrides the config.
     // (review 2026-08-06, F1)
+    // `-C --find-copies-harder` extends the same defense to a COPY: `cp
+    // .aws/credentials public.txt; git add` leaves the source blob UNCHANGED, so
+    // `-M` (rename detection only) can't pair it — git reports `public.txt` as a
+    // brand-new file whose body dumps the secret under the innocuous name, and the
+    // filter (seeing only `public.txt`) keeps it. `--find-copies-harder` inspects
+    // unmodified sources too, so git emits `diff --git a/.aws/credentials
+    // b/public.txt` + `copy from .aws/credentials`, whose `a/` side the Excluded
+    // arm strips (numstat gets `.aws/credentials => public.txt`, which
+    // `numstat_path_excluded` already expands). (review 2026-08-07, F1)
     let diff_output = std::process::Command::new("git")
-        .args(["-c", "core.quotePath=false", "show", "-M", "--format=", "--patch", &query.commit])
+        .args(["-c", "core.quotePath=false", "show", "-M", "-C", "--find-copies-harder", "--format=", "--patch", &query.commit])
         .current_dir(&work_dir)
         .output()
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("git show failed: {}", e)))?;
@@ -2085,7 +2094,7 @@ async fn git_show(
     // `worktree_path_excluded` unquoted and is recognized/dropped (else the
     // quoted `".env.\347..."` bypasses the leaf check and surfaces the name).
     let files: Vec<serde_json::Value> = std::process::Command::new("git")
-        .args(["-c", "core.quotePath=false", "show", "-M", "--format=", "--numstat", &query.commit])
+        .args(["-c", "core.quotePath=false", "show", "-M", "-C", "--find-copies-harder", "--format=", "--numstat", &query.commit])
         .current_dir(&work_dir)
         .output()
         .ok()
@@ -2405,12 +2414,18 @@ async fn git_worktree(
         //
         // `-M` forces rename detection so a relocated credential keeps its paired
         // `a/.aws/credentials b/public.txt` header (→ Excluded arm strips it) even
-        // under a repo-local `diff.renames=false`.
+        // under a repo-local `diff.renames=false`. `-C --find-copies-harder`
+        // extends that to a COPY (`cp .aws/credentials public.txt`): the source
+        // blob is unchanged, so `-M` alone can't pair it and git reports a
+        // brand-new `public.txt` dumping the secret; `--find-copies-harder` scans
+        // unmodified sources so git emits the paired `a/.aws/credentials` header
+        // the Excluded arm strips (review 2026-08-07, F1). Cost is bounded — the
+        // result is truncated to 512KB below and this is a single-user workspace.
         // `core.quotePath=false`: emit literal UTF-8 paths so a non-ASCII-named
         // credential leaf (e.g. `.env.生产`) reaches filter_diff_excluded's leaf
         // predicate unquoted (else the C-quoted header hits the fail-closed arm).
         let raw = std::process::Command::new("git")
-            .args(["-c", "core.quotePath=false", "diff", "HEAD", "-M", "--", "."])
+            .args(["-c", "core.quotePath=false", "diff", "HEAD", "-M", "-C", "--find-copies-harder", "--", "."])
             .current_dir(dir)
             .output()
             .ok()
@@ -4363,7 +4378,7 @@ mod path_safety_tests {
         // EXACT flags from git_worktree's diff invocation.
         let raw = String::from_utf8_lossy(
             &std::process::Command::new("git")
-                .args(["-c", "core.quotePath=false", "diff", "HEAD", "-M", "--", "."])
+                .args(["-c", "core.quotePath=false", "diff", "HEAD", "-M", "-C", "--find-copies-harder", "--", "."])
                 .current_dir(&dir)
                 .output()
                 .unwrap()
@@ -4411,7 +4426,7 @@ mod path_safety_tests {
         // EXACT flags from git_show's --patch invocation.
         let raw = String::from_utf8_lossy(
             &std::process::Command::new("git")
-                .args(["-c", "core.quotePath=false", "show", "-M", "--format=", "--patch", &commit])
+                .args(["-c", "core.quotePath=false", "show", "-M", "-C", "--find-copies-harder", "--format=", "--patch", &commit])
                 .current_dir(&dir)
                 .output()
                 .unwrap()
@@ -4422,6 +4437,118 @@ mod path_safety_tests {
         let _ = std::fs::remove_dir_all(&dir);
         assert!(!filtered.contains("SUPERSECRET"),
             "renamed credential must not leak even with diff.renames=false; got:\n{filtered}");
+    }
+
+    #[test]
+    fn git_worktree_diff_does_not_leak_copied_credential() {
+        // F1 (review 2026-08-07): the 2026-08-06 fix added `-M` (rename detection),
+        // which closed `git mv .aws/credentials public.txt`. But a COPY leaves the
+        // source blob UNCHANGED, so `-M` can't pair it — git reports `public.txt` as
+        // a brand-new add whose body dumps the secret under the innocuous new name,
+        // and filter_diff_excluded (seeing only `public.txt`) kept it. `-C` alone is
+        // NOT enough (git won't scan an unmodified source as a copy source); only
+        // `--find-copies-harder` re-associates it, emitting the paired
+        // `a/.aws/credentials b/public.txt` header the Excluded arm strips. Drive the
+        // EXACT flags the handler now uses.
+        let dir = std::env::temp_dir().join(format!("zmgr-wt-copy-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let ds = dir.to_str().unwrap();
+        let run = |args: &[&str]| {
+            std::process::Command::new("git").args(["-C", ds]).args(args).output().unwrap()
+        };
+        assert!(run(&["init", "-q"]).status.success(), "git init");
+        let _ = run(&["config", "user.email", "t@t"]);
+        let _ = run(&["config", "user.name", "t"]);
+        std::fs::create_dir_all(dir.join(".aws")).unwrap();
+        std::fs::write(dir.join(".aws/credentials"), "[default]\naws_secret_access_key=SUPERSECRET\n").unwrap();
+        std::fs::write(dir.join("readme.txt"), "hi\n").unwrap();
+        assert!(run(&["add", "-A"]).status.success(), "git add");
+        assert!(run(&["commit", "-qm", "init"]).status.success(), "git commit");
+        // COPY (not move): the source stays committed and UNCHANGED — the case `-M`
+        // could not pair. Byte-identical copy is the worst case (100% similarity).
+        std::fs::copy(dir.join(".aws/credentials"), dir.join("public.txt")).unwrap();
+        assert!(run(&["add", "public.txt"]).status.success(), "git add copy");
+
+        // EXACT flags from git_worktree's diff invocation.
+        let raw = String::from_utf8_lossy(
+            &std::process::Command::new("git")
+                .args(["-c", "core.quotePath=false", "diff", "HEAD", "-M", "-C", "--find-copies-harder", "--", "."])
+                .current_dir(&dir)
+                .output()
+                .unwrap()
+                .stdout,
+        ).to_string();
+        let filtered = filter_diff_excluded(&raw);
+
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(!filtered.contains("SUPERSECRET"),
+            "copied credential body must be stripped; got:\n{filtered}");
+        assert!(!filtered.contains("copy from .aws/credentials"),
+            "the copy header naming the credential must be stripped");
+    }
+
+    #[test]
+    fn git_show_does_not_leak_copied_credential() {
+        // F1 (review 2026-08-07): the git_show sibling of the copy leak. A commit that
+        // copies a credential out of a sensitive dir must not leak via `git show`.
+        // Handler now passes `-M -C --find-copies-harder`; drive the exact flags.
+        let dir = std::env::temp_dir().join(format!("zmgr-show-copy-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let ds = dir.to_str().unwrap();
+        let run = |args: &[&str]| {
+            std::process::Command::new("git").args(["-C", ds]).args(args).output().unwrap()
+        };
+        assert!(run(&["init", "-q"]).status.success(), "git init");
+        let _ = run(&["config", "user.email", "t@t"]);
+        let _ = run(&["config", "user.name", "t"]);
+        std::fs::create_dir_all(dir.join(".aws")).unwrap();
+        std::fs::write(dir.join(".aws/credentials"), "[default]\naws_secret_access_key=SUPERSECRET\n").unwrap();
+        std::fs::write(dir.join("readme.txt"), "hi\n").unwrap();
+        assert!(run(&["add", "-A"]).status.success(), "git add");
+        assert!(run(&["commit", "-qm", "init"]).status.success(), "git commit");
+        std::fs::copy(dir.join(".aws/credentials"), dir.join("public.txt")).unwrap();
+        assert!(run(&["add", "public.txt"]).status.success(), "git add copy");
+        assert!(run(&["commit", "-qm", "copy"]).status.success(), "git commit 2");
+        let commit = String::from_utf8(run(&["rev-parse", "HEAD"]).stdout).unwrap().trim().to_string();
+
+        // EXACT flags from git_show's --patch invocation.
+        let raw = String::from_utf8_lossy(
+            &std::process::Command::new("git")
+                .args(["-c", "core.quotePath=false", "show", "-M", "-C", "--find-copies-harder", "--format=", "--patch", &commit])
+                .current_dir(&dir)
+                .output()
+                .unwrap()
+                .stdout,
+        ).to_string();
+        let filtered = filter_diff_excluded(&raw);
+
+        // numstat side: the copy is reported as `.aws/credentials => public.txt`,
+        // which numstat_path_excluded must expand and drop (else the file list
+        // surfaces the credential source name).
+        let numstat = String::from_utf8_lossy(
+            &std::process::Command::new("git")
+                .args(["-c", "core.quotePath=false", "show", "-M", "-C", "--find-copies-harder", "--format=", "--numstat", &commit])
+                .current_dir(&dir)
+                .output()
+                .unwrap()
+                .stdout,
+        ).to_string();
+        let numstat_leaks = numstat
+            .lines()
+            .filter(|l| !l.trim().is_empty())
+            .any(|l| {
+                let parts: Vec<&str> = l.split('\t').collect();
+                parts.len() >= 3 && !numstat_path_excluded(parts[2])
+                    && (parts[2].contains(".aws") || parts[2].contains("public.txt"))
+            });
+
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(!filtered.contains("SUPERSECRET"),
+            "copied credential must not leak via git_show; got:\n{filtered}");
+        assert!(!numstat_leaks,
+            "numstat must drop the copy path pairing the credential; got:\n{numstat}");
     }
 
     #[test]

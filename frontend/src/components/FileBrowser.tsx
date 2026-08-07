@@ -93,6 +93,13 @@ export function FileBrowser({ sessionId }: Props) {
 
   const uploadRef = useRef<HTMLInputElement>(null)
 
+  // Monotonic token for in-flight file reads. openFile bumps it and captures the
+  // value; a resolved read only applies if it's still the latest — so clicking
+  // file A (slow) then B (fast) can't let A's contents overwrite B's preview, and
+  // navigating away (openDir/goCrumb, which clear preview) can't be undone by a
+  // late read landing. (review 2026-08-06, F2)
+  const openReqRef = useRef(0)
+
   // Bumped to force a re-list after a write op without restructuring deps.
   const [reloadKey, setReloadKey] = useState(0)
   const reload = useCallback(() => setReloadKey(k => k + 1), [])
@@ -119,10 +126,18 @@ export function FileBrowser({ sessionId }: Props) {
     return () => { ignore = true }
   }, [sessionId, cwd, effectiveBase, reloadKey])
 
+  // Clear the preview AND invalidate any in-flight file read, so a slow read that
+  // resolves after the user navigated away can't re-populate a stale preview. Every
+  // navigation/root-change site clears preview through this. (review 2026-08-06, F2)
+  const clearPreview = () => {
+    openReqRef.current++
+    setPreview(null)
+  }
+
   // Switch browse root to an absolute path under $HOME; reset into its top level.
   const chooseRoot = (abs: string) => {
     setPickingRoot(false)
-    setPreview(null)
+    clearPreview()
     setCwd('')
     setRoot(abs)
     try { localStorage.setItem(rootKey(sessionId), abs) } catch { /* ignore */ }
@@ -130,7 +145,7 @@ export function FileBrowser({ sessionId }: Props) {
 
   // Back to the session work_dir (default root).
   const resetRoot = () => {
-    setPreview(null)
+    clearPreview()
     setCwd('')
     setRoot('')
     try { localStorage.removeItem(rootKey(sessionId)) } catch { /* ignore */ }
@@ -145,12 +160,12 @@ export function FileBrowser({ sessionId }: Props) {
   }, [menu])
 
   const openDir = (name: string) => {
-    setPreview(null)
+    clearPreview()
     setCwd(join(cwd, name))
   }
 
   const goCrumb = (idx: number) => {
-    setPreview(null)
+    clearPreview()
     if (idx < 0) { setCwd(''); return }
     setCwd(cwd.split('/').slice(0, idx + 1).join('/'))
   }
@@ -163,13 +178,16 @@ export function FileBrowser({ sessionId }: Props) {
       return
     }
     if (HTML_EXTS.includes(e) || MD_EXTS.includes(e) || TEXT_EXTS.includes(e)) {
+      const req = ++openReqRef.current
       setPreview({ kind: 'loading', path })
       try {
         const text = await getSessionFile(sessionId, path, effectiveBase)
+        if (openReqRef.current !== req) return // a newer open (or navigation) superseded us
         if (HTML_EXTS.includes(e)) setPreview({ kind: 'html', path, text })
         else if (MD_EXTS.includes(e)) setPreview({ kind: 'markdown', path, text })
         else setPreview({ kind: 'text', path, text })
       } catch (err) {
+        if (openReqRef.current !== req) return
         setPreview({ kind: 'error', path, message: errMsg(err) || 'Failed to read file' })
       }
       return

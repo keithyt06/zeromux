@@ -2216,6 +2216,31 @@ fn build_run_metric(
     }
 }
 
+/// Fire the "turn finished while you were away" Web Push for a settling
+/// interactive turn. Shared by all three agent fan-outs so the notification
+/// reaches Claude, Kiro AND Codex sessions identically — the block used to live
+/// only in `spawn_acp_fanout`, so Kiro/Codex turns silently never pushed
+/// (review 2026-08-06, F4). Callers gate on the settling boundary and pass the
+/// turn duration (read from the FIFO front BEFORE `settle()` consumes it). The
+/// debounce/away-gate (`should_push_turn_done`) and the actual send run inside a
+/// spawned task — never await in the fan-out select loop.
+fn maybe_push_turn_done(mgr: &Weak<SessionManager>, sid: &str, owner_id: &str, dur_ms: i64) {
+    if let Some(m) = mgr.upgrade() {
+        if let Some(p) = m.push_handle() {
+            let now = now_millis();
+            let name = m.session_name(sid).unwrap_or_default();
+            let uid = owner_id.to_string();
+            let sid2 = sid.to_string();
+            tokio::spawn(async move {
+                if crate::push::should_push_turn_done(now, p.last_turn_push(&uid, &sid2), dur_ms) {
+                    p.mark_turn_pushed(&uid, &sid2, now);
+                    p.send_to_user(&uid, &crate::push::payload_for("turn_done", &name, &sid2, None)).await;
+                }
+            });
+        }
+    }
+}
+
 fn spawn_acp_fanout(
     sid: String,
     mut process: AcpProcess,
@@ -2322,23 +2347,10 @@ fn spawn_acp_fanout(
                                 // turn_done push: settling boundary of a non-scheduled
                                 // turn (active_run_id still None → human-interactive turn).
                                 // Must read active_run_id.is_none() BEFORE the take() below.
-                                // Fire-and-forget via tokio::spawn; never await in the fan-out.
+                                // dur read from the FIFO front BEFORE settle() consumes it.
                                 if boundary_count >= turn_seq && active_run_id.is_none() {
-                                    if let Some(m) = mgr.upgrade() {
-                                        if let Some(p) = m.push_handle() {
-                                            let now = now_millis();
-                                            let dur = turn_starts.front().map(|s| now - s).unwrap_or(0);
-                                            let name = m.session_name(&sid).unwrap_or_default();
-                                            let uid = owner_id.clone();
-                                            let sid2 = sid.clone();
-                                            tokio::spawn(async move {
-                                                if crate::push::should_push_turn_done(now, p.last_turn_push(&uid, &sid2), dur) {
-                                                    p.mark_turn_pushed(&uid, &sid2, now);
-                                                    p.send_to_user(&uid, &crate::push::payload_for("turn_done", &name, &sid2, None)).await;
-                                                }
-                                            });
-                                        }
-                                    }
+                                    let dur = turn_starts.front().map(|s| now_millis() - s).unwrap_or(0);
+                                    maybe_push_turn_done(&mgr, &sid, &owner_id, dur);
                                 }
                                 // Finalize a scheduled run exactly once, keyed
                                 // on active_run_id, mapped by terminal event type.
@@ -3034,6 +3046,12 @@ fn spawn_kiro_fanout(
                                     if let Some(m) = mgr.upgrade() {
                                         m.mark_turn(&sid, TurnState::Idle, turn_seq);
                                     }
+                                    // turn_done push (parity with spawn_acp_fanout — F4).
+                                    // Kiro/Codex run no scheduled tasks, so every settling
+                                    // turn here is interactive (no active_run_id gate needed).
+                                    // dur read BEFORE settle() consumes the FIFO front.
+                                    let dur = turn_starts.front().map(|s| now_millis() - s).unwrap_or(0);
+                                    maybe_push_turn_done(&mgr, &sid, &owner_id, dur);
                                 }
                                 // per-run metrics: one metric per boundary, intent overrides
                                 // event type (mirrors spawn_acp_fanout). Skipped when this
@@ -3289,6 +3307,12 @@ fn spawn_codex_fanout(
                                     if let Some(m) = mgr.upgrade() {
                                         m.mark_turn(&sid, TurnState::Idle, turn_seq);
                                     }
+                                    // turn_done push (parity with spawn_acp_fanout — F4).
+                                    // Kiro/Codex run no scheduled tasks, so every settling
+                                    // turn here is interactive (no active_run_id gate needed).
+                                    // dur read BEFORE settle() consumes the FIFO front.
+                                    let dur = turn_starts.front().map(|s| now_millis() - s).unwrap_or(0);
+                                    maybe_push_turn_done(&mgr, &sid, &owner_id, dur);
                                 }
                                 // per-run metrics: one metric per boundary, intent overrides
                                 // event type (mirrors spawn_acp_fanout). Skipped when this
@@ -5003,6 +5027,26 @@ mod lifetime_tests {
         });
         assert!(mgr.last_activity_ms(sid).unwrap() > 0,
             "a text ContentBlock is agent progress → must bump last_activity_ms");
+    }
+
+    #[tokio::test]
+    async fn maybe_push_turn_done_is_safe_noop_without_push_service() {
+        // F4 (review 2026-08-06): the turn_done push was extracted into the shared
+        // `maybe_push_turn_done` so all three fan-outs (Claude/Kiro/Codex) notify
+        // identically — Kiro/Codex previously never pushed. This guards the common
+        // path: with no PushService wired (push_handle() == None, the default) the
+        // helper must be a clean no-op and never panic, for any backend's session.
+        let (mgr, _dir) = make_manager();
+        let sid = "s-push";
+        let s = running_session_lt(sid, "owner1");
+        mgr.sessions.lock().unwrap().insert(sid.into(), s);
+        let weak = Arc::downgrade(&mgr);
+        // Call it exactly as the fan-outs do; must not panic with push disabled.
+        maybe_push_turn_done(&weak, sid, "owner1", 120_000);
+        // A dropped manager (Weak::upgrade → None) is also a safe no-op.
+        maybe_push_turn_done(&Weak::new(), sid, "owner1", 120_000);
+        tokio::task::yield_now().await; // let any (here: none) spawned task run
+        assert!(mgr.session_name(sid).is_some(), "session state untouched by the no-op push");
     }
 
     #[test]

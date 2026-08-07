@@ -206,16 +206,30 @@ fn ipv4_blocked(v4: std::net::Ipv4Addr) -> bool {
 }
 
 /// True if an IPv6 address must not be the target of an outbound push request.
-/// IPv4-mapped/compatible forms are reclassified through `ipv4_blocked` so that
-/// re-encoding an internal IPv4 as a v6 literal cannot bypass the v4 denylist.
+/// IPv4-mapped AND IPv4-compatible forms are reclassified through `ipv4_blocked`
+/// so that re-encoding an internal IPv4 as a v6 literal cannot bypass the v4
+/// denylist.
 fn ipv6_blocked(v6: std::net::Ipv6Addr) -> bool {
-    if let Some(v4) = v6.to_ipv4_mapped() {
-        return ipv4_blocked(v4);
-    }
-    v6.is_loopback()
+    // Native v6 special ranges are checked FIRST, before any v4 reclassification.
+    // This ordering is load-bearing: `to_ipv4()` (below) maps `::1` → `0.0.0.1`
+    // and `::` → `0.0.0.0`, and `0.0.0.1` is NOT in the v4 denylist — so an
+    // early v4 return would wrongly ALLOW `::1` loopback. Catch them as v6 first.
+    if v6.is_loopback()
         || v6.is_unspecified()
         || v6.is_unique_local()        // fc00::/7
         || v6.is_unicast_link_local()  // fe80::/10
+    {
+        return true;
+    }
+    // Then reclassify an embedded IPv4. `to_ipv4()` (unlike `to_ipv4_mapped()`)
+    // matches BOTH the mapped `::ffff:0:0/96` form AND the deprecated compatible
+    // `::/96` form (`::169.254.169.254` → 169.254.169.254), closing the sibling
+    // bypass where an internal v4 was re-encoded as an IPv4-compatible v6 literal.
+    // The `::/96` special addresses (::1/::) are already handled above.
+    if let Some(v4) = v6.to_ipv4() {
+        return ipv4_blocked(v4);
+    }
+    false
 }
 
 pub fn endpoint_is_safe(endpoint: &str) -> bool {
@@ -232,7 +246,18 @@ pub fn endpoint_is_safe(endpoint: &str) -> bool {
     // separate, larger change; the attacker model here is an approved user.
     match url.host() {
         None => false,
-        Some(url::Host::Domain(d)) => !d.eq_ignore_ascii_case("localhost"),
+        Some(url::Host::Domain(d)) => {
+            // `url` preserves an absolute-FQDN trailing dot in the host, so
+            // `localhost.` parses as Domain("localhost.") and slipped past an
+            // exact `== "localhost"` compare while still resolving to 127.0.0.1
+            // via the system resolver (blind loopback SSRF). Strip one trailing
+            // dot, then refuse `localhost` and the RFC-6761 `*.localhost` TLD
+            // (also loopback by spec). DNS rebinding of an arbitrary domain to an
+            // internal IP is still out of scope (needs connect-time resolve-and-pin).
+            let d = d.strip_suffix('.').unwrap_or(d);
+            !(d.eq_ignore_ascii_case("localhost")
+                || d.to_ascii_lowercase().ends_with(".localhost"))
+        }
         Some(url::Host::Ipv4(v4)) => !ipv4_blocked(v4),
         Some(url::Host::Ipv6(v6)) => !ipv6_blocked(v6),
     }
@@ -642,6 +667,26 @@ mod tests {
         assert!(!endpoint_is_safe("https://[fe80::1]/x"));               // link-local
         assert!(!endpoint_is_safe("https://169.254.169.254/x"));         // metadata stays blocked
         assert!(!endpoint_is_safe("https://100.64.0.1/x"));              // CGNAT / shared
+        // F1 (review 2026-08-06): `url` keeps a trailing dot in the host, so the
+        // absolute-FQDN forms of localhost slipped past an exact `== "localhost"`
+        // compare while still resolving to loopback. Plus the RFC-6761 `*.localhost`.
+        assert!(!endpoint_is_safe("https://localhost./x"));              // trailing-dot FQDN
+        assert!(!endpoint_is_safe("https://LOCALHOST./x"));              // case-insensitive
+        assert!(!endpoint_is_safe("https://foo.localhost/x"));           // RFC-6761 loopback TLD
+        assert!(!endpoint_is_safe("https://foo.localhost./x"));          // both
+        // F2 (review 2026-08-06): the deprecated IPv4-COMPATIBLE v6 form `::a.b.c.d`
+        // was not reclassified (`to_ipv4_mapped()` only matched the mapped form), so
+        // an internal v4 re-encoded this way bypassed the v4 denylist.
+        assert!(!endpoint_is_safe("https://[::169.254.169.254]/x"));     // compat metadata
+        assert!(!endpoint_is_safe("https://[::7f00:1]/x"));              // compat 127.0.0.1
+        assert!(!endpoint_is_safe("https://[::a00:5]/x"));               // compat 10.0.0.5
+        // Regression guard for the fix's ordering: `to_ipv4()` maps `::` → 0.0.0.0
+        // and `::1` → 0.0.0.1; 0.0.0.1 is NOT in the v4 denylist, so these MUST be
+        // caught by the native-v6 checks (loopback/unspecified) that now run first.
+        assert!(!endpoint_is_safe("https://[::1]/x"));                   // loopback (v6-first)
+        assert!(!endpoint_is_safe("https://[::]/x"));                    // unspecified (v6-first)
+        // A legitimate global IPv6 push endpoint must still be allowed (no v4 embed).
+        assert!(endpoint_is_safe("https://[2606:4700:4700::1111]/x"));
     }
 
     #[test]

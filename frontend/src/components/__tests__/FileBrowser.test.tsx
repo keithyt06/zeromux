@@ -94,6 +94,34 @@ describe('FileBrowser', () => {
     await waitFor(() => expect(screen.getByText(/pic-1\.png/)).toBeInTheDocument())
   })
 
+  it('out-of-order file reads: a slow first read cannot overwrite the newer selection (F2)', async () => {
+    vi.spyOn(api, 'listDir').mockResolvedValue({
+      entries: [
+        { name: 'a.txt', type: 'file', size: 3, mtime: 0, writable: true },
+        { name: 'b.txt', type: 'file', size: 3, mtime: 0, writable: true },
+      ],
+      truncated: false,
+    })
+    // a.txt read is slow (resolves LAST), b.txt is fast (resolves FIRST).
+    let resolveA: (v: string) => void = () => {}
+    const aPromise = new Promise<string>(r => { resolveA = r })
+    vi.spyOn(api, 'getSessionFile').mockImplementation((_sid, path) => {
+      if (path === 'a.txt') return aPromise
+      return Promise.resolve('BBB-content')
+    })
+
+    render(<FileBrowser sessionId="s1" />)
+    const a = await screen.findByText('a.txt')
+    a.click()                                   // open A (slow, pending)
+    screen.getByText('b.txt').click()           // then open B (fast) before A resolves
+    // B lands first.
+    expect(await screen.findByText('BBB-content')).toBeInTheDocument()
+    // Now A's slow read resolves — it must NOT clobber B's preview.
+    resolveA('AAA-content')
+    await waitFor(() => expect(screen.queryByText('AAA-content')).not.toBeInTheDocument())
+    expect(screen.getByText('BBB-content')).toBeInTheDocument()
+  })
+
   it('reset returns to work_dir root (default base, write controls back)', async () => {
     localStorage.setItem('zeromux:fb-root:s1', '/home/ubuntu/other')
     const spy = vi.spyOn(api, 'listDir').mockResolvedValue({ entries: [], truncated: false })

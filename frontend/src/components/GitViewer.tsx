@@ -72,15 +72,21 @@ export default function GitViewer({ sessionId, onForward }: Props) {
     setLoadingDiff(true)
     try {
       const data = await getGitShow(sessionId, hash)
+      // Stale-response guard: clicking commit A (slow `git show`) then B (fast)
+      // lands B first, then A overwrites — leaving the list highlighting B but the
+      // diff/header showing A. Bail if a newer selection has superseded this one.
+      // (review 2026-08-06, F2)
+      if (selectedHashRef.current !== hash) return
       setDiff(data.diff)
       setFiles(data.files)
       setCommitMeta(data.commit)
     } catch (e: any) {
+      if (selectedHashRef.current !== hash) return
       setDiff(`Error: ${e.message}`)
       setFiles([])
       setCommitMeta(null)
     }
-    setLoadingDiff(false)
+    if (selectedHashRef.current === hash) setLoadingDiff(false)
   }
 
   useEffect(() => { loadLog() }, [loadLog])

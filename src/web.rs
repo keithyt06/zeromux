@@ -2056,8 +2056,16 @@ async fn git_show(
     // which the credential filter can't recognize, so a non-ASCII-named .env/*.pem
     // would fail the exclusion OPEN and leak its hunk (filter_diff_excluded also
     // fails closed on any residual quoted header git emits regardless of this flag).
+    // `-M` forces rename detection. Without it a repo-local `diff.renames=false`
+    // (attacker-controlled: an agent/user can `git config diff.renames false` in
+    // its own work_dir) splits a `git mv .aws/credentials public.txt` commit into a
+    // DELETE of `.aws/credentials` (filtered) PLUS an ADD of `public.txt` whose body
+    // dumps the secret under the innocuous new name (kept → leaks). With `-M` git
+    // emits the paired `diff --git a/.aws/credentials b/public.txt` header, whose
+    // `a/` side `diff_header_path`'s Excluded arm strips. `-M` overrides the config.
+    // (review 2026-08-06, F1)
     let diff_output = std::process::Command::new("git")
-        .args(["-c", "core.quotePath=false", "show", "--format=", "--patch", &query.commit])
+        .args(["-c", "core.quotePath=false", "show", "-M", "--format=", "--patch", &query.commit])
         .current_dir(&work_dir)
         .output()
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("git show failed: {}", e)))?;
@@ -2077,7 +2085,7 @@ async fn git_show(
     // `worktree_path_excluded` unquoted and is recognized/dropped (else the
     // quoted `".env.\347..."` bypasses the leaf check and surfaces the name).
     let files: Vec<serde_json::Value> = std::process::Command::new("git")
-        .args(["-c", "core.quotePath=false", "show", "--format=", "--numstat", &query.commit])
+        .args(["-c", "core.quotePath=false", "show", "-M", "--format=", "--numstat", &query.commit])
         .current_dir(&work_dir)
         .output()
         .ok()
@@ -2379,34 +2387,36 @@ async fn git_worktree(
         .map(|o| o.status.success())
         .unwrap_or(false);
     let diff_raw = if has_head {
-        // Exclude every sensitive-named dir from the diff body via git pathspec
-        // magic, so a tracked-and-modified file under .ssh/.aws/.git/etc. can
-        // never leak its hunk (the file LIST is already filtered, but the diff
-        // text is whole-repo otherwise). Two pathspecs per name cover the dir at
-        // repo root and at any depth.
+        // `git diff HEAD` for the whole tree, then strip every sensitive section
+        // via `filter_diff_excluded` (the SAME rename-aware predicate the file list
+        // uses — it inspects BOTH the a/ and b/ side of each `diff --git` header, so
+        // a section that touches a sensitive dir or credential leaf on either side is
+        // dropped whole).
+        //
+        // Deliberately NO `:(exclude,glob)` pathspecs: excluding the sensitive dir
+        // from git's scope removed the OLD side of a rename, so `git mv
+        // .aws/credentials public.txt` was re-reported as a brand-new `public.txt`
+        // whose body dumped the secret under the innocuous new name — and
+        // `filter_diff_excluded` only saw the non-sensitive `public.txt`, so it
+        // passed the whole hunk through (one-request exfiltration, review
+        // 2026-08-06, F1). The pathspec was also redundant: a plain in-place modify
+        // of `.aws/config` still emits `diff --git a/.aws/config …`, whose dir
+        // component the filter's Path arm already strips.
+        //
+        // `-M` forces rename detection so a relocated credential keeps its paired
+        // `a/.aws/credentials b/public.txt` header (→ Excluded arm strips it) even
+        // under a repo-local `diff.renames=false`.
         // `core.quotePath=false`: emit literal UTF-8 paths so a non-ASCII-named
         // credential leaf (e.g. `.env.生产`) reaches filter_diff_excluded's leaf
-        // predicate unquoted (the pathspecs below only exclude sensitive *dirs*).
-        let mut diff_args: Vec<String> = vec![
-            "-c".into(), "core.quotePath=false".into(),
-            "diff".into(), "HEAD".into(), "--".into(), ".".into(),
-        ];
-        for name in SENSITIVE_DIR_NAMES {
-            diff_args.push(format!(":(exclude,glob){}/**", name));
-            diff_args.push(format!(":(exclude,glob)**/{}/**", name));
-            diff_args.push(format!(":(exclude,glob){name}")); // file/dir named <name> at root
-            diff_args.push(format!(":(exclude,glob)**/{name}")); // ...at any depth
-        }
+        // predicate unquoted (else the C-quoted header hits the fail-closed arm).
         let raw = std::process::Command::new("git")
-            .args(&diff_args)
+            .args(["-c", "core.quotePath=false", "diff", "HEAD", "-M", "--", "."])
             .current_dir(dir)
             .output()
             .ok()
             .filter(|o| o.status.success())
             .map(|o| String::from_utf8_lossy(&o.stdout).to_string())
             .unwrap_or_default();
-        // Second pass: drop credential-leaf file sections (.env/*.pem/id_*/...) that
-        // the dir-only pathspec can't express, via the shared file-list predicate.
         filter_diff_excluded(&raw)
     } else {
         String::new()
@@ -4317,6 +4327,101 @@ mod path_safety_tests {
         );
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn git_worktree_diff_does_not_leak_renamed_away_credential() {
+        // F1 (review 2026-08-06): the OLD `git_worktree` diff used `:(exclude,glob)`
+        // pathspecs to drop sensitive dirs. That removed the OLD side of a rename from
+        // git's scope, so `git mv .aws/credentials public.txt` was re-reported as a
+        // brand-new `public.txt` dumping the secret under the innocuous new name —
+        // which filter_diff_excluded (seeing only `public.txt`) passed through. The
+        // fix runs the SAME flags the handler now uses (`diff HEAD -M -- .`, no
+        // exclude pathspecs) so rename pairing survives and the a/.aws side is
+        // stripped. This test drives those exact flags against a real repo.
+        let dir = std::env::temp_dir().join(format!("zmgr-wt-rename-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let ds = dir.to_str().unwrap();
+        let run = |args: &[&str]| {
+            std::process::Command::new("git").args(["-C", ds]).args(args).output().unwrap()
+        };
+        assert!(run(&["init", "-q"]).status.success(), "git init");
+        let _ = run(&["config", "user.email", "t@t"]);
+        let _ = run(&["config", "user.name", "t"]);
+        std::fs::create_dir_all(dir.join(".aws")).unwrap();
+        std::fs::write(dir.join(".aws/credentials"), "[default]\naws_secret_access_key=SUPERSECRET\n").unwrap();
+        std::fs::write(dir.join("readme.txt"), "hi\n").unwrap();
+        assert!(run(&["add", "-A"]).status.success(), "git add");
+        assert!(run(&["commit", "-qm", "init"]).status.success(), "git commit");
+        // Relocate the credential OUT of the sensitive dir, then modify it slightly
+        // so a real hunk (not just a pure rename) is emitted — the worst case.
+        assert!(run(&["mv", ".aws/credentials", "public.txt"]).status.success(), "git mv");
+        std::fs::write(dir.join("public.txt"), "[default]\naws_secret_access_key=SUPERSECRET\nregion=us-east-1\n").unwrap();
+        assert!(run(&["add", "-A"]).status.success(), "git add 2");
+
+        // EXACT flags from git_worktree's diff invocation.
+        let raw = String::from_utf8_lossy(
+            &std::process::Command::new("git")
+                .args(["-c", "core.quotePath=false", "diff", "HEAD", "-M", "--", "."])
+                .current_dir(&dir)
+                .output()
+                .unwrap()
+                .stdout,
+        ).to_string();
+        let filtered = filter_diff_excluded(&raw);
+
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(!filtered.contains("SUPERSECRET"),
+            "relocated credential body must be stripped; got:\n{filtered}");
+        assert!(!filtered.contains("rename from .aws/credentials"),
+            "the rename header naming the credential must be stripped");
+        assert!(filtered.contains("readme.txt") || filtered.is_empty(),
+            "non-sensitive content (if any) survives; a pure clean-only diff may be empty");
+    }
+
+    #[test]
+    fn git_show_rename_detection_does_not_leak_credential_under_diff_renames_false() {
+        // F1 (review 2026-08-06): git_show without `-M` depends on git's DEFAULT
+        // rename detection, which a repo-local `diff.renames=false` (an agent can set
+        // it in its own work_dir) disables — splitting a rename commit into a delete
+        // (filtered) PLUS an add whose body leaks the secret under the new name. The
+        // handler now passes `-M`, which overrides the config. Drive the exact flags.
+        let dir = std::env::temp_dir().join(format!("zmgr-show-rename-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let ds = dir.to_str().unwrap();
+        let run = |args: &[&str]| {
+            std::process::Command::new("git").args(["-C", ds]).args(args).output().unwrap()
+        };
+        assert!(run(&["init", "-q"]).status.success(), "git init");
+        let _ = run(&["config", "user.email", "t@t"]);
+        let _ = run(&["config", "user.name", "t"]);
+        // The attacker-controlled repo config that defeated default detection.
+        let _ = run(&["config", "diff.renames", "false"]);
+        std::fs::create_dir_all(dir.join(".aws")).unwrap();
+        std::fs::write(dir.join(".aws/credentials"), "[default]\naws_secret_access_key=SUPERSECRET\n").unwrap();
+        std::fs::write(dir.join("readme.txt"), "hi\n").unwrap();
+        assert!(run(&["add", "-A"]).status.success(), "git add");
+        assert!(run(&["commit", "-qm", "init"]).status.success(), "git commit");
+        assert!(run(&["mv", ".aws/credentials", "public.txt"]).status.success(), "git mv");
+        assert!(run(&["commit", "-qam", "relocate"]).status.success(), "git commit 2");
+        let commit = String::from_utf8(run(&["rev-parse", "HEAD"]).stdout).unwrap().trim().to_string();
+
+        // EXACT flags from git_show's --patch invocation.
+        let raw = String::from_utf8_lossy(
+            &std::process::Command::new("git")
+                .args(["-c", "core.quotePath=false", "show", "-M", "--format=", "--patch", &commit])
+                .current_dir(&dir)
+                .output()
+                .unwrap()
+                .stdout,
+        ).to_string();
+        let filtered = filter_diff_excluded(&raw);
+
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(!filtered.contains("SUPERSECRET"),
+            "renamed credential must not leak even with diff.renames=false; got:\n{filtered}");
     }
 
     #[test]

@@ -2225,13 +2225,16 @@ fn build_run_metric(
 /// debounce/away-gate (`should_push_turn_done`) and the actual send run inside a
 /// spawned task — never await in the fan-out select loop.
 ///
-/// `outcome` is the turn's INTENT (`pending_outcome`, still `Some` for a turn the
-/// user explicitly Cancelled/Interrupted or the watchdog Timeout-killed). The
-/// turn_done payload is worded "✅ 完成 / 本轮已结束" (success), so firing it for a
-/// cancelled or timed-out turn tells the user their aborted turn *completed
-/// successfully* — a lie. Suppress the push for those outcomes; a Completed turn
-/// or a plain agent-side Error (which still "finished") is a legitimate turn_done.
-/// (review 2026-08-07, F3). Same suppression across all three fan-outs.
+/// `outcome` is the settling turn's INTENT — the caller passes
+/// `turn_starts.front_intent()`, i.e. the intent stamped on THIS turn's own FIFO
+/// entry (`Some` for a turn the user explicitly Cancelled/Interrupted or the
+/// watchdog Timeout-killed). The turn_done payload is worded "✅ 完成 / 本轮已结束"
+/// (success), so firing it for a cancelled or timed-out turn tells the user their
+/// aborted turn *completed successfully* — a lie. Suppress the push for those
+/// outcomes; a Completed turn or a plain agent-side Error (which still "finished")
+/// is a legitimate turn_done. (review 2026-08-07 F3; per-turn FIFO intent so a
+/// coupled interrupt-resend can't cross-contaminate — 2026-08-08 F2.) Same
+/// suppression across all three fan-outs.
 fn maybe_push_turn_done(
     mgr: &Weak<SessionManager>,
     sid: &str,
@@ -2299,10 +2302,10 @@ fn spawn_acp_fanout(
         // at every turn-start site and `settle()`d (pop_front) at the boundary,
         // pairing each FIFO-ordered boundary with its own turn (an interrupt-
         // resend starts turn N+1 before turn N's aborted boundary arrives, so a
-        // single slot would mis-attribute both — see TurnStarts). `pending_outcome`
-        // carries INTENT (Cancel/Interrupt→Cancelled, TimeoutKill→Timeout) set on
-        // the input branch and overrides the terminal-event inference.
-        let mut pending_outcome: Option<crate::run_metrics::RunOutcome> = None;
+        // single slot would mis-attribute both — see TurnStarts). Each entry also
+        // carries INTENT (Cancel/Interrupt→Cancelled, TimeoutKill→Timeout), stamped
+        // on the LIVE turn's entry via `set_live_intent` from the input branch, so
+        // it overrides the terminal-event inference for exactly that turn.
         let mut turn_starts = TurnStarts::default();
         // ── cost 差分状态(仅 claude-code;见 cost-calibration spec)──
         // 冷启动:prev=Some(0.0)→首轮增量=total 本身;resume:prev=None→首轮记 0。
@@ -2370,13 +2373,14 @@ fn spawn_acp_fanout(
                                 // turn_done push: settling boundary of a non-scheduled
                                 // turn (active_run_id still None → human-interactive turn).
                                 // Must read active_run_id.is_none() BEFORE the take() below.
-                                // dur read from the FIFO front BEFORE settle() consumes it.
+                                // dur AND intent read from the FIFO front (the settling
+                                // turn's own entry) BEFORE settle() consumes it — so a
+                                // Cancelled/Timeout turn is suppressed and coupled
+                                // interrupt-resend turns don't cross-contaminate
+                                // (review 2026-08-07 F3; 2026-08-08 F2).
                                 if boundary_count >= turn_seq && active_run_id.is_none() {
                                     let dur = turn_starts.front().map(|s| now_millis() - s).unwrap_or(0);
-                                    // pending_outcome is Copy — read (don't take) it here so a
-                                    // Cancelled/Timeout turn is suppressed; the metrics block
-                                    // below still .take()s it. (review 2026-08-07, F3)
-                                    maybe_push_turn_done(&mgr, &sid, &owner_id, dur, pending_outcome);
+                                    maybe_push_turn_done(&mgr, &sid, &owner_id, dur, turn_starts.front_intent());
                                 }
                                 // Finalize a scheduled run exactly once, keyed
                                 // on active_run_id, mapped by terminal event type.
@@ -2417,28 +2421,34 @@ fn spawn_acp_fanout(
                                     }
                                 }
                                 // per-run metrics: every boundary (completed/error/cancel/timeout)
-                                // records exactly one metric from this single exit. Intent
-                                // (pending_outcome) overrides the event-type inference; the
-                                // late boundaries of an interrupt-resend still each record a run
-                                // (they represent a real run that ended) — the turn_starts FIFO
-                                // pairs each with its own turn's start. Skipped only if this
-                                // boundary has no pending turn-start (turn_starts empty).
+                                // records exactly one metric from this single exit. The turn's
+                                // own intent (from its FIFO entry) overrides the event-type
+                                // inference; the late boundaries of an interrupt-resend still
+                                // each record a run (they represent a real run that ended) — the
+                                // turn_starts FIFO pairs each with its own turn's start+intent.
+                                // Skipped only if this boundary has no pending turn-start.
                                 let term = match &evt {
                                     AcpEvent::Result { .. } => crate::run_metrics::TerminalEvt::Result,
                                     AcpEvent::Error { .. } => crate::run_metrics::TerminalEvt::Error,
                                     _ => crate::run_metrics::TerminalEvt::Exit,
                                 };
-                                let outcome = crate::run_metrics::classify_outcome(term, pending_outcome.take());
+                                // Consume THIS boundary's own (start, intent) from the
+                                // FIFO front — boundaries drain in order, so the front
+                                // is the turn this boundary belongs to. The intent
+                                // (Cancel/Timeout, set on that turn's entry) overrides
+                                // the event-type inference and can't be stolen by a
+                                // coupled interrupt-resend turn (review 2026-08-08, F2).
+                                // 队首(最早未结算的 turn-start)决定本边界是否落 metric;
+                                // 若队列已空(罕见的多余边界)则不落 metric,且**不能**推进
+                                // prev_cost,否则该轮增量凭空消失(见 diff_cost_at_boundary)。
+                                let settled = turn_starts.settle();
+                                let will_record = settled.is_some();
+                                let outcome = crate::run_metrics::classify_outcome(
+                                    term, settled.and_then(|(_, o)| o));
                                 let (raw_cost, mt_in, mt_out) = match &evt {
                                     AcpEvent::Result { cost_usd, tokens_in, tokens_out, .. } => (*cost_usd, *tokens_in, *tokens_out),
                                     _ => (None, None, None),
                                 };
-                                // 本边界是否会落 metric:由 FIFO 队首(最早未结算的 turn-start)
-                                // 决定。boundaries 严格 FIFO、每 turn 恰一个,故 front() 就是本
-                                // 边界所属 turn 的 start;若队列已空(罕见的多余边界)则不落 metric,
-                                // 且**不能**推进 prev_cost,否则该轮增量凭空消失、lifetime_cost_usd
-                                // 偏低(见 diff_cost_at_boundary 文档)。settle() 在下方消费同一队首。
-                                let will_record = turn_starts.front().is_some();
                                 let mc = if is_claude {
                                     let (delta, new_prev, new_seen) = crate::run_metrics::diff_cost_at_boundary(
                                         prev_cost, raw_cost, first_cost_seen, is_resumed, will_record);
@@ -2453,7 +2463,7 @@ fn spawn_acp_fanout(
                                         if matches!(evt, AcpEvent::Exit { .. }) { "cli_exited" } else { "cli_error" }.to_string()),
                                     _ => None,
                                 };
-                                if let Some(started) = turn_starts.settle() {
+                                if let Some((started, _)) = settled {
                                     if let Some(m) = mgr.upgrade() {
                                         let rid = crate::run_metrics::new_run_id();
                                         let metric = build_run_metric(&rid, &sid, &work_dir, agent_label, turn_seq,
@@ -2620,8 +2630,10 @@ fn spawn_acp_fanout(
                         }
                         Some(SessionInput::Interrupt) => {
                             if local_running {
-                                // Intent: the interrupted turn is not a completion.
-                                pending_outcome = Some(crate::run_metrics::RunOutcome::Cancelled);
+                                // Intent: the LIVE turn (FIFO back) is not a completion.
+                                // Stamping the specific entry (not a shared slot) means a
+                                // coupled interrupt-resend can't misattribute it (F2).
+                                turn_starts.set_live_intent(crate::run_metrics::RunOutcome::Cancelled);
                                 if let Err(e) = process.interrupt().await {
                                     tracing::warn!("interrupt failed for {}: {}", sid, e);
                                 }
@@ -2632,13 +2644,15 @@ fn spawn_acp_fanout(
                             queue.clear();
                         }
                         Some(SessionInput::Cancel) => {
-                            // Intent before kill: the ensuing Exit must classify as Cancelled.
-                            pending_outcome = Some(crate::run_metrics::RunOutcome::Cancelled);
+                            // Intent before kill: the ensuing Exit must classify the
+                            // LIVE turn as Cancelled (FIFO back entry).
+                            turn_starts.set_live_intent(crate::run_metrics::RunOutcome::Cancelled);
                             process.kill().await;
                         }
                         Some(SessionInput::TimeoutKill { .. }) => {
-                            // Intent before kill: the ensuing Exit must classify as Timeout.
-                            pending_outcome = Some(crate::run_metrics::RunOutcome::Timeout);
+                            // Intent before kill: the ensuing Exit must classify the
+                            // LIVE turn as Timeout (FIFO back entry).
+                            turn_starts.set_live_intent(crate::run_metrics::RunOutcome::Timeout);
                             process.kill().await;
                         }
                         None => break, // all input senders dropped (session removed)
@@ -2710,30 +2724,57 @@ struct PendingPrompt {
 /// all later pairings. Holds because every start site is immediately followed
 /// by `send_prompt`, whose failure implies process death → an `Exit` boundary
 /// drains the stamp; and `Cancel`/`TimeoutKill` `kill()` the process (→ `Exit`).
-/// (An outcome-intent FIFO to label the aborted turn of a coupled interrupt-
-/// resend as Cancelled rather than Completed is a documented follow-up; the
-/// single `pending_outcome` slot still covers the standalone Cancel/Interrupt
-/// paths, and the aborted-turn label was already Completed before this fix.)
+///
+/// Each entry ALSO carries the turn's outcome INTENT (`Option<RunOutcome>`),
+/// paired 1:1 with its start-stamp. This replaces the earlier single
+/// `pending_outcome` slot, which conflated coupled interrupt-resend turns the
+/// same way a single start-slot conflated their durations: a Cancel/Timeout
+/// intent belongs to *the turn that was live when the user pressed the button*
+/// (the FIFO back at that instant), but the single slot was consumed by whichever
+/// boundary arrived first. So `resend-then-cancel` let the aborted turn's stale
+/// boundary steal the live turn's Cancelled intent (→ false "✅ 完成" push), and
+/// the mirror `cancel-then-resend` would have leaked the intent forward onto the
+/// next clean turn. Storing intent on the specific entry settles both orderings:
+/// `set_live_intent` stamps the back (the live turn) and each boundary reads only
+/// its own entry's intent. (review 2026-08-08, F2 — the documented follow-up to
+/// 2026-08-07 F3.)
 #[derive(Default)]
 struct TurnStarts {
-    inner: VecDeque<i64>,
+    inner: VecDeque<(i64, Option<crate::run_metrics::RunOutcome>)>,
 }
 
 impl TurnStarts {
-    /// A turn started at `ms`; enqueue its start-stamp.
+    /// A turn started at `ms`; enqueue its start-stamp with no intent yet.
     fn start(&mut self, ms: i64) {
-        self.inner.push_back(ms);
+        self.inner.push_back((ms, None));
+    }
+
+    /// Record the outcome INTENT for the currently-live turn (the FIFO back),
+    /// set when the user Cancels/Interrupts or the watchdog Timeout-kills it.
+    /// No-op when no turn is live (empty FIFO) — a cancel with nothing running
+    /// must NOT persist an intent that a future unrelated turn would consume.
+    fn set_live_intent(&mut self, outcome: crate::run_metrics::RunOutcome) {
+        if let Some(back) = self.inner.back_mut() {
+            back.1 = Some(outcome);
+        }
     }
 
     /// Peek the oldest pending start-stamp without consuming it (used for the
     /// turn_done push duration, read before the metric block settles it).
     fn front(&self) -> Option<i64> {
-        self.inner.front().copied()
+        self.inner.front().map(|(ms, _)| *ms)
     }
 
-    /// A boundary arrived; consume and return the oldest pending start-stamp,
+    /// Peek the oldest pending turn's outcome intent without consuming it (used
+    /// for the turn_done push suppression on the settling boundary — the front
+    /// IS the settling turn's entry, since boundaries drain the FIFO in order).
+    fn front_intent(&self) -> Option<crate::run_metrics::RunOutcome> {
+        self.inner.front().and_then(|(_, o)| *o)
+    }
+
+    /// A boundary arrived; consume and return the oldest pending (start, intent),
     /// or None if this boundary has no matching turn-start (spurious extra).
-    fn settle(&mut self) -> Option<i64> {
+    fn settle(&mut self) -> Option<(i64, Option<crate::run_metrics::RunOutcome>)> {
         self.inner.pop_front()
     }
 }
@@ -3034,7 +3075,8 @@ fn spawn_kiro_fanout(
         // 队列模式(G2b):passthrough 经 effective() 降级为 collect(见 QueueMode::effective)。
         let mut queue_mode = QueueMode::Collect;
         // ── per-run metrics state (mirrors spawn_acp_fanout) ──
-        let mut pending_outcome: Option<crate::run_metrics::RunOutcome> = None;
+        // Per-turn (start, intent) FIFO; intent stamped on the live turn via
+        // set_live_intent from the input branch (Cancel/Timeout). See TurnStarts.
         let mut turn_starts = TurnStarts::default();
         loop {
             tokio::select! {
@@ -3075,10 +3117,13 @@ fn spawn_kiro_fanout(
                                     // turn_done push (parity with spawn_acp_fanout — F4).
                                     // Kiro/Codex run no scheduled tasks, so every settling
                                     // turn here is interactive (no active_run_id gate needed).
-                                    // dur read BEFORE settle() consumes the FIFO front.
-                                    // pending_outcome (Copy) suppresses Cancelled/Timeout — F3.
+                                    // dur AND intent read from the FIFO front (the settling
+                                    // turn's own entry) BEFORE settle() consumes it — so a
+                                    // Cancelled/Timeout turn is suppressed and coupled
+                                    // interrupt-resend turns don't cross-contaminate
+                                    // (review 2026-08-07 F3; 2026-08-08 F2).
                                     let dur = turn_starts.front().map(|s| now_millis() - s).unwrap_or(0);
-                                    maybe_push_turn_done(&mgr, &sid, &owner_id, dur, pending_outcome);
+                                    maybe_push_turn_done(&mgr, &sid, &owner_id, dur, turn_starts.front_intent());
                                 }
                                 // per-run metrics: one metric per boundary, intent overrides
                                 // event type (mirrors spawn_acp_fanout). Skipped when this
@@ -3088,7 +3133,12 @@ fn spawn_kiro_fanout(
                                     AcpEvent::Error { .. } => crate::run_metrics::TerminalEvt::Error,
                                     _ => crate::run_metrics::TerminalEvt::Exit,
                                 };
-                                let outcome = crate::run_metrics::classify_outcome(term, pending_outcome.take());
+                                // Consume THIS boundary's own (start, intent) from the FIFO
+                                // front; the per-turn intent can't be stolen by a coupled
+                                // interrupt-resend turn (review 2026-08-08, F2).
+                                let settled = turn_starts.settle();
+                                let outcome = crate::run_metrics::classify_outcome(
+                                    term, settled.and_then(|(_, o)| o));
                                 let (mc, mt_in, mt_out) = match &evt {
                                     AcpEvent::Result { cost_usd, tokens_in, tokens_out, .. } => (*cost_usd, *tokens_in, *tokens_out),
                                     _ => (None, None, None),
@@ -3098,7 +3148,7 @@ fn spawn_kiro_fanout(
                                         if matches!(evt, AcpEvent::Exit { .. }) { "cli_exited" } else { "cli_error" }.to_string()),
                                     _ => None,
                                 };
-                                if let Some(started) = turn_starts.settle() {
+                                if let Some((started, _)) = settled {
                                     if let Some(m) = mgr.upgrade() {
                                         let rid = crate::run_metrics::new_run_id();
                                         let metric = build_run_metric(&rid, &sid, &work_dir, agent_label, turn_seq,
@@ -3218,8 +3268,9 @@ fn spawn_kiro_fanout(
                         }
                         Some(SessionInput::Interrupt) => {
                             if local_running {
-                                // Intent: the interrupted turn is not a completion.
-                                pending_outcome = Some(crate::run_metrics::RunOutcome::Cancelled);
+                                // Intent: the LIVE turn (FIFO back) is not a completion
+                                // (per-entry so a coupled resend can't misattribute — F2).
+                                turn_starts.set_live_intent(crate::run_metrics::RunOutcome::Cancelled);
                                 if let Err(e) = process.interrupt().await {
                                     tracing::warn!("interrupt failed for {}: {}", sid, e);
                                 }
@@ -3228,13 +3279,15 @@ fn spawn_kiro_fanout(
                             queue.clear();
                         }
                         Some(SessionInput::Cancel) => {
-                            // Intent before kill: the ensuing Exit must classify as Cancelled.
-                            pending_outcome = Some(crate::run_metrics::RunOutcome::Cancelled);
+                            // Intent before kill: classify the LIVE turn as Cancelled
+                            // (FIFO back entry — see spawn_acp_fanout, F2).
+                            turn_starts.set_live_intent(crate::run_metrics::RunOutcome::Cancelled);
                             process.kill().await;
                         }
                         Some(SessionInput::TimeoutKill { .. }) => {
-                            // Intent before kill: the ensuing Exit must classify as Timeout.
-                            pending_outcome = Some(crate::run_metrics::RunOutcome::Timeout);
+                            // Intent before kill: classify the LIVE turn as Timeout
+                            // (FIFO back entry — see spawn_acp_fanout, F2).
+                            turn_starts.set_live_intent(crate::run_metrics::RunOutcome::Timeout);
                             process.kill().await;
                         }
                         None => break,
@@ -3296,7 +3349,8 @@ fn spawn_codex_fanout(
         // collect(见 QueueMode::effective,review 2026-06-11)。
         let mut queue_mode = QueueMode::Collect;
         // ── per-run metrics state (mirrors spawn_acp_fanout) ──
-        let mut pending_outcome: Option<crate::run_metrics::RunOutcome> = None;
+        // Per-turn (start, intent) FIFO; intent stamped on the live turn via
+        // set_live_intent from the input branch (Cancel/Timeout). See TurnStarts.
         let mut turn_starts = TurnStarts::default();
         loop {
             tokio::select! {
@@ -3337,10 +3391,13 @@ fn spawn_codex_fanout(
                                     // turn_done push (parity with spawn_acp_fanout — F4).
                                     // Kiro/Codex run no scheduled tasks, so every settling
                                     // turn here is interactive (no active_run_id gate needed).
-                                    // dur read BEFORE settle() consumes the FIFO front.
-                                    // pending_outcome (Copy) suppresses Cancelled/Timeout — F3.
+                                    // dur AND intent read from the FIFO front (the settling
+                                    // turn's own entry) BEFORE settle() consumes it — so a
+                                    // Cancelled/Timeout turn is suppressed and coupled
+                                    // interrupt-resend turns don't cross-contaminate
+                                    // (review 2026-08-07 F3; 2026-08-08 F2).
                                     let dur = turn_starts.front().map(|s| now_millis() - s).unwrap_or(0);
-                                    maybe_push_turn_done(&mgr, &sid, &owner_id, dur, pending_outcome);
+                                    maybe_push_turn_done(&mgr, &sid, &owner_id, dur, turn_starts.front_intent());
                                 }
                                 // per-run metrics: one metric per boundary, intent overrides
                                 // event type (mirrors spawn_acp_fanout). Skipped when this
@@ -3350,7 +3407,12 @@ fn spawn_codex_fanout(
                                     AcpEvent::Error { .. } => crate::run_metrics::TerminalEvt::Error,
                                     _ => crate::run_metrics::TerminalEvt::Exit,
                                 };
-                                let outcome = crate::run_metrics::classify_outcome(term, pending_outcome.take());
+                                // Consume THIS boundary's own (start, intent) from the FIFO
+                                // front; the per-turn intent can't be stolen by a coupled
+                                // interrupt-resend turn (review 2026-08-08, F2).
+                                let settled = turn_starts.settle();
+                                let outcome = crate::run_metrics::classify_outcome(
+                                    term, settled.and_then(|(_, o)| o));
                                 let (mc, mt_in, mt_out) = match &evt {
                                     AcpEvent::Result { cost_usd, tokens_in, tokens_out, .. } => (*cost_usd, *tokens_in, *tokens_out),
                                     _ => (None, None, None),
@@ -3360,7 +3422,7 @@ fn spawn_codex_fanout(
                                         if matches!(evt, AcpEvent::Exit { .. }) { "cli_exited" } else { "cli_error" }.to_string()),
                                     _ => None,
                                 };
-                                if let Some(started) = turn_starts.settle() {
+                                if let Some((started, _)) = settled {
                                     if let Some(m) = mgr.upgrade() {
                                         let rid = crate::run_metrics::new_run_id();
                                         let metric = build_run_metric(&rid, &sid, &work_dir, agent_label, turn_seq,
@@ -3479,8 +3541,9 @@ fn spawn_codex_fanout(
                         }
                         Some(SessionInput::Interrupt) => {
                             if local_running {
-                                // Intent: the interrupted turn is not a completion.
-                                pending_outcome = Some(crate::run_metrics::RunOutcome::Cancelled);
+                                // Intent: the LIVE turn (FIFO back) is not a completion
+                                // (per-entry so a coupled resend can't misattribute — F2).
+                                turn_starts.set_live_intent(crate::run_metrics::RunOutcome::Cancelled);
                                 if let Err(e) = process.interrupt().await {
                                     tracing::warn!("interrupt failed for {}: {}", sid, e);
                                 }
@@ -3489,13 +3552,15 @@ fn spawn_codex_fanout(
                             queue.clear();
                         }
                         Some(SessionInput::Cancel) => {
-                            // Intent before kill: the ensuing Exit must classify as Cancelled.
-                            pending_outcome = Some(crate::run_metrics::RunOutcome::Cancelled);
+                            // Intent before kill: classify the LIVE turn as Cancelled
+                            // (FIFO back entry — see spawn_acp_fanout, F2).
+                            turn_starts.set_live_intent(crate::run_metrics::RunOutcome::Cancelled);
                             process.kill().await;
                         }
                         Some(SessionInput::TimeoutKill { .. }) => {
-                            // Intent before kill: the ensuing Exit must classify as Timeout.
-                            pending_outcome = Some(crate::run_metrics::RunOutcome::Timeout);
+                            // Intent before kill: classify the LIVE turn as Timeout
+                            // (FIFO back entry — see spawn_acp_fanout, F2).
+                            turn_starts.set_live_intent(crate::run_metrics::RunOutcome::Timeout);
                             process.kill().await;
                         }
                         None => break,
@@ -4122,14 +4187,119 @@ mod turn_state_tests {
 
         // boundary #1 (aborted turn 1) → T1, not T2
         assert_eq!(ts.front(), Some(1_000));
-        assert_eq!(ts.settle(), Some(1_000));
+        assert_eq!(ts.settle(), Some((1_000, None)));
         // boundary #2 (real answering turn) → T2, still recorded
         assert_eq!(ts.front(), Some(2_000));
-        assert_eq!(ts.settle(), Some(2_000));
+        assert_eq!(ts.settle(), Some((2_000, None)));
         // a spurious extra boundary with no pending start → no metric,
         // no baseline corruption (will_record=false path stays load-bearing)
         assert_eq!(ts.front(), None);
         assert_eq!(ts.settle(), None);
+    }
+
+    #[test]
+    fn intent_fifo_resend_then_cancel_attributes_cancel_to_the_live_turn() {
+        use crate::run_metrics::RunOutcome;
+        // F2 scenario A (review 2026-08-08): interrupt-RESEND, THEN cancel.
+        // turn 1 running; user resends (turn 2 starts) before turn 1's aborted
+        // boundary arrives — TWO entries in flight. The user then cancels the LIVE
+        // turn (turn 2). The old single `pending_outcome` slot let turn 1's aborted
+        // boundary (arriving first) STEAL the Cancelled intent, so turn 2's settling
+        // boundary read None → false "✅ 完成" push + mis-classified metric.
+        let mut ts = TurnStarts::default();
+        ts.start(1_000); // turn 1
+        ts.start(2_000); // turn 2 (resend) — now the live turn (FIFO back)
+        ts.set_live_intent(RunOutcome::Cancelled); // cancel targets turn 2
+
+        // Boundary #1 = aborted turn 1: its OWN entry carries no intent → event-based.
+        assert_eq!(ts.front_intent(), None, "turn 1 has no intent; the push isn't suppressed by turn 2's cancel");
+        let (start1, intent1) = ts.settle().unwrap();
+        assert_eq!(start1, 1_000);
+        assert_eq!(crate::run_metrics::classify_outcome(crate::run_metrics::TerminalEvt::Exit, intent1),
+            RunOutcome::Errored, "aborted turn 1 is event-based, NOT the live turn's cancel");
+
+        // Boundary #2 = live turn 2: carries the Cancelled intent → suppressed + Cancelled.
+        assert_eq!(ts.front_intent(), Some(RunOutcome::Cancelled), "turn 2's own boundary sees its cancel → push suppressed");
+        let (start2, intent2) = ts.settle().unwrap();
+        assert_eq!(start2, 2_000);
+        assert_eq!(crate::run_metrics::classify_outcome(crate::run_metrics::TerminalEvt::Exit, intent2),
+            RunOutcome::Cancelled);
+    }
+
+    #[test]
+    fn intent_fifo_cancel_then_resend_does_not_leak_intent_onto_the_fresh_turn() {
+        use crate::run_metrics::RunOutcome;
+        // F2 scenario B (the MIRROR — a naive settling-only gate would REGRESS this):
+        // cancel FIRST, THEN resend. The cancel targets turn 1 (live at that instant);
+        // the resend then starts a fresh turn 2. Turn 1's cancel must stay with turn 1
+        // and must NOT bleed onto the clean turn 2 (which would mislabel a completed
+        // turn as Cancelled and suppress its legitimate push).
+        let mut ts = TurnStarts::default();
+        ts.start(1_000); // turn 1 — live
+        ts.set_live_intent(RunOutcome::Cancelled); // cancel targets turn 1
+        ts.start(2_000); // turn 2 (resend) — fresh, no intent
+
+        // Boundary #1 = turn 1: carries the cancel.
+        assert_eq!(ts.front_intent(), Some(RunOutcome::Cancelled));
+        let (_, intent1) = ts.settle().unwrap();
+        assert_eq!(crate::run_metrics::classify_outcome(crate::run_metrics::TerminalEvt::Exit, intent1),
+            RunOutcome::Cancelled);
+
+        // Boundary #2 = turn 2: NO intent → a Result completes normally (push fires).
+        assert_eq!(ts.front_intent(), None, "fresh turn keeps no stale cancel");
+        let (_, intent2) = ts.settle().unwrap();
+        assert_eq!(crate::run_metrics::classify_outcome(crate::run_metrics::TerminalEvt::Result, intent2),
+            RunOutcome::Completed, "the fresh turn completes; its success push is NOT suppressed");
+    }
+
+    #[test]
+    fn set_live_intent_is_noop_when_no_turn_is_live() {
+        use crate::run_metrics::RunOutcome;
+        // A Cancel/Interrupt with nothing running must NOT persist an intent that a
+        // future unrelated turn would then consume (the fan-out only calls
+        // set_live_intent under `if local_running`, but the FIFO itself is defensive).
+        let mut ts = TurnStarts::default();
+        ts.set_live_intent(RunOutcome::Cancelled); // empty FIFO → dropped
+        ts.start(1_000);
+        assert_eq!(ts.front_intent(), None, "a later turn must not inherit a stale cancel");
+        assert_eq!(ts.settle(), Some((1_000, None)));
+    }
+
+    #[test]
+    fn double_boundary_turn_does_not_double_consume_or_double_suppress() {
+        use crate::run_metrics::RunOutcome;
+        // A single turn can emit TWO boundaries (Claude is_error Result then the
+        // always-on Exit; Codex Error then the resolving Result). Boundary 1 pops
+        // this turn's (start, intent); boundary 2 finds the FIFO EMPTY. Verify the
+        // second boundary neither records a stray metric (settle→None) nor mislabels
+        // via a foreign intent, and that front_intent→None so no wrong suppression.
+        // The push's own second-fire is separately prevented by dur=0 when front()
+        // is None (see the fan-out: `front().map(..).unwrap_or(0)`), which
+        // should_push_turn_done rejects (<60s) — the reason the empty-FIFO read is safe.
+        let mut ts = TurnStarts::default();
+        ts.start(1_000);
+        ts.set_live_intent(RunOutcome::Cancelled);
+        // boundary 1: the real turn — intent present, metric recorded.
+        assert_eq!(ts.front_intent(), Some(RunOutcome::Cancelled));
+        assert_eq!(ts.settle(), Some((1_000, Some(RunOutcome::Cancelled))));
+        // boundary 2 (same turn, extra Exit): FIFO empty → no intent, no metric,
+        // and front() is None so the fan-out's `dur` collapses to 0 (push rejected).
+        assert_eq!(ts.front(), None, "empty front → dur=0 → push not double-fired");
+        assert_eq!(ts.front_intent(), None, "no foreign intent read on the extra boundary");
+        assert_eq!(ts.settle(), None, "extra boundary records no stray metric / no desync");
+    }
+
+    #[test]
+    fn standalone_cancel_intent_is_consumed_on_the_single_turn() {
+        use crate::run_metrics::RunOutcome;
+        // The common standalone Cancel (no resend): one live turn, one boundary.
+        let mut ts = TurnStarts::default();
+        ts.start(1_000);
+        ts.set_live_intent(RunOutcome::Cancelled);
+        assert_eq!(ts.front_intent(), Some(RunOutcome::Cancelled), "push suppressed");
+        let (_, intent) = ts.settle().unwrap();
+        assert_eq!(crate::run_metrics::classify_outcome(crate::run_metrics::TerminalEvt::Exit, intent),
+            RunOutcome::Cancelled);
     }
 
     #[test]

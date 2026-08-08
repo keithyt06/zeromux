@@ -1,4 +1,4 @@
-import { useState, useEffect, useCallback } from 'react'
+import { useState, useEffect, useCallback, useRef } from 'react'
 import { X, ChevronLeft, Search, FileText, Folder } from 'lucide-react'
 import { listVault, getVaultFile, getVaultSearch, resolveWikiLink } from '../lib/api'
 import { filterVaultEntries, resolveVaultImageSrc, getRecentNotes, pushRecentNote, removeRecentNote } from '../lib/vault'
@@ -17,28 +17,43 @@ export default function VaultReader({ onClose, onTitleChange }: { onClose?: () =
   const [content, setContent] = useState('')
   const [truncated, setTruncated] = useState(false)
   const [recent, setRecent] = useState<string[]>(() => getRecentNotes())
+  // Monotonic request tokens so an out-of-order response can't paint stale
+  // content — the same stale-response hardening applied to GitViewer.selectCommit
+  // and FileBrowser.openFile (reviews 2026-08-03/06/07). A slow read of note A
+  // resolving AFTER a fast read of note B (tapped second) must not overwrite B.
+  const openReqRef = useRef(0)
+  const searchReqRef = useRef(0)
 
-  const loadDir = useCallback((path: string) => {
-    listVault(path).then(r => setEntries(filterVaultEntries(r.entries))).catch(() => setEntries([]))
-  }, [])
-  useEffect(() => { loadDir(cwd) }, [cwd, loadDir])
+  // `ignore` invalidates a stale directory listing when cwd changes before the
+  // in-flight listVault resolves (matches FileBrowser's listing effect).
+  useEffect(() => {
+    let ignore = false
+    listVault(cwd)
+      .then(r => { if (!ignore) setEntries(filterVaultEntries(r.entries)) })
+      .catch(() => { if (!ignore) setEntries([]) })
+    return () => { ignore = true }
+  }, [cwd])
 
   useEffect(() => {
     const t = setTimeout(() => {
       if (!query.trim()) { setResults([]); setSearchTruncated(false); return }
+      const req = ++searchReqRef.current
       getVaultSearch(query)
-        .then(r => { setResults(r.results); setSearchTruncated(!!r.truncated) })
-        .catch(() => { setResults([]); setSearchTruncated(false) })
+        .then(r => { if (searchReqRef.current === req) { setResults(r.results); setSearchTruncated(!!r.truncated) } })
+        .catch(() => { if (searchReqRef.current === req) { setResults([]); setSearchTruncated(false) } })
     }, 200)
     return () => clearTimeout(t)
   }, [query])
 
   const openNote = useCallback((path: string) => {
+    const req = ++openReqRef.current
     getVaultFile(path).then(r => {
+      if (openReqRef.current !== req) return // a newer openNote superseded this read
       setContent(r.content); setTruncated(r.truncated); setOpenPath(path); setMode('read')
       pushRecentNote(path); setRecent(getRecentNotes())
       onTitleChange?.(docTitleFromPath(path))
     }).catch(() => {
+      if (openReqRef.current !== req) return
       // A stale "最近打开" entry (note deleted/renamed in Obsidian) 404s here. Don't
       // swallow it silently — tell the user and prune the dead entry, matching the
       // onWikiLink sibling which already alerts on a missing target.

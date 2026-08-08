@@ -297,7 +297,20 @@ async fn list_directories(
 
 // ── Tmux session listing ──
 
-async fn list_tmux_sessions() -> Json<serde_json::Value> {
+async fn list_tmux_sessions(
+    user: axum::Extension<CurrentUser>,
+) -> Result<Json<serde_json::Value>, StatusCode> {
+    // Host tmux sessions are shared OS state with no per-user owner metadata, so
+    // any active user could otherwise enumerate every user's shell names here and
+    // then attach via POST /api/sessions {type:tmux, tmux_target:X}. Attaching to a
+    // pre-existing host tmux is inherently an operator action; admin-gate it. In
+    // legacy single-user mode the synthetic user is admin, so this is a no-op
+    // there; in OAuth multi-user mode it blocks cross-user shell hijack. The
+    // create_session tmux_target branch is gated symmetrically.
+    // (review 2026-08-08, F4.)
+    if !user.is_admin() {
+        return Err(StatusCode::FORBIDDEN);
+    }
     let output = std::process::Command::new("tmux")
         .args(["ls", "-F", "#{session_name}\t#{session_windows}\t#{session_attached}\t#{session_created}"])
         .output();
@@ -324,7 +337,7 @@ async fn list_tmux_sessions() -> Json<serde_json::Value> {
         _ => Vec::new(),
     };
 
-    Json(serde_json::json!({ "sessions": sessions }))
+    Ok(Json(serde_json::json!({ "sessions": sessions })))
 }
 
 // ── Session CRUD ──
@@ -385,6 +398,18 @@ async fn create_session(
     Json(req): Json<CreateSessionReq>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
     let type_label = req.session_type.to_string();
+
+    // Attaching to a PRE-EXISTING named host tmux session is an operator action:
+    // host tmux is shared OS state with no owner metadata, so a non-admin naming
+    // another user's session as tmux_target would hijack their live shell (the
+    // new session is stamped with the CALLER's owner_id, granting them the WS).
+    // Admin-gate it, symmetric with list_tmux_sessions. Creating a FRESH tmux
+    // session (tmux_target=None) stays open to everyone. Legacy mode's synthetic
+    // user is admin → no-op there. (review 2026-08-08, F4.)
+    if req.tmux_target.is_some() && !user.is_admin() {
+        return Err((StatusCode::FORBIDDEN, "attaching to an existing tmux session requires admin".into()));
+    }
+
     let work_dir = req.work_dir.unwrap_or_else(|| state.work_dir.clone());
 
     validate_work_dir_under_home(&work_dir)?;
@@ -2299,6 +2324,23 @@ fn diff_header_path(line: &str) -> DiffHeader<'_> {
         // `a/<path> b/<path>` — split into the a/ (old) and b/ side (new). A
         // quoted remainder (`"a/..." "b/..."`) matches neither ` b/` nor the
         // `a/` prefix → Unparseable (fail closed).
+        //
+        // The ` b/` separator is only unambiguous when it appears EXACTLY once:
+        // git always emits one ` b/` (before the new path), so a single occurrence
+        // must be the real separator. If a path itself contains ` b/` (a dir whose
+        // name ends in a space — e.g. rename `.env` → `loot b/public.txt` yields
+        // `diff --git a/.env b/loot b/public.txt`), there are ≥2 occurrences and
+        // `rsplit_once` lands on the wrong one, mis-deriving BOTH sides as innocuous
+        // (a_path=".env b/loot", b_path="public.txt") so a renamed/copied credential
+        // dumps its contents under the non-sensitive name. We cannot recover the
+        // true a|b boundary from this line alone (git itself relies on the
+        // `rename from`/`--- a/` lines for that), so fail CLOSED on any count != 1.
+        // The numstat/file-list side already drops such a file via its `=>` rename
+        // expansion, so this only realigns the diff-body filter with it.
+        // (review 2026-08-08, F1 — empirically reproduced HIGH credential leak.)
+        if rest.matches(" b/").count() != 1 {
+            return DiffHeader::Unparseable;
+        }
         let b_path = rest
             .rsplit_once(" b/")
             .map(|(_, b)| b.trim_end_matches(['\n', '\r']));
@@ -4784,6 +4826,49 @@ diff --git a/notes.txt b/.env
 ";
         let out = filter_diff_excluded(diff);
         assert!(!out.contains("NOWSENSITIVE"), "rename-into-.env hunk must be stripped");
+    }
+
+    #[test]
+    fn filter_diff_excluded_fails_closed_on_ambiguous_b_slash_in_dest() {
+        // F1 (review 2026-08-08): renaming/copying a credential into a directory
+        // whose name ends in a space makes git emit a header that contains the
+        // ` b/` token TWICE — `diff --git a/.env b/loot b/public.txt`. The old
+        // `rsplit_once(" b/")` split on the LAST one, so a_path=".env b/loot"
+        // (leaf "loot", not sensitive) and b_path="public.txt" (not sensitive),
+        // and the whole .env hunk leaked under the innocuous name. This exact
+        // header is what `git -c core.quotePath=false show -M -C
+        // --find-copies-harder` prints (empirically reproduced). The fix fails
+        // CLOSED whenever ` b/` doesn't appear exactly once, since the true a|b
+        // boundary is unrecoverable from this line alone.
+        let diff = "\
+diff --git a/.env b/loot b/public.txt
+similarity index 92%
+rename from .env
+rename to loot b/public.txt
+--- a/.env
++++ b/loot b/public.txt
+@@ -1,2 +1,3 @@
+ AWS_SECRET_KEY=SECRET_LINE_ONE
+ MORE=SECRET_LINE_TWO
++X=3
+diff --git a/src/main.rs b/src/main.rs
++let x = 1;
+";
+        let out = filter_diff_excluded(diff);
+        assert!(!out.contains("SECRET_LINE_ONE"), "ambiguous-header .env context must be stripped");
+        assert!(!out.contains("AWS_SECRET_KEY"), "ambiguous-header .env body must be stripped");
+        assert!(!out.contains("rename from .env"));
+        assert!(out.contains("let x = 1;"), "following clean section survives");
+        // Sanity: the classifier itself reports the ambiguous header as Unparseable.
+        assert!(matches!(
+            diff_header_path("diff --git a/.env b/loot b/public.txt\n"),
+            DiffHeader::Unparseable
+        ));
+        // And a normal single-` b/` header still parses cleanly.
+        assert!(matches!(
+            diff_header_path("diff --git a/src/main.rs b/src/main.rs\n"),
+            DiffHeader::Path("src/main.rs")
+        ));
     }
 
     #[test]

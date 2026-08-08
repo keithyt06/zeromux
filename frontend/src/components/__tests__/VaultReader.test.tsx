@@ -1,6 +1,7 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest'
 import { render, screen, fireEvent, waitFor } from '@testing-library/react'
 import VaultReader from '../VaultReader'
+import * as api from '../../lib/api'
 
 vi.mock('../../lib/api', () => ({
   listVault: vi.fn(async () => ({ entries: [{ name: 'note.md', type: 'file', size: 1, mtime: 0, writable: false }], truncated: false })),
@@ -35,5 +36,35 @@ describe('VaultReader', () => {
     expect(container.querySelector('.h-full')).not.toBeNull()
     // no close button when onClose omitted (close = delete the tab at list level)
     expect(container.querySelector('button svg.lucide-x')).toBeNull()
+  })
+
+  it('a slow read of note A resolving after note B was opened cannot paint A (F3 stale-response guard)', async () => {
+    // openNote used to write content/openPath unconditionally after the await —
+    // the same stale-response class fixed in GitViewer/FileBrowser but never
+    // ported here. Tap A (slow), then B (fast); if A resolves last it must NOT
+    // overwrite B. The fix bumps a monotonic openReqRef and bails a superseded read.
+    vi.mocked(api.listVault).mockResolvedValue({
+      entries: [
+        { name: 'A.md', type: 'file', size: 1, mtime: 0, writable: false },
+        { name: 'B.md', type: 'file', size: 1, mtime: 0, writable: false },
+      ],
+      truncated: false,
+    })
+    let resolveA: (v: { content: string; truncated: boolean }) => void = () => {}
+    let resolveB: (v: { content: string; truncated: boolean }) => void = () => {}
+    vi.mocked(api.getVaultFile).mockImplementation((path: string) =>
+      new Promise(r => { if (path === 'A.md') resolveA = r; else resolveB = r }),
+    )
+    render(<VaultReader onClose={() => {}} />)
+    fireEvent.click(await screen.findByText('A.md')) // req 1 (slow)
+    fireEvent.click(await screen.findByText('B.md')) // req 2 (fast) — supersedes
+    // B resolves first and paints; then A (the superseded read) resolves.
+    resolveB({ content: 'B-CONTENT', truncated: false })
+    await waitFor(() => expect(screen.getByText('B-CONTENT')).toBeInTheDocument())
+    resolveA({ content: 'A-CONTENT', truncated: false })
+    // Flush microtasks so the stale setState (if any) would land, then assert absence.
+    await new Promise(r => setTimeout(r, 0))
+    expect(screen.queryByText('A-CONTENT')).toBeNull()
+    expect(screen.getByText('B-CONTENT')).toBeInTheDocument()
   })
 })

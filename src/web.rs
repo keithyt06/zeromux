@@ -2098,8 +2098,28 @@ async fn git_show(
     // b/public.txt` + `copy from .aws/credentials`, whose `a/` side the Excluded
     // arm strips (numstat gets `.aws/credentials => public.txt`, which
     // `numstat_path_excluded` already expands). (review 2026-08-07, F1)
+    // Force the diff prefixes back to `a/`/`b/`. A repo-local `diff.noprefix=true`
+    // (`diff --git .env evil b/notes.txt`) or `diff.mnemonicPrefix=true`
+    // (`diff --git c/.env w/evil b/notes.txt`) — both attacker-controllable in the
+    // work_dir repo — change the header so `diff_header_path` mis-parses: the `a/`
+    // strip fails (a_path=None → the old-side credential check is skipped) AND a
+    // rename destination under a dir whose name ends in a space (`evil b/…`) leaves
+    // exactly ONE ` b/`, so the 08-08 fail-closed count guard doesn't trip and the
+    // b-side resolves to the innocuous leaf — dumping the renamed .env's hunk. The
+    // numstat/file-list side drops it via `=>`, so only the body leaked. Pinning
+    // `diff.srcPrefix=a/`/`diff.dstPrefix=b/` (git ≥2.45) + noprefix/mnemonicPrefix
+    // off restores `a/…  b/…` so the count guard fails closed. (review 2026-08-09)
+    //
+    // Prefix pinning only normalizes the HEADER; a repo-local `.git/config`
+    // `[diff] external = /bin/cat` or a `.gitattributes` `*.env diff=x` +
+    // `[diff "x"] command = /bin/cat` (both attacker-controllable in the work_dir
+    // repo) replace the BODY GENERATOR entirely — git then emits the raw file bytes
+    // with NO `diff --git` header, so the credential filter finds no section to
+    // exclude and the whole .env leaks. `--no-ext-diff` disables both the global
+    // external diff and per-driver `command=`; `--no-textconv` disables `textconv`
+    // filters on the same axis. Empirically reproduced + closed. (review 2026-08-09)
     let diff_output = std::process::Command::new("git")
-        .args(["-c", "core.quotePath=false", "show", "-M", "-C", "--find-copies-harder", "--format=", "--patch", &query.commit])
+        .args(["-c", "core.quotePath=false", "-c", "diff.noprefix=false", "-c", "diff.mnemonicPrefix=false", "-c", "diff.srcPrefix=a/", "-c", "diff.dstPrefix=b/", "show", "--no-ext-diff", "--no-textconv", "-M", "-C", "--find-copies-harder", "--format=", "--patch", &query.commit])
         .current_dir(&work_dir)
         .output()
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("git show failed: {}", e)))?;
@@ -2466,8 +2486,12 @@ async fn git_worktree(
         // `core.quotePath=false`: emit literal UTF-8 paths so a non-ASCII-named
         // credential leaf (e.g. `.env.生产`) reaches filter_diff_excluded's leaf
         // predicate unquoted (else the C-quoted header hits the fail-closed arm).
+        // Prefix pins + `--no-ext-diff --no-textconv`: see git_show — the latter two
+        // stop a repo-local `[diff] external`/`.gitattributes` diff driver from
+        // replacing the body generator and dumping raw credential bytes with no
+        // `diff --git` header for the filter to key on. (review 2026-08-09)
         let raw = std::process::Command::new("git")
-            .args(["-c", "core.quotePath=false", "diff", "HEAD", "-M", "-C", "--find-copies-harder", "--", "."])
+            .args(["-c", "core.quotePath=false", "-c", "diff.noprefix=false", "-c", "diff.mnemonicPrefix=false", "-c", "diff.srcPrefix=a/", "-c", "diff.dstPrefix=b/", "diff", "HEAD", "--no-ext-diff", "--no-textconv", "-M", "-C", "--find-copies-harder", "--", "."])
             .current_dir(dir)
             .output()
             .ok()
@@ -4591,6 +4615,109 @@ mod path_safety_tests {
             "copied credential must not leak via git_show; got:\n{filtered}");
         assert!(!numstat_leaks,
             "numstat must drop the copy path pairing the credential; got:\n{numstat}");
+    }
+
+    #[test]
+    fn git_diff_prefix_config_cannot_defeat_credential_filter() {
+        // review 2026-08-09: a repo-local `diff.mnemonicPrefix=true` (or
+        // `diff.noprefix=true`) — both attacker-controllable in the work_dir repo —
+        // rewrites the `diff --git` header away from `a/`/`b/`. Combined with a rename
+        // whose destination sits under a dir whose NAME ends in a space (`evil b/…`),
+        // the header becomes `diff --git c/.env w/evil b/notes.txt`: exactly ONE ` b/`
+        // (so the 08-08 fail-closed count guard doesn't trip), the `a/` strip fails
+        // (a_path=None → old-side credential check skipped), and the b-side resolves to
+        // the innocuous `notes.txt` — leaking the renamed .env's hunk. The handler now
+        // pins the prefixes back to `a/`/`b/`; drive the EXACT fixed flags and assert
+        // the secret is stripped. (Was HIGH: one-request credential exfiltration.)
+        let dir = std::env::temp_dir().join(format!("zmgr-prefix-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let ds = dir.to_str().unwrap();
+        let run = |args: &[&str]| {
+            std::process::Command::new("git").args(["-C", ds]).args(args).output().unwrap()
+        };
+        assert!(run(&["init", "-q"]).status.success(), "git init");
+        let _ = run(&["config", "user.email", "t@t"]);
+        let _ = run(&["config", "user.name", "t"]);
+        // Attacker-controlled repo config that rewrites the diff header prefixes.
+        let _ = run(&["config", "diff.mnemonicPrefix", "true"]);
+        std::fs::write(dir.join(".env"), "A=1\nSECRET=SUPERSECRET\nB=2\n").unwrap();
+        assert!(run(&["add", "-A"]).status.success(), "git add");
+        assert!(run(&["commit", "-qm", "init"]).status.success(), "git commit");
+        // Rename .env into a dir whose name ends in a space, and modify a line so a
+        // real hunk (not just a pure rename) is emitted.
+        std::fs::create_dir_all(dir.join("evil b")).unwrap();
+        assert!(run(&["mv", ".env", "evil b/notes.txt"]).status.success(), "git mv");
+        std::fs::write(dir.join("evil b/notes.txt"), "A=1\nSECRET=SUPERSECRET\nB=CHANGED\n").unwrap();
+        assert!(run(&["add", "-A"]).status.success(), "git add 2");
+
+        // EXACT flags from git_worktree's diff invocation (with the prefix pins).
+        let raw = String::from_utf8_lossy(
+            &std::process::Command::new("git")
+                .args(["-c", "core.quotePath=false", "-c", "diff.noprefix=false", "-c", "diff.mnemonicPrefix=false", "-c", "diff.srcPrefix=a/", "-c", "diff.dstPrefix=b/", "diff", "HEAD", "--no-ext-diff", "--no-textconv", "-M", "-C", "--find-copies-harder", "--", "."])
+                .current_dir(&dir)
+                .output()
+                .unwrap()
+                .stdout,
+        ).to_string();
+        let filtered = filter_diff_excluded(&raw);
+
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(!filtered.contains("SUPERSECRET"),
+            "prefix-config rename must not leak the .env body; got:\n{filtered}");
+        assert!(!filtered.contains("rename from .env"),
+            "the rename header naming the credential must be stripped");
+    }
+
+    #[test]
+    fn git_diff_external_driver_cannot_dump_raw_credential() {
+        // review 2026-08-09 (Codex second opinion): the prefix pins only normalize the
+        // HEADER. A repo-local `[diff] external = <cmd>` in .git/config, or a
+        // `.gitattributes` `*.env diff=x` + `[diff "x"] command = <cmd>` — both files
+        // the agent controls in the work_dir repo — replace the BODY GENERATOR: git
+        // runs the program and emits its raw output with NO `diff --git` header, so
+        // filter_diff_excluded finds no section to exclude and the full .env leaks.
+        // `--no-ext-diff` (disables `external` + per-driver `command=`) and
+        // `--no-textconv` (disables the textconv axis) close it. Drive the EXACT fixed
+        // git_worktree flags against a repo weaponized THREE ways. (Was HIGH.)
+        let dir = std::env::temp_dir().join(format!("zmgr-extdiff-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let ds = dir.to_str().unwrap();
+        let run = |args: &[&str]| {
+            std::process::Command::new("git").args(["-C", ds]).args(args).output().unwrap()
+        };
+        assert!(run(&["init", "-q"]).status.success(), "git init");
+        let _ = run(&["config", "user.email", "t@t"]);
+        let _ = run(&["config", "user.name", "t"]);
+        std::fs::write(dir.join(".env"), "A=1\nSECRET=SUPERSECRET\nB=2\n").unwrap();
+        assert!(run(&["add", "-A"]).status.success(), "git add");
+        assert!(run(&["commit", "-qm", "init"]).status.success(), "git commit");
+        std::fs::write(dir.join(".env"), "A=1\nSECRET=SUPERSECRET\nB=CHANGED\n").unwrap();
+        // Weaponize the repo: global external diff + a per-driver command + textconv,
+        // all pointed at `cat` (which dumps the object's raw bytes to stdout).
+        let _ = run(&["config", "diff.external", "/bin/cat"]);
+        let _ = run(&["config", "diff.leak.command", "/bin/cat"]);
+        let _ = run(&["config", "diff.leak.textconv", "/bin/cat"]);
+        std::fs::write(dir.join(".gitattributes"), "*.env diff=leak\n").unwrap();
+        assert!(run(&["add", "-A"]).status.success(), "git add 2");
+
+        // EXACT flags from git_worktree's diff invocation (with --no-ext-diff --no-textconv).
+        let raw = String::from_utf8_lossy(
+            &std::process::Command::new("git")
+                .args(["-c", "core.quotePath=false", "-c", "diff.noprefix=false", "-c", "diff.mnemonicPrefix=false", "-c", "diff.srcPrefix=a/", "-c", "diff.dstPrefix=b/", "diff", "HEAD", "--no-ext-diff", "--no-textconv", "-M", "-C", "--find-copies-harder", "--", "."])
+                .current_dir(&dir)
+                .output()
+                .unwrap()
+                .stdout,
+        ).to_string();
+        // Sanity: with the fix the body IS a real unified diff (header present) — so the
+        // filter's credential predicate has a section to exclude — and .env is dropped.
+        let filtered = filter_diff_excluded(&raw);
+
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(!filtered.contains("SUPERSECRET"),
+            "an external/textconv diff driver must not dump the raw .env body; got:\n{filtered}");
     }
 
     #[test]

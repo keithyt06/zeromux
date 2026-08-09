@@ -123,13 +123,26 @@ impl PushStore {
             .map(|d| d.as_millis() as i64)
             .unwrap_or(0);
         let conn = self.conn.lock().unwrap();
+        // `endpoint` is the PRIMARY KEY, but a push endpoint is NOT a per-user secret
+        // (FCM/Mozilla endpoints are observable and are even logged on the send path).
+        // Never let the conflict-update transfer OWNERSHIP: without the WHERE guard, a
+        // user B who POSTs a subscription whose `endpoint` collides with user A's row
+        // would silently reassign the row's user_id AND overwrite A's p256dh/auth keys —
+        // hijacking A's device (A stops receiving turn_done/run_failed/confirm pushes;
+        // B receives A's session notifications). This is the write-path mirror of
+        // `delete_for_user`'s owner scoping. Drop user_id from the SET list and only
+        // update a row the SAME user already owns; a foreign-endpoint collision becomes a
+        // 0-row no-op (the caller is authed, so the endpoint simply won't be registered
+        // under the attacker either). Legacy single-user mode is unaffected (one user).
+        // (review 2026-08-09)
         conn.execute(
             "INSERT INTO push_subscriptions (endpoint, user_id, p256dh, auth, created_ms, lvl_important, lvl_routine)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
              ON CONFLICT(endpoint) DO UPDATE SET
-                 user_id=excluded.user_id, p256dh=excluded.p256dh, auth=excluded.auth,
+                 p256dh=excluded.p256dh, auth=excluded.auth,
                  created_ms=excluded.created_ms,
-                 lvl_important=excluded.lvl_important, lvl_routine=excluded.lvl_routine",
+                 lvl_important=excluded.lvl_important, lvl_routine=excluded.lvl_routine
+             WHERE push_subscriptions.user_id = excluded.user_id",
             params![endpoint, user_id, p256dh, auth, now_ms, lvl_important as i64, lvl_routine as i64],
         ).map_err(|e| format!("upsert: {e}"))?;
         // Prune stale subscriptions: keep newest PUSH_MAX_SUBS_PER_USER per user.
@@ -793,6 +806,34 @@ mod tests {
         let subs = store.list_for_user("u1");
         assert_eq!(subs.len(), 1);
         assert!(subs[0].lvl_routine, "routine must update on re-upsert");
+    }
+
+    #[test]
+    fn upsert_cannot_hijack_another_users_subscription() {
+        // review 2026-08-09: `endpoint` is the PRIMARY KEY but not a per-user secret.
+        // A user B who upserts an endpoint already owned by user A must NOT be able to
+        // reassign the row's owner or overwrite A's crypto keys (device hijack / push
+        // DoS). The conflict-update is guarded by `WHERE user_id = excluded.user_id`.
+        let store = PushStore::open_in_memory().unwrap();
+        store.upsert("userA", "https://ep/shared", "kA", "aA", true, true).unwrap();
+
+        // Attacker B collides on A's endpoint with their own keys/levels.
+        store.upsert("userB", "https://ep/shared", "kB", "aB", true, false).unwrap();
+
+        // A must still own the row, with A's keys and levels intact.
+        let a = store.list_for_user("userA");
+        assert_eq!(a.len(), 1, "A's subscription must not be reassigned to B");
+        assert_eq!(a[0].p256dh, "kA", "A's crypto key must not be overwritten by B");
+        assert!(a[0].lvl_routine, "A's levels must not be overwritten by B");
+        // B never acquired the row.
+        assert_eq!(store.list_for_user("userB").len(), 0, "B must not acquire A's endpoint");
+
+        // A's own re-subscribe still updates A's keys/levels (0-row guard is owner-aware).
+        store.upsert("userA", "https://ep/shared", "kA2", "aA2", true, false).unwrap();
+        let a = store.list_for_user("userA");
+        assert_eq!(a.len(), 1);
+        assert_eq!(a[0].p256dh, "kA2", "owner's own re-upsert must update keys");
+        assert!(!a[0].lvl_routine, "owner's own re-upsert must update levels");
     }
 
     #[test]

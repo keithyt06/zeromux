@@ -123,6 +123,12 @@ export default function Sidebar({ sessions, docTabs, activeId, onSelect, onCreat
   // 没有它时 fetch 卡住会永远停在 Loading…（手机弱网下的实际表现）。
   const [dirError, setDirError] = useState<string | null>(null)
   const lastDirPath = useRef<string | undefined>(undefined)
+  // Monotonic request token: a slow listing (JuiceFS/S3, 8s abort) leaves the nav
+  // buttons clickable, so a second tap can start a newer fetch that resolves before
+  // the first. Without this, a stale response overwrites the newer listing — and
+  // currentPath is committed as the new session's work_dir, so the agent would run
+  // in the wrong directory. Drop superseded writes. (lastDirPath only feeds retry.)
+  const dirReqRef = useRef(0)
 
   // Tmux session list state
   const [tmuxSessions, setTmuxSessions] = useState<TmuxSession[]>([])
@@ -131,16 +137,19 @@ export default function Sidebar({ sessions, docTabs, activeId, onSelect, onCreat
   const ThemeIcon = theme === 'dark' ? Sun : Moon
 
   const loadDirs = useCallback(async (path?: string) => {
+    const req = ++dirReqRef.current
     lastDirPath.current = path
     setLoading(true)
     setDirError(null)
     try {
       const data = await listDirectories(path)
+      if (dirReqRef.current !== req) return
       setCurrentPath(data.current)
       setParentPath(data.parent)
       setHomePath(data.home)
       setDirs(data.entries)
     } catch (e) {
+      if (dirReqRef.current !== req) return
       // 超时（AbortError）或网络/权限错误：显式报错 + 让用户重试，
       // 而不是静默停在 Loading…。
       const msg = e instanceof DOMException && e.name === 'AbortError'
@@ -148,7 +157,7 @@ export default function Sidebar({ sessions, docTabs, activeId, onSelect, onCreat
         : (e instanceof Error ? e.message : '加载失败')
       setDirError(msg)
     }
-    setLoading(false)
+    if (dirReqRef.current === req) setLoading(false)
   }, [])
 
   const loadTmuxSessions = useCallback(async () => {

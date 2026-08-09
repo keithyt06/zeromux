@@ -1,4 +1,4 @@
-import { useState, useEffect, useCallback } from 'react'
+import { useState, useEffect, useCallback, useRef } from 'react'
 import { ChevronLeft, Home, Folder, FolderGit2 } from 'lucide-react'
 import type { DirEntry } from '../lib/api'
 import { listDirectories } from '../lib/api'
@@ -19,21 +19,31 @@ export default function DirectoryPicker({ initialPath, onSelect, onCancel }: {
   const [loading, setLoading] = useState(false)
   const [error, setError] = useState<string | null>(null)
 
+  // Guard against out-of-order listings: on the JuiceFS/S3-backed FS a listing can
+  // take seconds (listDirectories carries an 8s abort), and the nav buttons stay
+  // clickable while loading, so a second tap can start a newer fetch that resolves
+  // BEFORE the first. Without this token a stale response would overwrite the newer
+  // listing — and currentPath is what "使用此目录" commits as work_dir, so the
+  // session/scheduled task would run in the wrong directory. Drop superseded writes.
+  const dirReqRef = useRef(0)
   const loadDirs = useCallback(async (path?: string) => {
+    const req = ++dirReqRef.current
     setLoading(true)
     setError(null)
     try {
       const data = await listDirectories(path)
+      if (dirReqRef.current !== req) return
       setCurrentPath(data.current)
       setParentPath(data.parent)
       setHomePath(data.home)
       setDirs(data.entries)
     } catch (e) {
+      if (dirReqRef.current !== req) return
       // Surface the failure instead of silently committing an empty path: a
       // blank currentPath would otherwise let "使用此目录" return '' as work_dir.
       setError(e instanceof Error ? e.message : '无法加载目录')
     }
-    setLoading(false)
+    if (dirReqRef.current === req) setLoading(false)
   }, [])
 
   useEffect(() => { loadDirs(initialPath || undefined) }, [loadDirs, initialPath])

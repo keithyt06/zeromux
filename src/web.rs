@@ -2118,8 +2118,30 @@ async fn git_show(
     // exclude and the whole .env leaks. `--no-ext-diff` disables both the global
     // external diff and per-driver `command=`; `--no-textconv` disables `textconv`
     // filters on the same axis. Empirically reproduced + closed. (review 2026-08-09)
+    //
+    // `--no-color` closes a THIRD header-mangling axis orthogonal to the prefix
+    // pins and the body generator: a repo-local `color.ui=always` (or
+    // `color.diff=always`) — attacker-controllable in the work_dir `.git/config` —
+    // wraps every diff line in ANSI SGR escapes, so the header becomes
+    // `\x1b[1mdiff --git a/.env b/.env\x1b[m`. `diff_header_path`'s
+    // `strip_prefix("diff --git ")`/`"diff --cc "` then fails → the line is
+    // NotHeader → `filter_diff_excluded` never opens a skip section and copies the
+    // .env hunk through verbatim (the file-list/numstat side is NOT colorized, so
+    // the UI looks clean while the raw body leaks). `--no-color` beats config by
+    // git precedence, restoring the clean header the filter recognizes. Empirically
+    // reproduced + closed. (review 2026-08-10)
+    //
+    // `diff.relative=false` closes a FOURTH axis (Codex second opinion, verified):
+    // git runs with CWD = work_dir, and a repo-local `diff.relative=true` strips the
+    // CWD-relative path PREFIX from the header. If work_dir sits inside a sensitive
+    // dir (`.aws/`, `.ssh/`, `.git/`), a credential whose LEAF isn't a denylisted
+    // name (`.aws/config`) has its `.aws/` component stripped → `diff --git
+    // a/config b/config`, and `worktree_path_excluded`'s dir-component check no
+    // longer sees `.aws`, so the section leaks. `-c diff.relative=false` on the
+    // command line overrides the repo config and restores the full repo-root path.
+    // (review 2026-08-10)
     let diff_output = std::process::Command::new("git")
-        .args(["-c", "core.quotePath=false", "-c", "diff.noprefix=false", "-c", "diff.mnemonicPrefix=false", "-c", "diff.srcPrefix=a/", "-c", "diff.dstPrefix=b/", "show", "--no-ext-diff", "--no-textconv", "-M", "-C", "--find-copies-harder", "--format=", "--patch", &query.commit])
+        .args(["-c", "core.quotePath=false", "-c", "diff.noprefix=false", "-c", "diff.mnemonicPrefix=false", "-c", "diff.srcPrefix=a/", "-c", "diff.dstPrefix=b/", "-c", "diff.relative=false", "show", "--no-color", "--no-ext-diff", "--no-textconv", "-M", "-C", "--find-copies-harder", "--format=", "--patch", &query.commit])
         .current_dir(&work_dir)
         .output()
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("git show failed: {}", e)))?;
@@ -2490,8 +2512,15 @@ async fn git_worktree(
         // stop a repo-local `[diff] external`/`.gitattributes` diff driver from
         // replacing the body generator and dumping raw credential bytes with no
         // `diff --git` header for the filter to key on. (review 2026-08-09)
+        // `--no-color`: a repo-local `color.ui=always`/`color.diff=always` would
+        // otherwise ANSI-escape the `diff --git` header so `diff_header_path`'s
+        // prefix match fails and the credential hunk leaks. `diff.relative=false`:
+        // a repo-local `diff.relative=true` would strip the CWD-relative path prefix
+        // so a credential under a sensitive dir (work_dir inside `.aws/`) loses its
+        // dir component from the header and dodges worktree_path_excluded. See
+        // git_show for both. (2026-08-10)
         let raw = std::process::Command::new("git")
-            .args(["-c", "core.quotePath=false", "-c", "diff.noprefix=false", "-c", "diff.mnemonicPrefix=false", "-c", "diff.srcPrefix=a/", "-c", "diff.dstPrefix=b/", "diff", "HEAD", "--no-ext-diff", "--no-textconv", "-M", "-C", "--find-copies-harder", "--", "."])
+            .args(["-c", "core.quotePath=false", "-c", "diff.noprefix=false", "-c", "diff.mnemonicPrefix=false", "-c", "diff.srcPrefix=a/", "-c", "diff.dstPrefix=b/", "-c", "diff.relative=false", "diff", "HEAD", "--no-color", "--no-ext-diff", "--no-textconv", "-M", "-C", "--find-copies-harder", "--", "."])
             .current_dir(dir)
             .output()
             .ok()
@@ -4718,6 +4747,103 @@ mod path_safety_tests {
         let _ = std::fs::remove_dir_all(&dir);
         assert!(!filtered.contains("SUPERSECRET"),
             "an external/textconv diff driver must not dump the raw .env body; got:\n{filtered}");
+    }
+
+    #[test]
+    fn git_diff_color_config_cannot_defeat_credential_filter() {
+        // review 2026-08-10: a THIRD header-mangling axis orthogonal to the prefix
+        // pins and the body generator. A repo-local `color.ui=always` (or
+        // `color.diff=always`) — attacker-controllable in the work_dir `.git/config`
+        // — wraps every diff line in ANSI SGR escapes, so the header becomes
+        // `\x1b[1mdiff --git a/.env b/.env\x1b[m`. `diff_header_path`'s
+        // `strip_prefix("diff --git ")` then fails → the line is NotHeader →
+        // filter_diff_excluded never opens a skip section and copies the .env hunk
+        // through verbatim (numstat is NOT colorized, so the file list looks clean
+        // while the raw body leaks). The handler now passes `--no-color`, which beats
+        // config by git precedence. Drive the EXACT fixed git_worktree flags against a
+        // repo with color forced on, and assert the secret is stripped. (Was HIGH:
+        // one-request credential exfiltration through git_show + git_worktree.)
+        let dir = std::env::temp_dir().join(format!("zmgr-color-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let ds = dir.to_str().unwrap();
+        let run = |args: &[&str]| {
+            std::process::Command::new("git").args(["-C", ds]).args(args).output().unwrap()
+        };
+        assert!(run(&["init", "-q"]).status.success(), "git init");
+        let _ = run(&["config", "user.email", "t@t"]);
+        let _ = run(&["config", "user.name", "t"]);
+        // Attacker-controlled repo config that ANSI-colorizes every diff line.
+        let _ = run(&["config", "color.ui", "always"]);
+        std::fs::write(dir.join(".env"), "A=1\nSECRET=SUPERSECRET\nB=2\n").unwrap();
+        assert!(run(&["add", "-A"]).status.success(), "git add");
+        assert!(run(&["commit", "-qm", "init"]).status.success(), "git commit");
+        std::fs::write(dir.join(".env"), "A=1\nSECRET=SUPERSECRET\nB=CHANGED\n").unwrap();
+        assert!(run(&["add", "-A"]).status.success(), "git add 2");
+
+        // EXACT flags from git_worktree's diff invocation (with --no-color).
+        let raw = String::from_utf8_lossy(
+            &std::process::Command::new("git")
+                .args(["-c", "core.quotePath=false", "-c", "diff.noprefix=false", "-c", "diff.mnemonicPrefix=false", "-c", "diff.srcPrefix=a/", "-c", "diff.dstPrefix=b/", "-c", "diff.relative=false", "diff", "HEAD", "--no-color", "--no-ext-diff", "--no-textconv", "-M", "-C", "--find-copies-harder", "--", "."])
+                .current_dir(&dir)
+                .output()
+                .unwrap()
+                .stdout,
+        ).to_string();
+        let filtered = filter_diff_excluded(&raw);
+
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(!filtered.contains("SUPERSECRET"),
+            "a color.ui=always repo must not leak the .env body past the filter; got:\n{filtered}");
+    }
+
+    #[test]
+    fn git_diff_relative_config_cannot_strip_sensitive_dir_from_header() {
+        // review 2026-08-10 (Codex second opinion, verified): git runs with CWD =
+        // work_dir. A repo-local `diff.relative=true` strips the CWD-relative path
+        // PREFIX from the `diff --git` header. If work_dir sits inside a sensitive
+        // dir (`.aws/`), a credential whose LEAF is NOT a denylisted name
+        // (`.aws/config` — "config" alone is innocuous) has its `.aws/` component
+        // stripped → `diff --git a/config b/config`, so worktree_path_excluded's
+        // dir-component check no longer sees `.aws` and the section leaks. The
+        // handler now pins `diff.relative=false`. Drive the EXACT fixed flags with
+        // git run FROM the sensitive subdir (the attacker's work_dir) and assert the
+        // secret is stripped. (Was HIGH: one-request credential exfiltration.)
+        let root = std::env::temp_dir().join(format!("zmgr-rel-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join(".aws")).unwrap();
+        let rs = root.to_str().unwrap();
+        let run = |args: &[&str]| {
+            std::process::Command::new("git").args(["-C", rs]).args(args).output().unwrap()
+        };
+        assert!(run(&["init", "-q"]).status.success(), "git init");
+        let _ = run(&["config", "user.email", "t@t"]);
+        let _ = run(&["config", "user.name", "t"]);
+        // Attacker-controlled repo config that makes the header CWD-relative.
+        let _ = run(&["config", "diff.relative", "true"]);
+        // A credential under .aws whose leaf ("config") is NOT itself denylisted —
+        // it is caught ONLY by the .aws dir-component check that relative defeats.
+        std::fs::write(root.join(".aws/config"), "K=1\nSECRET=SUPERSECRET\n").unwrap();
+        assert!(run(&["add", "-A"]).status.success(), "git add");
+        assert!(run(&["commit", "-qm", "init"]).status.success(), "git commit");
+        std::fs::write(root.join(".aws/config"), "K=1\nSECRET=SUPERSECRET\nX=CHANGED\n").unwrap();
+        assert!(run(&["add", "-A"]).status.success(), "git add 2");
+
+        // EXACT flags from git_worktree's diff invocation (with diff.relative=false),
+        // run FROM the .aws work_dir where the attacker's session lives.
+        let raw = String::from_utf8_lossy(
+            &std::process::Command::new("git")
+                .args(["-c", "core.quotePath=false", "-c", "diff.noprefix=false", "-c", "diff.mnemonicPrefix=false", "-c", "diff.srcPrefix=a/", "-c", "diff.dstPrefix=b/", "-c", "diff.relative=false", "diff", "HEAD", "--no-color", "--no-ext-diff", "--no-textconv", "-M", "-C", "--find-copies-harder", "--", "."])
+                .current_dir(root.join(".aws"))
+                .output()
+                .unwrap()
+                .stdout,
+        ).to_string();
+        let filtered = filter_diff_excluded(&raw);
+
+        let _ = std::fs::remove_dir_all(&root);
+        assert!(!filtered.contains("SUPERSECRET"),
+            "diff.relative must not strip the .aws/ component so the section leaks; got:\n{filtered}");
     }
 
     #[test]

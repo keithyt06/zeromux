@@ -173,12 +173,17 @@ export function FileBrowser({ sessionId }: Props) {
   const openFile = async (entry: DirListEntry) => {
     const path = join(cwd, entry.name)
     const e = ext(entry.name)
+    // Bump the request token for EVERY selection, not just the async text read.
+    // The image/unsupported branches are synchronous but must still invalidate a
+    // prior in-flight text read: text-A (slow) → image-B in the same dir would
+    // otherwise leave the token unchanged, so A's late response passed its guard
+    // and clobbered B's preview (+ the row highlight). (review 2026-08-10)
+    const req = ++openReqRef.current
     if (IMAGE_EXTS.includes(e)) {
       setPreview({ kind: 'image', path })
       return
     }
     if (HTML_EXTS.includes(e) || MD_EXTS.includes(e) || TEXT_EXTS.includes(e)) {
-      const req = ++openReqRef.current
       setPreview({ kind: 'loading', path })
       try {
         const text = await getSessionFile(sessionId, path, effectiveBase)

@@ -122,6 +122,33 @@ describe('FileBrowser', () => {
     expect(screen.getByText('BBB-content')).toBeInTheDocument()
   })
 
+  it('a slow text read cannot overwrite a newer IMAGE selection (F2, review 2026-08-10)', async () => {
+    // The openReqRef bump used to live inside the text branch only, so selecting an
+    // image (synchronous, no token bump) in the same dir left the token unchanged —
+    // a slow prior text read then passed its guard and flipped the pane back to text.
+    vi.spyOn(api, 'listDir').mockResolvedValue({
+      entries: [
+        { name: 'a.txt', type: 'file', size: 3, mtime: 0, writable: true },
+        { name: 'b.png', type: 'file', size: 3, mtime: 0, writable: true },
+      ],
+      truncated: false,
+    })
+    let resolveA: (v: string) => void = () => {}
+    const aPromise = new Promise<string>(r => { resolveA = r })
+    vi.spyOn(api, 'getSessionFile').mockImplementation(() => aPromise) // a.txt read is slow
+
+    render(<FileBrowser sessionId="s1" />)
+    const a = await screen.findByText('a.txt')
+    a.click()                                   // open A (slow text, pending)
+    screen.getByText('b.png').click()           // then select image B before A resolves
+    // The image pane is shown immediately (synchronous branch).
+    expect(await screen.findByAltText('b.png')).toBeInTheDocument()
+    // A's slow text read resolves — it must NOT replace the image with A's text.
+    resolveA('AAA-content')
+    await waitFor(() => expect(screen.queryByText('AAA-content')).not.toBeInTheDocument())
+    expect(screen.getByAltText('b.png')).toBeInTheDocument()
+  })
+
   it('deleting the previewed file while its read is in flight cannot repopulate the pane (F2 parity)', async () => {
     // handleDelete used a bare setPreview(null), which cleared the pane but did NOT
     // bump openReqRef — so a slow openFile read of the just-deleted file, resolving

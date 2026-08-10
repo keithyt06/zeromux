@@ -234,6 +234,22 @@ fn ipv6_blocked(v6: std::net::Ipv6Addr) -> bool {
     {
         return true;
     }
+    // Translation/tunnel prefixes that embed a v4 destination `to_ipv4()` does NOT
+    // recognize. On a host behind a NAT64 gateway (AWS DNS64/NAT64 subnets), an
+    // endpoint like `https://[64:ff9b::a9fe:a9fe]` is translated to a real request
+    // to 169.254.169.254 (a9fe = 169.254 twice) — blind SSRF to the metadata
+    // service that sidesteps the entire v4 denylist. 6to4 (2002::/16) embeds a v4 in
+    // the same spirit, and the deprecated site-local fec0::/10 matches neither
+    // is_unicast_link_local (fe80::/10) nor is_unique_local (fc00::/7). No real push
+    // service (FCM/APNs/Mozilla autopush) uses these prefixes, so blocking them
+    // outright is safe defense-in-depth. (review 2026-08-10, F4)
+    let seg = v6.segments();
+    if seg[0] == 0x2002                              // 6to4 2002::/16
+        || (seg[0] == 0x64 && seg[1] == 0xff9b)      // NAT64 well-known 64:ff9b::/96
+        || (seg[0] & 0xffc0) == 0xfec0               // deprecated site-local fec0::/10
+    {
+        return true;
+    }
     // Then reclassify an embedded IPv4. `to_ipv4()` (unlike `to_ipv4_mapped()`)
     // matches BOTH the mapped `::ffff:0:0/96` form AND the deprecated compatible
     // `::/96` form (`::169.254.169.254` → 169.254.169.254), closing the sibling
@@ -698,6 +714,11 @@ mod tests {
         // caught by the native-v6 checks (loopback/unspecified) that now run first.
         assert!(!endpoint_is_safe("https://[::1]/x"));                   // loopback (v6-first)
         assert!(!endpoint_is_safe("https://[::]/x"));                    // unspecified (v6-first)
+        // Translation/tunnel prefixes that embed a v4 dest `to_ipv4()` can't see —
+        // NAT64 to the metadata address, 6to4, deprecated site-local. (2026-08-10 F4)
+        assert!(!endpoint_is_safe("https://[64:ff9b::a9fe:a9fe]/x"));     // NAT64 → 169.254.169.254
+        assert!(!endpoint_is_safe("https://[2002:a9fe:a9fe::1]/x"));      // 6to4 embedding metadata
+        assert!(!endpoint_is_safe("https://[fec0::1]/x"));               // deprecated site-local
         // A legitimate global IPv6 push endpoint must still be allowed (no v4 embed).
         assert!(endpoint_is_safe("https://[2606:4700:4700::1111]/x"));
     }

@@ -2546,6 +2546,14 @@ fn spawn_acp_fanout(
                                 match queue_mode {
                                     QueueMode::Interrupt if local_running => {
                                         // 打断当前 turn,丢弃任何待合并,立即发新 prompt。
+                                        // Stamp Cancelled intent on the live turn (FIFO back) BEFORE
+                                        // starting turn N+1 — same as the explicit Interrupt handler.
+                                        // Without it, the interrupted turn's boundary settles with no
+                                        // intent and classify_outcome records it Completed/Errored
+                                        // instead of Cancelled, diverging from the Interrupt button.
+                                        // The back is still the live turn here (turn_seq not yet
+                                        // bumped), so it targets the correct entry. (review 2026-08-10)
+                                        turn_starts.set_live_intent(crate::run_metrics::RunOutcome::Cancelled);
                                         if let Err(e) = process.interrupt().await {
                                             tracing::warn!("interrupt (queue mode) failed for {}: {}", sid, e);
                                         }
@@ -3205,6 +3213,9 @@ fn spawn_kiro_fanout(
                                 // passthrough 已在 SetQueueMode 处降级为 collect。
                                 match queue_mode {
                                     QueueMode::Interrupt if local_running => {
+                                        // Stamp Cancelled intent on the live turn before starting
+                                        // the next — see the Claude fan-out. (review 2026-08-10)
+                                        turn_starts.set_live_intent(crate::run_metrics::RunOutcome::Cancelled);
                                         if let Err(e) = process.interrupt().await {
                                             tracing::warn!("interrupt (queue mode) failed for {}: {}", sid, e);
                                         }
@@ -3478,6 +3489,11 @@ fn spawn_codex_fanout(
                                 // 非调度 prompt:按队列模式分流(G2b)。
                                 match queue_mode {
                                     QueueMode::Interrupt if local_running => {
+                                        // Stamp Cancelled intent on the live turn before starting
+                                        // the next — see the Claude fan-out. Codex interrupt emits
+                                        // AcpEvent::Error, which would otherwise classify Errored.
+                                        // (review 2026-08-10)
+                                        turn_starts.set_live_intent(crate::run_metrics::RunOutcome::Cancelled);
                                         if let Err(e) = process.interrupt().await {
                                             tracing::warn!("interrupt (queue mode) failed for {}: {}", sid, e);
                                         }
@@ -4250,6 +4266,43 @@ mod turn_state_tests {
         let (_, intent2) = ts.settle().unwrap();
         assert_eq!(crate::run_metrics::classify_outcome(crate::run_metrics::TerminalEvt::Result, intent2),
             RunOutcome::Completed, "the fresh turn completes; its success push is NOT suppressed");
+    }
+
+    #[test]
+    fn queue_mode_interrupt_resend_records_the_interrupted_turn_as_cancelled() {
+        use crate::run_metrics::RunOutcome;
+        // review 2026-08-10 (F3): the QueueMode::Interrupt resend arm interrupts the
+        // running turn and starts the next. Before the fix it did NOT stamp Cancelled
+        // intent on the interrupted turn (only the explicit Interrupt button did), so
+        // the aborted turn's boundary settled with no intent and classify_outcome
+        // recorded it Completed (Kiro's cancel→Result / Claude) or Errored (Codex's
+        // cancel→Error) — the SAME user action ("interrupt the running turn") yielding
+        // a different metric depending on which route triggered it.
+        //
+        // This models the FIXED fan-out ordering: set_live_intent(Cancelled) on the
+        // live turn (FIFO back = turn 1, before turn_seq is bumped), THEN start turn 2.
+        let mut ts = TurnStarts::default();
+        ts.start(1_000); // turn 1 — running
+        // — user sends a new prompt in Interrupt mode → the arm now stamps first:
+        ts.set_live_intent(RunOutcome::Cancelled); // targets the still-live turn 1
+        ts.start(2_000); // turn 2 (the resend) — fresh, no intent
+
+        // Boundary #1 = the interrupted turn 1. Even though the backend delivers it as
+        // a Result (Kiro cancel) or Error (Codex), the stamped intent wins → Cancelled.
+        assert_eq!(ts.front_intent(), Some(RunOutcome::Cancelled));
+        let (start1, intent1) = ts.settle().unwrap();
+        assert_eq!(start1, 1_000);
+        assert_eq!(crate::run_metrics::classify_outcome(crate::run_metrics::TerminalEvt::Result, intent1),
+            RunOutcome::Cancelled, "the interrupted turn must be Cancelled, not Completed");
+        assert_eq!(crate::run_metrics::classify_outcome(crate::run_metrics::TerminalEvt::Error, intent1),
+            RunOutcome::Cancelled, "…and not Errored (Codex's interrupt Error path)");
+
+        // Boundary #2 = the resend turn 2: clean, completes normally, push not suppressed.
+        assert_eq!(ts.front_intent(), None, "the resend turn carries no stale cancel");
+        let (start2, intent2) = ts.settle().unwrap();
+        assert_eq!(start2, 2_000);
+        assert_eq!(crate::run_metrics::classify_outcome(crate::run_metrics::TerminalEvt::Result, intent2),
+            RunOutcome::Completed);
     }
 
     #[test]

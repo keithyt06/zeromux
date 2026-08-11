@@ -2160,8 +2160,14 @@ async fn git_show(
     // `core.quotePath=false` so a non-ASCII credential filename reaches
     // `worktree_path_excluded` unquoted and is recognized/dropped (else the
     // quoted `".env.\347..."` bypasses the leaf check and surfaces the name).
+    // `diff.relative=false`: mirror the patch-body pin (line ~2144). A repo-local
+    // `diff.relative=true` + CWD=work_dir strips the CWD-relative leading dir from
+    // numstat paths too, so a non-credential-named leaf under a sensitive dir
+    // (`.aws/config` → `config`) would dodge `numstat_path_excluded`'s dir check and
+    // surface its NAME + churn counts in the file list. The body is already protected
+    // by the patch-side pin; this closes the metadata sibling. (review 2026-08-11, F5)
     let files: Vec<serde_json::Value> = std::process::Command::new("git")
-        .args(["-c", "core.quotePath=false", "show", "-M", "-C", "--find-copies-harder", "--format=", "--numstat", &query.commit])
+        .args(["-c", "core.quotePath=false", "-c", "diff.relative=false", "show", "-M", "-C", "--find-copies-harder", "--format=", "--numstat", &query.commit])
         .current_dir(&work_dir)
         .output()
         .ok()
@@ -2263,6 +2269,16 @@ fn worktree_path_excluded(path: &str) -> bool {
 /// concrete paths and exclude if either is sensitive; a plain path (no `=>`)
 /// falls through to the normal predicate.
 fn numstat_path_excluded(field: &str) -> bool {
+    // Fail CLOSED on a git C-quoted field (leading `"`): git quotes a name with a
+    // tab/newline/`"`/`\`/control byte REGARDLESS of `core.quotePath=false`, and a
+    // quoted `".env\tx"` bypasses `is_credential_path`'s `starts_with(".env")` (it
+    // starts with `"`), surfacing the credential's SOURCE name in the file list. The
+    // paired diff-body leak is closed in `diff_header_path`; this closes the name
+    // side. A quoted field on either half of a `=>` rename is equally unsafe.
+    // (review 2026-08-11, F1 secondary.)
+    if field.trim_start().starts_with('"') || field.contains(" \"") {
+        return true;
+    }
     if !field.contains("=>") {
         return worktree_path_excluded(field);
     }
@@ -2380,6 +2396,29 @@ fn diff_header_path(line: &str) -> DiffHeader<'_> {
         // The numstat/file-list side already drops such a file via its `=>` rename
         // expansion, so this only realigns the diff-body filter with it.
         // (review 2026-08-08, F1 — empirically reproduced HIGH credential leak.)
+        //
+        // QUOTE-AWARE FAIL-CLOSED (review 2026-08-11, F1 — Codex second opinion,
+        // empirically reproduced). git C-quotes EACH side INDEPENDENTLY, and it quotes
+        // a side whenever the name contains a byte it must escape (tab, newline, `"`,
+        // `\`, control) REGARDLESS of `core.quotePath=false` (which only governs
+        // high-bit/non-ASCII bytes). So a rename/modify can quote just ONE side:
+        //   diff --git "a/.env\tx" b/public.txt   (old-side quoted — credential leaks its OLD body)
+        //   diff --git a/x.txt "b/.env\ty"        (new-side quoted)
+        // and — worse — a quoted side can INJECT or ELIDE the bare ` b/` bytes the
+        // split keys on (a quoted old path `"a/a b/x"` carries a spurious ` b/`; a
+        // quoted new path hides the real one), desyncing `rsplit_once`/the count guard
+        // so a credential dodges `worktree_path_excluded`. We cannot trust ANY
+        // substring split of a header that contains a quoted path, and we deliberately
+        // do NOT hand-roll a C-unquoter (git's escaping is subtle; a decode bug would
+        // reopen the hole). Instead: because with `core.quotePath=false` a `"` appears
+        // in this remainder ONLY as git's opening/closing quote (a literal `"` in a
+        // name itself forces quoting), the presence of ANY `"` byte proves a side was
+        // quoted → fail CLOSED. Unquoted headers (the overwhelming common case) are
+        // unaffected and still parsed below. The paired numstat/status file-list is
+        // closed by `numstat_path_excluded`'s leading-`"` guard.
+        if rest.contains('"') {
+            return DiffHeader::Unparseable;
+        }
         if rest.matches(" b/").count() != 1 {
             return DiffHeader::Unparseable;
         }
@@ -2395,6 +2434,14 @@ fn diff_header_path(line: &str) -> DiffHeader<'_> {
             .unwrap_or(rest)
             .strip_prefix("a/")
             .map(|s| s.trim_end_matches(['\n', '\r']));
+        // Defense-in-depth: with `diff.srcPrefix=a/` pinned and the quote guard above
+        // already excluding any quoted side, a well-formed unquoted header ALWAYS
+        // starts `a/…`, so `a_path == None` can only mean a malformed/mangled old
+        // side — fail CLOSED. (Subsumed by the `"` guard for the quoted case; kept as
+        // a cheap belt-and-suspenders for any residual unquoted-but-malformed shape.)
+        if a_path.is_none() {
+            return DiffHeader::Unparseable;
+        }
         return match b_path.or(a_path) {
             Some(p) if !p.is_empty() => {
                 // Exclude if EITHER side is sensitive — a rename to/from a
@@ -5121,6 +5168,76 @@ diff --git a/src/main.rs b/src/main.rs
         assert!(matches!(
             diff_header_path("diff --git a/src/main.rs b/src/main.rs\n"),
             DiffHeader::Path("src/main.rs")
+        ));
+    }
+
+    #[test]
+    fn cquoted_diff_git_header_does_not_leak_credential() {
+        // git C-quotes EACH side of a `diff --git` header INDEPENDENTLY whenever the
+        // name has a byte it must escape (tab/newline/"/\\/control) — REGARDLESS of
+        // core.quotePath=false. Any quoted side breaks the substring `a/`/` b/`
+        // parse, so a credential can dodge worktree_path_excluded. The fix fails
+        // CLOSED on any `"` in the header remainder (a `"` can only be git's quoting
+        // with quotePath=false). Cover every axis Codex flagged. (review 2026-08-11, F1)
+
+        // (a) OLD side quoted (rename away from credential `.env\tx` → public.txt):
+        //     exactly one bare ` b/`, a-side `a/`-strip fails → old code leaked.
+        let header_a = "diff --git \"a/.env\\tx\" b/public.txt\n";
+        assert!(matches!(diff_header_path(header_a), DiffHeader::Unparseable),
+            "old-side-quoted rename header must fail closed");
+
+        // (b) NEW side quoted (rename into a quote-forcing credential name):
+        let header_b = "diff --git a/x.txt \"b/.env\\ty\"\n";
+        assert!(matches!(diff_header_path(header_b), DiffHeader::Unparseable),
+            "new-side-quoted rename header must fail closed");
+
+        // (c) plain MODIFY of a quoted-name credential (both sides quoted, zero ` b/`):
+        let header_c = "diff --git \"a/.env\\tx\" \"b/.env\\tx\"\n";
+        assert!(matches!(diff_header_path(header_c), DiffHeader::Unparseable),
+            "both-sides-quoted modify header must fail closed");
+
+        // (d) ` b/`-injection: a quoted old path carrying a spurious ` b/` inside the
+        //     quotes could fabricate a count of 1 and shift the split. The `"` guard
+        //     catches it before the count guard even runs.
+        let header_d = "diff --git \"a/a b/x\" \"b/.env\\ty\"\n";
+        assert!(matches!(diff_header_path(header_d), DiffHeader::Unparseable),
+            "quoted side injecting a spurious ` b/` must fail closed");
+
+        // End-to-end: the old-side-quoted rename's credential body must be stripped.
+        let diff = "diff --git \"a/.env\\tx\" b/public.txt\n\
+similarity index 73%\n\
+rename from \".env\\tx\"\n\
+rename to public.txt\n\
+index 50399f3..dab3bbb 100644\n\
+--- \"a/.env\\tx\"\n\
++++ b/public.txt\n\
+@@ -1 +1,2 @@\n\
+ SECRET=SUPERSECRET\n\
++more=1\n\
+diff --git a/src/main.rs b/src/main.rs\n\
++let x = 1;\n";
+        let out = filter_diff_excluded(diff);
+        assert!(!out.contains("SUPERSECRET"), "quoted-header rename body must be stripped");
+        assert!(!out.contains("rename from"), "rename metadata must be stripped");
+        assert!(out.contains("let x = 1;"), "following clean section survives");
+
+        // Secondary: the numstat file-list side quotes the SAME way; it must not
+        // surface the credential's name either.
+        assert!(numstat_path_excluded("\".env\\tx\" => public.txt"), "quoted numstat source must be excluded");
+        assert!(numstat_path_excluded("x.txt => \".env\\ty\""), "quoted numstat dest must be excluded");
+        assert!(numstat_path_excluded("\".env\\tx\""), "bare quoted credential field excluded");
+
+        // A normal (unquoted) clean rename must still parse and survive both sides.
+        assert!(!numstat_path_excluded("old.rs => new.rs"), "clean rename not over-excluded");
+        assert!(matches!(
+            diff_header_path("diff --git a/old.rs b/new.rs\n"),
+            DiffHeader::Path("new.rs")
+        ));
+        // And an unquoted rename AWAY from a credential is still caught by Excluded
+        // (not the quote guard) — regression guard for the pre-existing path.
+        assert!(matches!(
+            diff_header_path("diff --git a/.env b/public.txt\n"),
+            DiffHeader::Excluded
         ));
     }
 

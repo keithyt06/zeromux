@@ -370,7 +370,24 @@ async fn run_event_loop(
                         if stdin.write_all(buf.as_bytes()).await.is_err() { return; }
                         let _ = stdin.flush().await;
                     }
-                    Some(Cmd::Stop) | None => return,
+                    Some(Cmd::Stop) | None => {
+                        // Emit a terminal boundary before returning, mirroring Codex's
+                        // Stop arm (codex_process.rs) and Claude's stdout-EOF→Exit
+                        // (process.rs). `kill()` enqueues `Cmd::Stop` BEFORE `child.kill()`,
+                        // and this `select!` is not `biased`, so on a wedged/silent turn
+                        // (lines pending) the cmd_rx branch wins over the stdout-EOF branch
+                        // that would otherwise send Exit (line ~335). Without an Exit here
+                        // the fan-out's turn-settle logic — which only runs inside its
+                        // `if is_boundary` block on Result/Error/Exit — never fires, so a
+                        // watchdog-Timeout or Cancel of a Kiro turn records NO run metric
+                        // (its `turn_starts` FIFO entry, carrying the Timeout/Cancelled
+                        // intent, is stranded), diverging from Claude/Codex which both
+                        // record it. Exit is idempotent w.r.t. session state (the
+                        // boundary_count>=turn_seq clamp tolerates a second boundary if the
+                        // EOF arm also fires). (review 2026-08-11, F-KIRO parity)
+                        let _ = tx.send(AcpEvent::Exit { code: 0 }).await;
+                        return;
+                    }
                 }
             }
         }
@@ -602,6 +619,44 @@ mod tests {
                 other => panic!("expected Result for {stop}, got {other:?}"),
             }
         }
+    }
+
+    #[tokio::test]
+    async fn stop_emits_terminal_exit_boundary_for_metric_settle() {
+        // review 2026-08-11, F-KIRO parity: kill() enqueues Cmd::Stop before
+        // child.kill(); the event loop must emit a terminal AcpEvent::Exit so the
+        // fan-out's `if is_boundary` block settles the turn's FIFO intent and records
+        // the Timeout/Cancelled run metric — matching Claude (stdout-EOF→Exit) and
+        // Codex (Stop→Exit). A `cat` child gives us a real, silent ChildStdin/ChildStdout
+        // that stays open (so the stdout-EOF arm can't fire first), isolating the
+        // Cmd::Stop path.
+        use tokio::process::Command;
+        use tokio::io::{AsyncBufReadExt, BufReader};
+        let mut child = Command::new("cat")
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .spawn()
+            .expect("spawn cat");
+        let stdin = child.stdin.take().unwrap();
+        let lines = BufReader::new(child.stdout.take().unwrap()).lines();
+        let (tx, mut rx) = mpsc::channel::<AcpEvent>(16);
+        let (cmd_tx, cmd_rx) = mpsc::channel::<Cmd>(16);
+        let handle = tokio::spawn(run_event_loop(lines, stdin, tx, cmd_rx, "s1".to_string()));
+
+        // Silent turn (nothing on stdout) → send Stop, as kill() does.
+        cmd_tx.send(Cmd::Stop).await.unwrap();
+
+        let evt = tokio::time::timeout(std::time::Duration::from_secs(2), rx.recv())
+            .await
+            .expect("Stop must yield a terminal boundary, not silence")
+            .expect("channel should carry the Exit before closing");
+        assert!(
+            matches!(evt, AcpEvent::Exit { .. }),
+            "Cmd::Stop must emit a terminal Exit boundary so the fan-out settles the \
+             metric; got {evt:?}"
+        );
+        let _ = child.kill().await;
+        let _ = handle.await;
     }
 
     #[tokio::test]

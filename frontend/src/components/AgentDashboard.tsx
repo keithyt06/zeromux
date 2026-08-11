@@ -1,4 +1,4 @@
-import { useState, useEffect, useCallback } from 'react'
+import { useState, useEffect, useCallback, useRef } from 'react'
 import { listEvents, deleteEvent } from '../lib/api'
 import type { AgentEvent } from '../lib/api'
 import { Trash2, RefreshCw, Bot, Wrench, CheckCircle, AlertCircle, Flag, Zap } from 'lucide-react'
@@ -36,7 +36,16 @@ export default function AgentDashboard({ sessionId }: Props) {
   const [loading, setLoading] = useState(true)
   const [filter, setFilter] = useState<{ agent?: string; event?: string }>({})
 
+  // Monotonic request token: loadEvents fires from the filter-change effect, the
+  // 10s auto-refresh interval, AND the manual Refresh button, so a slower earlier
+  // fetch (e.g. the wider `agent=claude` query) can resolve AFTER a later one (the
+  // unfiltered "All" click) and overwrite it — painting a filtered subset while the
+  // filter UI highlights "All". A delete's in-flight refresh could likewise resurrect
+  // the just-removed row. Bump at the TOP of every call and drop stale responses.
+  // (review 2026-08-11, F-FE — the tracked stale-response class.)
+  const reqRef = useRef(0)
   const loadEvents = useCallback(async () => {
+    const req = ++reqRef.current
     setLoading(true)
     try {
       const data = await listEvents({
@@ -45,9 +54,12 @@ export default function AgentDashboard({ sessionId }: Props) {
         event: filter.event,
         limit: 100,
       })
+      if (reqRef.current !== req) return
       setEvents(data.events)
-    } catch { /* ignore */ }
-    setLoading(false)
+    } catch {
+      if (reqRef.current !== req) return
+    }
+    if (reqRef.current === req) setLoading(false)
   }, [sessionId, filter])
 
   useEffect(() => { loadEvents() }, [loadEvents])
@@ -61,6 +73,9 @@ export default function AgentDashboard({ sessionId }: Props) {
   const handleDelete = async (id: string) => {
     try {
       await deleteEvent(id)
+      // Invalidate any loadEvents already in flight so its (pre-delete) snapshot
+      // can't resurrect the row we're optimistically removing here.
+      reqRef.current++
       setEvents(prev => prev.filter(e => e.id !== id))
     } catch { /* ignore */ }
   }

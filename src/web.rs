@@ -1401,6 +1401,62 @@ fn git_ref_is_commit(work_dir: &str, git_ref: &str) -> bool {
         .unwrap_or(false)
 }
 
+/// Build `-c filter.<name>.clean=cat …` overrides that neutralize EVERY repo-local
+/// content filter before running a diff.
+///
+/// This closes a credential-leak axis orthogonal to the header pins and the
+/// `--no-ext-diff`/`--no-textconv` body-generator pins (review 2026-08-12, F-GIT-CLEAN-FILTER,
+/// empirically reproduced HIGH). A repo-local `filter.<name>.clean` (declared via
+/// `.gitattributes` `public.txt filter=<name>` + `.git/config [filter "<name>"] clean = …`,
+/// both attacker-controllable in the work_dir repo) runs on the WORKING-TREE side of
+/// `git diff HEAD`. It is a shell command whose STDOUT becomes the "clean" (index-side)
+/// content git diffs — so `clean = "cat; cat .env"` injects the live contents of an
+/// UNtracked `.env` (or any absolute path — `cat /home/u/.ssh/id_rsa`) into the hunk of
+/// the innocuously-named `public.txt`. The diff header is a clean `diff --git a/public.txt
+/// b/public.txt`, so `diff_header_path` → `Path("public.txt")` → not excluded → the secret
+/// bytes stream to the client. It defeats every path-based guard because the bytes never
+/// travel under a sensitive path. `--no-ext-diff`/`--no-textconv` do NOT disable it — the
+/// clean/smudge/process filter is a separate axis (content ingestion, not diff rendering).
+///
+/// Fix: enumerate the repo's `filter.*.{clean,smudge,process}` keys and override each on
+/// the command line to the identity passthrough (`clean=cat`, `smudge=cat`, empty
+/// `process` disables the long-running variant). `-c` beats repo config by git precedence,
+/// so the working-tree content is diffed verbatim with no injection. We override the EXACT
+/// keys git reports (via `git config -z --get-regexp`) rather than reconstructing filter
+/// names — a filter name may itself contain `.` (`filter.my.evil.clean`), so name
+/// reconstruction from the tail token is ambiguous. `-c` on a `filter.<n>.process` value
+/// we set to empty makes git fall back to clean/smudge, which we've pinned to `cat`.
+/// We do NOT touch `.git/` on disk (racy + attacker-writable) and `core.attributesFile`
+/// can't help (in-tree `.gitattributes` wins by precedence — verified).
+fn git_filter_neutralize_args(work_dir: &std::path::Path) -> Vec<String> {
+    let out = std::process::Command::new("git")
+        .arg("-C")
+        .arg(work_dir)
+        .args(["config", "-z", "--get-regexp", r"^filter\..*\.(clean|smudge|process)$"])
+        .output();
+    let mut args: Vec<String> = Vec::new();
+    if let Ok(o) = out {
+        if o.status.success() {
+            // `-z` records are `key\nvalue\0`; the key is up to the first `\n`.
+            for rec in String::from_utf8_lossy(&o.stdout).split('\0') {
+                let key = rec.split('\n').next().unwrap_or("");
+                if key.is_empty() {
+                    continue;
+                }
+                args.push("-c".to_string());
+                // Empty `process` disables the long-running filter (git falls back to
+                // clean/smudge); clean/smudge → `cat` is an identity passthrough.
+                if key.ends_with(".process") {
+                    args.push(format!("{}=", key));
+                } else {
+                    args.push(format!("{}=cat", key));
+                }
+            }
+        }
+    }
+    args
+}
+
 /// Unified resolve + verify: lexical `..` guard → `base.join(rel)` → canonicalize →
 /// `starts_with(base_canonical)` recheck. canonicalize failure (dangling / escaping
 /// symlink) → 403. canonicalize follows symlinks, so a symlink whose real target is
@@ -2140,8 +2196,25 @@ async fn git_show(
     // longer sees `.aws`, so the section leaks. `-c diff.relative=false` on the
     // command line overrides the repo config and restores the full repo-root path.
     // (review 2026-08-10)
+    //
+    // `git_filter_neutralize_args` closes a FIFTH axis (review 2026-08-12,
+    // F-GIT-CLEAN-FILTER): a repo-local `filter.<name>.clean` runs a shell command
+    // whose stdout becomes the diffed content, letting it splice arbitrary file bytes
+    // (`clean = "cat; cat .env"`) into an innocuously-named file's hunk — orthogonal to
+    // `--no-ext-diff`/`--no-textconv`, which only govern diff RENDERING, not content
+    // ingestion. Overriding every `filter.*.{clean,smudge,process}` to identity neuters it.
+    //
+    // `--submodule=short` closes a SIXTH axis (review 2026-08-12, Codex second opinion,
+    // reproduced): a repo-local `diff.submodule=diff` makes the TOP-level diff embed a
+    // submodule's INLINE diff, and that nested repo carries its OWN `.gitattributes` +
+    // `filter.*.clean` that `git_filter_neutralize_args` (which only enumerates the TOP
+    // repo's config) never sees — so the submodule's clean filter re-opens the exact leak
+    // one level down. `--submodule=short` (a CLI flag → beats config) forces the safe
+    // commit-range summary instead of an inline nested diff. It's git's default, so no
+    // legitimate output is lost.
     let diff_output = std::process::Command::new("git")
-        .args(["-c", "core.quotePath=false", "-c", "diff.noprefix=false", "-c", "diff.mnemonicPrefix=false", "-c", "diff.srcPrefix=a/", "-c", "diff.dstPrefix=b/", "-c", "diff.relative=false", "show", "--no-color", "--no-ext-diff", "--no-textconv", "-M", "-C", "--find-copies-harder", "--format=", "--patch", &query.commit])
+        .args(git_filter_neutralize_args(std::path::Path::new(&work_dir)))
+        .args(["-c", "core.quotePath=false", "-c", "diff.noprefix=false", "-c", "diff.mnemonicPrefix=false", "-c", "diff.srcPrefix=a/", "-c", "diff.dstPrefix=b/", "-c", "diff.relative=false", "show", "--no-color", "--no-ext-diff", "--no-textconv", "--submodule=short", "-M", "-C", "--find-copies-harder", "--format=", "--patch", &query.commit])
         .current_dir(&work_dir)
         .output()
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("git show failed: {}", e)))?;
@@ -2303,10 +2376,22 @@ fn numstat_path_excluded(field: &str) -> bool {
 
 /// Drop files whose path is excluded (sensitive dir component or credential leaf),
 /// so a worktree diff can never surface .ssh/.aws/.env/*.pem contents.
+///
+/// BOTH the new `path` AND the rename source `old_path` must be checked: a rename
+/// AWAY from a credential (`git mv .aws/credentials public.txt`) records
+/// `path="public.txt", old_path=".aws/credentials"`. The new leaf is innocuous, so a
+/// `path`-only check keeps the row and serializes the sensitive OLD name to the client.
+/// The diff BODY for such a rename is already stripped (diff_header_path's Excluded arm
+/// sees the `a/.aws/credentials` side), and the numstat file list drops it via
+/// `numstat_path_excluded`'s `=>` expansion — this closes the porcelain/worktree file
+/// list, the last mirror of that same rename-source leak. (review 2026-08-12, F-OLDPATH.)
 fn filter_sensitive_files(files: Vec<WorktreeFile>) -> Vec<WorktreeFile> {
     files
         .into_iter()
-        .filter(|f| !worktree_path_excluded(&f.path))
+        .filter(|f| {
+            !worktree_path_excluded(&f.path)
+                && !f.old_path.as_deref().is_some_and(worktree_path_excluded)
+        })
         .collect()
 }
 
@@ -2566,8 +2651,18 @@ async fn git_worktree(
         // so a credential under a sensitive dir (work_dir inside `.aws/`) loses its
         // dir component from the header and dodges worktree_path_excluded. See
         // git_show for both. (2026-08-10)
+        // `git_filter_neutralize_args`: a repo-local `filter.<name>.clean` runs on the
+        // WORKING-TREE side of `diff HEAD` and can splice arbitrary/untracked file bytes
+        // (`clean = "cat; cat .env"`) into an innocuously-named file's hunk — the most
+        // dangerous vector here since it leaks the LIVE working tree, tracked or not.
+        // Orthogonal to `--no-ext-diff`/`--no-textconv`. See git_show. (review 2026-08-12)
+        // `--submodule=short`: a repo-local `diff.submodule=diff` would inline a
+        // submodule's diff, and the nested repo's own clean filter (unseen by the
+        // top-level neutralize enumeration) re-opens the leak — force the safe
+        // commit-range summary. See git_show. (review 2026-08-12, Codex second opinion)
         let raw = std::process::Command::new("git")
-            .args(["-c", "core.quotePath=false", "-c", "diff.noprefix=false", "-c", "diff.mnemonicPrefix=false", "-c", "diff.srcPrefix=a/", "-c", "diff.dstPrefix=b/", "-c", "diff.relative=false", "diff", "HEAD", "--no-color", "--no-ext-diff", "--no-textconv", "-M", "-C", "--find-copies-harder", "--", "."])
+            .args(git_filter_neutralize_args(dir))
+            .args(["-c", "core.quotePath=false", "-c", "diff.noprefix=false", "-c", "diff.mnemonicPrefix=false", "-c", "diff.srcPrefix=a/", "-c", "diff.dstPrefix=b/", "-c", "diff.relative=false", "diff", "HEAD", "--no-color", "--no-ext-diff", "--no-textconv", "--submodule=short", "-M", "-C", "--find-copies-harder", "--", "."])
             .current_dir(dir)
             .output()
             .ok()
@@ -4797,6 +4892,140 @@ mod path_safety_tests {
     }
 
     #[test]
+    fn git_clean_filter_cannot_splice_untracked_credential_into_diff() {
+        // review 2026-08-12 (F-GIT-CLEAN-FILTER, empirically reproduced HIGH): a
+        // repo-local `filter.<name>.clean` runs on the WORKING-TREE side of `diff HEAD`
+        // and is a shell command whose STDOUT becomes the diffed content. It is a FIFTH
+        // axis orthogonal to the header pins and `--no-ext-diff`/`--no-textconv` (which
+        // only govern diff RENDERING, not content ingestion). `clean = "cat; cat .env"`
+        // splices the live contents of an UNtracked `.env` (or any absolute path) into
+        // the hunk of the innocuously-named `public.txt`, whose clean header
+        // `diff --git a/public.txt b/public.txt` sails past worktree_path_excluded. The
+        // handler now passes `git_filter_neutralize_args`, overriding every
+        // `filter.*.{clean,smudge,process}` to identity. Drive the EXACT fixed
+        // git_worktree flags (including the neutralize args) against the weaponized repo.
+        let dir = std::env::temp_dir().join(format!("zmgr-cleanfilter-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let ds = dir.to_str().unwrap();
+        let run = |args: &[&str]| {
+            std::process::Command::new("git").args(["-C", ds]).args(args).output().unwrap()
+        };
+        assert!(run(&["init", "-q"]).status.success(), "git init");
+        let _ = run(&["config", "user.email", "t@t"]);
+        let _ = run(&["config", "user.name", "t"]);
+        // Innocuous tracked file, committed CLEAN (no filter yet) so the blob holds no
+        // secret — proving the leak is the LIVE working-tree filter, not a committed blob.
+        std::fs::write(dir.join("public.txt"), "hello\n").unwrap();
+        assert!(run(&["add", "public.txt"]).status.success(), "git add");
+        assert!(run(&["commit", "-qm", "init"]).status.success(), "git commit");
+        // The secret lives in an UNTRACKED .env — the clean filter reads it from disk.
+        std::fs::write(dir.join(".env"), "AWS_SECRET_ACCESS_KEY=CLEANFILTER_SECRET\n").unwrap();
+        // Weaponize: a clean filter that appends the untracked .env's bytes; wire it to
+        // public.txt via a committed .gitattributes. Use a DOTTED filter name to prove
+        // the neutralizer overrides the exact reported key, not a reconstructed name.
+        let _ = run(&["config", "filter.my.evil.clean", "cat; cat .env"]);
+        std::fs::write(dir.join(".gitattributes"), "public.txt filter=my.evil\n").unwrap();
+        assert!(run(&["add", ".gitattributes"]).status.success(), "git add attrs");
+        assert!(run(&["commit", "-qm", "attrs"]).status.success(), "git commit attrs");
+        // Modify public.txt so it shows in `diff HEAD` (its clean-filtered content leaks).
+        std::fs::write(dir.join("public.txt"), "hello2\n").unwrap();
+
+        // Sanity: WITHOUT the neutralize args the secret DOES leak (guards the test).
+        let leaked = String::from_utf8_lossy(
+            &std::process::Command::new("git")
+                .args(["-c", "core.quotePath=false", "diff", "HEAD", "--no-color", "--no-ext-diff", "--no-textconv", "--", "."])
+                .current_dir(&dir)
+                .output()
+                .unwrap()
+                .stdout,
+        ).to_string();
+        assert!(leaked.contains("CLEANFILTER_SECRET"),
+            "test precondition: the clean filter must leak without the fix; got:\n{leaked}");
+
+        // EXACT flags from git_worktree's diff invocation, WITH the neutralize args.
+        let raw = String::from_utf8_lossy(
+            &std::process::Command::new("git")
+                .args(git_filter_neutralize_args(&dir))
+                .args(["-c", "core.quotePath=false", "-c", "diff.noprefix=false", "-c", "diff.mnemonicPrefix=false", "-c", "diff.srcPrefix=a/", "-c", "diff.dstPrefix=b/", "-c", "diff.relative=false", "diff", "HEAD", "--no-color", "--no-ext-diff", "--no-textconv", "--submodule=short", "-M", "-C", "--find-copies-harder", "--", "."])
+                .current_dir(&dir)
+                .output()
+                .unwrap()
+                .stdout,
+        ).to_string();
+        let filtered = filter_diff_excluded(&raw);
+
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(!filtered.contains("CLEANFILTER_SECRET"),
+            "a repo-local clean filter must not splice an untracked credential into a \
+             non-sensitive file's diff; got:\n{filtered}");
+    }
+
+    #[test]
+    fn git_submodule_inline_diff_cannot_leak_nested_clean_filter_secret() {
+        // review 2026-08-12 (Codex second opinion, reproduced): a repo-local
+        // `diff.submodule=diff` makes the TOP-level `git diff HEAD` embed a submodule's
+        // INLINE diff. The nested repo carries its OWN `.gitattributes` + `filter.*.clean`
+        // that git_filter_neutralize_args (top-repo config only) never enumerates, so the
+        // submodule's clean filter re-opens the F-GIT-CLEAN-FILTER leak one level down.
+        // `--submodule=short` (CLI flag → beats config) forces the safe commit-range
+        // summary. Drive the EXACT fixed git_worktree flags against a weaponized submodule.
+        let root = std::env::temp_dir().join(format!("zmgr-submod-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let sub = root.join("sub");
+        std::fs::create_dir_all(&sub).unwrap();
+        let rs = root.to_str().unwrap();
+        let ss = sub.to_str().unwrap();
+        let git = |cwd: &str, args: &[&str]| {
+            std::process::Command::new("git").args(["-C", cwd]).args(args).output().unwrap()
+        };
+        // Submodule repo with a benign committed file.
+        assert!(git(ss, &["init", "-q"]).status.success(), "sub init");
+        let _ = git(ss, &["config", "user.email", "t@t"]);
+        let _ = git(ss, &["config", "user.name", "t"]);
+        std::fs::write(sub.join("inner.txt"), "inner\n").unwrap();
+        assert!(git(ss, &["add", "inner.txt"]).status.success(), "sub add");
+        assert!(git(ss, &["commit", "-qm", "init"]).status.success(), "sub commit");
+        // Top repo embeds the submodule (file protocol must be explicitly allowed).
+        assert!(git(rs, &["init", "-q"]).status.success(), "top init");
+        let _ = git(rs, &["config", "user.email", "t@t"]);
+        let _ = git(rs, &["config", "user.name", "t"]);
+        let add = git(rs, &["-c", "protocol.file.allow=always", "submodule", "add", "./sub", "sub"]);
+        // Some CI git builds forbid file-protocol submodules outright; skip cleanly then.
+        if !add.status.success() {
+            let _ = std::fs::remove_dir_all(&root);
+            return;
+        }
+        assert!(git(rs, &["commit", "-qm", "add submodule"]).status.success(), "top commit");
+        // Weaponize the submodule: untracked secret + clean filter wired to inner.txt.
+        std::fs::write(sub.join(".env"), "SUBMODULE_SECRET=LEAKED_VIA_SUBMODULE\n").unwrap();
+        let _ = git(ss, &["config", "filter.x.clean", "cat; cat .env"]);
+        std::fs::write(sub.join(".gitattributes"), "inner.txt filter=x\n").unwrap();
+        assert!(git(ss, &["add", ".gitattributes"]).status.success(), "sub add attrs");
+        assert!(git(ss, &["commit", "-qm", "attrs"]).status.success(), "sub commit attrs");
+        std::fs::write(sub.join("inner.txt"), "inner2\n").unwrap();
+        // Attacker top-level config: inline submodule diffs.
+        let _ = git(rs, &["config", "diff.submodule", "diff"]);
+
+        // EXACT flags from git_worktree's diff invocation (WITH --submodule=short).
+        let raw = String::from_utf8_lossy(
+            &std::process::Command::new("git")
+                .args(git_filter_neutralize_args(&root))
+                .args(["-c", "core.quotePath=false", "-c", "diff.noprefix=false", "-c", "diff.mnemonicPrefix=false", "-c", "diff.srcPrefix=a/", "-c", "diff.dstPrefix=b/", "-c", "diff.relative=false", "diff", "HEAD", "--no-color", "--no-ext-diff", "--no-textconv", "--submodule=short", "-M", "-C", "--find-copies-harder", "--", "."])
+                .current_dir(&root)
+                .output()
+                .unwrap()
+                .stdout,
+        ).to_string();
+        let filtered = filter_diff_excluded(&raw);
+
+        let _ = std::fs::remove_dir_all(&root);
+        assert!(!filtered.contains("LEAKED_VIA_SUBMODULE"),
+            "an inline submodule diff must not leak the nested repo's clean-filter secret; got:\n{filtered}");
+    }
+
+    #[test]
     fn git_diff_color_config_cannot_defeat_credential_filter() {
         // review 2026-08-10: a THIRD header-mangling axis orthogonal to the prefix
         // pins and the body generator. A repo-local `color.ui=always` (or
@@ -4964,6 +5193,27 @@ mod path_safety_tests {
         let out = filter_sensitive_files(files);
         assert_eq!(out.len(), 1, "only the non-credential file survives");
         assert_eq!(out[0].path, "src/main.rs");
+    }
+
+    #[test]
+    fn filter_sensitive_files_drops_rename_away_from_credential_old_path() {
+        // review 2026-08-12 (F-OLDPATH): a rename AWAY from a credential records the
+        // sensitive name in `old_path` while `path` is innocuous. A `path`-only filter
+        // keeps the row and serializes `old_path` (e.g. ".aws/credentials") to the
+        // client — the porcelain/worktree mirror of the numstat rename-token leak that
+        // was closed on 2026-08-06/08-11. Both sides must be checked.
+        let files = vec![
+            WorktreeFile { path: "src/main.rs".into(), status: " M".into(), staged: false, old_path: None },
+            // rename .aws/credentials -> public.txt (sensitive DIR component in old side)
+            WorktreeFile { path: "public.txt".into(), status: "R ".into(), staged: true, old_path: Some(".aws/credentials".into()) },
+            // rename .env -> config.txt (credential LEAF in old side)
+            WorktreeFile { path: "config.txt".into(), status: "R ".into(), staged: true, old_path: Some(".env".into()) },
+        ];
+        let out = filter_sensitive_files(files);
+        assert_eq!(out.len(), 1, "both credential-sourced renames are dropped");
+        assert_eq!(out[0].path, "src/main.rs");
+        assert!(out.iter().all(|f| f.old_path.as_deref() != Some(".aws/credentials")),
+            "a rename's sensitive old_path must never reach the client");
     }
 
     #[test]

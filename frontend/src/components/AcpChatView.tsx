@@ -134,9 +134,14 @@ export default function AcpChatView({ sessionId, agentType = 'claude', onRegiste
   // independently of showMetrics so the header badge is always available.
   const [lifetime, setLifetime] = useState({ turns: 0, duration_ms: 0, cost_usd: 0 })
   useEffect(() => {
+    // Guard against out-of-order resolves: metricsRefresh bumps this on every turn
+    // boundary and getSessionRuns can be slow on JuiceFS, so a stale earlier fetch
+    // could revert the cumulative badge to a smaller value. (review 2026-08-12)
+    let ignore = false
     getSessionRuns(sessionId, { limit: 0 })
-      .then(data => { if (data.lifetime) setLifetime(data.lifetime) })
+      .then(data => { if (!ignore && data.lifetime) setLifetime(data.lifetime) })
       .catch(() => { /* ignore — lifetime badge is non-critical */ })
+    return () => { ignore = true }
   }, [sessionId, metricsRefresh])
   // 输出密度(G2b/P2):concise(默认)折叠思考+原始工具输入;full 全显。
   const [density, setDensity] = useState<Density>('concise')

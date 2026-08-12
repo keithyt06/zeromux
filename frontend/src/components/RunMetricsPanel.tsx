@@ -1,4 +1,4 @@
-import { useState, useEffect, useCallback } from 'react'
+import { useState, useEffect, useCallback, useRef } from 'react'
 import { ChevronRight, ThumbsUp, ThumbsDown } from 'lucide-react'
 import { getSessionRuns, postRunVerdict } from '../lib/api'
 import type { RunMetric, RunStats, RunOutcome } from '../lib/api'
@@ -56,9 +56,17 @@ export function RunMetricsPanel({ sessionId, turnStartedMs, running, refreshKey 
   const [stats, setStats] = useState<RunStats | null>(null)
   const [nowMs, setNowMs] = useState(() => Date.now())
 
+  // Monotonic request guard: on the JuiceFS/S3-backed FS getSessionRuns can take
+  // seconds, so two turn-boundary loads (bumped via refreshKey) can resolve out of
+  // order — a slow earlier load overwriting a fast later one drops the newest run
+  // rows and reverts stats, and it does NOT self-correct until the next turn. Mirror
+  // the reqRef pattern every sibling loader uses. (review 2026-08-12, F-METRICS-STALE)
+  const reqRef = useRef(0)
   const load = useCallback(async () => {
+    const req = ++reqRef.current
     try {
       const data = await getSessionRuns(sessionId, { limit: 50 })
+      if (reqRef.current !== req) return
       setRuns(data.runs)
       setStats(data.stats)
     } catch { /* ignore */ }

@@ -2216,6 +2216,22 @@ fn build_run_metric(
     }
 }
 
+/// A turn whose FIFO intent is `Cancelled` (user Cancel/Interrupt) or `Timeout`
+/// (watchdog kill) was DELIBERATELY aborted — it did not genuinely complete or fail.
+/// Both the `turn_done` push ("✅ 完成") and the scheduled `run_failed` push
+/// ("⚠️ 失败 · 进程退出") must suppress on this: the abort's real outcome is surfaced
+/// elsewhere (the metric's intent-override classification, and — for a side-effecting
+/// scheduled task — the watchdog's `confirm` push). Sending either here would lie about
+/// the cause and, for run_failed, double-notify. Single source of truth for both call
+/// sites so they can't drift. (review 2026-08-12, F-RUNFAILED-INTENT.)
+fn intent_suppresses_push(intent: Option<crate::run_metrics::RunOutcome>) -> bool {
+    matches!(
+        intent,
+        Some(crate::run_metrics::RunOutcome::Cancelled)
+            | Some(crate::run_metrics::RunOutcome::Timeout)
+    )
+}
+
 /// Fire the "turn finished while you were away" Web Push for a settling
 /// interactive turn. Shared by all three agent fan-outs so the notification
 /// reaches Claude, Kiro AND Codex sessions identically — the block used to live
@@ -2244,11 +2260,7 @@ fn maybe_push_turn_done(
 ) {
     // A turn the user aborted (Cancel/Interrupt → Cancelled) or the watchdog
     // killed (Timeout) did NOT complete — never tell the user "✅ 完成".
-    if matches!(
-        outcome,
-        Some(crate::run_metrics::RunOutcome::Cancelled)
-            | Some(crate::run_metrics::RunOutcome::Timeout)
-    ) {
+    if intent_suppresses_push(outcome) {
         return;
     }
     if let Some(m) = mgr.upgrade() {
@@ -2382,6 +2394,22 @@ fn spawn_acp_fanout(
                                     let dur = turn_starts.front().map(|s| now_millis() - s).unwrap_or(0);
                                     maybe_push_turn_done(&mgr, &sid, &owner_id, dur, turn_starts.front_intent());
                                 }
+                                // Whether the settling turn was DELIBERATELY aborted
+                                // (user Cancel / watchdog Timeout stamped its FIFO
+                                // intent). Read from the front BEFORE settle() consumes
+                                // it — same source `maybe_push_turn_done` and the metric
+                                // classifier use. The `run_failed` push below must honor
+                                // it too: a Timeout kill is already surfaced via the
+                                // scheduler's `confirm` push (side-effecting) or is a
+                                // deliberate abort, and a Cancel is user-initiated — so a
+                                // "⚠️ 失败 · 进程退出" push there both lies about the cause
+                                // (real cause is idle/watchdog-timeout or cancel) and, for
+                                // a side-effecting task, DOUBLE-notifies alongside the
+                                // confirm push. The `turn_done` path was hardened for this
+                                // exact intent-vs-event-type gap (2026-08-07 F3 / 08-08 F2);
+                                // this closes the sibling on the scheduled run_failed path.
+                                // (review 2026-08-12, F-RUNFAILED-INTENT.)
+                                let intent_aborted = intent_suppresses_push(turn_starts.front_intent());
                                 // Finalize a scheduled run exactly once, keyed
                                 // on active_run_id, mapped by terminal event type.
                                 if let Some(rid) = active_run_id.take() {
@@ -2394,26 +2422,36 @@ fn spawn_acp_fanout(
                                             }
                                             AcpEvent::Error { .. } => {
                                                 m.finalize_run(&rid, "failed", None, Some("cli_error"));
-                                                // run_failed push: scheduled run ended with error
-                                                if let Some(p2) = m.push_handle() {
-                                                    let name = m.session_name(&sid).unwrap_or_default();
-                                                    let uid = owner_id.clone();
-                                                    let sid2 = sid.clone();
-                                                    tokio::spawn(async move {
-                                                        p2.send_to_user(&uid, &crate::push::payload_for("run_failed", &name, &sid2, Some("cli_error"))).await;
-                                                    });
+                                                // run_failed push: scheduled run ended with error —
+                                                // suppressed when the turn was deliberately aborted
+                                                // (Cancel/Timeout), whose real outcome is surfaced
+                                                // elsewhere (confirm push / metric).
+                                                if !intent_aborted {
+                                                    if let Some(p2) = m.push_handle() {
+                                                        let name = m.session_name(&sid).unwrap_or_default();
+                                                        let uid = owner_id.clone();
+                                                        let sid2 = sid.clone();
+                                                        tokio::spawn(async move {
+                                                            p2.send_to_user(&uid, &crate::push::payload_for("run_failed", &name, &sid2, Some("cli_error"))).await;
+                                                        });
+                                                    }
                                                 }
                                             }
                                             AcpEvent::Exit { .. } => {
                                                 m.finalize_run(&rid, "failed", None, Some("cli_exited"));
-                                                // run_failed push: scheduled run exited unexpectedly
-                                                if let Some(p2) = m.push_handle() {
-                                                    let name = m.session_name(&sid).unwrap_or_default();
-                                                    let uid = owner_id.clone();
-                                                    let sid2 = sid.clone();
-                                                    tokio::spawn(async move {
-                                                        p2.send_to_user(&uid, &crate::push::payload_for("run_failed", &name, &sid2, Some("cli_exited"))).await;
-                                                    });
+                                                // run_failed push: scheduled run exited unexpectedly —
+                                                // suppressed on a deliberate abort (see above): a
+                                                // Timeout-killed run's stdout-EOF→Exit is not a genuine
+                                                // failure to notify about.
+                                                if !intent_aborted {
+                                                    if let Some(p2) = m.push_handle() {
+                                                        let name = m.session_name(&sid).unwrap_or_default();
+                                                        let uid = owner_id.clone();
+                                                        let sid2 = sid.clone();
+                                                        tokio::spawn(async move {
+                                                            p2.send_to_user(&uid, &crate::push::payload_for("run_failed", &name, &sid2, Some("cli_exited"))).await;
+                                                        });
+                                                    }
                                                 }
                                             }
                                             _ => { active_run_id = Some(rid); } // not terminal, keep waiting
@@ -5313,14 +5351,40 @@ mod lifetime_tests {
         // suppression predicate the helper's guard uses, so the classification can't
         // silently drift (the helper's send path needs a live PushService + async
         // runtime; the guard itself is a pure match tested directly here).
+        // Assert the EXACT shared predicate both push sites now consult (the
+        // `intent_suppresses_push` helper), so turn_done and run_failed can't drift.
         use crate::run_metrics::RunOutcome;
-        let suppressed = |o: Option<RunOutcome>| matches!(o,
-            Some(RunOutcome::Cancelled) | Some(RunOutcome::Timeout));
-        assert!(suppressed(Some(RunOutcome::Cancelled)), "cancelled turn must not push ✅完成");
-        assert!(suppressed(Some(RunOutcome::Timeout)), "timeout-killed turn must not push ✅完成");
-        assert!(!suppressed(Some(RunOutcome::Completed)), "a completed turn is a real turn_done");
-        assert!(!suppressed(Some(RunOutcome::Errored)), "an agent-side error still finished the turn");
-        assert!(!suppressed(None), "no recorded intent (normal Result boundary) pushes");
+        assert!(intent_suppresses_push(Some(RunOutcome::Cancelled)), "cancelled turn must not push ✅完成");
+        assert!(intent_suppresses_push(Some(RunOutcome::Timeout)), "timeout-killed turn must not push ✅完成");
+        assert!(!intent_suppresses_push(Some(RunOutcome::Completed)), "a completed turn is a real turn_done");
+        assert!(!intent_suppresses_push(Some(RunOutcome::Errored)), "an agent-side error still finished the turn");
+        assert!(!intent_suppresses_push(None), "no recorded intent (normal Result boundary) pushes");
+    }
+
+    #[test]
+    fn run_failed_push_suppressed_on_deliberate_abort_intent() {
+        // review 2026-08-12 (F-RUNFAILED-INTENT): the scheduled `run_failed` push at the
+        // Error/Exit boundary fired purely on terminal EVENT TYPE, ignoring the settling
+        // turn's FIFO intent. A watchdog Timeout-kill (idle_timeout/watchdog_timeout) or a
+        // user Cancel drives the child to death → stdout-EOF → AcpEvent::Exit, so the push
+        // fired "⚠️ 失败 · 进程退出" — a lie about the cause, and for a side-effecting task a
+        // SECOND notification alongside the scheduler's `confirm` push. The metric for the
+        // same boundary is (correctly) classified Timeout/Cancelled via intent-override, so
+        // run_failed was the sole liar. The push is now gated on `!intent_suppresses_push`,
+        // the SAME predicate turn_done uses. This asserts that predicate governs the abort
+        // case (Timeout/Cancelled suppress) while genuine errors/exits (no abort intent)
+        // still notify.
+        use crate::run_metrics::RunOutcome;
+        // Deliberately-aborted turns: run_failed must be suppressed.
+        assert!(intent_suppresses_push(Some(RunOutcome::Timeout)),
+            "a watchdog Timeout-killed scheduled run must NOT push run_failed 'cli_exited'");
+        assert!(intent_suppresses_push(Some(RunOutcome::Cancelled)),
+            "a user-Cancelled scheduled run must NOT push run_failed");
+        // Genuine failures with no abort intent: run_failed still fires.
+        assert!(!intent_suppresses_push(None),
+            "a genuine CLI crash/exit (no abort intent) is a real run_failed → still push");
+        assert!(!intent_suppresses_push(Some(RunOutcome::Errored)),
+            "an agent-side error that isn't an abort is a real run_failed → still push");
     }
 
     #[test]

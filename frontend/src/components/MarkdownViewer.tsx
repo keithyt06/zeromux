@@ -53,6 +53,12 @@ export default function MarkdownViewer({ sessionId, sessionType }: Props) {
   // Upload
   const uploadRef = useRef<HTMLInputElement>(null)
 
+  // Stale-response guard for selectFile: a slow read of file A resolving after
+  // the user selected file B must not clobber B's content/highlight. Same class
+  // fixed in VaultReader.openNote / FileBrowser.openFile — bumped at the TOP of
+  // every selection and checked before every setState. (review 2026-08-13)
+  const selectReqRef = useRef(0)
+
   // Docs base directory (tmux sessions only)
   const [docsBaseDir, setDocsBaseDir] = useState(() => localStorage.getItem(DOCS_BASEDIR_KEY) || '')
   const [showBaseConfig, setShowBaseConfig] = useState(false)
@@ -86,16 +92,19 @@ export default function MarkdownViewer({ sessionId, sessionType }: Props) {
   }, [sessionId, effectiveBaseDir])
 
   const selectFile = async (path: string) => {
+    const req = ++selectReqRef.current
     setSelectedPath(path)
     setEditing(false)
     setLoadingContent(true)
     try {
       const text = await getSessionFile(sessionId, path, effectiveBaseDir)
+      if (selectReqRef.current !== req) return // a newer selection superseded this read
       setContent(text)
     } catch (e: any) {
+      if (selectReqRef.current !== req) return
       setContent(`*Error loading file: ${e.message}*`)
     }
-    setLoadingContent(false)
+    if (selectReqRef.current === req) setLoadingContent(false)
   }
 
   useEffect(() => { loadFiles() }, [loadFiles])

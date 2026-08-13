@@ -1418,43 +1418,64 @@ fn git_ref_is_commit(work_dir: &str, git_ref: &str) -> bool {
 /// travel under a sensitive path. `--no-ext-diff`/`--no-textconv` do NOT disable it — the
 /// clean/smudge/process filter is a separate axis (content ingestion, not diff rendering).
 ///
-/// Fix: enumerate the repo's `filter.*.{clean,smudge,process}` keys and override each on
-/// the command line to the identity passthrough (`clean=cat`, `smudge=cat`, empty
-/// `process` disables the long-running variant). `-c` beats repo config by git precedence,
+/// Fix: enumerate the repo's `filter.*.{clean,smudge,process}` keys and override each to
+/// the identity passthrough (`clean=cat`, `smudge=cat`, empty `process` disables the
+/// long-running variant). Command-supplied config beats repo config by git precedence,
 /// so the working-tree content is diffed verbatim with no injection. We override the EXACT
 /// keys git reports (via `git config -z --get-regexp`) rather than reconstructing filter
 /// names — a filter name may itself contain `.` (`filter.my.evil.clean`), so name
-/// reconstruction from the tail token is ambiguous. `-c` on a `filter.<n>.process` value
-/// we set to empty makes git fall back to clean/smudge, which we've pinned to `cat`.
+/// reconstruction from the tail token is ambiguous. Setting a `filter.<n>.process` to empty
+/// makes git fall back to clean/smudge, which we've pinned to `cat`.
 /// We do NOT touch `.git/` on disk (racy + attacker-writable) and `core.attributesFile`
 /// can't help (in-tree `.gitattributes` wins by precedence — verified).
-fn git_filter_neutralize_args(work_dir: &std::path::Path) -> Vec<String> {
+///
+/// The override is applied via the `GIT_CONFIG_COUNT`/`GIT_CONFIG_KEY_<n>`/
+/// `GIT_CONFIG_VALUE_<n>` env protocol, NOT `-c key=value`. `-c` splits its argument on the
+/// FIRST `=`, so a filter whose SUBSECTION NAME itself contains `=` (a legal git subsection:
+/// `[filter "a=b"]`, wired via `.gitattributes` `public.txt filter=a=b`, both
+/// attacker-controllable) is UNEXPRESSIBLE as `-c` — `filter.a=b.clean=cat` parses as key
+/// `filter.a`, value `b.clean=cat`, leaving the real `filter.a=b.clean` untouched and the
+/// clean filter live (empirically reproduced HIGH leak, review 2026-08-13). The env form
+/// carries key and value in SEPARATE variables, so an `=` in the key is passed literally
+/// and the exact reported key is overridden. Returns the `(name, value)` env pairs; the
+/// caller applies them with `Command::envs`. Empty when the repo declares no such keys.
+fn git_filter_neutralize_env(work_dir: &std::path::Path) -> Vec<(String, String)> {
     let out = std::process::Command::new("git")
         .arg("-C")
         .arg(work_dir)
         .args(["config", "-z", "--get-regexp", r"^filter\..*\.(clean|smudge|process)$"])
         .output();
-    let mut args: Vec<String> = Vec::new();
+    let mut keys: Vec<String> = Vec::new();
     if let Ok(o) = out {
         if o.status.success() {
             // `-z` records are `key\nvalue\0`; the key is up to the first `\n`.
             for rec in String::from_utf8_lossy(&o.stdout).split('\0') {
                 let key = rec.split('\n').next().unwrap_or("");
-                if key.is_empty() {
-                    continue;
-                }
-                args.push("-c".to_string());
-                // Empty `process` disables the long-running filter (git falls back to
-                // clean/smudge); clean/smudge → `cat` is an identity passthrough.
-                if key.ends_with(".process") {
-                    args.push(format!("{}=", key));
-                } else {
-                    args.push(format!("{}=cat", key));
+                if !key.is_empty() {
+                    keys.push(key.to_string());
                 }
             }
         }
     }
-    args
+    // Always pin GIT_CONFIG_COUNT — even to "0" — so an ambient GIT_CONFIG_COUNT /
+    // GIT_CONFIG_KEY_* in the server's own environment can't be honored by git on the
+    // no-filters path. `Command::envs` overrides but does not clear inherited vars, so
+    // returning `[]` here would leave a stray ambient count live (Codex second opinion,
+    // review 2026-08-13). Not attacker-controlled in the threat model, but cheap
+    // belt-and-suspenders on a security-critical invocation.
+    if keys.is_empty() {
+        return vec![("GIT_CONFIG_COUNT".to_string(), "0".to_string())];
+    }
+    let mut env: Vec<(String, String)> = Vec::with_capacity(keys.len() * 2 + 1);
+    env.push(("GIT_CONFIG_COUNT".to_string(), keys.len().to_string()));
+    for (i, key) in keys.iter().enumerate() {
+        // Empty `process` disables the long-running filter (git falls back to
+        // clean/smudge); clean/smudge → `cat` is an identity passthrough.
+        let value = if key.ends_with(".process") { "" } else { "cat" };
+        env.push((format!("GIT_CONFIG_KEY_{}", i), key.clone()));
+        env.push((format!("GIT_CONFIG_VALUE_{}", i), value.to_string()));
+    }
+    env
 }
 
 /// Unified resolve + verify: lexical `..` guard → `base.join(rel)` → canonicalize →
@@ -2213,7 +2234,7 @@ async fn git_show(
     // commit-range summary instead of an inline nested diff. It's git's default, so no
     // legitimate output is lost.
     let diff_output = std::process::Command::new("git")
-        .args(git_filter_neutralize_args(std::path::Path::new(&work_dir)))
+        .envs(git_filter_neutralize_env(std::path::Path::new(&work_dir)))
         .args(["-c", "core.quotePath=false", "-c", "diff.noprefix=false", "-c", "diff.mnemonicPrefix=false", "-c", "diff.srcPrefix=a/", "-c", "diff.dstPrefix=b/", "-c", "diff.relative=false", "show", "--no-color", "--no-ext-diff", "--no-textconv", "--submodule=short", "-M", "-C", "--find-copies-harder", "--format=", "--patch", &query.commit])
         .current_dir(&work_dir)
         .output()
@@ -2661,7 +2682,7 @@ async fn git_worktree(
         // top-level neutralize enumeration) re-opens the leak — force the safe
         // commit-range summary. See git_show. (review 2026-08-12, Codex second opinion)
         let raw = std::process::Command::new("git")
-            .args(git_filter_neutralize_args(dir))
+            .envs(git_filter_neutralize_env(dir))
             .args(["-c", "core.quotePath=false", "-c", "diff.noprefix=false", "-c", "diff.mnemonicPrefix=false", "-c", "diff.srcPrefix=a/", "-c", "diff.dstPrefix=b/", "-c", "diff.relative=false", "diff", "HEAD", "--no-color", "--no-ext-diff", "--no-textconv", "--submodule=short", "-M", "-C", "--find-copies-harder", "--", "."])
             .current_dir(dir)
             .output()
@@ -4946,7 +4967,7 @@ mod path_safety_tests {
         // EXACT flags from git_worktree's diff invocation, WITH the neutralize args.
         let raw = String::from_utf8_lossy(
             &std::process::Command::new("git")
-                .args(git_filter_neutralize_args(&dir))
+                .envs(git_filter_neutralize_env(&dir))
                 .args(["-c", "core.quotePath=false", "-c", "diff.noprefix=false", "-c", "diff.mnemonicPrefix=false", "-c", "diff.srcPrefix=a/", "-c", "diff.dstPrefix=b/", "-c", "diff.relative=false", "diff", "HEAD", "--no-color", "--no-ext-diff", "--no-textconv", "--submodule=short", "-M", "-C", "--find-copies-harder", "--", "."])
                 .current_dir(&dir)
                 .output()
@@ -4959,6 +4980,149 @@ mod path_safety_tests {
         assert!(!filtered.contains("CLEANFILTER_SECRET"),
             "a repo-local clean filter must not splice an untracked credential into a \
              non-sensitive file's diff; got:\n{filtered}");
+    }
+
+    #[test]
+    fn git_clean_filter_with_equals_in_subsection_name_cannot_leak_credential() {
+        // review 2026-08-13 (empirically reproduced HIGH): the F-GIT-CLEAN-FILTER
+        // neutralizer used `-c filter.<name>.clean=cat`, but `-c NAME=VALUE` splits on
+        // the FIRST `=`. A git subsection name may legally contain `=` — `[filter "a=b"]`
+        // wired via `.gitattributes` `public.txt filter=a=b`, both attacker-controllable
+        // in the work_dir repo. The reported key `filter.a=b.clean` is UNEXPRESSIBLE as
+        // `-c`: `filter.a=b.clean=cat` parses as key `filter.a`, value `b.clean=cat`,
+        // leaving the real `filter.a=b.clean` config LIVE, so the clean filter still runs
+        // and splices the untracked `.env` into `public.txt`'s hunk under the clean
+        // header `diff --git a/public.txt b/public.txt`. The fix switches the neutralizer
+        // to the `GIT_CONFIG_COUNT`/`GIT_CONFIG_KEY_<n>`/`GIT_CONFIG_VALUE_<n>` env form,
+        // which carries key and value SEPARATELY so an `=` in the key is passed literally.
+        let dir = std::env::temp_dir().join(format!("zmgr-cleanfiltereq-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let ds = dir.to_str().unwrap();
+        let run = |args: &[&str]| {
+            std::process::Command::new("git").args(["-C", ds]).args(args).output().unwrap()
+        };
+        assert!(run(&["init", "-q"]).status.success(), "git init");
+        let _ = run(&["config", "user.email", "t@t"]);
+        let _ = run(&["config", "user.name", "t"]);
+        std::fs::write(dir.join("public.txt"), "hello\n").unwrap();
+        assert!(run(&["add", "public.txt"]).status.success(), "git add");
+        assert!(run(&["commit", "-qm", "init"]).status.success(), "git commit");
+        std::fs::write(dir.join(".env"), "AWS_SECRET_ACCESS_KEY=EQNAME_SECRET\n").unwrap();
+        // Subsection name contains `=` — legal git config, unexpressible via `-c`.
+        let _ = run(&["config", "filter.a=b.clean", "cat; cat .env"]);
+        std::fs::write(dir.join(".gitattributes"), "public.txt filter=a=b\n").unwrap();
+        assert!(run(&["add", ".gitattributes"]).status.success(), "git add attrs");
+        assert!(run(&["commit", "-qm", "attrs"]).status.success(), "git commit attrs");
+        std::fs::write(dir.join("public.txt"), "hello2\n").unwrap();
+
+        // Sanity: git reports the `=`-bearing key verbatim, and the neutralizer emits it.
+        let env = git_filter_neutralize_env(&dir);
+        assert!(env.iter().any(|(_, v)| v == "filter.a=b.clean"),
+            "neutralizer must enumerate the `=`-bearing key; got:\n{env:?}");
+
+        // Sanity: WITHOUT the neutralize env the secret DOES leak (guards the test).
+        let leaked = String::from_utf8_lossy(
+            &std::process::Command::new("git")
+                .args(["-c", "core.quotePath=false", "diff", "HEAD", "--no-color", "--no-ext-diff", "--no-textconv", "--", "."])
+                .current_dir(&dir)
+                .output()
+                .unwrap()
+                .stdout,
+        ).to_string();
+        assert!(leaked.contains("EQNAME_SECRET"),
+            "test precondition: the clean filter must leak without the fix; got:\n{leaked}");
+
+        // EXACT flags from git_worktree's diff invocation, WITH the neutralize env.
+        let raw = String::from_utf8_lossy(
+            &std::process::Command::new("git")
+                .envs(git_filter_neutralize_env(&dir))
+                .args(["-c", "core.quotePath=false", "-c", "diff.noprefix=false", "-c", "diff.mnemonicPrefix=false", "-c", "diff.srcPrefix=a/", "-c", "diff.dstPrefix=b/", "-c", "diff.relative=false", "diff", "HEAD", "--no-color", "--no-ext-diff", "--no-textconv", "--submodule=short", "-M", "-C", "--find-copies-harder", "--", "."])
+                .current_dir(&dir)
+                .output()
+                .unwrap()
+                .stdout,
+        ).to_string();
+        let filtered = filter_diff_excluded(&raw);
+
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(!filtered.contains("EQNAME_SECRET"),
+            "a clean filter whose subsection name contains `=` must still be neutralized; \
+             got:\n{filtered}");
+    }
+
+    #[test]
+    fn git_filter_neutralize_env_pins_count_zero_when_no_filters() {
+        // review 2026-08-13 (Codex second opinion, defense-in-depth): `Command::envs`
+        // OVERRIDES but does not CLEAR inherited env, so on the no-filters path the
+        // neutralizer must still emit `GIT_CONFIG_COUNT=0` — otherwise a stray ambient
+        // `GIT_CONFIG_COUNT`/`GIT_CONFIG_KEY_*` in the SERVER's own environment would be
+        // honored by git for this invocation. Returning `[]` here left that gap.
+        let dir = std::env::temp_dir().join(format!("zmgr-cfcount0-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let ds = dir.to_str().unwrap();
+        let run = |args: &[&str]| {
+            std::process::Command::new("git").args(["-C", ds]).args(args).output().unwrap()
+        };
+        assert!(run(&["init", "-q"]).status.success(), "git init");
+        // A repo with no content filters declared.
+        let env = git_filter_neutralize_env(&dir);
+        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(env, vec![("GIT_CONFIG_COUNT".to_string(), "0".to_string())],
+            "no-filters path must pin GIT_CONFIG_COUNT=0 (not return empty), so an ambient \
+             GIT_CONFIG_COUNT in the server env cannot leak through; got:\n{env:?}");
+    }
+
+    #[test]
+    fn git_clean_filter_with_newline_in_subsection_fails_closed() {
+        // review 2026-08-13 (Codex second opinion Q3, empirically checked): a newline in
+        // the filter SUBSECTION name would truncate the key at `rec.split('\n').next()`
+        // and override the WRONG key (same class as the `=` bug). But git's config parser
+        // REJECTS a literal newline in a subsection: a hand-written `[filter "a\nb"]`
+        // header is a "bad config line" that makes git FATALLY fail every command reading
+        // that config — including the diff itself — so the leak fails CLOSED (git errors,
+        // no diff, no secret) rather than open. This test pins that guarantee: the
+        // neutralizer enumeration on such a repo does not silently produce a truncated
+        // key that would neutralize the wrong thing, because git refuses to parse it.
+        let dir = std::env::temp_dir().join(format!("zmgr-cfnl-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let ds = dir.to_str().unwrap();
+        let run = |args: &[&str]| {
+            std::process::Command::new("git").args(["-C", ds]).args(args).output().unwrap()
+        };
+        assert!(run(&["init", "-q"]).status.success(), "git init");
+        let _ = run(&["config", "user.email", "t@t"]);
+        let _ = run(&["config", "user.name", "t"]);
+        std::fs::write(dir.join("public.txt"), "hello\n").unwrap();
+        assert!(run(&["add", "public.txt"]).status.success(), "git add");
+        assert!(run(&["commit", "-qm", "init"]).status.success(), "git commit");
+        std::fs::write(dir.join(".env"), "AWS_SECRET_ACCESS_KEY=NL_SECRET\n").unwrap();
+        // Hand-write a subsection with a literal newline directly into .git/config.
+        let cfg_path = dir.join(".git").join("config");
+        let mut cfg = std::fs::read_to_string(&cfg_path).unwrap();
+        cfg.push_str("[filter \"a\nb\"]\n\tclean = cat; cat .env\n");
+        std::fs::write(&cfg_path, cfg).unwrap();
+        std::fs::write(dir.join(".gitattributes"), "public.txt filter=anb\n").unwrap();
+        std::fs::write(dir.join("public.txt"), "hello2\n").unwrap();
+
+        // The exact git_worktree invocation with the neutralize env applied.
+        let out = std::process::Command::new("git")
+            .envs(git_filter_neutralize_env(&dir))
+            .args(["-c", "core.quotePath=false", "-c", "diff.noprefix=false", "-c", "diff.mnemonicPrefix=false", "-c", "diff.srcPrefix=a/", "-c", "diff.dstPrefix=b/", "-c", "diff.relative=false", "diff", "HEAD", "--no-color", "--no-ext-diff", "--no-textconv", "--submodule=short", "-M", "-C", "--find-copies-harder", "--", "."])
+            .current_dir(&dir)
+            .output()
+            .unwrap();
+        let raw = String::from_utf8_lossy(&out.stdout).to_string();
+        let filtered = filter_diff_excluded(&raw);
+
+        let _ = std::fs::remove_dir_all(&dir);
+        // Fail-closed: git rejects the bad-config-line repo, so the secret never appears in
+        // the diff output regardless of the neutralizer's key parsing.
+        assert!(!filtered.contains("NL_SECRET"),
+            "a newline-in-subsection clean filter must not leak (git fails closed on the \
+             bad config line); got:\n{filtered}");
     }
 
     #[test]
@@ -5011,7 +5175,7 @@ mod path_safety_tests {
         // EXACT flags from git_worktree's diff invocation (WITH --submodule=short).
         let raw = String::from_utf8_lossy(
             &std::process::Command::new("git")
-                .args(git_filter_neutralize_args(&root))
+                .envs(git_filter_neutralize_env(&root))
                 .args(["-c", "core.quotePath=false", "-c", "diff.noprefix=false", "-c", "diff.mnemonicPrefix=false", "-c", "diff.srcPrefix=a/", "-c", "diff.dstPrefix=b/", "-c", "diff.relative=false", "diff", "HEAD", "--no-color", "--no-ext-diff", "--no-textconv", "--submodule=short", "-M", "-C", "--find-copies-harder", "--", "."])
                 .current_dir(&root)
                 .output()

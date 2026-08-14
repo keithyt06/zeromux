@@ -2566,6 +2566,17 @@ fn spawn_acp_fanout(
                                 queue.clear();
                                 active_run_id = run_id.clone();
                                 if local_running {
+                                    // Parity with the QueueMode::Interrupt arm (review 2026-08-10):
+                                    // stamp Cancelled on the live turn (FIFO back, turn_seq not yet
+                                    // bumped) BEFORE interrupting, else its boundary settles with no
+                                    // intent and classify_outcome mislabels it Completed/Errored +
+                                    // fires a false "✅ 完成" push. LATENT today — `run_id:Some`
+                                    // prompts come only from `trigger_run`, which always spawns a
+                                    // FRESH session (local_running == false here), so this branch is
+                                    // currently dead; kept as defensive symmetry so routing a
+                                    // scheduled prompt into a busy session can't reopen the 08-10
+                                    // mislabel. (review 2026-08-14, F2 — latent parity hardening.)
+                                    turn_starts.set_live_intent(crate::run_metrics::RunOutcome::Cancelled);
                                     if let Err(e) = process.interrupt().await {
                                         tracing::warn!("interrupt before resend failed for {}: {}", sid, e);
                                     }
@@ -3233,6 +3244,10 @@ fn spawn_kiro_fanout(
                                 // C3:调度 prompt 绕过 collect(kiro 当前不跑调度,留此分支保持三 fanout 对称)
                                 queue.clear();
                                 if local_running {
+                                    // Latent parity hardening — see the Claude fan-out's run_id arm
+                                    // (review 2026-08-14, F2). Kiro runs no scheduled tasks so this is
+                                    // doubly dead, but the three fanouts are kept byte-symmetric.
+                                    turn_starts.set_live_intent(crate::run_metrics::RunOutcome::Cancelled);
                                     if let Err(e) = process.interrupt().await {
                                         tracing::warn!("interrupt before resend failed for {}: {}", sid, e);
                                     }
@@ -3510,6 +3525,10 @@ fn spawn_codex_fanout(
                                 // C3:调度 prompt 绕过 collect(codex 当前不跑调度,留此分支保持三 fanout 对称)
                                 queue.clear();
                                 if local_running {
+                                    // Latent parity hardening — see the Claude fan-out's run_id arm
+                                    // (review 2026-08-14, F2). Codex runs no scheduled tasks so this is
+                                    // doubly dead, but the three fanouts are kept byte-symmetric.
+                                    turn_starts.set_live_intent(crate::run_metrics::RunOutcome::Cancelled);
                                     if let Err(e) = process.interrupt().await {
                                         tracing::warn!("interrupt before resend failed for {}: {}", sid, e);
                                     }

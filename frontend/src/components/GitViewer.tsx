@@ -99,8 +99,21 @@ export default function GitViewer({ sessionId, onForward }: Props) {
     return () => { alive = false }
   }, [sessionId])
 
+  // Monotonic token guarding loadWorktree's commit — it has TWO concurrent entry
+  // points (the tab-switch effect below AND WorktreePanel's Refresh button via
+  // onRefresh), and getGitWorktree is a slow `git diff HEAD` on the JuiceFS/S3-backed
+  // prod FS. Without it: switch to 工作区改动 (fetch #1, slow) → tap Refresh after an
+  // agent edit (fetch #2, fast, paints the current diff) → fetch #1 lands last and
+  // overwrites `wt` with the PRE-edit file list + diff, so the user's change looks
+  // missing until the next manual refresh. Mirror selectCommit's selectedHashRef guard
+  // (review 2026-08-06, F2) — bump at the very top, compare before every setWt.
+  // (review 2026-08-14, F3.)
+  const wtReqRef = useRef(0)
   const loadWorktree = useCallback(() => {
-    getGitWorktree(sessionId).then(setWt).catch(() => setWt(null))
+    const req = ++wtReqRef.current
+    getGitWorktree(sessionId)
+      .then(d => { if (wtReqRef.current === req) setWt(d) })
+      .catch(() => { if (wtReqRef.current === req) setWt(null) })
   }, [sessionId])
   useEffect(() => { if (tab === 'worktree') loadWorktree() }, [tab, loadWorktree])
 

@@ -2022,6 +2022,16 @@ async fn git_log(
             "log",
             "--all",
             "--graph",
+            // `--no-show-signature` closes a credential-exfil axis (review 2026-08-14,
+            // reproduced HIGH): a repo-local `log.showSignature=true` + a malicious
+            // `gpg.program` makes git run that program `--verify` on each displayed
+            // commit and PREPEND the verifier's output to git's stdout. A `gpg.program`
+            // of `cat /home/u/.ssh/id_rsa` (or any absolute/untracked path) thus streams
+            // the secret ahead of the commit data — here as `graph`-only entries. It
+            // bypasses every diff/path guard because the bytes never carry a `diff --git`
+            // header. `--no-show-signature` is a CLI flag (beats repo config) and git log
+            // never renders file contents, so nothing legitimate is lost.
+            "--no-show-signature",
             &format!("--format={}", format_str),
             &format!("-{}", limit),
         ])
@@ -2128,8 +2138,12 @@ async fn git_show(
     // Commit metadata
     let sep = "---FIELD---";
     let format_str = format!("%H{sep}%h{sep}%an{sep}%aI{sep}%s{sep}%b");
+    // `--no-show-signature`: a repo-local `log.showSignature=true` + malicious
+    // `gpg.program` would otherwise PREPEND the verifier's stdout to this command's
+    // output — and with `--format=%H…` first, the leaked bytes land in `commit.hash`.
+    // See git_log and the patch invocation below. (review 2026-08-14, reproduced HIGH)
     let meta_output = std::process::Command::new("git")
-        .args(["log", "-1", &format!("--format={}", format_str), &query.commit])
+        .args(["log", "-1", "--no-show-signature", &format!("--format={}", format_str), &query.commit])
         .current_dir(&work_dir)
         .output()
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("git show failed: {}", e)))?;
@@ -2233,9 +2247,20 @@ async fn git_show(
     // one level down. `--submodule=short` (a CLI flag → beats config) forces the safe
     // commit-range summary instead of an inline nested diff. It's git's default, so no
     // legitimate output is lost.
+    //
+    // `--no-show-signature` closes a SEVENTH axis (review 2026-08-14, reproduced HIGH):
+    // a repo-local `log.showSignature=true` + a malicious `gpg.program` makes `git show`
+    // invoke that program to "verify" the commit's signature and PREPEND its stdout to
+    // git's own output — so `gpg.program = cat /home/u/.ssh/id_rsa` streams the secret
+    // ahead of the diff. Those lines carry no `diff --git` header, so filter_diff_excluded
+    // leaves `skipping=false` and copies them through verbatim. Orthogonal to every prior
+    // pin: it is a signature-VERIFICATION mechanism, not a diff-body generator (so
+    // `--no-ext-diff`/`--no-textconv`/clean-filter neutralization never touch it) and the
+    // bytes appear around, not inside, the headers. `--no-show-signature` is a CLI flag
+    // (beats repo config) → verification never runs, so no legitimate output changes.
     let diff_output = std::process::Command::new("git")
         .envs(git_filter_neutralize_env(std::path::Path::new(&work_dir)))
-        .args(["-c", "core.quotePath=false", "-c", "diff.noprefix=false", "-c", "diff.mnemonicPrefix=false", "-c", "diff.srcPrefix=a/", "-c", "diff.dstPrefix=b/", "-c", "diff.relative=false", "show", "--no-color", "--no-ext-diff", "--no-textconv", "--submodule=short", "-M", "-C", "--find-copies-harder", "--format=", "--patch", &query.commit])
+        .args(["-c", "core.quotePath=false", "-c", "diff.noprefix=false", "-c", "diff.mnemonicPrefix=false", "-c", "diff.srcPrefix=a/", "-c", "diff.dstPrefix=b/", "-c", "diff.relative=false", "show", "--no-show-signature", "--no-color", "--no-ext-diff", "--no-textconv", "--submodule=short", "-M", "-C", "--find-copies-harder", "--format=", "--patch", &query.commit])
         .current_dir(&work_dir)
         .output()
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("git show failed: {}", e)))?;
@@ -2260,8 +2285,13 @@ async fn git_show(
     // (`.aws/config` → `config`) would dodge `numstat_path_excluded`'s dir check and
     // surface its NAME + churn counts in the file list. The body is already protected
     // by the patch-side pin; this closes the metadata sibling. (review 2026-08-11, F5)
+    // `--no-show-signature`: the numstat sibling leaks too — a malicious `gpg.program`
+    // that emits a well-formed `0\t0\t<secret>` line during "verification" surfaces the
+    // secret in the file-list path column (the naive `cat`d secret is dropped by the
+    // `parts.len() >= 3` tab check, but the attacker controls the verifier's output, so
+    // a tabbed line passes). Same fix as the patch body. (review 2026-08-14, reproduced)
     let files: Vec<serde_json::Value> = std::process::Command::new("git")
-        .args(["-c", "core.quotePath=false", "-c", "diff.relative=false", "show", "-M", "-C", "--find-copies-harder", "--format=", "--numstat", &query.commit])
+        .args(["-c", "core.quotePath=false", "-c", "diff.relative=false", "show", "--no-show-signature", "-M", "-C", "--find-copies-harder", "--format=", "--numstat", &query.commit])
         .current_dir(&work_dir)
         .output()
         .ok()
@@ -5284,6 +5314,121 @@ mod path_safety_tests {
         let _ = std::fs::remove_dir_all(&root);
         assert!(!filtered.contains("SUPERSECRET"),
             "diff.relative must not strip the .aws/ component so the section leaks; got:\n{filtered}");
+    }
+
+    #[test]
+    fn git_show_signature_gpg_program_cannot_exfil_credential() {
+        // review 2026-08-14 (empirically reproduced HIGH): a repo-local
+        // `log.showSignature=true` + a malicious `gpg.program` is a SEVENTH credential
+        // exfil axis, orthogonal to every prior pin. When git DISPLAYS a signed commit it
+        // runs `gpg.program --verify` and PREPENDS the verifier's stdout to git's own
+        // output. A `gpg.program` that `cat`s an absolute/untracked secret path thus
+        // streams the secret ahead of the commit data — with NO `diff --git` header, so
+        // filter_diff_excluded keeps `skipping=false` and copies it through; on the numstat
+        // sibling a crafted `0\t0\t<secret>` line surfaces the secret in the path column.
+        // The fix pins `--no-show-signature` (CLI flag → beats repo config) on git_show's
+        // patch + numstat invocations and git_log. This drives the EXACT fixed flags.
+        let dir = std::env::temp_dir().join(format!("zmgr-gpgsig-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let ds = dir.to_str().unwrap();
+        let run = |args: &[&str]| {
+            std::process::Command::new("git").args(["-C", ds]).args(args).output().unwrap()
+        };
+        assert!(run(&["init", "-q"]).status.success(), "git init");
+        let _ = run(&["config", "user.email", "t@t"]);
+        let _ = run(&["config", "user.name", "t"]);
+        // The secret lives OUTSIDE the repo — the gpg helper reads it by absolute path,
+        // proving the leak is not a tracked/committed file the path guards would catch.
+        let secret = dir.join("outside_secret.txt");
+        std::fs::write(&secret, "SIGSECRET=leakme12345\n").unwrap();
+        // Fake gpg.program: on `--verify` dump the secret AND a well-formed numstat line
+        // (both sinks); on the signing path emit valid status + armored signature so the
+        // signed commit actually gets created.
+        let gpg = dir.join("fakegpg.sh");
+        std::fs::write(&gpg, format!(
+            "#!/bin/sh\n\
+             for a in \"$@\"; do case \"$a\" in --verify) \
+               s=$(cat '{secret}'); \
+               printf '0\\t0\\t%s\\n' \"$s\" 1>&2; \
+               echo '[GNUPG:] GOODSIG 0 t' 1>&2; exit 0;; esac; done\n\
+             echo '[GNUPG:] SIG_CREATED D' 1>&2\n\
+             echo '-----BEGIN PGP SIGNATURE-----'; echo; echo 'iEYEABECAAYFAk=='; \
+             echo '-----END PGP SIGNATURE-----'\n",
+            secret = secret.display()
+        )).unwrap();
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&gpg, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        let _ = run(&["config", "gpg.program", gpg.to_str().unwrap()]);
+        let _ = run(&["config", "log.showSignature", "true"]);
+        std::fs::write(dir.join("public.txt"), "hello\n").unwrap();
+        assert!(run(&["add", "public.txt"]).status.success(), "git add");
+        // Sign the commit (uses the fake gpg's signing path). Keep -S and -m separate:
+        // the combined `-qSm msg` form binds `msg` as a pathspec, not the message.
+        assert!(run(&["commit", "-q", "-S", "-m", "msg"]).status.success(), "git commit -S");
+        let commit = String::from_utf8(run(&["rev-parse", "HEAD"]).stdout)
+            .unwrap().trim().to_string();
+
+        // Sanity: WITHOUT --no-show-signature the secret DOES leak (guards the test).
+        let leaked = String::from_utf8_lossy(
+            &std::process::Command::new("git")
+                .args(["-c", "core.quotePath=false", "show", "--no-color", "--no-ext-diff", "--no-textconv", "--format=", "--patch", &commit])
+                .current_dir(&dir)
+                .output()
+                .unwrap()
+                .stdout,
+        ).to_string();
+        assert!(leaked.contains("SIGSECRET"),
+            "test precondition: showSignature+gpg.program must leak without the fix; got:\n{leaked}");
+
+        // git_show PATCH — EXACT fixed flags (with --no-show-signature).
+        let patch = filter_diff_excluded(&String::from_utf8_lossy(
+            &std::process::Command::new("git")
+                .envs(git_filter_neutralize_env(&dir))
+                .args(["-c", "core.quotePath=false", "-c", "diff.noprefix=false", "-c", "diff.mnemonicPrefix=false", "-c", "diff.srcPrefix=a/", "-c", "diff.dstPrefix=b/", "-c", "diff.relative=false", "show", "--no-show-signature", "--no-color", "--no-ext-diff", "--no-textconv", "--submodule=short", "-M", "-C", "--find-copies-harder", "--format=", "--patch", &commit])
+                .current_dir(&dir)
+                .output()
+                .unwrap()
+                .stdout,
+        ));
+
+        // git_show META — EXACT fixed flags.
+        let meta = String::from_utf8_lossy(
+            &std::process::Command::new("git")
+                .args(["log", "-1", "--no-show-signature", "--format=%H---FIELD---%h", &commit])
+                .current_dir(&dir)
+                .output()
+                .unwrap()
+                .stdout,
+        ).to_string();
+
+        // git_show NUMSTAT — EXACT fixed flags.
+        let numstat = String::from_utf8_lossy(
+            &std::process::Command::new("git")
+                .args(["-c", "core.quotePath=false", "-c", "diff.relative=false", "show", "--no-show-signature", "-M", "-C", "--find-copies-harder", "--format=", "--numstat", &commit])
+                .current_dir(&dir)
+                .output()
+                .unwrap()
+                .stdout,
+        ).to_string();
+
+        // git_log — EXACT fixed flags.
+        let log = String::from_utf8_lossy(
+            &std::process::Command::new("git")
+                .args(["log", "--all", "--graph", "--no-show-signature", "--format=COMMIT_START%H", "-1"])
+                .current_dir(&dir)
+                .output()
+                .unwrap()
+                .stdout,
+        ).to_string();
+
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(!patch.contains("SIGSECRET"), "git_show patch leaked; got:\n{patch}");
+        assert!(!meta.contains("SIGSECRET"), "git_show meta leaked; got:\n{meta}");
+        assert!(!numstat.contains("SIGSECRET"), "git_show numstat leaked; got:\n{numstat}");
+        assert!(!log.contains("SIGSECRET"), "git_log leaked; got:\n{log}");
     }
 
     #[test]

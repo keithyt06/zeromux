@@ -1,4 +1,4 @@
-import { useState, useEffect, useCallback } from 'react'
+import { useState, useEffect, useCallback, useRef } from 'react'
 import type { SessionInfo, SessionMetaStatus, NoteEntry } from '../lib/api'
 import { updateSession, listNotes, createNote, deleteNote } from '../lib/api'
 import { ChevronDown, ChevronRight, FileText, StickyNote, GitBranch, X, Activity, BarChart3 } from 'lucide-react'
@@ -52,9 +52,23 @@ export default function SessionInfoBar({ session, onUpdate, onToggleFiles, onTog
     } catch { /* ignore */ }
   }, [session.id, onUpdate])
 
+  // Notes list is fetched from `~/.zeromux/notes/{dir_hash}/` — a multi-second
+  // JuiceFS/S3 directory read — every time the info bar is expanded. The note
+  // input + delete buttons live INSIDE that just-expanded panel, so the user can
+  // add/delete a note (optimistic `setNotes` below) BEFORE the expand's `loadNotes`
+  // resolves. Without a stale guard the slow list (a pre-mutation snapshot) would
+  // resolve last and unconditionally overwrite state: an added note vanishes (though
+  // it persisted server-side → user re-adds → duplicate), or a deleted note reappears
+  // as a ghost row (delete again 404s, swallowed). Same optimistic-mutation-vs-
+  // in-flight-refresh race AgentDashboard was hardened against (reqRef, review
+  // 2026-08-11): bump at the top of loadNotes and before each optimistic write, drop
+  // superseded responses. (review 2026-08-15, F-FE.)
+  const reqRef = useRef(0)
   const loadNotes = useCallback(async () => {
+    const req = ++reqRef.current
     try {
       const data = await listNotes(session.id)
+      if (reqRef.current !== req) return
       setNotes(data.notes)
     } catch { /* ignore */ }
   }, [session.id])
@@ -79,6 +93,9 @@ export default function SessionInfoBar({ session, onUpdate, onToggleFiles, onTog
     setSubmitting(true)
     try {
       const note = await createNote(session.id, text)
+      // Invalidate any loadNotes already in flight so its pre-add snapshot can't
+      // clobber the note we're optimistically prepending.
+      reqRef.current++
       setNotes(prev => [note, ...prev])
       setNoteInput('')
     } catch { /* ignore */ }
@@ -88,6 +105,9 @@ export default function SessionInfoBar({ session, onUpdate, onToggleFiles, onTog
   const handleDeleteNote = async (noteId: string) => {
     try {
       await deleteNote(session.id, noteId)
+      // Invalidate any in-flight loadNotes so its pre-delete snapshot can't
+      // resurrect the row we're optimistically removing.
+      reqRef.current++
       setNotes(prev => prev.filter(n => n.id !== noteId))
     } catch { /* ignore */ }
   }

@@ -621,16 +621,43 @@ async fn run_event_loop(
                                             // error so the user knows to resend. (A full
                                             // fix would stash + auto-redispatch after
                                             // call_fut resolves; deferred.)
+                                            //
+                                            // Emit the notice as a NON-boundary
+                                            // ContentBlock{error}, NOT AcpEvent::Error.
+                                            // The fan-out treats AcpEvent::Error as a turn
+                                            // BOUNDARY (session_manager.rs is_boundary), but
+                                            // by the time a prompt reaches this in-turn
+                                            // select the fan-out has ALREADY bumped turn_seq
+                                            // + turn_starts.start() for the next turn while
+                                            // this call_fut is still in flight. A boundary
+                                            // here would settle the FIFO FRONT (the running
+                                            // turn's entry, no intent → recorded Errored)
+                                            // even though call_fut later succeeds, and shift
+                                            // every subsequent turn's outcome by one. A
+                                            // non-boundary error-styled ContentBlock still
+                                            // shows the user the "resend" notice but leaves
+                                            // the turn to be settled only by call_fut's real
+                                            // terminal event — exactly the F-CODEX-1 fix for
+                                            // the mid-turn `Notify::Error` case above.
+                                            // (review 2026-08-15, F-CODEX-PROMPT-BOUNDARY.)
                                             tracing::warn!(
                                                 "codex: prompt received during \
                                                  in-flight turn; not delivered"
                                             );
                                             let _ = event_tx
-                                                .send(AcpEvent::Error {
-                                                    message: "Codex was still finishing \
+                                                .send(AcpEvent::ContentBlock {
+                                                    block_type: std::borrow::Cow::Borrowed("error"),
+                                                    turn_id: 0,
+                                                    text: Some(
+                                                        "Codex was still finishing \
                                                         the previous turn; your follow-up \
                                                         was not delivered — please resend."
                                                         .to_string(),
+                                                    ),
+                                                    name: None,
+                                                    input: None,
+                                                    streaming: Some(false),
+                                                    summary: None,
                                                 })
                                                 .await;
                                         }

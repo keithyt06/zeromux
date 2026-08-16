@@ -85,6 +85,14 @@ export function RunMetricsPanel({ sessionId, turnStartedMs, running, refreshKey 
   }, [running, turnStartedMs])
 
   const setVerdict = useCallback(async (runId: string, verdict: string) => {
+    // Invalidate any load() already in flight so its pre-verdict snapshot can't
+    // resolve last and revert the row we're optimistically flipping. A turn
+    // boundary (refreshKey bump) fires a slow JuiceFS/S3 getSessionRuns; if the
+    // user clicks a verdict while it's in flight, that stale GET predates the
+    // POST and would clobber the human mark back to unmarked until the next turn.
+    // Same reqRef discipline the sibling optimistic mutations use (AgentDashboard
+    // handleDelete, SessionInfoBar handleAddNote/handleDeleteNote).
+    reqRef.current++
     // Optimistic: flip the row immediately, mark it human-sourced.
     setRuns(prev => prev.map(r =>
       r.run_id === runId ? { ...r, verdict, verdict_source: 'human' } : r

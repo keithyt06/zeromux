@@ -1,4 +1,4 @@
-import { render, screen, waitFor } from '@testing-library/react'
+import { render, screen, waitFor, fireEvent } from '@testing-library/react'
 import { describe, it, expect, vi, beforeEach } from 'vitest'
 import type { RunMetric, RunStats } from '../../lib/api'
 import * as api from '../../lib/api'
@@ -58,5 +58,52 @@ describe('RunMetricsPanel stale-response race', () => {
     resolveSlow({ runs: [run('r1', 1)], stats: stats(1) })
     await waitFor(() => expect(screen.getByText(/2 次/)).toBeInTheDocument())
     expect(screen.queryByText(/1 次/)).not.toBeInTheDocument()
+  })
+
+  // An optimistic verdict flip must not be reverted by a slow load already in
+  // flight (a turn-boundary refreshKey bump). setVerdict does an optimistic
+  // setRuns; without bumping reqRef, the pre-click getSessionRuns snapshot
+  // resolves last and clobbers the human mark back to unmarked until the next
+  // turn. Mirrors AgentDashboard.handleDelete / SessionInfoBar note mutations.
+  it('optimistic verdict survives a slow turn-boundary load resolving after the click', async () => {
+    // Call 1 (mount) resolves fast → paints r1 (unmarked). Call 2 (refreshKey
+    // bump) is a SLOW turn-boundary load carrying the pre-verdict snapshot.
+    let resolveSlow: (v: { runs: RunMetric[]; stats: RunStats }) => void = () => {}
+    const slowP = new Promise<{ runs: RunMetric[]; stats: RunStats }>(r => { resolveSlow = r })
+    let call = 0
+    vi.spyOn(api, 'getSessionRuns').mockImplementation(() => {
+      call += 1
+      return (call === 1
+        ? Promise.resolve({ runs: [run('r1', 1)], stats: stats(1) })
+        : slowP
+      ) as ReturnType<typeof api.getSessionRuns>
+    })
+    vi.spyOn(api, 'postRunVerdict').mockResolvedValue(undefined as unknown as Awaited<ReturnType<typeof api.postRunVerdict>>)
+
+    const { RunMetricsPanel } = await import('../RunMetricsPanel')
+    const { rerender } = render(
+      <RunMetricsPanel sessionId="s1" turnStartedMs={null} running={false} refreshKey={0} />
+    )
+    fireEvent.click(screen.getByText('运行记录'))
+    const up = await screen.findByLabelText('thumbs up')
+
+    // A turn boundary fires the SLOW load (still in flight).
+    rerender(<RunMetricsPanel sessionId="s1" turnStartedMs={null} running={false} refreshKey={1} />)
+
+    // Unmarked rows carry `text-[var(--text-muted)]`; a marked 'good' drops it
+    // for the solid accent-green class. (Both states contain the substring
+    // "accent-green" via the hover: class, so text-muted is the real discriminator.)
+    const marked = () => !screen.getByLabelText('thumbs up').className.includes('text-[var(--text-muted)]')
+    expect(marked()).toBe(false)
+
+    // User clicks the verdict while that load is in flight → optimistic mark.
+    fireEvent.click(up)
+    await waitFor(() => expect(marked()).toBe(true))
+
+    // The stale pre-click snapshot (r1 unmarked) resolves LAST. reqRef was bumped
+    // by setVerdict, so it must be dropped — the verdict must stay marked.
+    resolveSlow({ runs: [run('r1', 1)], stats: stats(1) })
+    await new Promise(r => setTimeout(r, 0))
+    expect(marked()).toBe(true)
   })
 })

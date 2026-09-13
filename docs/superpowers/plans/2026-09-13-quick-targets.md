@@ -1102,7 +1102,7 @@ export async function forgetQuickTarget(kind: 'dir' | 'note', path: string, agen
 - [ ] **Step 4: 跑测试确认通过**
 
 Run: `cd frontend && npx vitest run src/lib/__tests__/quickTargets.test.ts`
-Expected: PASS，8 个绿。
+Expected: PASS，7 个绿。
 
 - [ ] **Step 5: Commit**
 
@@ -1463,7 +1463,7 @@ export default function QuickTargets({ kind, onPick, onChangeAgent, onPickWithPr
 - [ ] **Step 4: 跑测试确认通过**
 
 Run: `cd frontend && npx vitest run src/components/__tests__/QuickTargets.test.tsx`
-Expected: PASS，8 个绿。
+Expected: PASS，7 个绿。
 
 - [ ] **Step 5: 验证 stale 测试不是空转（可证伪性检查）**
 

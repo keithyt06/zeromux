@@ -1,7 +1,7 @@
 # Kiro Crew 接入设计 —— zeromux v2「有记忆的驾驶舱」
 
 - **日期**：2026-09-13
-- **状态**：待实现（已过 CTO + 产品总监交叉评审）
+- **状态**：**已审核通过**（CTO + 产品总监交叉评审，用户 2026-09-13 批准），待实现
 - **范围**：新增 `SessionType::Crew`；**删除 Kiro 后端**；扩展 `AcpEvent`（审批 + 上下文用量）；新增记忆的第一方 UI
 - **决策依据**：所有接口行为均在本机实测（Ubuntu 24.04 / KiroCrew 0.6.0 / kiro-cli 2.3.0）；所有代码论断均给出 `文件:行号`
 - **本文档经过一次自我纠错**：初稿 §5.2 的安全分析事实错误，已在该节推翻并说明原因
@@ -295,8 +295,8 @@ Gateway 自己会排队（实测忙时返回 `queued:true`）。zeromux 的 `Que
 
 | 新变体 | 来源 | 为什么必须加 |
 |---|---|---|
-| `Approval { id, tool, purpose, slot }` | Gateway 的 approval 请求（已在 fan-out 订阅的那条 WS 里） | 替代 `mode:trust`，见下 |
-| `ContextUsage { used, total }` | `context_usage` 帧 | zeromux **自己没有**这个能力，纯白拿的新功能。初稿把它列为"丢弃"是信息损失 |
+| `Approval { id, tool, tool_input, tool_purpose, slot }` | Gateway 的 `approval` 帧（已在 fan-out 订阅的那条 WS 里） | 替代 `mode:trust`，见 §4.5。**字段名以附录 A.1.2 的实测为准**（是 `tool_purpose`/`tool_input`，不是 `purpose`/`input`），且三者在 Gateway 侧已 redact |
+| `ContextUsage { used, total }` | `context_usage` 帧 | zeromux **自己没有**这个能力，纯白拿。初稿把它列为"丢弃"是信息损失。`total == 0` 或缺失时**丢弃该帧**（前端拿它做分母，否则渲染 `NaN%`） |
 
 #### ⚠️ 实现陷阱（必须先读，否则会浪费一整轮调试）
 
@@ -804,7 +804,7 @@ Restart=on-failure   RestartSec=10   StartLimitBurst=3/300s   KillMode=control-g
 
 **可考虑的最大动作**：把 composer 的 `ListPlus` 与 `Brain` 合并进同一个 popover（省一个按钮位，缓解 §9.2.1 的宽度压力），**功能保留**。此项列为可选。
 
-### 14.3 Notes —— 建议删，**但需你拍板**
+### 14.3 Notes —— **删（已获用户确认 2026-09-13）**
 
 **数据**：`notes.db` 的 `notes` = **1 行**（标题「帮我全选」，`2026-06-06T12:00:19Z`）。**3 个月 7 天，没有第二条。**
 
@@ -817,7 +817,7 @@ Restart=on-failure   RestartSec=10   StartLimitBurst=3/300s   KillMode=control-g
 - **删掉一整套 stale-guard** —— `SessionInfoBar.tsx:55-113` 那段 `reqRef` 是 2026-08-15 修的 MED 级 stale-response bug。**删功能比维护 bug 修复划算**
 - 消灭一个隐形按钮（`NoteItem` 的删除键用 `hovered`，手机上摸不到）
 
-**这是不可逆动作，且可能有习惯因素，需你确认后再执行。**
+**已获用户明确确认执行。** 唯一那条 note（`~/.zeromux/notes/073707de/20260606_120019_6e68.md`，标题「帮我全选」）随功能一并移除；`notes.db` 保留在磁盘上不主动删除（用户数据，删代码不删数据）。
 
 ### 14.4 zeromux 定时任务面板 —— 不删，入口降级 + 徽章合并
 
@@ -851,7 +851,7 @@ Restart=on-failure   RestartSec=10   StartLimitBurst=3/300s   KillMode=control-g
 | **2** | `AcpEvent::Approval` + `ContextUsage` + 前端 2 个 case（**同一 commit**）；审批内联卡片 + 「待你处理」合并徽章 | 手机锁屏收到审批推送 → 3 tap 内完成批准 |
 | **3** | composer 的 `Brain` 就地记忆入口（9.2.1）+ 写入回执 | **用户一周内成功写入 ≥3 条记忆** |
 | **4** | 记忆面板 overlay（9.2.2）+ `source` 来源标注（12.3） | 打开面板能看到第 3 批写入的记忆，且标出来源 |
-| **5** | 删 Kiro 后端（含 DB 清理）；notes 删除（**待你确认**）；定时任务入口降级 | `cargo test` / `npm test` 零回归 |
+| **5** | 删 Kiro 后端（含 DB 清理）；**删 notes**（已确认）；定时任务入口降级 | `cargo test` / `npm test` 零回归 |
 | **6** | 观察是否真的用 subagent / TaskRunner；**没发生就不做** | — |
 
 **批次 3 先于批次 4**：因为记忆现在是空的，先造面板会看到空面板。**先解决写入，再解决查看。**
@@ -874,16 +874,78 @@ Restart=on-failure   RestartSec=10   StartLimitBurst=3/300s   KillMode=control-g
 > 本附录记录在 CTO / 产品总监交叉评审期间新做的实测。**这些事实会重塑第一阶段范围**，
 > 正文中与之冲突的表述以本附录为准。
 
-### A.1 认证矩阵完全互补 —— zeromux 必须同时持有两种凭证
+### A.1 认证：token 覆盖全部端点，secret 只覆盖 `/api/chat*` 那批（**已订正**）
 
-正文 2.1 只说了"两套并存"，实测发现更强的结论：**两套凭证覆盖的端点集合完全不相交**。
+> **本节订正了我自己先前写错的结论。** 初版附录写"两套凭证覆盖的端点集合完全不相交、
+> zeromux 必须双持"——**那是用一个已过期的 token 测出来的假象**。用 fresh token 重测后
+> 结论完全不同。
+
+**权威矩阵**（每次都用刚 mint 的 20h token 重测）：
 
 | 端点 | `X-Internal-Secret` | `?token=` |
 |---|---|---|
-| `/api/chat/slots`、`/api/chat`、`/api/spawn`、`/api/crons`、`/api/lessons`、`/api/taskrunner`、`/api/workflows/runs`、`/api/artifacts` | **200** | 403 |
-| `/api/approvals`、`/api/memory/*`、`/api/notifications`、`/api/sessions`、`/api/models`、`/api/status`、`/api/monitors` | 403 | **200** |
+| `/api/chat/slots`、`/api/spawn`、`/api/crons`、`/api/taskrunner`、`/api/workflows/runs`、`/api/artifacts`、`/api/lessons` | 200 | **200** |
+| `/api/memory/*`、`/api/approvals`、`/api/status`、`/api/sessions`、`/api/models`、`/api/monitors`、`/api/notifications` | 403 | **200** |
 
-**含义**：会话/cron/subagent 面只认 secret；**记忆面与状态面只认 token**。任何跨这两组的功能（例如"对话页 + 记忆查看"）都必须双持凭证。这不是可选优化，是硬约束。
+**结论：token 是超集，15/15 端点全通。** secret 只在 `_MIXED_INTERNAL_API_PATHS`（`server.py:716-760`）那批上额外可用。
+
+**实现含义（比初版简单得多）**：
+- **只需持有 token 一种凭证**，不需要按端点分流。
+- secret 的唯一用途是**换取 token**（`GET /api/token/local`，头 `X-Local-Secret`）。
+- 例外：**WebSocket 只认 `?token=`**（secret 在 WS 上 403）—— 这一条初版是对的。
+
+### A.1.1 `?ttl=` 收的是 duration 字符串，不是秒数（**关键**）
+
+实测：
+
+```
+?ttl=300  → expires_in = 72000   ← 静默回落到上限 20h，不报错
+?ttl=5m   → expires_in = 300
+?ttl=20h  → expires_in = 72000
+```
+
+`MAX_SESSION_TTL_SECS = 20*3600`（`token_auth.py:693`）。
+
+**这消掉了初版的一条"承重约束"**：初版说 token `exp ≈ 5 分钟`、"记忆面板若轮询必须有 re-mint 逻辑"。真相是**用 `?ttl=20h` mint 一次就够 20 小时**，面板不需要 re-mint。我先前观察到的 5 分钟 exp，是因为没带 `ttl` 参数时的默认行为与我误读了 `exp` / `session_exp` 两个字段。
+
+**但 fan-out 的每次重连仍应重新 mint** —— 那是廉价操作（一次 loopback GET），且能自然覆盖"token 在长连接期间被 revoke"的情形。
+
+### A.1.2 approval 帧的确切字段（**订正 §4.4 的字段名**）
+
+实测 `interaction_coordinator.py:40-48` 的 payload 构造：
+
+```python
+state._pending_approvals[approval_id] = {
+    "id": approval_id,
+    "source": source,                                   # "dashboard" 等来源标识
+    "tool": _redact(tool, ...),
+    "tool_input": _redact(tool_input, ...),
+    "tool_purpose": _redact(tool_purpose, ...),
+    "slot": slot,
+    "ts": time.time(),
+}
+state.broadcast_ws("approval", ...)                     # WS 帧 type = "approval"
+```
+
+**三处订正 §4.4 的初版描述**：
+
+1. 字段名是 **`tool_purpose`** / **`tool_input`**，不是 `purpose` / `input`。
+2. `tool` / `tool_input` / `tool_purpose` **在 Gateway 侧已过 redact**（凭证与 exfil URL 已被抹掉）—— zeromux 不需要再做一遍，但也不能假设它们是原始值。
+3. `data.slot` **存在** —— I1 的 slot 过滤对 approval 帧同样适用。
+
+`POST /api/approvals/{id}/{action}` 接受 **三个** action：`approve` / `reject` / `reject_once`（`sessions.py:1603-1610`）。成功回 `{"ok":true}`，找不到或已过期回 **404**。第一期只用前两个，但后端代理**不要把第三个写死掉**。
+
+### A.1.3 approval payload **不带只读标记** —— 因此第一期砍掉 `auto_read` 档
+
+起草期设计过一个「只读工具自动批准」档（`auto_read`），需要一个"这个工具是只读的"信号。**实测该信号不存在**：payload 的 `source` 是 `"dashboard"` 这类**来源**标识（`interaction_coordinator.py:77`），不是工具只读性；`tool_call.kind == "execute"` 只出现在 `tool_call` 帧上，approval 帧本身不携带。
+
+**决定：第一期只做「每次询问」一档。** 连带后果：
+
+- 审批 select 变成只有一个可选值的**死控件** → **不做那个 select**。`SessionInfoBar` 因 notes 删除腾出的空间暂时空着（或留给日后真有第二档时）。
+- `AcpEvent::Approval` 不需要只读性字段。
+- 前端 `approvalMode` prop 与 `approvalModeRef` 不需要存在。
+
+**若日后要加 `auto_read`**：正确做法是在 fan-out 侧把同 `tool_call_id` 的 `tool_call.kind` 缓存起来，等 approval 帧到达时查表 —— 而不是猜一个 payload 里没有的字段。这条写在这里，免得日后重新发明。
 
 ### A.2 Crew **没有** Web Push（zeromux 不可替代性的最硬证据）
 

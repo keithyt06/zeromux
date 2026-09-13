@@ -271,6 +271,43 @@ async fn main() {
             .expect("Failed to initialize quick targets store"),
     );
 
+    // Cold-start backfill: on the release that introduces quick targets the table is
+    // empty, yet the user's session history already holds what it wants. Without this
+    // the first New Session screen shows an empty list, fires onEmpty, and jumps to
+    // the type picker — which reads as "the dialog flashed and vanished".
+    //
+    // Only interactive sessions seed the board, mirroring the create_session bump
+    // site's rules exactly: scheduled runs (source_task_id) would let cron decide the
+    // ranking, and worktree paths / deleted dirs are dead entries. Canonicalize so a
+    // trailing-slash variant can't become a second row. Best-effort: a backfill
+    // hiccup must never prevent startup.
+    match session_store.load_all() {
+        Ok(persisted) => {
+            let history: Vec<(String, String, String, i64)> = persisted
+                .iter()
+                .filter(|p| p.source_task_id.is_none())
+                .filter_map(|p| {
+                    let real = std::fs::canonicalize(&p.work_dir).ok()?;
+                    if !real.is_dir() {
+                        return None;
+                    }
+                    Some((
+                        p.owner_id.clone(),
+                        real.to_string_lossy().to_string(),
+                        p.session_type.to_string(),
+                        p.created_ms,
+                    ))
+                })
+                .collect();
+            match quick_targets_store.seed_from_history(&history) {
+                Ok(0) => {}
+                Ok(n) => println!("Seeded {} quick targets from session history", n),
+                Err(e) => eprintln!("Quick-target seeding skipped: {}", e),
+            }
+        }
+        Err(e) => eprintln!("Quick-target seeding skipped (session load failed): {}", e),
+    }
+
     let scheduled_store = Arc::new(
         scheduled_tasks::ScheduledStore::open(std::path::Path::new(&data_dir_str))
             .expect("Failed to initialize scheduled store"),

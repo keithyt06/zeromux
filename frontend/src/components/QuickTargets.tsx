@@ -30,6 +30,8 @@ export default function QuickTargets({ kind, onPick, onChangeAgent, onPickWithPr
 }) {
   const [items, setItems] = useState<QuickTarget[]>([])
   const [loaded, setLoaded] = useState(false)
+  // 区分「加载失败」与「真的没有数据」——只有后者才该触发 onEmpty 的自动跳转。
+  const [failed, setFailed] = useState(false)
   const [openMenu, setOpenMenu] = useState<string | null>(null)   // path|agent 的 key
 
   // 单调请求令牌。本组件同时具备「慢 GET」（JueceFS/S3 上的 per-row 守卫）与
@@ -40,6 +42,7 @@ export default function QuickTargets({ kind, onPick, onChangeAgent, onPickWithPr
 
   const load = useCallback(async () => {
     const req = ++reqRef.current
+    setFailed(false)
     try {
       const data = await listQuickTargets(kind)
       if (reqRef.current !== req) return
@@ -48,6 +51,11 @@ export default function QuickTargets({ kind, onPick, onChangeAgent, onPickWithPr
       if (reqRef.current !== req) return
       // 快速入口是加速器，不是主路径：加载失败就安静地什么都不显示，让用户回落到
       // 目录浏览，而不是弹错误挡住新建会话。
+      //
+      // 但 failed 必须与「真的没有数据」区分开：onEmpty 会让父级自动跳到类型选择器，
+      // 而那个跳转只有在「确实没有历史」时才是对的。请求失败时跳转会把一次网络抖动
+      // 变成「对话框闪一下就跳走」，用户无法分辨。
+      setFailed(true)
       setItems([])
     }
     if (reqRef.current === req) setLoaded(true)
@@ -60,7 +68,9 @@ export default function QuickTargets({ kind, onPick, onChangeAgent, onPickWithPr
 
   // 空列表时通知父级，让它改渲染原来的类型选择器 —— 否则全新库点 ＋ 只看到一个标题
   // 加一行「其他目录…」，比改动前更差。
-  useEffect(() => { if (loaded && items.length === 0) onEmpty?.() }, [loaded, items.length, onEmpty])
+  useEffect(() => {
+    if (loaded && !failed && items.length === 0) onEmpty?.()
+  }, [loaded, failed, items.length, onEmpty])
 
   const forget = useCallback(async (it: QuickTarget) => {
     reqRef.current++      // 使任何在途 GET 失效，否则旧快照会让这条复活成 ghost

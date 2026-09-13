@@ -138,6 +138,49 @@ impl QuickTargetStore {
         Ok(())
     }
 
+    /// One-shot cold-start backfill from the caller's session history.
+    ///
+    /// WHY: when this feature ships, the table is empty — but the user's `sessions`
+    /// table already holds exactly the data it wants: (work_dir, type, owner_id).
+    /// Without a backfill the first screen renders an empty list, fires `onEmpty`,
+    /// and the UI jumps straight to the type picker — which reads to the user as
+    /// "the dialog flashed and vanished" (observed live 2026-09-13).
+    ///
+    /// Idempotent by whole-table check, deliberately: if ANY row exists the seed is
+    /// skipped entirely. Two reasons — (a) re-seeding on every restart would add +1
+    /// hit to historical dirs each boot, drowning the user's real usage frequency in
+    /// a count of how often the process restarted; (b) once the user has real bumps,
+    /// resurfacing long-dropped dirs would fight the frecency ranking.
+    ///
+    /// `history` entries are `(owner_id, work_dir, session_type, created_ms)`. The
+    /// caller is responsible for passing only interactive sessions and for path
+    /// canonicalization — mirroring what the `create_session` bump site does.
+    pub fn seed_from_history(
+        &self,
+        history: &[(String, String, String, i64)],
+    ) -> Result<usize, String> {
+        let conn = self.conn.lock().unwrap();
+        let existing: i64 = conn
+            .query_row("SELECT COUNT(*) FROM quick_targets", [], |row| row.get(0))
+            .map_err(|e| format!("seed count failed: {}", e))?;
+        if existing > 0 {
+            return Ok(0);
+        }
+        let mut n = 0;
+        for (owner, path, agent, created_ms) in history {
+            conn.execute(
+                "INSERT INTO quick_targets (user_id, kind, path, agent, hits, last_ms, score_raw)
+                 VALUES (?1, 'dir', ?2, ?3, 1, ?4, 1.0)
+                 ON CONFLICT(user_id, kind, path, agent) DO UPDATE SET
+                   last_ms = max(last_ms, excluded.last_ms)",
+                params![owner, path, agent, created_ms],
+            )
+            .map_err(|e| format!("seed insert failed: {}", e))?;
+            n += 1;
+        }
+        Ok(n)
+    }
+
     /// 取候选行（不评分、不排序——那是 rank 的职责）。
     /// ORDER BY last_ms DESC 保证截断时留下的是最近用过的。
     pub fn candidates(&self, user_id: &str, kind: &str) -> Result<Vec<QuickTargetRow>, String> {
@@ -327,6 +370,47 @@ mod tests {
         let rows = s.candidates("u1", "dir").unwrap();
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].agent, "codex", "另一个 agent 的行不受影响");
+    }
+
+    #[test]
+    fn seed_from_history_is_one_shot_and_idempotent() {
+        // 冷启动回填：新功能上线时表是空的，而用户的 sessions 表里已经有现成的
+        // (work_dir, type, owner) 历史。不回填的话首屏空列表 → onEmpty → 自动跳
+        // pick-type，用户看到的就是「对话框闪一下就跳走」(2026-09-13 线上实测)。
+        let (s, _d) = tmp_store();
+        let hist = vec![
+            ("u1".to_string(), "/w/a".to_string(), "claude".to_string(), T0),
+            ("u1".to_string(), "/w/b".to_string(), "tmux".to_string(), T0 + DAY),
+        ];
+        let n = s.seed_from_history(&hist).unwrap();
+        assert_eq!(n, 2, "首次应回填 2 行");
+        let rows = s.candidates("u1", "dir").unwrap();
+        assert_eq!(rows.len(), 2);
+        // 回填用会话自己的 created_ms 作 last_ms，这样最近开过的目录自然排在前
+        let b = rows.iter().find(|r| r.path == "/w/b").unwrap();
+        assert_eq!(b.last_ms, T0 + DAY);
+
+        // 幂等：表非空即整体跳过，绝不重复累加分数（否则每次重启都给历史目录 +1，
+        // 用户真实的使用频率会被启动次数淹没）
+        let n2 = s.seed_from_history(&hist).unwrap();
+        assert_eq!(n2, 0, "表非空时必须整体跳过");
+        assert_eq!(s.candidates("u1", "dir").unwrap().len(), 2);
+        for r in s.candidates("u1", "dir").unwrap() {
+            assert_eq!(r.hits, 1, "幂等：hits 不得被重复回填抬高");
+        }
+    }
+
+    #[test]
+    fn seed_from_history_skips_when_table_already_has_rows() {
+        // 用户已经真实用过（表里有 bump 出来的行）→ 回填必须整体不介入，
+        // 免得把早已掉出榜的旧目录重新顶上来。
+        let (s, _d) = tmp_store();
+        s.bump("u1", "dir", "/w/real", "claude", T0).unwrap();
+        let n = s.seed_from_history(&[("u1".into(), "/w/old".into(), "claude".into(), T0)]).unwrap();
+        assert_eq!(n, 0);
+        let rows = s.candidates("u1", "dir").unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].path, "/w/real");
     }
 
     #[test]

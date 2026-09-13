@@ -63,6 +63,7 @@ pub fn build_router(state: Arc<AppState>) -> Router {
         .route("/api/scheduled-tasks/{id}/runs", get(list_scheduled_runs))
         .route("/api/scheduler/health", get(scheduler_health))
         .route("/api/directories", get(list_directories))
+        .route("/api/quick-targets", get(list_quick_targets).delete(forget_quick_target))
         .route("/api/push/vapid-key", get(push_vapid_key))
         .route("/api/push/subscribe", post(push_subscribe))
         .route("/api/push/unsubscribe", post(push_unsubscribe))
@@ -293,6 +294,235 @@ async fn list_directories(
             .map(|p| p.to_string_lossy().to_string()),
         "entries": entries,
     })))
+}
+
+/// dir 条目的展示对：(display=basename, hint=以 ~ 缩写的父路径)。
+/// hint 的存在意义是区分同名 basename（多个 repo 都有 `scripts/`）。
+///
+/// 用 Path::strip_prefix 而非字符串 starts_with：后者会把 /home/ubuntu-backup
+/// 误判为 $HOME 的子路径，缩写成 "~-backup"。
+fn dir_display_hint(path: &str, home: &str) -> (String, String) {
+    let p = std::path::Path::new(path);
+    let display = p
+        .file_name()
+        .map(|n| n.to_string_lossy().to_string())
+        .unwrap_or_else(|| path.to_string());
+    let parent = match p.parent() {
+        Some(x) => x,
+        None => return (display, String::new()),
+    };
+    let hint = match parent.strip_prefix(home) {
+        Ok(rel) if rel.as_os_str().is_empty() => "~".to_string(),
+        Ok(rel) => format!("~/{}", rel.to_string_lossy()),
+        Err(_) => parent.to_string_lossy().to_string(),
+    };
+    (display, hint)
+}
+
+/// note 条目的展示对：(display=笔记名去 .md, hint=父目录相对路径)。
+/// vault 内 `_index.md` 不止一个，只显示 basename 无法分辨 → 必须带父目录。
+fn note_display_hint(rel_path: &str) -> (String, String) {
+    let (dir, base) = match rel_path.rfind('/') {
+        Some(i) => (&rel_path[..i], &rel_path[i + 1..]),
+        None => ("", rel_path),
+    };
+    let display = if base.to_ascii_lowercase().ends_with(".md") {
+        base[..base.len() - 3].to_string()
+    } else {
+        base.to_string()
+    };
+    (display, dir.to_string())
+}
+
+/// 一条历史行现在还能不能用。三态而非 bool 是刻意的 —— 见 Invalid/Unknown 的区别。
+enum TargetValidity {
+    /// 校验通过，返回给前端。
+    Valid,
+    /// 确定性拒绝（不在 $HOME 下 / 命中敏感目录 / 不是目录 / NotFound）→ 删行。
+    Invalid,
+    /// 瞬时 IO 失败（JuiceFS 抖动让 canonicalize 失败）→ 本次不返回，但保留行。
+    /// 若把这种情况也删行，用户的常用目录会因为一次文件系统抖动丢掉几周累积的
+    /// frecency。
+    Unknown,
+}
+
+/// dir 行的校验：与 list_directories 完全相同的守卫组合（web.rs:248-252），
+/// 而不是「存的时候合法所以永远合法」—— 存的是历史，路径可能已被删除、已被替换为
+/// 指向 ~/.ssh 的 symlink、或守卫规则本身已升级加严。
+fn validate_dir_target(path: &str) -> TargetValidity {
+    let p = std::path::Path::new(path);
+    // 先用 symlink_metadata 区分「不存在」（确定性）与「其它 IO 错误」（瞬时）。
+    match p.symlink_metadata() {
+        Ok(_) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return TargetValidity::Invalid,
+        Err(_) => return TargetValidity::Unknown,
+    }
+    let canonical = match p.canonicalize() {
+        Ok(c) => c,
+        // 路径存在但 canonicalize 失败 → 瞬时 IO / 权限，保留行。
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return TargetValidity::Invalid,
+        Err(_) => return TargetValidity::Unknown,
+    };
+    // validate_browse_root 做 canonicalize + under-$HOME + is-dir + 敏感目录拒绝。
+    // 它内部会再 canonicalize 一次；这里已确认路径可 canonicalize，故其失败即确定性拒绝。
+    if validate_browse_root(path).is_err() {
+        return TargetValidity::Invalid;
+    }
+    if read_hits_home_dotdir(&canonical) || !canonical.is_dir() {
+        return TargetValidity::Invalid;
+    }
+    TargetValidity::Valid
+}
+
+/// note 行的校验：仍在 vault 内、无 dot 组件、非敏感、文件仍存在。
+fn validate_note_target(base: &str, rel: &str) -> TargetValidity {
+    if vault_path_has_dot_component(rel) {
+        return TargetValidity::Invalid;
+    }
+    let base_path = std::path::Path::new(base);
+    let joined = base_path.join(rel);
+    match joined.symlink_metadata() {
+        Ok(_) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return TargetValidity::Invalid,
+        Err(_) => return TargetValidity::Unknown,
+    }
+    let real = match resolve_and_verify(base_path, rel) {
+        Ok(p) => p,
+        Err(_) => return TargetValidity::Invalid,
+    };
+    if descends_into_sensitive_dir(base_path, &real)
+        || vault_real_hits_dot_component(base_path, &real)
+        || !real.is_file()
+    {
+        return TargetValidity::Invalid;
+    }
+    TargetValidity::Valid
+}
+
+#[derive(serde::Deserialize)]
+struct QuickTargetQuery {
+    kind: String,
+}
+
+#[derive(serde::Deserialize)]
+struct QuickTargetForgetQuery {
+    kind: String,
+    path: String,
+    #[serde(default)]
+    agent: String,
+}
+
+/// 只接受这两种 kind；其它一律 400（防止用任意 kind 字符串把表当通用 KV 用，
+/// 也防止 still_valid 的 else 分支把未知 kind 当 note 处理）。
+fn validate_kind(kind: &str) -> Result<(), (StatusCode, String)> {
+    if kind == "dir" || kind == "note" {
+        Ok(())
+    } else {
+        Err((StatusCode::BAD_REQUEST, "kind must be 'dir' or 'note'".into()))
+    }
+}
+
+async fn list_quick_targets(
+    State(state): State<Arc<AppState>>,
+    user: axum::Extension<CurrentUser>,
+    Query(q): Query<QuickTargetQuery>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    validate_kind(&q.kind)?;
+    // note 的可见性跟 vault 一致：vault 未配置或调用者非 admin → 空列表（而不是
+    // 泄漏「有哪些笔记曾被打开」）。注意这个早退也保护了历史数据：不走到下面的
+    // 校验循环，就不会因为 vault 暂时未配置而把全部 note 行删光。
+    let vault_dir: Option<String> = match vault_base(&state, &user) {
+        Ok(b) => Some(b.to_string()),
+        Err(_) if q.kind == "note" => {
+            return Ok(Json(serde_json::json!({ "top": [] })));
+        }
+        Err(_) => None,
+    };
+
+    let rows = state
+        .quick_targets
+        .candidates(&user.id, &q.kind)
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
+
+    let home = std::env::var("HOME").unwrap_or_else(|_| "/home/ubuntu".to_string());
+
+    // 每行的守卫都是同步文件系统 IO，JuiceFS 上实测约 20ms/行（canonicalize 约
+    // 10ms + metadata 约 10ms）。候选上限 16 → 最坏约 320ms。绝不能在 tokio worker
+    // 上同步阻塞这么久（只有 8 个 worker，且首屏每次打开都会走这条路径，事件驱动
+    // 刷新还会把频率乘上去）。挪进 spawn_blocking。
+    let kind = q.kind.clone();
+    let rows_for_task = rows.clone();
+    let vault_for_task = vault_dir.clone();
+    let (alive, dead) = tokio::task::spawn_blocking(move || {
+        let mut alive = Vec::new();
+        let mut dead = Vec::new();
+        for r in rows_for_task {
+            let verdict = if kind == "dir" {
+                validate_dir_target(&r.path)
+            } else {
+                match vault_for_task.as_deref() {
+                    Some(base) => validate_note_target(base, &r.path),
+                    None => TargetValidity::Unknown,
+                }
+            };
+            match verdict {
+                TargetValidity::Valid => alive.push(r),
+                TargetValidity::Invalid => dead.push(r),
+                TargetValidity::Unknown => {} // 本次不返回，保留行
+            }
+        }
+        (alive, dead)
+    })
+    .await
+    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("validation task failed: {}", e)))?;
+
+    // 确定性失效的行就地清理；失败只忽略（下次还会再试）。
+    for r in &dead {
+        let _ = state.quick_targets.forget(&user.id, &r.kind, &r.path, &r.agent);
+    }
+
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0);
+    let top = crate::quick_targets::rank(alive, now_ms);
+
+    let items: Vec<_> = top
+        .iter()
+        .map(|r| {
+            let (display, hint) = if r.kind == "dir" {
+                dir_display_hint(&r.path, &home)
+            } else {
+                note_display_hint(&r.path)
+            };
+            serde_json::json!({
+                "kind": r.kind,
+                "path": r.path,
+                "agent": r.agent,
+                "display": display,
+                "hint": hint,
+            })
+        })
+        .collect();
+
+    Ok(Json(serde_json::json!({ "top": items })))
+}
+
+/// 从榜上移除。用 query param 而不是 JSON body：api.ts 全部 7 处 DELETE 调用都没有
+/// body（如 deleteSessionFile 用 ?path=），DELETE-with-body 在 RFC 9110 里语义未定义
+/// 且会被中间层（这里是 nginx 反代）丢弃 → axum 的 Json 提取器 400 → 前端 catch
+/// 静默吞掉 → 表现为「移除按钮不管用」。
+async fn forget_quick_target(
+    State(state): State<Arc<AppState>>,
+    user: axum::Extension<CurrentUser>,
+    Query(q): Query<QuickTargetForgetQuery>,
+) -> Result<StatusCode, (StatusCode, String)> {
+    validate_kind(&q.kind)?;
+    state
+        .quick_targets
+        .forget(&user.id, &q.kind, &q.path, &q.agent)
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
+    Ok(StatusCode::NO_CONTENT)
 }
 
 // ── Tmux session listing ──
@@ -3794,6 +4024,48 @@ mod path_safety_tests {
         let ssh = format!("{}/.ssh", home);
         std::fs::create_dir_all(&ssh).ok();
         assert!(validate_browse_root(&ssh).is_err()); // sensitive
+    }
+
+    #[test]
+    fn quick_target_display_and_hint_for_dir() {
+        let (d, h) = dir_display_hint("/home/ubuntu/s3-workspace/keith-space/ai/zeromux", "/home/ubuntu");
+        assert_eq!(d, "zeromux");
+        assert_eq!(h, "~/s3-workspace/keith-space/ai");
+    }
+
+    #[test]
+    fn quick_target_display_hint_for_dir_directly_under_home() {
+        let (d, h) = dir_display_hint("/home/ubuntu/drafts", "/home/ubuntu");
+        assert_eq!(d, "drafts");
+        assert_eq!(h, "~");
+    }
+
+    #[test]
+    fn quick_target_dir_hint_does_not_abbreviate_sibling_of_home() {
+        // /home/ubuntu-backup 只是与 $HOME 共前缀的兄弟目录，不能被缩写成 "~-backup"。
+        // 纯字符串 starts_with 会误判，必须按路径边界比较。
+        let (_, h) = dir_display_hint("/home/ubuntu-backup/x/y", "/home/ubuntu");
+        assert_eq!(h, "/home/ubuntu-backup/x", "共前缀的兄弟目录不得缩写");
+    }
+
+    #[test]
+    fn quick_target_display_and_hint_for_note() {
+        let (d, h) = note_display_hint("projects/long-term/考研英语/_index.md");
+        assert_eq!(d, "_index");
+        assert_eq!(h, "projects/long-term/考研英语");
+    }
+
+    #[test]
+    fn quick_target_note_at_vault_root_has_empty_hint() {
+        let (d, h) = note_display_hint("README.md");
+        assert_eq!(d, "README");
+        assert_eq!(h, "", "顶层笔记 hint 为空串");
+    }
+
+    #[test]
+    fn quick_target_note_display_strips_md_case_insensitively() {
+        let (d, _) = note_display_hint("a/B.MD");
+        assert_eq!(d, "B");
     }
 
     #[test]

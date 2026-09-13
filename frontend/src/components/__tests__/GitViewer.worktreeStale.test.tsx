@@ -18,7 +18,7 @@ describe('GitViewer worktree stale-response race', () => {
     is_git: true,
     truncated: false,
     diff,
-    files: [{ path, status: ' M', staged: false, old_path: null }],
+    files: [{ path, status: ' M', staged: false, old_path: undefined }],
   })
 
   it('a slow first worktree load cannot overwrite the newer Refresh result', async () => {

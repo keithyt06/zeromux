@@ -471,9 +471,26 @@ zeromux 有完整的 PWA + VAPID Web Push（`push.rs` 935 行，三类触发 + S
 
 > `spawn rejected: no surface could show the approval prompt, so nobody could answer it (no dashboard client is connected). The spawn was refused now rather than held until the reaper's deadline.`
 
-**但这不是死局**：`hooks.auto_approve_sources`（`hooks.py:307,393,427`）与 `defaults.json` 的 `hooks.auto_approve_tools` 可放开自动批准（当前用户 `config.json` 的 `hooks` 为空 `{}`）。
+**但这不是死局，而且解法比预想的干净得多。** `admission.py:791-799` 自己列出了四条放开途径：
 
-**含义**：审批 UI 从"subagent 的必需前置"降级为"可选增强"。第一期若不做审批 UI，需配置 auto-approve 才能用 subagent；两条路都通，取舍交由评审决定。
+1. spawn 时带 **`approval_mode="auto"`**（逐次调用参数）
+2. 父会话在 dashboard 里开 Trust
+3. `config.json` 设 `hooks.auto_approve_subagent_spawn = true`
+4. `hooks.auto_approve_sources` 加入 `"subagent"`
+
+**实测第 1 条端到端通过**：
+
+```
+POST /api/spawn  {"task":"Reply with exactly SUBOK2 and nothing else.","approval_mode":"auto"}
+→ {"id":"3acc86b8","status":"spawned"}
+轮询 GET /api/spawn →
+  {"id":"3acc86b8","done":true,"outcome":"completed","result":"SUBOK2","error":""}
+```
+
+**含义（这一条修正了本节的初始判断）**：subagent 只需在 API 调用里多带一个字段即可工作 —— **不需要审批 UI，也不需要改 Crew 的全局配置**。因此：
+
+- subagent 可以在第一期就获得第一方支持，边际成本仅为一个 JSON 字段；
+- 审批 UI 彻底降级为"想要更强安全性时的可选项"，不再是任何能力的前置条件。
 
 ### A.4 Crew cron 的能力与体量远超 zeromux 版
 

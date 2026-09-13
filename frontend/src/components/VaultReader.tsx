@@ -1,7 +1,9 @@
 import { useState, useEffect, useCallback, useRef } from 'react'
 import { X, ChevronLeft, Search, FileText, Folder } from 'lucide-react'
 import { listVault, getVaultFile, getVaultSearch, resolveWikiLink } from '../lib/api'
-import { filterVaultEntries, resolveVaultImageSrc, getRecentNotes, pushRecentNote, removeRecentNote } from '../lib/vault'
+import { filterVaultEntries, resolveVaultImageSrc } from '../lib/vault'
+import QuickTargets from './QuickTargets'
+import { notifyQuickTargetsChanged } from '../lib/quickTargetsBus'
 import MarkdownContent from './markdown/MarkdownContent'
 import type { DirListEntry } from '../lib/api'
 import { docTitleFromPath } from '../lib/docTabs'
@@ -16,7 +18,6 @@ export default function VaultReader({ onClose, onTitleChange }: { onClose?: () =
   const [openPath, setOpenPath] = useState('')
   const [content, setContent] = useState('')
   const [truncated, setTruncated] = useState(false)
-  const [recent, setRecent] = useState<string[]>(() => getRecentNotes())
   // Monotonic request tokens so an out-of-order response can't paint stale
   // content — the same stale-response hardening applied to GitViewer.selectCommit
   // and FileBrowser.openFile (reviews 2026-08-03/06/07). A slow read of note A
@@ -50,15 +51,14 @@ export default function VaultReader({ onClose, onTitleChange }: { onClose?: () =
     getVaultFile(path).then(r => {
       if (openReqRef.current !== req) return // a newer openNote superseded this read
       setContent(r.content); setTruncated(r.truncated); setOpenPath(path); setMode('read')
-      pushRecentNote(path); setRecent(getRecentNotes())
+      notifyQuickTargetsChanged()   // vault_file bumped on the server; re-rank the list
       onTitleChange?.(docTitleFromPath(path))
     }).catch(() => {
       if (openReqRef.current !== req) return
-      // A stale "最近打开" entry (note deleted/renamed in Obsidian) 404s here. Don't
-      // swallow it silently — tell the user and prune the dead entry, matching the
-      // onWikiLink sibling which already alerts on a missing target.
+      // A stale entry (note deleted/moved in Obsidian) 404s here. The backend's
+      // read-time guard prunes and deletes the row on the next listing, so all
+      // that's left to do is tell the user.
       alert('无法打开笔记(可能已被删除或移动):' + path)
-      removeRecentNote(path); setRecent(getRecentNotes())
     })
   }, [onTitleChange])
 
@@ -115,13 +115,13 @@ export default function VaultReader({ onClose, onTitleChange }: { onClose?: () =
           ))}{results.length === 0 && <li className="px-3 py-2 text-xs text-[var(--text-secondary)]">无匹配</li>}{searchTruncated && <li className="px-3 py-2 text-xs text-[var(--accent-yellow)]">仅显示前 100 条结果,请细化搜索</li>}</ul>
         ) : (
           <>
-            {recent.length > 0 && cwd === '' && (
-              <div className="px-3 pt-2">
-                <div className="text-xs text-[var(--text-secondary)] mb-1">最近打开</div>
-                {recent.map(p => <button key={p} onClick={() => openNote(p)} className="flex items-center gap-2 w-full px-1 py-1 text-sm text-left hover:bg-[var(--bg-tertiary)] rounded"><FileText size={14} />{p.split('/').pop()}</button>)}
-                <div className="h-px bg-[var(--border)] my-2" />
-              </div>
-            )}
+            {/* `hidden` rather than conditional rendering: VaultReader stays mounted in
+                App.tsx (visibility toggled by class, deliberately never unmounted so
+                scroll state survives), so conditional rendering would remount on every
+                cwd change and re-pay the full per-note validation IO. */}
+            <div className={cwd === '' ? '' : 'hidden'}>
+              <QuickTargets kind="note" onPick={(path) => openNote(path)} />
+            </div>
             {crumbs.length > 0 && (
               <button onClick={() => setCwd(crumbs.slice(0, -1).join('/'))} className="flex items-center gap-1 px-3 py-2 text-sm text-[var(--text-secondary)]"><ChevronLeft size={14} />返回上级</button>
             )}

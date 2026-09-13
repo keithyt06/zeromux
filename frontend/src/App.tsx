@@ -2,6 +2,7 @@ import { useState, useEffect, useCallback, useMemo, useRef } from 'react'
 import type { SessionInfo, SessionType, UserInfo } from './lib/api'
 import { listSessions, createSession, deleteSession, checkAuth, legacyLogin, clearAuth, renameSession, listConfirmations, getSessionStatus, isAuthError } from './lib/api'
 import { deepLinkView } from './lib/deeplink'
+import { notifyQuickTargetsChanged } from './lib/quickTargetsBus'
 import { resyncPush, shouldResyncNow } from './lib/push'
 import { useTheme } from './lib/theme'
 import Sidebar from './components/Sidebar'
@@ -244,6 +245,7 @@ export default function App() {
       return
     }
     const s = await createSession(type, undefined, workDir, tmuxTarget, initialPrompt)
+    notifyQuickTargetsChanged()   // the backend just bumped; re-rank any mounted quick lists
     setSessions(prev => [...prev, s])
     setActiveId(s.id)
   }, [])

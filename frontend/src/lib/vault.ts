@@ -30,21 +30,3 @@ export function resolveVaultImageSrc(src: string, noteRelPath: string): string {
   return vaultRawUrl(parts.join('/'))
 }
 
-const RECENT_KEY = 'zmx-vault-recent'
-export function getRecentNotes(): string[] {
-  // Guard both parse errors AND a valid-JSON non-array (e.g. tampered "5"/{}), which
-  // would otherwise blow up the .filter in pushRecentNote/removeRecentNote.
-  try {
-    const v = JSON.parse(localStorage.getItem(RECENT_KEY) || '[]')
-    return Array.isArray(v) ? v.filter((p): p is string => typeof p === 'string') : []
-  } catch { return [] }
-}
-export function pushRecentNote(path: string): void {
-  const cur = getRecentNotes().filter(p => p !== path)
-  cur.unshift(path)
-  localStorage.setItem(RECENT_KEY, JSON.stringify(cur.slice(0, 10)))
-}
-// Drop a stale entry (e.g. a note deleted/renamed in Obsidian that 404s on open).
-export function removeRecentNote(path: string): void {
-  localStorage.setItem(RECENT_KEY, JSON.stringify(getRecentNotes().filter(p => p !== path)))
-}

@@ -2,6 +2,7 @@ import { useState, useEffect, useCallback, useRef } from 'react'
 import { ChevronLeft, Home, Folder, FolderGit2 } from 'lucide-react'
 import type { DirEntry } from '../lib/api'
 import { listDirectories } from '../lib/api'
+import QuickTargets from './QuickTargets'
 
 /** Inline directory browser, mirroring the New Session "Select directory" flow.
  *  Self-contained navigation state; the only outputs are onSelect (commit the
@@ -89,6 +90,8 @@ export default function DirectoryPicker({ initialPath, onSelect, onCancel }: {
           使用此目录
         </button>
       </div>
+
+      <QuickTargets kind="dir" onPick={(path) => onSelect(path)} />
 
       {/* Parent nav */}
       {parentPath && (

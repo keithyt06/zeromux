@@ -13,6 +13,7 @@ import { usePromptPresets } from '../lib/usePromptPresets'
 import { applyPreset } from '../lib/applyPreset'
 import { isStuck } from '../lib/stuck'
 import { ClaudeCodeIcon, KiroIcon, CodexIcon } from './BrandIcons'
+import QuickTargets from './QuickTargets'
 
 interface Props {
   sessions: SessionInfo[]
@@ -60,7 +61,7 @@ function TurnDot({ s }: { s: SessionInfo }) {
   return <span className={`w-2 h-2 rounded-full shrink-0 ${cls}`} title={stuck ? '可能卡住' : undefined} />
 }
 
-type NewSessionStep = 'closed' | 'pick-type' | 'pick-terminal-mode' | 'pick-dir' | 'pick-tmux' | 'pick-prompt' | 'manage-prompts'
+type NewSessionStep = 'closed' | 'quick' | 'pick-type' | 'pick-terminal-mode' | 'pick-dir' | 'pick-tmux' | 'pick-prompt' | 'manage-prompts'
 
 /** Per-agent-type icon used in session list rows. Kept in one place so the
  *  sidebar's two render sites (active row, condensed row) stay in sync as
@@ -170,14 +171,21 @@ export default function Sidebar({ sessions, docTabs, activeId, onSelect, onCreat
   }, [])
 
   const openTypePicker = () => {
-    setStep('pick-type')
+    setStep('quick')
     setPendingType(null)
+    setPendingDir(null)   // start clean on every open so a leftover dir can't leak in
   }
 
   const selectType = (type: SessionType) => {
     setPendingType(type)
     if (type === 'tmux') {
       setStep('pick-terminal-mode')
+    } else if (pendingDir) {
+      // Arrived from a quick card's "换 agent 类型": the dir is already fixed and
+      // only the type changes, so skip the browser and go straight to the prompt page.
+      setPromptDraft('')
+      presetStore.reload()
+      setStep('pick-prompt')
     } else {
       setStep('pick-dir')
       loadDirs()
@@ -185,6 +193,9 @@ export default function Sidebar({ sessions, docTabs, activeId, onSelect, onCreat
   }
 
   const selectNewShell = () => {
+    // Honour a dir already fixed by a quick card — otherwise "open dir A in a
+    // terminal" throws the user back into a 5-level directory browse.
+    if (pendingDir) { onCreate('tmux', pendingDir); closeAfterCreate(); return }
     setStep('pick-dir')
     loadDirs()
   }
@@ -196,14 +207,14 @@ export default function Sidebar({ sessions, docTabs, activeId, onSelect, onCreat
 
   const attachTmuxSession = (name: string) => {
     onCreate('tmux', undefined, name)
-    setStep('closed')
+    closeAfterCreate()
   }
 
   const selectDir = (path: string) => {
     if (!pendingType) { setStep('closed'); return }
     if (pendingType === 'tmux') {
       onCreate('tmux', path)
-      setStep('closed')
+      closeAfterCreate()
     } else {
       setPendingDir(path)
       setPromptDraft('')
@@ -219,20 +230,29 @@ export default function Sidebar({ sessions, docTabs, activeId, onSelect, onCreat
     setPendingDir(null)
   }
 
+  // Post-creation teardown: close the popover, and on mobile the full-screen
+  // sidebar too — otherwise the user finishes creating a session and is left
+  // staring at a backdrop that hides it, so "1 tap" would not be true. The
+  // existing handleSelect only toggles on *selecting* an existing session.
+  const closeAfterCreate = () => {
+    close()
+    if (mobile) onToggle()
+  }
+
   const submitWithPrompt = () => {
     if (!pendingType || !pendingDir) { setStep('closed'); return }
     const trimmed = promptDraft.trim()
     onCreate(pendingType, pendingDir, undefined, trimmed ? promptDraft : undefined)
     setPromptDraft('')
     setPendingDir(null)
-    setStep('closed')
+    closeAfterCreate()
   }
   const submitSkip = () => {
     if (!pendingType || !pendingDir) { setStep('closed'); return }
     onCreate(pendingType, pendingDir)
     setPromptDraft('')
     setPendingDir(null)
-    setStep('closed')
+    closeAfterCreate()
   }
 
   const handleSelect = (id: string) => {
@@ -469,10 +489,75 @@ export default function Sidebar({ sessions, docTabs, activeId, onSelect, onCreat
         {step !== 'closed' && (
           <>
             <div className="fixed inset-0 z-10" onClick={close} />
-            <div className="absolute bottom-full left-2 mb-1 bg-[var(--bg-tertiary)] border border-[var(--border)] rounded-lg py-1 w-56 z-20 shadow-xl">
+            <div className={`absolute bottom-full left-2 mb-1 bg-[var(--bg-tertiary)] border border-[var(--border)] rounded-lg py-1 ${mobile ? 'w-[calc(100vw-1rem)]' : 'w-56'} z-20 shadow-xl`}>
+              {step === 'quick' && (
+                <>
+                  <div className="px-3 py-1.5 text-[10px] font-semibold text-[var(--text-muted)] uppercase tracking-wider">
+                    新建会话
+                  </div>
+                  {/* 一击直达：点一行 = 用该行的 agent 直接创建，0 次列目录请求。
+                      刻意跳过 prompt 页——中间插一页就退化成「少点两下的老流程」，
+                      而且信息零丢失：会话建好后 AcpChatView 的 composer 里有一模一样的
+                      preset 选择器。要带 prompt 的场景走行级操作单。 */}
+                  <QuickTargets
+                    kind="dir"
+                    onPick={(path, agent) => {
+                      if (!agent) { setPendingDir(path); setStep('pick-type'); return }
+                      onCreate(agent, path)
+                      closeAfterCreate()
+                    }}
+                    onChangeAgent={(path) => { setPendingDir(path); setStep('pick-type') }}
+                    onPickWithPrompt={(path, agent) => {
+                      setPendingDir(path)
+                      setPendingType(agent ?? null)
+                      setPromptDraft('')
+                      presetStore.reload()
+                      setStep(agent ? 'pick-prompt' : 'pick-type')
+                    }}
+                    // 列表为空（全新库）时直接跳到类型选择器，而不是给出一个只有标题
+                    // 加一行「其他目录…」的空壳首屏——那比改动前更差。
+                    onEmpty={() => setStep('pick-type')}
+                  />
+                  <button
+                    type="button"
+                    onClick={() => { setPendingDir(null); setStep('pick-type') }}
+                    className="flex items-center gap-2 w-full px-3 py-2.5 min-h-[44px] text-xs text-[var(--text-secondary)] hover:bg-[var(--bg-hover)] transition-colors"
+                  >
+                    <Folder size={13} className="shrink-0" />
+                    <span>其他目录…</span>
+                  </button>
+                  {/* Obsidian 显式保底入口：'vault' 在 App.tsx 于前端短路，
+                      不经过 create_session，所以它永远不会出现在 dir 榜上。若只靠
+                      「其他目录…」里的那份，入口会从今天的 2 tap 退化到 3 tap。 */}
+                  {vaultEnabled && (
+                    <button
+                      type="button"
+                      onClick={() => { onCreate('vault'); closeAfterCreate() }}
+                      className="flex items-center gap-2 w-full px-3 py-2.5 min-h-[44px] text-xs text-[var(--text-secondary)] hover:bg-[var(--bg-hover)] transition-colors"
+                    >
+                      <BookOpen size={13} className="shrink-0" />
+                      <span>Obsidian 笔记库</span>
+                    </button>
+                  )}
+                </>
+              )}
+
               {step === 'pick-type' && (
                 <>
-                  <div className="px-3 py-1.5 text-[10px] font-semibold text-[var(--text-muted)] uppercase tracking-wider">Select type</div>
+                  {/* `quick` is the first screen now, so pick-type is a second screen and
+                      needs a way back — matching pick-terminal-mode / pick-dir. */}
+                  <div className="flex items-center gap-1 px-2 py-1.5 border-b border-[var(--border)]">
+                    <button
+                      onClick={() => { setPendingDir(null); setStep('quick') }}
+                      className="p-0.5 text-[var(--text-secondary)] hover:text-[var(--text-primary)] rounded transition-colors"
+                      title="返回"
+                    >
+                      <ChevronLeft size={14} />
+                    </button>
+                    <span className="text-[10px] font-semibold text-[var(--text-muted)] uppercase tracking-wider truncate flex-1">
+                      Select type
+                    </span>
+                  </div>
                   <button
                     onClick={() => selectType('tmux')}
                     className="flex items-center gap-2.5 w-full px-3 py-2 text-xs text-[var(--text-primary)] hover:bg-[var(--bg-hover)] transition-colors"
@@ -633,7 +718,8 @@ export default function Sidebar({ sessions, docTabs, activeId, onSelect, onCreat
                     </div>
                     <button
                       onClick={() => selectDir(currentPath)}
-                      className="w-full py-1 text-[10px] font-semibold bg-[var(--accent-blue)] hover:bg-[var(--accent-blue-hover)] text-white rounded transition-colors"
+                      disabled={!currentPath}
+                      className="w-full py-1 text-[10px] font-semibold bg-[var(--accent-blue)] hover:bg-[var(--accent-blue-hover)] text-white rounded transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
                     >
                       Use this directory
                     </button>
@@ -690,7 +776,7 @@ export default function Sidebar({ sessions, docTabs, activeId, onSelect, onCreat
                 <>
                   <div className="flex items-center gap-1 px-2 py-1.5 border-b border-[var(--border)]">
                     <button
-                      onClick={() => setStep('pick-dir')}
+                      onClick={() => setStep(currentPath ? 'pick-dir' : 'pick-type')}
                       className="p-0.5 text-[var(--text-secondary)] hover:text-[var(--text-primary)] rounded transition-colors"
                       title="Back"
                     >
@@ -795,7 +881,7 @@ export default function Sidebar({ sessions, docTabs, activeId, onSelect, onCreat
         {showSettings && (
           <>
             <div className="fixed inset-0 z-10" onClick={() => setShowSettings(false)} />
-            <div className="absolute bottom-full left-2 mb-1 bg-[var(--bg-tertiary)] border border-[var(--border)] rounded-lg py-1 w-56 z-20 shadow-xl">
+            <div className={`absolute bottom-full left-2 mb-1 bg-[var(--bg-tertiary)] border border-[var(--border)] rounded-lg py-1 ${mobile ? 'w-[calc(100vw-1rem)]' : 'w-56'} z-20 shadow-xl`}>
               <div className="px-3 py-1.5 text-[10px] font-semibold text-[var(--text-muted)] uppercase tracking-wider">Settings</div>
               <button
                 onClick={onToggleTheme}
@@ -834,7 +920,7 @@ export default function Sidebar({ sessions, docTabs, activeId, onSelect, onCreat
         {showPromptManager && (
           <>
             <div className="fixed inset-0 z-10" onClick={() => setShowPromptManager(false)} />
-            <div className="absolute bottom-full left-2 mb-1 bg-[var(--bg-tertiary)] border border-[var(--border)] rounded-lg py-1 w-56 z-20 shadow-xl">
+            <div className={`absolute bottom-full left-2 mb-1 bg-[var(--bg-tertiary)] border border-[var(--border)] rounded-lg py-1 ${mobile ? 'w-[calc(100vw-1rem)]' : 'w-56'} z-20 shadow-xl`}>
               <div className="flex items-center gap-1 px-2 py-1.5 border-b border-[var(--border)]">
                 <span className="text-[10px] font-semibold text-[var(--text-muted)] uppercase tracking-wider flex-1">管理常用 prompt</span>
               </div>

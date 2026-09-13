@@ -153,6 +153,7 @@ pub struct AppState {
     pub push: Option<std::sync::Arc<crate::push::PushService>>,
     pub vault_dir: Option<String>,
     pub vault_index: Option<std::sync::Arc<web::VaultIndex>>,
+    pub quick_targets: Arc<quick_targets::QuickTargetStore>,
 }
 
 fn gen_random_string(len: usize) -> String {
@@ -261,6 +262,13 @@ async fn main() {
     let session_store = Arc::new(
         session_store::SessionStore::open(std::path::Path::new(&data_dir_str))
             .expect("Failed to initialize session store"),
+    );
+
+    // 常用目录/笔记 frecency。与 sessions 同库、总是开启（不依赖 OAuth 模式）：
+    // legacy 模式的 CurrentUser::legacy().id 是固定 "legacy"，owner-scope 仍成立。
+    let quick_targets_store = Arc::new(
+        quick_targets::QuickTargetStore::open(std::path::Path::new(&data_dir_str))
+            .expect("Failed to initialize quick targets store"),
     );
 
     let scheduled_store = Arc::new(
@@ -379,6 +387,7 @@ async fn main() {
         push: push_service.clone(),
         vault_dir,
         vault_index,
+        quick_targets: quick_targets_store,
     });
 
     // Wire PushService into SessionManager and ScheduledStore if available.

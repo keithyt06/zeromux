@@ -461,6 +461,43 @@ async fn create_session(
         state.sessions.send_initial_prompt(&id, &prompt).await;
     }
 
+    // 记一次「用户真的去了那里」。刻意写在 HTTP handler 层而不下沉到
+    // session_manager 的 create_* 方法：定时任务走 create_acp_session_tagged
+    // 那条独立路径，把 bump 留在这里，「cron 不污染 frecency」就是架构保证，
+    // 而不是一行在未来重构里容易丢失的 if。
+    //
+    // 三个刻意的取舍：
+    // 1. 记 req 提交的 work_dir 而非 resolve_work_dir 之后的 effective_dir——
+    //    开启 --worktree-isolation 时后者是 .zeromux-worktrees/<id>/ 这类一次性
+    //    路径，记它下次点击必然失效。
+    // 2. 用 canonicalize 后的路径，否则 /home/ubuntu/x 与 /home/ubuntu/x/ 会存成
+    //    两行。canonicalize 只解 symlink，不是 resolve_work_dir 的 worktree 改写，
+    //    所以与上一条不冲突。
+    // 3. attach 既有 host tmux（tmux_target.is_some()）不记：那条路径上用户没有
+    //    选目录，work_dir 是 state.work_dir 的兜底值（线上即 --work-dir
+    //    /home/ubuntu），记它等于往榜上插一条用户从未选择过的 ~。
+    //
+    // best-effort：一个「记住我去过哪」的功能没有资格让会话创建失败。
+    if req.tmux_target.is_none() {
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as i64)
+            .unwrap_or(0);
+        // now_ms == 0 只在系统时钟早于 UNIX_EPOCH 时出现。写进 last_ms 会让该行的
+        // 衰减基准永久错位，而 bump 本就允许失败，所以直接跳过。
+        if now_ms > 0 {
+            let canonical_dir = std::path::Path::new(&work_dir)
+                .canonicalize()
+                .map(|p| p.to_string_lossy().to_string())
+                .unwrap_or_else(|_| work_dir.clone());
+            if let Err(e) = state.quick_targets.bump(
+                &owner_id, "dir", &canonical_dir, &type_label, now_ms,
+            ) {
+                eprintln!("quick_targets bump (dir) skipped: {}", e);
+            }
+        }
+    }
+
     Ok(Json(serde_json::json!({
         "id": id,
         "name": name,
@@ -3467,6 +3504,25 @@ async fn vault_file(
         }
     }
     let (content, truncated) = read_text_file_capped(&real)?;
+    // 笔记打开成功才记（失败/403 分支不记）。
+    //
+    // 记规范化后的 vault-relative 路径而非 q.path：resolve_and_verify 接受
+    // CurDir/ParentDir 组件，所以 "a/b.md"、"./a/b.md"、"a/../a/b.md" 解析到同一
+    // 文件，直接记 q.path 会存成 3 行、各自累积、首屏出现 3 条同名条目——与本功能
+    // 「靠父目录区分同名 _index.md」的目标正好相反。
+    //
+    // agent 传空串：note 无 agent 概念。空串而非 NULL 是 PK 去重的前提。
+    if let Some(rel) = real.strip_prefix(base_path).ok().map(|p| p.to_string_lossy().to_string()) {
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as i64)
+            .unwrap_or(0);
+        if now_ms > 0 {
+            if let Err(e) = state.quick_targets.bump(&user.id, "note", &rel, "", now_ms) {
+                eprintln!("quick_targets bump (note) skipped: {}", e);
+            }
+        }
+    }
     Ok(Json(serde_json::json!({ "path": q.path, "content": content, "truncated": truncated })))
 }
 

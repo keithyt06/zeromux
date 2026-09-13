@@ -2,9 +2,11 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** 让 New Session 与 Obsidian 打开笔记时,把最常用的目标（frecency 排序 + 手动 pin）直接摆在首屏,做到「1 次点击、0 次列目录请求」。
+**Goal:** 让 New Session 与 Obsidian 打开笔记时,把最常用的目标（frecency 排序）直接摆在首屏,做到「1 次点击、0 次列目录请求」,且列表随用户操作实时重排。
 
-**Architecture:** 后端新增一张 `quick_targets` 表（`kind='dir'|'note'` 两种实例共用），bump 只发生在 `web.rs` 的两个交互式 HTTP handler（`create_session` / `vault_file`）成功分支——因此「定时任务不污染 frecency」是架构保证而非条件判断。指数半衰期评分在 Rust 内计算（不在 SQL），读取时对每条重跑与 `list_directories` 相同的路径守卫并剔除+删行自愈。前端一个 `QuickTargets` 组件复用于三处入口。
+**Architecture:** 后端新增一张 `quick_targets` 表，行的身份是 `(user_id, kind, path, agent)`——同一目录用三个 agent 就是三行，各自独立累积 frecency、标签稳定不漂移。bump 只发生在 `web.rs` 的两个交互式 HTTP handler（`create_session` / `vault_file`）成功分支——因此「定时任务不污染 frecency」是架构保证而非条件判断。指数半衰期评分在 Rust 内计算（不在 SQL），读取时对每条重跑与 `list_directories` 相同的路径守卫，三态自愈（确定性拒绝才删行，瞬时 IO 错误只剔除）。前端一个 `QuickTargets` 组件复用于三处入口，通过模块级 `quickTargetsBus` 实现事件驱动刷新。
+
+**本计划为 v2**，对应 spec 的 v2 修订（纳入两条新约束 + CTO/PM 交叉 review）。v1 相对 v2 的主要差异：砍掉 pin 全套、行身份加 `agent`、砍 `is_git`、hover-only 控件改行级操作单、手机弹层宽度、Obsidian 保底入口、`spawn_blocking`、`DELETE` 改 query param。
 
 **Tech Stack:** Rust / Axum / rusqlite 0.31 (bundled) / React 19 / Vite / Tailwind v4 / vitest + @testing-library/react
 
@@ -14,8 +16,14 @@
 
 - **语言规范**：用户可见字符串与文档用中文；代码与注释用英文（本 repo 双语惯例）。
 - **半衰期常量**：`HALF_LIFE_MS = 14 * 24 * 3600 * 1000`（14 天，以毫秒表示）。
-- **Top N 常量**：`TOP_N = 5`。不做可配置。
-- **候选上限**：SQL 取候选 `LIMIT 50`。
+- **Top N 常量**：`TOP_N = 5`。不做可配置。**这是显示上限，表里不删行**（挤出即清零会把纯 recency 的病重新引入 frecency）。
+- **候选上限**：`CANDIDATE_LIMIT = 16`（不是 50）。上限的约束是 per-row 文件系统守卫的 IO（JuiceFS 实测约 20ms/行），不是内存。
+- **无 pin 机制**：不做 `pinned` 列、不做 pin 端点、不做行内 pin 按钮。
+- **行身份含 agent**：`PRIMARY KEY (user_id, kind, path, agent)`，`agent TEXT NOT NULL DEFAULT ''`。**必须 NOT NULL**——SQLite 的 PK 列允许 NULL 且 `NULL != NULL`，可空会让 `kind='note'`（agent 恒空）每打开一次笔记插一行（已实测：NULL 插 3 次得 3 行，空串插 3 次得 1 行）。
+- **无 `is_git` 字段**：占 per-row IO 成本一半却只用于选图标；行首图标改为显示 agent 品牌图标。
+- **禁止 hover-only 控件**：Tailwind v4 把 `group-hover:*` 编译进 `@media (hover:hover)`（已在 `frontend/dist/assets/index-*.css` 实测），手机上整条规则不生效 → 元素永久 `opacity:0` 但仍可点击 = 隐形按钮。用户主设备是手机，一律改为「整行主目标 + 一个 `⌄` 行级操作单」。
+- **DELETE 用 query param**，不带 JSON body（`api.ts` 全部 7 处 DELETE 零先例，且 nginx 在前会丢 body）。
+- **事件驱动刷新**：前端发射点必须精确镜像后端两处 bump，不多不少。
 - **owner-scope 强制**：`quick_targets` 的**每一条** SQL（SELECT/UPDATE/DELETE/UPSERT）都必须带 `user_id = ?`。read 与 write 对称。
 - **bump 为 best-effort**：失败只 `eprintln!` 记录，绝不让 session 创建 / 笔记打开返回 5xx。
 - **无公开 bump 端点、无 import 端点**。`pin` / `DELETE` 只能改动**已存在**的行，不能凭空插入 path。
@@ -29,24 +37,37 @@
 
 **Files:**
 - Create: `src/quick_targets.rs`
-- Modify: `src/main.rs:120`（`mod` 声明区，紧邻 `mod prompts;` 等）
+- Modify: `src/main.rs`（mod 声明区，**实际在 `L1-20`**，`mod prompts;` 在 `L12`）
 
 **Interfaces:**
 - Consumes: 无（本任务是根）
 - Produces:
   - `pub struct QuickTargetStore`，`pub fn open(data_dir: &Path) -> Result<Self, String>`
-  - `pub struct QuickTargetRow { pub kind: String, pub path: String, pub hits: i64, pub last_ms: i64, pub score_raw: f64, pub pinned: bool, pub last_agent: Option<String> }`
-  - `pub fn bump(&self, user_id: &str, kind: &str, path: &str, last_agent: Option<&str>, now_ms: i64) -> Result<(), String>`
+  - `pub struct QuickTargetRow { pub kind: String, pub path: String, pub agent: String, pub hits: i64, pub last_ms: i64, pub score_raw: f64 }`
+  - `pub fn bump(&self, user_id: &str, kind: &str, path: &str, agent: &str, now_ms: i64) -> Result<(), String>`
   - `pub fn candidates(&self, user_id: &str, kind: &str) -> Result<Vec<QuickTargetRow>, String>`
-  - `pub fn set_pinned(&self, user_id: &str, kind: &str, path: &str, pinned: bool) -> Result<bool, String>`（返回 false = 行不存在）
-  - `pub fn forget(&self, user_id: &str, kind: &str, path: &str) -> Result<(), String>`
+  - `pub fn forget(&self, user_id: &str, kind: &str, path: &str, agent: &str) -> Result<(), String>`
   - `pub fn decayed_score(score_raw: f64, last_ms: i64, now_ms: i64) -> f64`
-  - `pub fn rank(rows: Vec<QuickTargetRow>, now_ms: i64) -> (Vec<QuickTargetRow>, Vec<QuickTargetRow>)`（返回 `(pinned, top)`）
+  - `pub fn rank(rows: Vec<QuickTargetRow>, now_ms: i64) -> Vec<QuickTargetRow>`
   - `pub const HALF_LIFE_MS: i64`、`pub const TOP_N: usize`
 
-- [ ] **Step 1: 写失败的测试**
+- [ ] **Step 1: 先注册模块（必须在写测试之前）**
 
-在 `src/quick_targets.rs` 末尾创建（文件此时还没有实现体，先只放测试模块 + 上面列出的签名骨架会编译失败——这是预期的）。完整测试模块：
+在 `src/main.rs` 的 mod 声明区（**`L1-20`**，紧邻 `mod prompts;`（`L12`））加一行：
+
+```rust
+mod quick_targets;
+```
+
+并创建空文件 `src/quick_targets.rs`（内容随后写）。
+
+**为什么这一步必须最先做**：Rust 不编译未在 crate root 声明的模块。若先写测试再声明 mod，
+`cargo test` 会输出 `running 0 tests ... ok`（退出码 0），而不是编译失败 —— TDD 的
+「先看红灯」这一步会假绿，实现者会以为命令写错或环境坏了。
+
+- [ ] **Step 2: 写失败的测试**
+
+把以下内容写入 `src/quick_targets.rs`（此时只有测试模块，无实现体）：
 
 ```rust
 #[cfg(test)]
@@ -65,39 +86,59 @@ mod tests {
     #[test]
     fn first_bump_inserts_with_score_one() {
         let (s, _d) = tmp_store();
-        s.bump("u1", "dir", "/w/a", Some("claude"), T0).unwrap();
+        s.bump("u1", "dir", "/w/a", "claude", T0).unwrap();
         let rows = s.candidates("u1", "dir").unwrap();
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].hits, 1);
         assert_eq!(rows[0].last_ms, T0);
-        assert!((rows[0].score_raw - 1.0).abs() < 1e-9, "first insert must be exactly 1.0");
-        assert_eq!(rows[0].last_agent.as_deref(), Some("claude"));
-        assert!(!rows[0].pinned);
+        assert!((rows[0].score_raw - 1.0).abs() < 1e-9, "首次插入必须恰好 1.0");
+        assert_eq!(rows[0].agent, "claude");
     }
 
     #[test]
-    fn repeated_bump_accumulates_hits_and_score() {
+    fn repeated_bump_same_agent_accumulates_in_one_row() {
         let (s, _d) = tmp_store();
-        s.bump("u1", "dir", "/w/a", Some("claude"), T0).unwrap();
-        s.bump("u1", "dir", "/w/a", Some("codex"), T0 + DAY).unwrap();
+        s.bump("u1", "dir", "/w/a", "claude", T0).unwrap();
+        s.bump("u1", "dir", "/w/a", "claude", T0 + DAY).unwrap();
         let rows = s.candidates("u1", "dir").unwrap();
-        assert_eq!(rows.len(), 1, "same path must upsert, not duplicate");
+        assert_eq!(rows.len(), 1, "同 (path, agent) 必须 upsert 而非新增行");
         assert_eq!(rows[0].hits, 2);
         assert_eq!(rows[0].last_ms, T0 + DAY);
-        // 1.0 衰减 1 天后 + 1.0 → 介于 1.0 与 2.0 之间，且严格大于 1.0
+        // 1.0 衰减 1 天后 + 1.0 → 严格介于 1.0 与 2.0 之间
         assert!(rows[0].score_raw > 1.0 && rows[0].score_raw < 2.0);
-        assert_eq!(rows[0].last_agent.as_deref(), Some("codex"), "last_agent 被最新一次覆盖");
     }
 
     #[test]
-    fn bump_with_none_agent_does_not_erase_existing_agent() {
-        // kind='note' 的 bump 传 None；同一 store 里 dir 行的 last_agent 不该被 None 清掉
+    fn same_path_different_agents_are_separate_rows() {
+        // 这是 v2 的核心：同一目录用三个 agent → 三行，各自一击直达、标签稳定不漂移。
+        // v1 只有一个 last_agent 被覆盖，导致「行上的标签自己变」。
         let (s, _d) = tmp_store();
-        s.bump("u1", "dir", "/w/a", Some("claude"), T0).unwrap();
-        s.bump("u1", "dir", "/w/a", None, T0 + DAY).unwrap();
+        s.bump("u1", "dir", "/w/a", "claude", T0).unwrap();
+        s.bump("u1", "dir", "/w/a", "codex", T0 + DAY).unwrap();
+        s.bump("u1", "dir", "/w/a", "tmux", T0 + 2 * DAY).unwrap();
         let rows = s.candidates("u1", "dir").unwrap();
-        assert_eq!(rows[0].last_agent.as_deref(), Some("claude"),
-                   "None 表示「本次不带类型信息」，不是「清空」");
+        assert_eq!(rows.len(), 3, "三个 agent 三行");
+        let mut agents: Vec<&str> = rows.iter().map(|r| r.agent.as_str()).collect();
+        agents.sort();
+        assert_eq!(agents, vec!["claude", "codex", "tmux"]);
+        // 各自独立累积：claude 只 bump 过一次
+        let claude = rows.iter().find(|r| r.agent == "claude").unwrap();
+        assert_eq!(claude.hits, 1);
+    }
+
+    #[test]
+    fn note_rows_use_empty_agent_and_still_dedupe() {
+        // 回归测试：已实测 SQLite 的 PK 列允许 NULL 且 NULL != NULL，
+        // 所以若 agent 可空，note（agent 恒空）每打开一次就插一行 → frecency 报废。
+        // 空串是真值，PK 正常去重。
+        let (s, _d) = tmp_store();
+        for i in 0..3 {
+            s.bump("u1", "note", "projects/a.md", "", T0 + i * DAY).unwrap();
+        }
+        let rows = s.candidates("u1", "note").unwrap();
+        assert_eq!(rows.len(), 1, "同一篇笔记连开 3 次必须仍是 1 行");
+        assert_eq!(rows[0].hits, 3);
+        assert_eq!(rows[0].agent, "");
     }
 
     #[test]
@@ -113,51 +154,39 @@ mod tests {
 
     #[test]
     fn decayed_score_clamps_negative_elapsed() {
-        // 时钟回拨：now < last_ms 不应放大分数
+        // 时钟回拨 / NTP 校正：now < last_ms 不应放大分数
         let s = decayed_score(1.0, T0, T0 - 10 * DAY);
         assert!(s <= 1.0 + 1e-9, "负 elapsed 必须钳到不放大，实际 {}", s);
     }
 
     #[test]
-    fn rank_orders_unpinned_by_decayed_score_desc() {
-        let rows = vec![
-            QuickTargetRow { kind: "dir".into(), path: "/old-heavy".into(), hits: 20,
-                             last_ms: T0 - 60 * DAY, score_raw: 20.0, pinned: false, last_agent: None },
-            QuickTargetRow { kind: "dir".into(), path: "/fresh-light".into(), hits: 2,
-                             last_ms: T0, score_raw: 2.0, pinned: false, last_agent: None },
-        ];
-        let (pinned, top) = rank(rows, T0);
-        assert!(pinned.is_empty());
+    fn rank_orders_by_decayed_score_desc() {
+        let row = |path: &str, last_ms: i64, score_raw: f64| QuickTargetRow {
+            kind: "dir".into(), path: path.into(), agent: "claude".into(),
+            hits: 1, last_ms, score_raw,
+        };
         // old-heavy: 20 * 0.5^(60/14) ≈ 1.0；fresh-light: 2.0 → fresh 在前
-        assert_eq!(top[0].path, "/fresh-light");
-        assert_eq!(top[1].path, "/old-heavy");
+        let out = rank(vec![row("/old-heavy", T0 - 60 * DAY, 20.0),
+                            row("/fresh-light", T0, 2.0)], T0);
+        assert_eq!(out[0].path, "/fresh-light");
+        assert_eq!(out[1].path, "/old-heavy");
     }
 
     #[test]
-    fn rank_pinned_come_first_and_do_not_consume_top_n_slots() {
-        let mut rows = vec![QuickTargetRow {
-            kind: "dir".into(), path: "/pinned".into(), hits: 1,
-            last_ms: T0 - 300 * DAY, score_raw: 1.0, pinned: true, last_agent: None,
-        }];
-        // 6 条未 pin，分数递减
-        for i in 0..6 {
-            rows.push(QuickTargetRow {
-                kind: "dir".into(), path: format!("/u{}", i), hits: 1,
-                last_ms: T0, score_raw: 10.0 - i as f64, pinned: false, last_agent: None,
-            });
-        }
-        let (pinned, top) = rank(rows, T0);
-        assert_eq!(pinned.len(), 1, "pinned 全部返回");
-        assert_eq!(pinned[0].path, "/pinned", "pinned 即便分数最低也返回");
-        assert_eq!(top.len(), TOP_N, "未 pin 部分恰好 TOP_N 条");
-        assert_eq!(top[0].path, "/u0");
-        assert!(top.iter().all(|r| !r.pinned), "top 不含 pinned 条目");
+    fn rank_truncates_to_top_n() {
+        let rows: Vec<_> = (0..9).map(|i| QuickTargetRow {
+            kind: "dir".into(), path: format!("/u{}", i), agent: "claude".into(),
+            hits: 1, last_ms: T0, score_raw: 10.0 - i as f64,
+        }).collect();
+        let out = rank(rows, T0);
+        assert_eq!(out.len(), TOP_N, "恰好 TOP_N 条（显示上限）");
+        assert_eq!(out[0].path, "/u0", "最高分在前");
     }
 
     #[test]
     fn owner_scope_isolates_users_on_read() {
         let (s, _d) = tmp_store();
-        s.bump("u1", "dir", "/w/a", None, T0).unwrap();
+        s.bump("u1", "dir", "/w/a", "claude", T0).unwrap();
         assert_eq!(s.candidates("u1", "dir").unwrap().len(), 1);
         assert!(s.candidates("u2", "dir").unwrap().is_empty(), "u2 不该看到 u1 的行");
     }
@@ -165,113 +194,111 @@ mod tests {
     #[test]
     fn kind_scope_isolates_dir_from_note() {
         let (s, _d) = tmp_store();
-        s.bump("u1", "dir", "same/path", None, T0).unwrap();
-        s.bump("u1", "note", "same/path", None, T0).unwrap();
+        s.bump("u1", "dir", "same/path", "claude", T0).unwrap();
+        s.bump("u1", "note", "same/path", "", T0).unwrap();
         assert_eq!(s.candidates("u1", "dir").unwrap().len(), 1);
         assert_eq!(s.candidates("u1", "note").unwrap().len(), 1);
     }
 
     #[test]
-    fn set_pinned_is_owner_scoped_and_requires_existing_row() {
+    fn forget_is_owner_scoped_and_agent_specific() {
         let (s, _d) = tmp_store();
-        s.bump("u1", "dir", "/w/a", None, T0).unwrap();
-        // 跨用户 pin 无效
-        assert!(!s.set_pinned("u2", "dir", "/w/a", true).unwrap(), "跨用户必须返回 false");
-        assert!(!s.candidates("u1", "dir").unwrap()[0].pinned, "u1 的行不该被 u2 改动");
-        // 不存在的 path 不能被凭空创建
-        assert!(!s.set_pinned("u1", "dir", "/never/seen", true).unwrap());
-        assert_eq!(s.candidates("u1", "dir").unwrap().len(), 1, "pin 不得插入新行");
-        // 本人 pin 生效
-        assert!(s.set_pinned("u1", "dir", "/w/a", true).unwrap());
-        assert!(s.candidates("u1", "dir").unwrap()[0].pinned);
+        s.bump("u1", "dir", "/w/a", "claude", T0).unwrap();
+        s.bump("u1", "dir", "/w/a", "codex", T0).unwrap();
+        // 跨用户删无效
+        s.forget("u2", "dir", "/w/a", "claude").unwrap();
+        assert_eq!(s.candidates("u1", "dir").unwrap().len(), 2, "u2 不能删 u1 的行");
+        // 只删指定 agent 那一行
+        s.forget("u1", "dir", "/w/a", "claude").unwrap();
+        let rows = s.candidates("u1", "dir").unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].agent, "codex", "另一个 agent 的行不受影响");
     }
 
     #[test]
-    fn forget_is_owner_scoped() {
+    fn candidates_are_capped_at_candidate_limit() {
         let (s, _d) = tmp_store();
-        s.bump("u1", "dir", "/w/a", None, T0).unwrap();
-        s.forget("u2", "dir", "/w/a").unwrap();
-        assert_eq!(s.candidates("u1", "dir").unwrap().len(), 1, "u2 不能删 u1 的行");
-        s.forget("u1", "dir", "/w/a").unwrap();
-        assert!(s.candidates("u1", "dir").unwrap().is_empty());
-    }
-
-    #[test]
-    fn candidates_are_capped() {
-        let (s, _d) = tmp_store();
-        for i in 0..60 {
-            s.bump("u1", "dir", &format!("/w/{}", i), None, T0 + i).unwrap();
+        for i in 0..30 {
+            s.bump("u1", "dir", &format!("/w/{}", i), "claude", T0 + i).unwrap();
         }
         let rows = s.candidates("u1", "dir").unwrap();
-        assert_eq!(rows.len(), 50, "候选上限 50，防表膨胀时读全表");
-        // 最近的先取（last_ms DESC）→ /w/59 必在其中，/w/0 必被截掉
-        assert!(rows.iter().any(|r| r.path == "/w/59"));
+        assert_eq!(rows.len(), 16, "候选上限 16（per-row 守卫 IO 是真正的约束）");
+        // 最近的先取（last_ms DESC）
+        assert!(rows.iter().any(|r| r.path == "/w/29"));
         assert!(!rows.iter().any(|r| r.path == "/w/0"));
     }
 }
 ```
 
-- [ ] **Step 2: 跑测试确认失败**
+- [ ] **Step 3: 跑测试确认失败**
 
 Run: `cargo test quick_targets 2>&1 | tail -20`
-Expected: 编译失败——`cannot find type QuickTargetStore` / `cannot find function decayed_score`（实现体还不存在）。
+Expected: **编译失败** —— `cannot find type QuickTargetStore in this scope` /
+`cannot find function decayed_score`。（因为 Step 1 已声明 mod，所以这里是真编译错，
+不是 "0 tests ok"。）
 
-- [ ] **Step 3: 写最小实现**
+- [ ] **Step 4: 写实现**
 
-在 `src/quick_targets.rs` **顶部**（测试模块之前）写入：
+在 `src/quick_targets.rs` 的测试模块**之前**插入：
 
 ```rust
 //! 常用目录/笔记的 frecency 排行（quick targets）。
 //! 一张表承载两种实例：kind='dir'（会话工作目录）与 kind='note'（vault 笔记）。
 //! 与 session_store 同库（~/.zeromux/zeromux.db），总是开启，不依赖 OAuth 模式。
 //!
+//! 行的身份是 (user_id, kind, path, agent)：同一目录用三个 agent 就是三行，各自
+//! 独立累积 frecency。这样每一行都自描述且稳定——单个 last_agent 会被最新一次 bump
+//! 覆盖，导致「行上的标签自己变、一击直达的结果跟着变」。
+//!
 //! 评分：指数半衰期。写入时只更新一行；衰减在 READ 时计算，故无需后台衰减任务
 //! 也无需周期性重写全表。衰减刻意在 Rust 里算而不在 SQL 里算——rusqlite 0.31
-//! bundled SQLite 不带 pow(),为此开 math 扩展或注册自定义函数不划算。
+//! bundled SQLite 不带 pow()，为此开 math 扩展或注册自定义函数不划算。
 
-use rusqlite::{params, Connection};
+use rusqlite::{params, Connection, OptionalExtension};
 use std::path::Path;
 use std::sync::Mutex;
 
 /// 半衰期 14 天（毫秒）。两周不碰的目标自然掉出 Top5。
 pub const HALF_LIFE_MS: i64 = 14 * 24 * 3600 * 1000;
-/// 未 pin 的返回条数。pinned 不占这些名额。
+/// 返回给前端的条数上限。这是 **显示** 上限——表里不删行。
+/// 基于排名的表内挤出会清零累积分，把纯 recency 的病重新引入 frecency
+/// （长期常用但暂时掉出 Top5 的目标将永远无法回榜）。
 pub const TOP_N: usize = 5;
-/// SQL 候选上限。实际量级是几十条，此上限只为防表意外膨胀时把全表读进内存。
-const CANDIDATE_LIMIT: i64 = 50;
+/// SQL 候选上限。约束不是内存而是 **读出时每行都要付一次文件系统守卫**
+/// （JuiceFS 上实测约 20ms/行）。为返回 5 行而校验 50 行是 10× 浪费；
+/// 16 留足冗余（坏行剔除后仍够凑满 5 条）。
+const CANDIDATE_LIMIT: i64 = 16;
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct QuickTargetRow {
     pub kind: String,
     pub path: String,
+    /// dir: 'claude'|'kiro'|'codex'|'tmux'；note: 空串。
+    /// 空串而非 NULL 是刻意的：SQLite 的 PRIMARY KEY 列允许 NULL 且 NULL != NULL，
+    /// 可空会让 note（agent 恒空）每打开一次就插一行。
+    pub agent: String,
     pub hits: i64,
     pub last_ms: i64,
     pub score_raw: f64,
-    pub pinned: bool,
-    /// 仅 kind='dir' 有意义：上次在此目录创建的会话类型。
-    pub last_agent: Option<String>,
 }
 
 /// 把累积分按距今时长做指数衰减。
-/// elapsed 为负（时钟回拨/NTP 调整）时钳到 0，避免放大分数。
+/// elapsed 为负（时钟回拨/NTP 校正）时钳到 0，避免放大分数。
 pub fn decayed_score(score_raw: f64, last_ms: i64, now_ms: i64) -> f64 {
     let elapsed = (now_ms - last_ms).max(0) as f64;
     score_raw * 0.5_f64.powf(elapsed / HALF_LIFE_MS as f64)
 }
 
-/// 拆成 (pinned, top)。pinned 全部返回且不占 TOP_N 名额——pin 是用户显式声明的
-/// 「常见目录」，若与算法竞争名额，pin 3 个就只剩 2 个自动推荐位，功能互相抵消。
-pub fn rank(rows: Vec<QuickTargetRow>, now_ms: i64) -> (Vec<QuickTargetRow>, Vec<QuickTargetRow>) {
-    let (mut pinned, mut rest): (Vec<_>, Vec<_>) = rows.into_iter().partition(|r| r.pinned);
-    let by_score_desc = |a: &QuickTargetRow, b: &QuickTargetRow| {
+/// 按衰减后分数降序取前 TOP_N 条。
+pub fn rank(rows: Vec<QuickTargetRow>, now_ms: i64) -> Vec<QuickTargetRow> {
+    let mut rows = rows;
+    rows.sort_by(|a, b| {
         decayed_score(b.score_raw, b.last_ms, now_ms)
             .partial_cmp(&decayed_score(a.score_raw, a.last_ms, now_ms))
             .unwrap_or(std::cmp::Ordering::Equal)
-    };
-    pinned.sort_by(by_score_desc);
-    rest.sort_by(by_score_desc);
-    rest.truncate(TOP_N);
-    (pinned, rest)
+    });
+    rows.truncate(TOP_N);
+    rows
 }
 
 pub struct QuickTargetStore {
@@ -290,12 +317,11 @@ impl QuickTargetStore {
                 user_id     TEXT NOT NULL,
                 kind        TEXT NOT NULL,
                 path        TEXT NOT NULL,
+                agent       TEXT NOT NULL DEFAULT '',
                 hits        INTEGER NOT NULL DEFAULT 0,
                 last_ms     INTEGER NOT NULL,
                 score_raw   REAL    NOT NULL DEFAULT 0,
-                pinned      INTEGER NOT NULL DEFAULT 0,
-                last_agent  TEXT,
-                PRIMARY KEY (user_id, kind, path)
+                PRIMARY KEY (user_id, kind, path, agent)
             );
             CREATE INDEX IF NOT EXISTS idx_qt_lookup
                 ON quick_targets(user_id, kind, last_ms DESC);",
@@ -308,9 +334,6 @@ impl QuickTargetStore {
     /// 首次插入直接置 score_raw=1.0（没有前一个 last_ms 可衰减）；再次 bump 时
     /// 先把旧分衰减到 now 再 +1.0。
     ///
-    /// last_agent=None 表示「本次不带类型信息」（kind='note' 恒为 None），
-    /// 不是「清空」——用 COALESCE 保留已有值。
-    ///
     /// 衰减刻意用「先读后写」而不是在 SQL 的 ON CONFLICT 分支里算：SQLite 没有
     /// pow()，无法在 UPDATE 里做指数衰减。读与写在同一把 Mutex 内，故不存在
     /// read-modify-write 竞态。
@@ -319,15 +342,15 @@ impl QuickTargetStore {
         user_id: &str,
         kind: &str,
         path: &str,
-        last_agent: Option<&str>,
+        agent: &str,
         now_ms: i64,
     ) -> Result<(), String> {
         let conn = self.conn.lock().unwrap();
         let existing: Option<(f64, i64)> = conn
             .query_row(
                 "SELECT score_raw, last_ms FROM quick_targets
-                 WHERE user_id = ?1 AND kind = ?2 AND path = ?3",
-                params![user_id, kind, path],
+                 WHERE user_id = ?1 AND kind = ?2 AND path = ?3 AND agent = ?4",
+                params![user_id, kind, path, agent],
                 |row| Ok((row.get(0)?, row.get(1)?)),
             )
             .optional()
@@ -337,9 +360,9 @@ impl QuickTargetStore {
             None => {
                 conn.execute(
                     "INSERT INTO quick_targets
-                       (user_id, kind, path, hits, last_ms, score_raw, pinned, last_agent)
-                     VALUES (?1, ?2, ?3, 1, ?4, 1.0, 0, ?5)",
-                    params![user_id, kind, path, now_ms, last_agent],
+                       (user_id, kind, path, agent, hits, last_ms, score_raw)
+                     VALUES (?1, ?2, ?3, ?4, 1, ?5, 1.0)",
+                    params![user_id, kind, path, agent, now_ms],
                 )
                 .map_err(|e| format!("bump insert failed: {}", e))?;
             }
@@ -347,12 +370,11 @@ impl QuickTargetStore {
                 let next = decayed_score(score_raw, last_ms, now_ms) + 1.0;
                 conn.execute(
                     "UPDATE quick_targets SET
-                       hits       = hits + 1,
-                       score_raw  = ?4,
-                       last_ms    = ?5,
-                       last_agent = COALESCE(?6, last_agent)
-                     WHERE user_id = ?1 AND kind = ?2 AND path = ?3",
-                    params![user_id, kind, path, next, now_ms, last_agent],
+                       hits      = hits + 1,
+                       score_raw = ?5,
+                       last_ms   = ?6
+                     WHERE user_id = ?1 AND kind = ?2 AND path = ?3 AND agent = ?4",
+                    params![user_id, kind, path, agent, next, now_ms],
                 )
                 .map_err(|e| format!("bump update failed: {}", e))?;
             }
@@ -366,10 +388,10 @@ impl QuickTargetStore {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn
             .prepare(
-                "SELECT kind, path, hits, last_ms, score_raw, pinned, last_agent
+                "SELECT kind, path, agent, hits, last_ms, score_raw
                  FROM quick_targets
                  WHERE user_id = ?1 AND kind = ?2
-                 ORDER BY pinned DESC, last_ms DESC
+                 ORDER BY last_ms DESC
                  LIMIT ?3",
             )
             .map_err(|e| format!("prepare failed: {}", e))?;
@@ -378,11 +400,10 @@ impl QuickTargetStore {
                 Ok(QuickTargetRow {
                     kind: row.get(0)?,
                     path: row.get(1)?,
-                    hits: row.get(2)?,
-                    last_ms: row.get(3)?,
-                    score_raw: row.get(4)?,
-                    pinned: row.get::<_, i64>(5)? != 0,
-                    last_agent: row.get(6)?,
+                    agent: row.get(2)?,
+                    hits: row.get(3)?,
+                    last_ms: row.get(4)?,
+                    score_raw: row.get(5)?,
                 })
             })
             .map_err(|e| format!("query failed: {}", e))?;
@@ -393,46 +414,19 @@ impl QuickTargetStore {
         Ok(out)
     }
 
-    /// 置/取消 pin。只能改动已存在的行——返回 false 表示没有匹配行（不存在，
-    /// 或属于别的 user）。刻意不 upsert：能凭空插入 path 的写端点等于让前端
-    /// 伪造使用历史，与被否决的公开 bump 端点是同一个洞。
-    pub fn set_pinned(&self, user_id: &str, kind: &str, path: &str, pinned: bool) -> Result<bool, String> {
-        let conn = self.conn.lock().unwrap();
-        let n = conn
-            .execute(
-                "UPDATE quick_targets SET pinned = ?4
-                 WHERE user_id = ?1 AND kind = ?2 AND path = ?3",
-                params![user_id, kind, path, pinned as i64],
-            )
-            .map_err(|e| format!("set_pinned failed: {}", e))?;
-        Ok(n > 0)
-    }
-
-    /// 从榜上移除。owner-scope 与 read 对称（教训：2026-08-09 push 订阅跨用户劫持）。
-    pub fn forget(&self, user_id: &str, kind: &str, path: &str) -> Result<(), String> {
+    /// 从榜上移除一行。owner-scope 与 read 对称（教训：2026-08-09 push 订阅跨用户劫持）。
+    /// agent 参与匹配：只删指定的「目录 + agent」组合，同目录其它 agent 的行不受影响。
+    pub fn forget(&self, user_id: &str, kind: &str, path: &str, agent: &str) -> Result<(), String> {
         let conn = self.conn.lock().unwrap();
         conn.execute(
-            "DELETE FROM quick_targets WHERE user_id = ?1 AND kind = ?2 AND path = ?3",
-            params![user_id, kind, path],
+            "DELETE FROM quick_targets
+             WHERE user_id = ?1 AND kind = ?2 AND path = ?3 AND agent = ?4",
+            params![user_id, kind, path, agent],
         )
         .map_err(|e| format!("forget failed: {}", e))?;
         Ok(())
     }
 }
-```
-
-顶部 import 用（`optional()` 需要 `OptionalExtension`）：
-
-```rust
-use rusqlite::{params, Connection, OptionalExtension};
-```
-
-- [ ] **Step 4: 注册模块**
-
-在 `src/main.rs` 的 mod 声明区（`mod prompts;` 附近）加一行：
-
-```rust
-mod quick_targets;
 ```
 
 - [ ] **Step 5: 跑测试确认通过**
@@ -446,10 +440,14 @@ Expected: PASS，13 个测试全绿。
 git add src/quick_targets.rs src/main.rs
 git commit -m "feat(quick-targets): frecency 存储层 + 指数半衰期评分纯函数
 
-一张 quick_targets 表承载 kind='dir'|'note' 两种实例。衰减在 Rust 算不在
-SQL 算(rusqlite bundled 无 pow(),不为此加构建依赖);bump 的 read-modify-write
-在同一把 Mutex 内故无竞态。pinned 不占 TOP_N 名额;set_pinned/forget 与读
-对称地 owner-scope,且 set_pinned 只能改已存在的行(不能凭空插入 path)。
+行的身份是 (user_id, kind, path, agent):同一目录用三个 agent 就是三行,各自独立
+累积 frecency、标签稳定不漂移(单个 last_agent 会被最新一次 bump 覆盖,导致行上
+标签自己变)。agent 用 NOT NULL DEFAULT '' 而非可空:已实测 SQLite 的 PK 列允许
+NULL 且 NULL!=NULL,可空会让 note(agent 恒空)每打开一次就插一行。
+
+衰减在 Rust 算不在 SQL 算(rusqlite bundled 无 pow());bump 的 read-modify-write
+在同一把 Mutex 内故无竞态。TOP_N 是显示上限,表里不删行——基于排名的挤出会清零
+累积分,把纯 recency 的病重新引入 frecency。
 
 Co-Authored-By: Claude Opus 5 (1M context) <noreply@anthropic.com>"
 ```
@@ -459,7 +457,7 @@ Co-Authored-By: Claude Opus 5 (1M context) <noreply@anthropic.com>"
 ### Task 2: 接入 AppState + 两处 bump 落点
 
 **Files:**
-- Modify: `src/main.rs:129-155`（`AppState` 加字段）、`src/main.rs:261`（open store 并注入）
+- Modify: `src/main.rs:129-155`（`AppState` 加字段）、`src/main.rs:260-263` 之后（open store）
 - Modify: `src/web.rs:395`（`create_session` 成功分支 bump）、`src/web.rs:3448`（`vault_file` 成功分支 bump）
 
 **Interfaces:**
@@ -468,7 +466,7 @@ Co-Authored-By: Claude Opus 5 (1M context) <noreply@anthropic.com>"
 
 - [ ] **Step 1: AppState 加字段**
 
-`src/main.rs` 的 `pub struct AppState`（约 `L129`）在 `pub vault_index:` 之后加：
+`src/main.rs` 的 `pub struct AppState`（`L129-155`）在 `pub vault_index:` 之后加：
 
 ```rust
     pub quick_targets: Arc<quick_targets::QuickTargetStore>,
@@ -476,7 +474,7 @@ Co-Authored-By: Claude Opus 5 (1M context) <noreply@anthropic.com>"
 
 - [ ] **Step 2: 启动时 open store**
 
-`src/main.rs` 中 `session_store` 那一段（约 `L261`）之后加：
+`src/main.rs` 中 `session_store` 那一段（`L260-263`）之后加：
 
 ```rust
     // 常用目录/笔记 frecency。与 sessions 同库、总是开启（不依赖 OAuth 模式）：
@@ -487,11 +485,13 @@ Co-Authored-By: Claude Opus 5 (1M context) <noreply@anthropic.com>"
     );
 ```
 
-并在构造 `AppState { ... }` 的字面量里加一行 `quick_targets: quick_targets_store,`（紧随 `vault_index` 之后，保持与结构体字段同序）。
+并在构造 `AppState { ... }` 的字面量里加 `quick_targets: quick_targets_store,`
+（紧随 `vault_index` 之后，与结构体字段同序）。
 
 - [ ] **Step 3: `create_session` 成功分支 bump**
 
-`src/web.rs` 的 `create_session`（`L395`）中，`let id = match req.session_type { ... };` 之后、返回 `Json` 之前插入：
+`src/web.rs` 的 `create_session`（`L395`）中，`let id = match req.session_type { ... };`
+之后、返回 `Json` 之前插入：
 
 ```rust
     // 记一次「用户真的去了那里」。刻意写在 HTTP handler 层而不下沉到
@@ -499,55 +499,78 @@ Co-Authored-By: Claude Opus 5 (1M context) <noreply@anthropic.com>"
     // 那条独立路径，把 bump 留在这里，「cron 不污染 frecency」就是架构保证，
     // 而不是一行在未来重构里容易丢失的 if。
     //
-    // 记 req 提交的 work_dir 而非 resolve_work_dir 之后的 effective_dir:
-    // 开启 --worktree-isolation 时后者是 .zeromux-worktrees/<id>/ 这类一次性
-    // 路径,记它下次点击必然失效。
+    // 三个刻意的取舍：
+    // 1. 记 req 提交的 work_dir 而非 resolve_work_dir 之后的 effective_dir——
+    //    开启 --worktree-isolation 时后者是 .zeromux-worktrees/<id>/ 这类一次性
+    //    路径，记它下次点击必然失效。
+    // 2. 用 canonicalize 后的路径，否则 /home/ubuntu/x 与 /home/ubuntu/x/ 会存成
+    //    两行。canonicalize 只解 symlink，不是 resolve_work_dir 的 worktree 改写，
+    //    所以与上一条不冲突。
+    // 3. attach 既有 host tmux（tmux_target.is_some()）不记：那条路径上用户没有
+    //    选目录，work_dir 是 state.work_dir 的兜底值（线上即 --work-dir
+    //    /home/ubuntu），记它等于往榜上插一条用户从未选择过的 ~。
     //
-    // best-effort: 一个「记住我去过哪」的功能没有资格让会话创建失败。
-    if let Err(e) = state.quick_targets.bump(
-        &owner_id,
-        "dir",
-        &work_dir,
-        Some(&type_label),
-        std::time::SystemTime::now()
+    // best-effort：一个「记住我去过哪」的功能没有资格让会话创建失败。
+    if req.tmux_target.is_none() {
+        let now_ms = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_millis() as i64)
-            .unwrap_or(0),
-    ) {
-        eprintln!("quick_targets bump (dir) skipped: {}", e);
+            .unwrap_or(0);
+        // now_ms == 0 只在系统时钟早于 UNIX_EPOCH 时出现。写进 last_ms 会让该行的
+        // 衰减基准永久错位，而 bump 本就允许失败，所以直接跳过。
+        if now_ms > 0 {
+            let canonical_dir = std::path::Path::new(&work_dir)
+                .canonicalize()
+                .map(|p| p.to_string_lossy().to_string())
+                .unwrap_or_else(|_| work_dir.clone());
+            if let Err(e) = state.quick_targets.bump(
+                &owner_id, "dir", &canonical_dir, &type_label, now_ms,
+            ) {
+                eprintln!("quick_targets bump (dir) skipped: {}", e);
+            }
+        }
     }
 ```
 
-（已核实 `session_manager.rs:259` 的 `now_millis` **没有** `pub`，故不能跨模块调用——
-上面内联 `SystemTime` 即最终形态，无需再判断。）
+**注意 `type_label` 对 tmux 就是 `"tmux"`，这是刻意保留的**（`web.rs:400`）：在某目录开
+一个终端确实是「用户真的去了那里」，而 `(path, "tmux")` 是独立一行，不会污染同目录的
+`(path, "claude")`。
 
 - [ ] **Step 4: `vault_file` 成功分支 bump**
 
-`src/web.rs` 的 `vault_file`（`L3448`）末尾，`let (content, truncated) = read_text_file_capped(&real)?;` 之后、`Ok(Json(...))` 之前插入：
+`src/web.rs` 的 `vault_file`（`L3448`）末尾，`let (content, truncated) = read_text_file_capped(&real)?;`
+之后、`Ok(Json(...))` 之前插入：
 
 ```rust
-    // 笔记打开成功才记（失败/403 分支不记）。kind='note' 无 agent 概念 → None。
-    if let Err(e) = state.quick_targets.bump(
-        &user.id,
-        "note",
-        &q.path,
-        None,
-        std::time::SystemTime::now()
+    // 笔记打开成功才记（失败/403 分支不记）。
+    //
+    // 记规范化后的 vault-relative 路径而非 q.path：resolve_and_verify 接受
+    // CurDir/ParentDir 组件，所以 "a/b.md"、"./a/b.md"、"a/../a/b.md" 解析到同一
+    // 文件，直接记 q.path 会存成 3 行、各自累积、首屏出现 3 条同名条目——与本功能
+    // 「靠父目录区分同名 _index.md」的目标正好相反。
+    //
+    // agent 传空串：note 无 agent 概念。空串而非 NULL 是 PK 去重的前提。
+    if let Some(rel) = real.strip_prefix(base_path).ok().map(|p| p.to_string_lossy().to_string()) {
+        let now_ms = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_millis() as i64)
-            .unwrap_or(0),
-    ) {
-        eprintln!("quick_targets bump (note) skipped: {}", e);
+            .unwrap_or(0);
+        if now_ms > 0 {
+            if let Err(e) = state.quick_targets.bump(&user.id, "note", &rel, "", now_ms) {
+                eprintln!("quick_targets bump (note) skipped: {}", e);
+            }
+        }
     }
 ```
 
-- [ ] **Step 5: 编译验证**
+- [ ] **Step 5: 编译 + 全量测试**
 
 Run: `cargo check 2>&1 | tail -20`
-Expected: 无错误。若报 `AppState` 字段缺失，检查是否所有构造 `AppState` 的地方（含测试）都加了新字段。
+Expected: 无错误。若报 `AppState` 字段缺失，检查所有构造 `AppState` 的地方（含测试）
+是否都加了新字段。
 
 Run: `cargo test 2>&1 | tail -15`
-Expected: 全部既有测试仍绿 + Task 1 的 13 个绿。
+Expected: 既有测试全绿 + Task 1 的 13 个绿。
 
 - [ ] **Step 6: Commit**
 
@@ -557,36 +580,43 @@ git commit -m "feat(quick-targets): 接入 AppState + create_session/vault_file 
 
 bump 只写在 web.rs 的交互式 handler,不下沉 session_manager——定时任务走
 create_acp_session_tagged 独立路径,故「cron 不污染 frecency」是架构保证。
-记 req.work_dir 而非 effective_dir(worktree 隔离下后者是一次性路径)。
-两处 bump 均 best-effort,失败只记日志不影响主流程。
+三处刻意取舍:记 work_dir 而非 effective_dir(worktree 隔离下后者是一次性路径);
+canonicalize 以免尾斜杠存两行;attach 既有 host tmux 不记(那条路径用户没选目录,
+work_dir 是兜底的 ~)。note 侧记 strip_prefix 后的相对路径,否则 ./a.md 与 a.md
+会存成两行。now_ms==0(时钟早于 epoch)直接跳过,不把坏基准写进 last_ms。
 
 Co-Authored-By: Claude Opus 5 (1M context) <noreply@anthropic.com>"
 ```
 
 ---
-
-### Task 3: 三个 REST 端点 + 读出时守卫自愈
+### Task 3: 两个 REST 端点 + 三态守卫自愈（含 `spawn_blocking`）
 
 **Files:**
-- Modify: `src/web.rs:65`（路由注册，authed `/api/*` 组内）
-- Modify: `src/web.rs`（新增 3 个 handler + 1 个纯函数，建议紧邻 `list_directories` 之后即 `L300` 附近）
+- Modify: `src/web.rs:65`（路由注册，authed `/api/*` 组内，`/api/directories` 之后）
+- Modify: `src/web.rs`（新增 2 个 handler + 3 个纯函数，建议紧邻 `list_directories` 之后即 `L300` 附近）
 
 **Interfaces:**
-- Consumes: Task 2 的 `state.quick_targets`；既有守卫 `validate_browse_root`（`web.rs:1075`）、`read_hits_home_dotdir`（`web.rs:1242`）、`vault_base`（`web.rs:3364`）、`resolve_and_verify`
-- Produces: HTTP 端点
-  - `GET /api/quick-targets?kind=dir|note` → `{ pinned: [...], top: [...] }`
-  - `POST /api/quick-targets/pin` ← `{ kind, path, pinned }`
-  - `DELETE /api/quick-targets` ← `{ kind, path }`
-  - 条目 JSON：`{ kind, path, display, hint, pinned, last_agent, is_git }`
+- Consumes: Task 2 的 `state.quick_targets`；既有守卫（**全部已核实位于 `web.rs` 同文件，直接可调**）：
+  `validate_browse_root`（`L1075`）、`descends_into_sensitive_dir`（`L1222`）、
+  `read_hits_home_dotdir`（`L1242`）、`resolve_and_verify`（`L1491`）、
+  `vault_path_has_dot_component`（`L3341`）、`vault_real_hits_dot_component`（`L3352`）、
+  `vault_base`（`L3364`）
+- Produces:
+  - `GET /api/quick-targets?kind=dir|note` → `{ top: [...] }`
+  - `DELETE /api/quick-targets?kind=&path=&agent=` → 204
+  - 条目 JSON：`{ kind, path, agent, display, hint }`
+  - `fn dir_display_hint(path: &str, home: &str) -> (String, String)`
+  - `fn note_display_hint(rel_path: &str) -> (String, String)`
+  - `enum TargetValidity { Valid, Invalid, Unknown }`
 
 - [ ] **Step 1: 写失败的测试**
 
-在 `src/web.rs` 既有的 `#[cfg(test)] mod tests` 内追加（该模块已存在，见 `web.rs:3732` 附近的 `validate_browse_root_accepts_normal_rejects_sensitive`）：
+在 `src/web.rs` 既有的路径安全测试模块内追加（模块名 `path_safety_tests`，
+锚点：`validate_browse_root_accepts_normal_rejects_sensitive` 在 `L3732` 附近）：
 
 ```rust
     #[test]
     fn quick_target_display_and_hint_for_dir() {
-        // dir: display=basename, hint=以 ~ 缩写的父路径
         let (d, h) = dir_display_hint("/home/ubuntu/s3-workspace/keith-space/ai/zeromux", "/home/ubuntu");
         assert_eq!(d, "zeromux");
         assert_eq!(h, "~/s3-workspace/keith-space/ai");
@@ -600,8 +630,15 @@ Co-Authored-By: Claude Opus 5 (1M context) <noreply@anthropic.com>"
     }
 
     #[test]
+    fn quick_target_dir_hint_does_not_abbreviate_sibling_of_home() {
+        // /home/ubuntu-backup 只是与 $HOME 共前缀的兄弟目录，不能被缩写成 "~-backup"。
+        // 纯字符串 starts_with 会误判，必须按路径边界比较。
+        let (_, h) = dir_display_hint("/home/ubuntu-backup/x/y", "/home/ubuntu");
+        assert_eq!(h, "/home/ubuntu-backup/x", "共前缀的兄弟目录不得缩写");
+    }
+
+    #[test]
     fn quick_target_display_and_hint_for_note() {
-        // note: display=笔记名去 .md, hint=父目录相对路径
         let (d, h) = note_display_hint("projects/long-term/考研英语/_index.md");
         assert_eq!(d, "_index");
         assert_eq!(h, "projects/long-term/考研英语");
@@ -624,35 +661,38 @@ Co-Authored-By: Claude Opus 5 (1M context) <noreply@anthropic.com>"
 - [ ] **Step 2: 跑测试确认失败**
 
 Run: `cargo test quick_target_ 2>&1 | tail -15`
-Expected: 编译失败——`cannot find function dir_display_hint` / `note_display_hint`。
+Expected: 编译失败 —— `cannot find function dir_display_hint` / `note_display_hint`。
 
-- [ ] **Step 3: 写两个纯函数**
+- [ ] **Step 3: 写三个纯函数**
 
 在 `src/web.rs` 的 `list_directories` 之后（`L300` 附近）加：
 
 ```rust
 /// dir 条目的展示对：(display=basename, hint=以 ~ 缩写的父路径)。
-/// hint 存在的意义是区分同名 basename（多个 repo 都有 `scripts/`）。
+/// hint 的存在意义是区分同名 basename（多个 repo 都有 `scripts/`）。
+///
+/// 用 Path::strip_prefix 而非字符串 starts_with：后者会把 /home/ubuntu-backup
+/// 误判为 $HOME 的子路径，缩写成 "~-backup"。
 fn dir_display_hint(path: &str, home: &str) -> (String, String) {
     let p = std::path::Path::new(path);
     let display = p
         .file_name()
         .map(|n| n.to_string_lossy().to_string())
         .unwrap_or_else(|| path.to_string());
-    let parent = p
-        .parent()
-        .map(|x| x.to_string_lossy().to_string())
-        .unwrap_or_default();
-    let hint = if !home.is_empty() && parent.starts_with(home) {
-        parent.replacen(home, "~", 1)
-    } else {
-        parent
+    let parent = match p.parent() {
+        Some(x) => x,
+        None => return (display, String::new()),
+    };
+    let hint = match parent.strip_prefix(home) {
+        Ok(rel) if rel.as_os_str().is_empty() => "~".to_string(),
+        Ok(rel) => format!("~/{}", rel.to_string_lossy()),
+        Err(_) => parent.to_string_lossy().to_string(),
     };
     (display, hint)
 }
 
 /// note 条目的展示对：(display=笔记名去 .md, hint=父目录相对路径)。
-/// vault 内 `_index.md` 不止一个,只显示 basename 无法分辨 → 必须带父目录。
+/// vault 内 `_index.md` 不止一个，只显示 basename 无法分辨 → 必须带父目录。
 fn note_display_hint(rel_path: &str) -> (String, String) {
     let (dir, base) = match rel_path.rfind('/') {
         Some(i) => (&rel_path[..i], &rel_path[i + 1..]),
@@ -665,37 +705,98 @@ fn note_display_hint(rel_path: &str) -> (String, String) {
     };
     (display, dir.to_string())
 }
+
+/// 一条历史行现在还能不能用。三态而非 bool 是刻意的 —— 见 Invalid/Unknown 的区别。
+enum TargetValidity {
+    /// 校验通过，返回给前端。
+    Valid,
+    /// 确定性拒绝（不在 $HOME 下 / 命中敏感目录 / 不是目录 / NotFound）→ 删行。
+    Invalid,
+    /// 瞬时 IO 失败（JuiceFS 抖动让 canonicalize 失败）→ 本次不返回，但保留行。
+    /// 若把这种情况也删行，用户的常用目录会因为一次文件系统抖动丢掉几周累积的
+    /// frecency。
+    Unknown,
+}
 ```
 
 - [ ] **Step 4: 跑测试确认通过**
 
 Run: `cargo test quick_target_ 2>&1 | tail -15`
-Expected: PASS，5 个绿。
+Expected: PASS，6 个绿。
 
-- [ ] **Step 5: 写三个 handler**
+- [ ] **Step 5: 写校验函数 + 两个 handler**
 
-紧随上面两个纯函数加入：
+紧随上面三个纯函数加入：
 
 ```rust
+/// dir 行的校验：与 list_directories 完全相同的守卫组合（web.rs:248-252），
+/// 而不是「存的时候合法所以永远合法」—— 存的是历史，路径可能已被删除、已被替换为
+/// 指向 ~/.ssh 的 symlink、或守卫规则本身已升级加严。
+fn validate_dir_target(path: &str) -> TargetValidity {
+    let p = std::path::Path::new(path);
+    // 先用 symlink_metadata 区分「不存在」（确定性）与「其它 IO 错误」（瞬时）。
+    match p.symlink_metadata() {
+        Ok(_) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return TargetValidity::Invalid,
+        Err(_) => return TargetValidity::Unknown,
+    }
+    let canonical = match p.canonicalize() {
+        Ok(c) => c,
+        // 路径存在但 canonicalize 失败 → 瞬时 IO / 权限，保留行。
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return TargetValidity::Invalid,
+        Err(_) => return TargetValidity::Unknown,
+    };
+    // validate_browse_root 做 canonicalize + under-$HOME + is-dir + 敏感目录拒绝。
+    // 它内部会再 canonicalize 一次；这里已确认路径可 canonicalize，故其失败即确定性拒绝。
+    if validate_browse_root(path).is_err() {
+        return TargetValidity::Invalid;
+    }
+    if read_hits_home_dotdir(&canonical) || !canonical.is_dir() {
+        return TargetValidity::Invalid;
+    }
+    TargetValidity::Valid
+}
+
+/// note 行的校验：仍在 vault 内、无 dot 组件、非敏感、文件仍存在。
+fn validate_note_target(base: &str, rel: &str) -> TargetValidity {
+    if vault_path_has_dot_component(rel) {
+        return TargetValidity::Invalid;
+    }
+    let base_path = std::path::Path::new(base);
+    let joined = base_path.join(rel);
+    match joined.symlink_metadata() {
+        Ok(_) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return TargetValidity::Invalid,
+        Err(_) => return TargetValidity::Unknown,
+    }
+    let real = match resolve_and_verify(base_path, rel) {
+        Ok(p) => p,
+        Err(_) => return TargetValidity::Invalid,
+    };
+    if descends_into_sensitive_dir(base_path, &real)
+        || vault_real_hits_dot_component(base_path, &real)
+        || !real.is_file()
+    {
+        return TargetValidity::Invalid;
+    }
+    TargetValidity::Valid
+}
+
 #[derive(serde::Deserialize)]
 struct QuickTargetQuery {
     kind: String,
 }
 
 #[derive(serde::Deserialize)]
-struct QuickTargetPinReq {
+struct QuickTargetForgetQuery {
     kind: String,
     path: String,
-    pinned: bool,
+    #[serde(default)]
+    agent: String,
 }
 
-#[derive(serde::Deserialize)]
-struct QuickTargetForgetReq {
-    kind: String,
-    path: String,
-}
-
-/// 只接受这两种 kind；其它一律 400（防止用任意 kind 字符串把表当通用 KV 用）。
+/// 只接受这两种 kind；其它一律 400（防止用任意 kind 字符串把表当通用 KV 用，
+/// 也防止 still_valid 的 else 分支把未知 kind 当 note 处理）。
 fn validate_kind(kind: &str) -> Result<(), (StatusCode, String)> {
     if kind == "dir" || kind == "note" {
         Ok(())
@@ -704,12 +805,6 @@ fn validate_kind(kind: &str) -> Result<(), (StatusCode, String)> {
     }
 }
 
-/// 读出时对每条重新校验，失败即剔除 + 删行（自愈）。
-///
-/// 存的是历史，而历史里的路径可能已被删除、已被替换为指向 ~/.ssh 的 symlink、
-/// 或守卫规则本身已升级加严。所以这里跑与 list_directories 完全相同的守卫组合
-/// （validate_browse_root + read_hits_home_dotdir），而不是「存的时候合法所以
-/// 永远合法」。顺手删行，避免同一条坏路径每次都重复校验。
 async fn list_quick_targets(
     State(state): State<Arc<AppState>>,
     user: axum::Extension<CurrentUser>,
@@ -717,10 +812,15 @@ async fn list_quick_targets(
 ) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
     validate_kind(&q.kind)?;
     // note 的可见性跟 vault 一致：vault 未配置或调用者非 admin → 空列表（而不是
-    // 泄漏「有哪些笔记曾被打开」）。
-    if q.kind == "note" && vault_base(&state, &user).is_err() {
-        return Ok(Json(serde_json::json!({ "pinned": [], "top": [] })));
-    }
+    // 泄漏「有哪些笔记曾被打开」）。注意这个早退也保护了历史数据：不走到下面的
+    // 校验循环，就不会因为 vault 暂时未配置而把全部 note 行删光。
+    let vault_dir: Option<String> = match vault_base(&state, &user) {
+        Ok(b) => Some(b.to_string()),
+        Err(_) if q.kind == "note" => {
+            return Ok(Json(serde_json::json!({ "top": [] })));
+        }
+        Err(_) => None,
+    };
 
     let rows = state
         .quick_targets
@@ -728,120 +828,89 @@ async fn list_quick_targets(
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
 
     let home = std::env::var("HOME").unwrap_or_else(|_| "/home/ubuntu".to_string());
-    let mut alive = Vec::new();
-    for r in rows {
-        if quick_target_still_valid(&state, &user, &r) {
-            alive.push(r);
-        } else {
-            // 坏行就地清理；失败只忽略（下次还会再试）。
-            let _ = state.quick_targets.forget(&user.id, &r.kind, &r.path);
+
+    // 每行的守卫都是同步文件系统 IO，JuiceFS 上实测约 20ms/行（canonicalize 约
+    // 10ms + metadata 约 10ms）。候选上限 16 → 最坏约 320ms。绝不能在 tokio worker
+    // 上同步阻塞这么久（只有 8 个 worker，且首屏每次打开都会走这条路径，事件驱动
+    // 刷新还会把频率乘上去）。挪进 spawn_blocking。
+    let kind = q.kind.clone();
+    let rows_for_task = rows.clone();
+    let vault_for_task = vault_dir.clone();
+    let (alive, dead) = tokio::task::spawn_blocking(move || {
+        let mut alive = Vec::new();
+        let mut dead = Vec::new();
+        for r in rows_for_task {
+            let verdict = if kind == "dir" {
+                validate_dir_target(&r.path)
+            } else {
+                match vault_for_task.as_deref() {
+                    Some(base) => validate_note_target(base, &r.path),
+                    None => TargetValidity::Unknown,
+                }
+            };
+            match verdict {
+                TargetValidity::Valid => alive.push(r),
+                TargetValidity::Invalid => dead.push(r),
+                TargetValidity::Unknown => {} // 本次不返回，保留行
+            }
         }
+        (alive, dead)
+    })
+    .await
+    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("validation task failed: {}", e)))?;
+
+    // 确定性失效的行就地清理；失败只忽略（下次还会再试）。
+    for r in &dead {
+        let _ = state.quick_targets.forget(&user.id, &r.kind, &r.path, &r.agent);
     }
 
     let now_ms = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_millis() as i64)
         .unwrap_or(0);
-    let (pinned, top) = crate::quick_targets::rank(alive, now_ms);
+    let top = crate::quick_targets::rank(alive, now_ms);
 
-    let to_json = |r: &crate::quick_targets::QuickTargetRow| {
-        let (display, hint) = if r.kind == "dir" {
-            dir_display_hint(&r.path, &home)
-        } else {
-            note_display_hint(&r.path)
-        };
-        let is_git = r.kind == "dir" && std::path::Path::new(&r.path).join(".git").exists();
-        serde_json::json!({
-            "kind": r.kind,
-            "path": r.path,
-            "display": display,
-            "hint": hint,
-            "pinned": r.pinned,
-            "last_agent": r.last_agent,
-            "is_git": is_git,
+    let items: Vec<_> = top
+        .iter()
+        .map(|r| {
+            let (display, hint) = if r.kind == "dir" {
+                dir_display_hint(&r.path, &home)
+            } else {
+                note_display_hint(&r.path)
+            };
+            serde_json::json!({
+                "kind": r.kind,
+                "path": r.path,
+                "agent": r.agent,
+                "display": display,
+                "hint": hint,
+            })
         })
-    };
+        .collect();
 
-    Ok(Json(serde_json::json!({
-        "pinned": pinned.iter().map(to_json).collect::<Vec<_>>(),
-        "top": top.iter().map(to_json).collect::<Vec<_>>(),
-    })))
+    Ok(Json(serde_json::json!({ "top": items })))
 }
 
-/// 一条历史行现在还能不能用。
-/// dir：与 list_directories 同一组守卫 + 仍是目录。
-/// note：仍在 vault 内、无 dot 组件、非敏感、文件仍存在。
-fn quick_target_still_valid(
-    state: &AppState,
-    user: &CurrentUser,
-    r: &crate::quick_targets::QuickTargetRow,
-) -> bool {
-    if r.kind == "dir" {
-        let canonical = match validate_browse_root(&r.path) {
-            Ok(p) => p,
-            Err(_) => return false,
-        };
-        if read_hits_home_dotdir(&canonical) {
-            return false;
-        }
-        return canonical.is_dir();
-    }
-    // note
-    let base = match vault_base(state, user) {
-        Ok(b) => b,
-        Err(_) => return false,
-    };
-    if vault_path_has_dot_component(&r.path) {
-        return false;
-    }
-    let base_path = std::path::Path::new(base);
-    let real = match resolve_and_verify(base_path, &r.path) {
-        Ok(p) => p,
-        Err(_) => return false,
-    };
-    if descends_into_sensitive_dir(base_path, &real) || vault_real_hits_dot_component(base_path, &real) {
-        return false;
-    }
-    real.is_file()
-}
-
-/// 置/取消 pin。404 = 该 user 名下无此行——刻意不 upsert：能凭空插入 path 的
-/// 写端点等于伪造使用历史，与被否决的公开 bump 端点是同一个洞。
-async fn pin_quick_target(
-    State(state): State<Arc<AppState>>,
-    user: axum::Extension<CurrentUser>,
-    Json(req): Json<QuickTargetPinReq>,
-) -> Result<StatusCode, (StatusCode, String)> {
-    validate_kind(&req.kind)?;
-    let updated = state
-        .quick_targets
-        .set_pinned(&user.id, &req.kind, &req.path, req.pinned)
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
-    if updated {
-        Ok(StatusCode::NO_CONTENT)
-    } else {
-        Err((StatusCode::NOT_FOUND, "quick target not found".into()))
-    }
-}
-
+/// 从榜上移除。用 query param 而不是 JSON body：api.ts 全部 7 处 DELETE 调用都没有
+/// body（如 deleteSessionFile 用 ?path=），DELETE-with-body 在 RFC 9110 里语义未定义
+/// 且会被中间层（这里是 nginx 反代）丢弃 → axum 的 Json 提取器 400 → 前端 catch
+/// 静默吞掉 → 表现为「移除按钮不管用」。
 async fn forget_quick_target(
     State(state): State<Arc<AppState>>,
     user: axum::Extension<CurrentUser>,
-    Json(req): Json<QuickTargetForgetReq>,
+    Query(q): Query<QuickTargetForgetQuery>,
 ) -> Result<StatusCode, (StatusCode, String)> {
-    validate_kind(&req.kind)?;
+    validate_kind(&q.kind)?;
     state
         .quick_targets
-        .forget(&user.id, &req.kind, &req.path)
+        .forget(&user.id, &q.kind, &q.path, &q.agent)
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
     Ok(StatusCode::NO_CONTENT)
 }
 ```
 
-本 handler 用到的六个守卫已核实全部位于 `web.rs` 同文件内，直接可调，无需改可见性：
-`validate_browse_root`（`L1075`）、`descends_into_sensitive_dir`（`L1222`）、
-`read_hits_home_dotdir`（`L1242`）、`resolve_and_verify`（`L1491`）、
-`vault_path_has_dot_component`（`L3341`）、`vault_real_hits_dot_component`（`L3352`）。
+**`QuickTargetRow` 需要 `Clone`**（上面 `rows.clone()` 用到）—— Task 1 的定义已带
+`#[derive(Debug, Clone, PartialEq)]`，无需改动。
 
 - [ ] **Step 6: 注册路由**
 
@@ -849,62 +918,59 @@ async fn forget_quick_target(
 
 ```rust
         .route("/api/quick-targets", get(list_quick_targets).delete(forget_quick_target))
-        .route("/api/quick-targets/pin", post(pin_quick_target))
 ```
 
 - [ ] **Step 7: 编译 + 全量测试**
 
 Run: `cargo test 2>&1 | tail -15`
-Expected: 全绿（既有 + Task 1 的 13 + Task 3 的 5）。
+Expected: 全绿（既有 + Task 1 的 13 + Task 3 的 6）。
 
 - [ ] **Step 8: Commit**
 
 ```bash
 git add src/web.rs
-git commit -m "feat(quick-targets): 三个 REST 端点 + 读出时守卫自愈
+git commit -m "feat(quick-targets): 两个 REST 端点 + 三态守卫自愈
 
-GET 对每条历史行重跑 list_directories 同一组守卫(validate_browse_root +
-read_hits_home_dotdir)并剔除+删行——存的是历史,路径可能已被删/改指向
-~/.ssh/守卫已加严,不能「存时合法即永远合法」。note 的可见性跟随 vault_base,
-未配置或非 admin 返回空列表而不泄漏曾打开过哪些笔记。pin 只改已存在的行,
-无匹配返回 404 而不 upsert。
+GET 对每条历史行重跑 list_directories 同一组守卫,但三态而非 bool:确定性拒绝
+(不在 $HOME/命中敏感目录/不是目录/NotFound)才删行,瞬时 IO 失败只剔除保留行——
+否则用户常用目录会因一次 JuiceFS 抖动丢掉几周累积的 frecency。守卫循环整体挪进
+spawn_blocking:每行约 20ms 同步 IO,候选 16 行最坏约 320ms,不能占 tokio worker。
+
+DELETE 用 query param 而非 JSON body(api.ts 全部 7 处 DELETE 零先例,且 nginx
+反代会丢 body → axum Json 提取器 400 → 前端静默吞掉 → 表现为按钮不管用)。
+dir_display_hint 用 Path::strip_prefix 而非字符串 starts_with,否则
+/home/ubuntu-backup 会被误缩写成 ~-backup。
 
 Co-Authored-By: Claude Opus 5 (1M context) <noreply@anthropic.com>"
 ```
 
 ---
 
-### Task 4: 前端 API 封装 + `last_agent` 白名单纯函数
+### Task 4: 前端 API 封装 + agent 白名单 + 事件总线
 
 **Files:**
-- Modify: `frontend/src/lib/api.ts`（类型 + 3 个封装，建议加在 `listDirectories` 之后即 `L190` 附近）
+- Modify: `frontend/src/lib/api.ts`（类型 + 2 个封装，加在 `listDirectories` 之后即 `L190` 附近）
 - Create: `frontend/src/lib/quickTargets.ts`
+- Create: `frontend/src/lib/quickTargetsBus.ts`
 - Test: `frontend/src/lib/__tests__/quickTargets.test.ts`
 
 **Interfaces:**
-- Consumes: Task 3 的三个端点；既有 `api()` helper（`api.ts:92`）、`SessionType`（`api.ts:1`）
+- Consumes: Task 3 的两个端点；既有 `api()` helper（`api.ts:92`）、`SessionType`（`api.ts:1`）
 - Produces:
-  - `export interface QuickTarget { kind: 'dir' | 'note'; path: string; display: string; hint: string; pinned: boolean; last_agent: string | null; is_git: boolean }`
-  - `export interface QuickTargetList { pinned: QuickTarget[]; top: QuickTarget[] }`
-  - `listQuickTargets(kind: 'dir' | 'note'): Promise<QuickTargetList>`
-  - `pinQuickTarget(kind, path, pinned): Promise<void>`
-  - `forgetQuickTarget(kind, path): Promise<void>`
-  - `coerceAgent(v: string | null | undefined): SessionType | null`（`quickTargets.ts`）
-  - `flatten(list: QuickTargetList): QuickTarget[]`（`quickTargets.ts`）
+  - `export interface QuickTarget { kind: 'dir' | 'note'; path: string; agent: string; display: string; hint: string }`
+  - `listQuickTargets(kind: 'dir' | 'note'): Promise<{ top: QuickTarget[] }>`
+  - `forgetQuickTarget(kind, path, agent): Promise<void>`
+  - `coerceAgent(v: string | null | undefined): SessionType | null`
+  - `notifyQuickTargetsChanged(): void`、`subscribeQuickTargets(fn): () => void`
 
 - [ ] **Step 1: 写失败的测试**
 
 创建 `frontend/src/lib/__tests__/quickTargets.test.ts`：
 
 ```ts
-import { describe, it, expect } from 'vitest'
-import { coerceAgent, flatten } from '../quickTargets'
-import type { QuickTarget, QuickTargetList } from '../api'
-
-const t = (over: Partial<QuickTarget> = {}): QuickTarget => ({
-  kind: 'dir', path: '/w/a', display: 'a', hint: '~', pinned: false,
-  last_agent: null, is_git: false, ...over,
-})
+import { describe, it, expect, vi } from 'vitest'
+import { coerceAgent } from '../quickTargets'
+import { notifyQuickTargetsChanged, subscribeQuickTargets } from '../quickTargetsBus'
 
 describe('coerceAgent', () => {
   it('接受当前四种 SessionType', () => {
@@ -914,7 +980,11 @@ describe('coerceAgent', () => {
     expect(coerceAgent('tmux')).toBe('tmux')
   })
 
-  it('null / undefined → null（旧行或首次记录，退化到 pick-type）', () => {
+  it('空串 → null（note 行不参与 agent 校验）', () => {
+    expect(coerceAgent('')).toBeNull()
+  })
+
+  it('null / undefined → null', () => {
     expect(coerceAgent(null)).toBeNull()
     expect(coerceAgent(undefined)).toBeNull()
   })
@@ -922,26 +992,32 @@ describe('coerceAgent', () => {
   it('未知字符串 → null，绝不把脏值发给后端', () => {
     // 某个 agent 类型日后被移除时，库里的旧行会留下已失效的字符串。
     expect(coerceAgent('gemini')).toBeNull()
-    expect(coerceAgent('')).toBeNull()
     expect(coerceAgent('CLAUDE')).toBeNull()   // 大小写敏感，不做宽松匹配
   })
 })
 
-describe('flatten', () => {
-  it('pinned 在前，top 在后，顺序保持后端给的', () => {
-    const list: QuickTargetList = {
-      pinned: [t({ path: '/p1', pinned: true }), t({ path: '/p2', pinned: true })],
-      top: [t({ path: '/t1' }), t({ path: '/t2' })],
-    }
-    expect(flatten(list).map(x => x.path)).toEqual(['/p1', '/p2', '/t1', '/t2'])
+describe('quickTargetsBus', () => {
+  it('notify 触发所有订阅者', () => {
+    const a = vi.fn()
+    const b = vi.fn()
+    const offA = subscribeQuickTargets(a)
+    const offB = subscribeQuickTargets(b)
+    notifyQuickTargetsChanged()
+    expect(a).toHaveBeenCalledTimes(1)
+    expect(b).toHaveBeenCalledTimes(1)
+    offA(); offB()
   })
 
-  it('空列表安全', () => {
-    expect(flatten({ pinned: [], top: [] })).toEqual([])
+  it('退订后不再收到通知（组件 unmount 后不能泄漏）', () => {
+    const f = vi.fn()
+    const off = subscribeQuickTargets(f)
+    off()
+    notifyQuickTargetsChanged()
+    expect(f).not.toHaveBeenCalled()
   })
 
-  it('后端字段缺失时不崩（防御性：老后端/部分部署）', () => {
-    expect(flatten({} as QuickTargetList)).toEqual([])
+  it('无订阅者时 notify 不抛', () => {
+    expect(() => notifyQuickTargetsChanged()).not.toThrow()
   })
 })
 ```
@@ -956,21 +1032,43 @@ Expected: FAIL — `Failed to resolve import "../quickTargets"`。
 创建 `frontend/src/lib/quickTargets.ts`：
 
 ```ts
-import type { SessionType, QuickTarget, QuickTargetList } from './api'
+import type { SessionType } from './api'
 
-// 当前支持的会话类型。last_agent 是库里的字符串：某个 agent 类型日后被移除时
-// （如 kiro），旧行会留下已失效的值。用白名单校验后再用，而不是把脏字符串
-// 原样发给后端。
+// 当前支持的会话类型。agent 是库里的字符串：某个 agent 类型日后被移除时（如 kiro），
+// 旧行会留下已失效的值。用白名单校验后再用，而不是把脏字符串原样发给后端。
+// note 行的 agent 是空串，不在白名单里 → 返回 null，由调用方走 Obsidian 路径。
 const AGENTS: readonly SessionType[] = ['tmux', 'claude', 'kiro', 'codex']
 
-/** 把库里的 last_agent 收敛为合法 SessionType；不合法/缺失返回 null（调用方退化到选类型）。 */
+/** 把库里的 agent 收敛为合法 SessionType；不合法/缺失返回 null。 */
 export function coerceAgent(v: string | null | undefined): SessionType | null {
   return AGENTS.includes(v as SessionType) ? (v as SessionType) : null
 }
+```
 
-/** pinned 在前、top 在后拍平成一个渲染列表。字段缺失时返回空数组而不抛。 */
-export function flatten(list: QuickTargetList): QuickTarget[] {
-  return [...(list?.pinned ?? []), ...(list?.top ?? [])]
+创建 `frontend/src/lib/quickTargetsBus.ts`：
+
+```ts
+// quick_targets 变更的进程内广播。
+//
+// bump 发生在后端（create_session / vault_file 的副作用），前端只有在自己触发了
+// 那些动作时才知道要刷新——所以由动作发起方 notify()，所有挂载中的 QuickTargets
+// 重新 GET。没有它，列表就是「挂载时取一次」的静态快照：VaultReader 在 App.tsx
+// 里常驻挂载（用 hidden 切换可见性，刻意不 unmount 以保留滚动状态），会一直显示
+// 几小时前的顺序。
+//
+// 刻意不用 props refreshKey：三个入口分布在 Sidebar / FileBrowser(modal) /
+// ScheduledTasksPanel / VaultReader 四条不同的树路径上，穿 props 会让「一份实现
+// 多处复用」退化成每加一个入口改一次调用链。
+const listeners = new Set<() => void>()
+
+export function notifyQuickTargetsChanged(): void {
+  // 复制一份再遍历：监听者在回调里退订（组件 unmount）不会破坏本次迭代。
+  for (const f of Array.from(listeners)) f()
+}
+
+export function subscribeQuickTargets(f: () => void): () => void {
+  listeners.add(f)
+  return () => { listeners.delete(f) }
 }
 ```
 
@@ -982,37 +1080,21 @@ export function flatten(list: QuickTargetList): QuickTarget[] {
 export interface QuickTarget {
   kind: 'dir' | 'note'
   path: string
+  /** dir: claude|kiro|codex|tmux；note: 空串 */
+  agent: string
   display: string
   hint: string
-  pinned: boolean
-  last_agent: string | null
-  is_git: boolean
 }
 
-export interface QuickTargetList {
-  pinned: QuickTarget[]
-  top: QuickTarget[]
-}
-
-export async function listQuickTargets(kind: 'dir' | 'note'): Promise<QuickTargetList> {
+export async function listQuickTargets(kind: 'dir' | 'note'): Promise<{ top: QuickTarget[] }> {
   const res = await api(`/api/quick-targets?kind=${kind}`)
   if (!res.ok) throw new Error(await res.text())
   return res.json()
 }
 
-export async function pinQuickTarget(kind: 'dir' | 'note', path: string, pinned: boolean): Promise<void> {
-  const res = await api('/api/quick-targets/pin', {
-    method: 'POST',
-    body: JSON.stringify({ kind, path, pinned }),
-  })
-  if (!res.ok) throw new Error(await res.text())
-}
-
-export async function forgetQuickTarget(kind: 'dir' | 'note', path: string): Promise<void> {
-  const res = await api('/api/quick-targets', {
-    method: 'DELETE',
-    body: JSON.stringify({ kind, path }),
-  })
+export async function forgetQuickTarget(kind: 'dir' | 'note', path: string, agent: string): Promise<void> {
+  const params = new URLSearchParams({ kind, path, agent })
+  const res = await api(`/api/quick-targets?${params}`, { method: 'DELETE' })
   if (!res.ok) throw new Error(await res.text())
 }
 ```
@@ -1020,147 +1102,194 @@ export async function forgetQuickTarget(kind: 'dir' | 'note', path: string): Pro
 - [ ] **Step 4: 跑测试确认通过**
 
 Run: `cd frontend && npx vitest run src/lib/__tests__/quickTargets.test.ts`
-Expected: PASS，9 个绿。
+Expected: PASS，8 个绿。
 
 - [ ] **Step 5: Commit**
 
 ```bash
-git add frontend/src/lib/api.ts frontend/src/lib/quickTargets.ts frontend/src/lib/__tests__/quickTargets.test.ts
-git commit -m "feat(quick-targets): 前端 API 封装 + last_agent 白名单收敛
+git add frontend/src/lib/api.ts frontend/src/lib/quickTargets.ts frontend/src/lib/quickTargetsBus.ts frontend/src/lib/__tests__/quickTargets.test.ts
+git commit -m "feat(quick-targets): 前端 API 封装 + agent 白名单 + 事件总线
 
-coerceAgent 用白名单把库里的 last_agent 收敛为合法 SessionType:某个 agent
-类型日后被移除时旧行会留下失效字符串,不能原样发给后端。
+coerceAgent 用白名单把库里的 agent 收敛为合法 SessionType(某个类型日后被移除时
+旧行会留下失效字符串,不能原样发给后端)。quickTargetsBus 是 12 行的进程内广播,
+用于事件驱动刷新——没有它列表就是「挂载时取一次」的静态快照,而 VaultReader 在
+App.tsx 里常驻挂载不 unmount,会一直显示几小时前的顺序。不用 props refreshKey:
+四个入口分布在四条不同树路径上,穿 props 会让「一份实现多处复用」退化。
 
 Co-Authored-By: Claude Opus 5 (1M context) <noreply@anthropic.com>"
 ```
 
 ---
-
-### Task 5: `QuickTargets` 组件（含 stale-response 防护）
+### Task 5: `QuickTargets` 组件（两行版式 + 行级操作单 + 事件驱动 + stale 防护）
 
 **Files:**
 - Create: `frontend/src/components/QuickTargets.tsx`
-- Test: `frontend/src/components/__tests__/QuickTargets.stale.test.tsx`
+- Test: `frontend/src/components/__tests__/QuickTargets.test.tsx`
 
 **Interfaces:**
-- Consumes: Task 4 的 `listQuickTargets` / `pinQuickTarget` / `forgetQuickTarget` / `coerceAgent` / `flatten`
+- Consumes: Task 4 的 `listQuickTargets` / `forgetQuickTarget` / `coerceAgent` / `subscribeQuickTargets`；
+  既有 `SessionTypeIcon` 的图标来源 `BrandIcons`（`ClaudeCodeIcon` / `KiroIcon` / `CodexIcon`，
+  已在 `Sidebar.tsx:15` 导入）
 - Produces: 默认导出组件，props：
   ```ts
   {
     kind: 'dir' | 'note'
     onPick: (path: string, agent: SessionType | null) => void
-    onPickType?: (path: string) => void   // 点 ▸ 时改选类型；不传则不渲染 ▸
-    emptyHint?: string
+    onChangeAgent?: (path: string) => void     // 行级操作单「换 agent 类型」
+    onPickWithPrompt?: (path: string, agent: SessionType | null) => void
+    onEmpty?: () => void                        // 列表为空时通知父级（父级可改渲染 pick-type）
   }
   ```
 
 - [ ] **Step 1: 写失败的测试**
 
-创建 `frontend/src/components/__tests__/QuickTargets.stale.test.tsx`：
+创建 `frontend/src/components/__tests__/QuickTargets.test.tsx`：
 
 ```tsx
-import { render, screen, waitFor } from '@testing-library/react'
+import { render, screen, waitFor, act } from '@testing-library/react'
 import { describe, it, expect, vi, beforeEach } from 'vitest'
 import QuickTargets from '../QuickTargets'
 import * as api from '../../lib/api'
-import type { QuickTargetList, QuickTarget } from '../../lib/api'
+import { notifyQuickTargetsChanged } from '../../lib/quickTargetsBus'
+import type { QuickTarget } from '../../lib/api'
 
-// 本 repo 已因 stale-response clobber 修过 12 次（AgentDashboard / GitViewer /
-// FileBrowser / MarkdownViewer / SessionInfoBar / usePromptPresets…）。本组件
-// 同时具备「慢 GET」与「乐观 mutation」两个条件，是该 bug 的教科书场景，
-// 第一版就必须带 reqRef。
+const t = (over: Partial<QuickTarget> = {}): QuickTarget => ({
+  kind: 'dir', path: '/w/a', agent: 'claude', display: 'a', hint: '~', ...over,
+})
+const list = (top: QuickTarget[]) => ({ top })
+
+describe('QuickTargets 事件驱动刷新', () => {
+  beforeEach(() => vi.restoreAllMocks())
+
+  it('notifyQuickTargetsChanged() 让挂载中的组件重新取数并重排', async () => {
+    // 这是新约束 1 的核心：列表不能是「挂载时取一次」的静态快照。
+    let call = 0
+    vi.spyOn(api, 'listQuickTargets').mockImplementation(() => {
+      call += 1
+      return Promise.resolve(call === 1
+        ? list([t({ path: '/w/old', display: 'old' })])
+        : list([t({ path: '/w/new', display: 'new' })]))
+    })
+
+    render(<QuickTargets kind="dir" onPick={() => {}} />)
+    await screen.findByText('old')
+
+    notifyQuickTargetsChanged()
+    await screen.findByText('new')
+    expect(screen.queryByText('old')).not.toBeInTheDocument()
+  })
+})
+
 describe('QuickTargets stale-response 防护', () => {
   beforeEach(() => vi.restoreAllMocks())
 
-  const t = (over: Partial<QuickTarget> = {}): QuickTarget => ({
-    kind: 'dir', path: '/w/a', display: 'a', hint: '~', pinned: false,
-    last_agent: 'claude', is_git: false, ...over,
-  })
-  const list = (top: QuickTarget[], pinned: QuickTarget[] = []): QuickTargetList => ({ pinned, top })
-
-  it('慢的首次 GET 不能覆盖 forget 之后的新 GET', async () => {
-    // 场景：面板打开触发 GET#1（JuiceFS 慢）；用户在旧快照上点「移除」，
-    // 乐观移除 + 触发 GET#2（快，已不含该条）；GET#1 迟到若写入，
-    // 被移除的条目会复活成 ghost。
-    let resolveSlow: (v: QuickTargetList) => void = () => {}
-    const slow = new Promise<QuickTargetList>(r => { resolveSlow = r })
+  // 本 repo 已因 stale-response clobber 修过 12 次。本组件同时具备「慢 GET」
+  // （JuiceFS 上的 per-row 守卫）与「乐观 mutation」（forget 先改本地再 refetch）。
+  //
+  // 这个测试的时序是**实测确定**的，三点都关键，改动任一点都会让它退化成空转：
+  // 1. forget 的网络调用**永不 resolve** —— 锁住时间窗，使唯一能改变 UI 的写入
+  //    只有那个陈旧 GET。否则 forget 完成后的「纠正性 load」会把 ghost 修好，
+  //    测试即便在无守卫时也绿（实测确认过这个陷阱）。
+  // 2. 后续 GET 全部复用同一个慢 promise —— 同上，杜绝纠正性 load 掩盖问题。
+  // 3. 断言用 `act` 精确围栏而非 `waitFor` 轮询 —— waitFor 会一直轮询到 ghost
+  //    被修好为止，从而看不见中间那个错误状态。
+  it('forget 在途期间到达的陈旧 GET 不得让已移除的行重新出现', async () => {
+    let resolvePre: (v: { top: QuickTarget[] }) => void = () => {}
+    const pre = new Promise<{ top: QuickTarget[] }>(r => { resolvePre = r })
     let call = 0
     vi.spyOn(api, 'listQuickTargets').mockImplementation(() => {
       call += 1
-      if (call === 1) return slow
-      return Promise.resolve(list([t({ path: '/w/keep', display: 'keep' })]))
+      if (call === 1) return Promise.resolve(list([
+        t({ path: '/w/gone', display: 'gone' }),
+        t({ path: '/w/keep', display: 'keep' }),
+      ]))
+      return pre   // 后续 GET 全用这个慢 promise
     })
-    vi.spyOn(api, 'forgetQuickTarget').mockResolvedValue(undefined)
+    vi.spyOn(api, 'forgetQuickTarget').mockImplementation(() => new Promise<void>(() => {}))
 
     render(<QuickTargets kind="dir" onPick={() => {}} />)
-
-    // GET#1 迟到前先让它有内容可显示：先解析 GET#1，再做 forget，
-    // 然后让一个更旧的响应尝试写入 —— 用第二轮 GET 作为「新」响应。
-    resolveSlow(list([t({ path: '/w/gone', display: 'gone' }), t({ path: '/w/keep', display: 'keep' })]))
     await screen.findByText('gone')
 
-    // 点「移除」→ 乐观移除 + refetch（GET#2 不含 gone）
+    act(() => { notifyQuickTargetsChanged() })   // GET#2 起飞（慢，携带移除前的快照）
+
     const row = screen.getByText('gone').closest('li')!
-    ;(row.querySelector('[data-testid="qt-forget"]') as HTMLElement).click()
-
-    await waitFor(() => expect(screen.queryByText('gone')).not.toBeInTheDocument())
-    expect(screen.getByText('keep')).toBeInTheDocument()
-  })
-
-  it('乐观 pin 之后到达的旧 GET 不能把 pin 状态回滚', async () => {
-    let resolveStale: (v: QuickTargetList) => void = () => {}
-    const stale = new Promise<QuickTargetList>(r => { resolveStale = r })
-    let call = 0
-    vi.spyOn(api, 'listQuickTargets').mockImplementation(() => {
-      call += 1
-      if (call === 1) return Promise.resolve(list([t({ path: '/w/a', display: 'a', pinned: false })]))
-      return stale   // pin 后触发的 refetch 很慢
+    await act(async () => {
+      ;(row.querySelector('[data-testid="qt-menu"]') as HTMLElement).click()
     })
-    vi.spyOn(api, 'pinQuickTarget').mockResolvedValue(undefined)
+    await act(async () => { screen.getByTestId('qt-forget').click() })
+    expect(screen.queryByText('gone')).not.toBeInTheDocument()   // 乐观移除已生效
 
-    render(<QuickTargets kind="dir" onPick={() => {}} />)
-    await screen.findByText('a')
-
-    const row = screen.getByText('a').closest('li')!
-    ;(row.querySelector('[data-testid="qt-pin"]') as HTMLElement).click()
-    // 乐观置 pin：图标状态立即变为已 pin
-    await waitFor(() =>
-      expect(row.querySelector('[data-testid="qt-pin"]')!.getAttribute('data-pinned')).toBe('true'))
-
-    // 此时一个「pin 之前」的旧快照迟到（pinned=false）——必须被丢弃
-    resolveStale(list([t({ path: '/w/a', display: 'a', pinned: false })]))
-    await new Promise(r => setTimeout(r, 0))
-    expect(screen.getByText('a').closest('li')!
-      .querySelector('[data-testid="qt-pin"]')!.getAttribute('data-pinned')).toBe('true')
+    // 陈旧快照（仍含 gone）现在到达。有 reqRef bump → 丢弃；无 bump → gone 复活。
+    await act(async () => {
+      resolvePre(list([
+        t({ path: '/w/gone', display: 'gone' }),
+        t({ path: '/w/keep', display: 'keep' }),
+      ]))
+      await Promise.resolve(); await Promise.resolve()
+    })
+    expect(screen.queryByText('gone')).not.toBeInTheDocument()
   })
+})
 
-  it('last_agent 为未知字符串时点行走 onPickType，不把脏值传给 onPick', async () => {
+describe('QuickTargets agent 收敛与取用', () => {
+  beforeEach(() => vi.restoreAllMocks())
+
+  it('agent 合法时点行直接 onPick 带类型', async () => {
     vi.spyOn(api, 'listQuickTargets').mockResolvedValue(
-      list([t({ path: '/w/x', display: 'x', last_agent: 'gemini' })]))
+      list([t({ path: '/w/y', display: 'y', agent: 'codex' })]))
     const onPick = vi.fn()
-    const onPickType = vi.fn()
-    render(<QuickTargets kind="dir" onPick={onPick} onPickType={onPickType} />)
-
-    ;(await screen.findByText('x')).click()
-    expect(onPick).not.toHaveBeenCalled()
-    expect(onPickType).toHaveBeenCalledWith('/w/x')
-  })
-
-  it('last_agent 合法时点行直接 onPick 带类型', async () => {
-    vi.spyOn(api, 'listQuickTargets').mockResolvedValue(
-      list([t({ path: '/w/y', display: 'y', last_agent: 'codex' })]))
-    const onPick = vi.fn()
-    render(<QuickTargets kind="dir" onPick={onPick} onPickType={() => {}} />)
-
+    render(<QuickTargets kind="dir" onPick={onPick} onChangeAgent={() => {}} />)
     ;(await screen.findByText('y')).click()
     expect(onPick).toHaveBeenCalledWith('/w/y', 'codex')
+  })
+
+  it('agent 为未知字符串时点行走 onChangeAgent，不把脏值传给 onPick', async () => {
+    vi.spyOn(api, 'listQuickTargets').mockResolvedValue(
+      list([t({ path: '/w/x', display: 'x', agent: 'gemini' })]))
+    const onPick = vi.fn()
+    const onChangeAgent = vi.fn()
+    render(<QuickTargets kind="dir" onPick={onPick} onChangeAgent={onChangeAgent} />)
+    ;(await screen.findByText('x')).click()
+    expect(onPick).not.toHaveBeenCalled()
+    expect(onChangeAgent).toHaveBeenCalledWith('/w/x')
+  })
+
+  it('note 行（agent 空串）点行走 onPick 且 agent 为 null', async () => {
+    vi.spyOn(api, 'listQuickTargets').mockResolvedValue(
+      list([t({ kind: 'note', path: 'p/a.md', display: 'a', hint: 'p', agent: '' })]))
+    const onPick = vi.fn()
+    render(<QuickTargets kind="note" onPick={onPick} />)
+    ;(await screen.findByText('a')).click()
+    expect(onPick).toHaveBeenCalledWith('p/a.md', null)
+  })
+})
+
+describe('QuickTargets 手机可用性', () => {
+  beforeEach(() => vi.restoreAllMocks())
+
+  it('行级操作单入口不依赖 hover：无 hover 也可见可点', async () => {
+    // Tailwind v4 把 group-hover:* 编译进 @media (hover:hover)，手机上整条规则不生效
+    // → 元素永久 opacity:0 但仍可点击 = 隐形按钮。用户主设备是手机，故禁止 hover-only。
+    vi.spyOn(api, 'listQuickTargets').mockResolvedValue(
+      list([t({ path: '/w/a', display: 'a' })]))
+    render(<QuickTargets kind="dir" onPick={() => {}} onChangeAgent={() => {}} />)
+    const menu = await screen.findByTestId('qt-menu')
+    expect(menu.className).not.toMatch(/opacity-0/)
+    expect(menu.className).not.toMatch(/group-hover/)
+  })
+
+  it('列表为空时通知父级（父级据此渲染 pick-type，而不是给出空壳首屏）', async () => {
+    vi.spyOn(api, 'listQuickTargets').mockResolvedValue(list([]))
+    const onEmpty = vi.fn()
+    render(<QuickTargets kind="dir" onPick={() => {}} onEmpty={onEmpty} />)
+    await waitFor(() => expect(onEmpty).toHaveBeenCalled())
   })
 })
 ```
 
 - [ ] **Step 2: 跑测试确认失败**
 
-Run: `cd frontend && npx vitest run src/components/__tests__/QuickTargets.stale.test.tsx`
+Run: `cd frontend && npx vitest run src/components/__tests__/QuickTargets.test.tsx`
 Expected: FAIL — `Failed to resolve import "../QuickTargets"`。
 
 - [ ] **Step 3: 写实现**
@@ -1169,132 +1298,163 @@ Expected: FAIL — `Failed to resolve import "../QuickTargets"`。
 
 ```tsx
 import { useState, useEffect, useCallback, useRef } from 'react'
-import { Pin, PinOff, X, Folder, FolderGit2, FileText, ChevronRight } from 'lucide-react'
-import type { SessionType, QuickTarget, QuickTargetList } from '../lib/api'
-import { listQuickTargets, pinQuickTarget, forgetQuickTarget } from '../lib/api'
-import { coerceAgent, flatten } from '../lib/quickTargets'
+import { MoreVertical, X, FileText, Terminal, Repeat, MessageSquarePlus } from 'lucide-react'
+import type { SessionType, QuickTarget } from '../lib/api'
+import { listQuickTargets, forgetQuickTarget } from '../lib/api'
+import { coerceAgent } from '../lib/quickTargets'
+import { subscribeQuickTargets } from '../lib/quickTargetsBus'
+import { ClaudeCodeIcon, KiroIcon, CodexIcon } from './BrandIcons'
 
-/** 常用目录/笔记快速入口。一份实现服务三处：New Session 首屏、pick-dir 顶部、
+/** 行首图标 = 这一行会开出什么。比行尾一个小写标签的信息量更高，且省下约 44px 宽度
+ *  给目录名和 hint（224px 弹层里这是决定性的）。 */
+function RowIcon({ kind, agent, size = 15 }: { kind: 'dir' | 'note'; agent: string; size?: number }) {
+  if (kind === 'note') return <FileText size={size} className="text-[var(--accent-blue)] shrink-0" />
+  switch (coerceAgent(agent)) {
+    case 'claude': return <ClaudeCodeIcon size={size} className="shrink-0" />
+    case 'kiro':   return <KiroIcon size={size} className="shrink-0" />
+    case 'codex':  return <CodexIcon size={size} className="shrink-0" />
+    case 'tmux':   return <Terminal size={size} className="text-[var(--accent-green-text)] shrink-0" />
+    default:       return <Terminal size={size} className="text-[var(--text-muted)] shrink-0" />
+  }
+}
+
+/** 常用目录/笔记快速入口。一份实现服务三处：New Session 首屏、DirectoryPicker 顶部、
  *  VaultReader 的「最近打开」。kind 决定数据源与图标，其余行为一致。 */
-export default function QuickTargets({ kind, onPick, onPickType, emptyHint }: {
+export default function QuickTargets({ kind, onPick, onChangeAgent, onPickWithPrompt, onEmpty }: {
   kind: 'dir' | 'note'
   onPick: (path: string, agent: SessionType | null) => void
-  onPickType?: (path: string) => void
-  emptyHint?: string
+  onChangeAgent?: (path: string) => void
+  onPickWithPrompt?: (path: string, agent: SessionType | null) => void
+  onEmpty?: () => void
 }) {
   const [items, setItems] = useState<QuickTarget[]>([])
   const [loaded, setLoaded] = useState(false)
+  const [openMenu, setOpenMenu] = useState<string | null>(null)   // path|agent 的 key
 
-  // 单调请求令牌。本组件同时具备「慢 GET」（JuiceFS/S3）与「乐观 mutation」
-  // （pin/forget 立即改本地 state 后 refetch）两个条件，正是本 repo 修过 12 次的
-  // stale-response clobber 场景：一个乐观写之前发出的旧 GET 迟到，会把刚 pin 的
-  // 条目回滚、把刚移除的条目复活成 ghost。fetch 顶部 bump，每个乐观写前也 bump，
-  // await 后守卫 —— 两侧都护。
+  // 单调请求令牌。本组件同时具备「慢 GET」（JueceFS/S3 上的 per-row 守卫）与
+  // 「乐观 mutation」（forget 先改本地 state 再 refetch）两个条件，正是本 repo 修过
+  // 12 次的 stale-response clobber 场景：一个乐观写之前发出的旧 GET 迟到，会把刚
+  // 移除的条目复活成 ghost。fetch 顶部 bump，每个乐观写前也 bump，await 后守卫。
   const reqRef = useRef(0)
 
   const load = useCallback(async () => {
     const req = ++reqRef.current
     try {
-      const data: QuickTargetList = await listQuickTargets(kind)
+      const data = await listQuickTargets(kind)
       if (reqRef.current !== req) return
-      setItems(flatten(data))
+      setItems(data?.top ?? [])
     } catch {
       if (reqRef.current !== req) return
-      // 快速入口是加速器,不是主路径:加载失败就安静地什么都不显示,
-      // 让用户回落到目录浏览,而不是弹错误挡住新建会话。
+      // 快速入口是加速器，不是主路径：加载失败就安静地什么都不显示，让用户回落到
+      // 目录浏览，而不是弹错误挡住新建会话。
       setItems([])
     }
     if (reqRef.current === req) setLoaded(true)
   }, [kind])
 
   useEffect(() => { load() }, [load])
+  // 事件驱动刷新：没有它，列表就是挂载时的静态快照（VaultReader 常驻挂载，会一直
+  // 显示几小时前的顺序）。发射点精确镜像后端两处 bump。
+  useEffect(() => subscribeQuickTargets(load), [load])
 
-  const togglePin = useCallback(async (it: QuickTarget) => {
-    const next = !it.pinned
-    reqRef.current++      // 使任何在途 GET 失效，否则旧快照会回滚这次乐观写
-    setItems(prev => prev.map(x => x.path === it.path ? { ...x, pinned: next } : x))
-    try { await pinQuickTarget(kind, it.path, next) } catch { /* 下次 load 会纠正 */ }
-    load()
-  }, [kind, load])
+  // 空列表时通知父级，让它改渲染原来的类型选择器 —— 否则全新库点 ＋ 只看到一个标题
+  // 加一行「其他目录…」，比改动前更差。
+  useEffect(() => { if (loaded && items.length === 0) onEmpty?.() }, [loaded, items.length, onEmpty])
 
   const forget = useCallback(async (it: QuickTarget) => {
-    reqRef.current++      // 同上：防止在途 GET 让被移除的条目复活
-    setItems(prev => prev.filter(x => x.path !== it.path))
-    try { await forgetQuickTarget(kind, it.path) } catch { /* 下次 load 会纠正 */ }
+    reqRef.current++      // 使任何在途 GET 失效，否则旧快照会让这条复活成 ghost
+    setItems(prev => prev.filter(x => !(x.path === it.path && x.agent === it.agent)))
+    setOpenMenu(null)
+    try { await forgetQuickTarget(kind, it.path, it.agent) } catch { /* 下次 load 会纠正 */ }
     load()
   }, [kind, load])
 
   const pick = (it: QuickTarget) => {
-    const agent = coerceAgent(it.last_agent)
-    // agent 不合法（库里的旧类型已被移除）或本来就没有 → 交给调用方选类型，
-    // 绝不把脏字符串当 SessionType 发出去。
-    if (kind === 'dir' && !agent && onPickType) { onPickType(it.path); return }
+    if (it.kind === 'note') { onPick(it.path, null); return }
+    const agent = coerceAgent(it.agent)
+    // agent 不合法（库里的旧类型已被移除）→ 交给调用方选类型，绝不把脏字符串当
+    // SessionType 发出去。
+    if (!agent) { onChangeAgent?.(it.path); return }
     onPick(it.path, agent)
   }
 
-  if (!loaded || items.length === 0) {
-    return emptyHint && loaded
-      ? <div className="px-3 py-2 text-[10px] text-[var(--text-muted)]">{emptyHint}</div>
-      : null
-  }
+  if (!loaded || items.length === 0) return null
 
   return (
-    <ul className="border-b border-[var(--border)]">
-      {items.map(it => (
-        <li key={it.path} className="group flex items-center gap-1 pr-1 hover:bg-[var(--bg-hover)]">
-          <button
-            type="button"
-            onClick={() => pick(it)}
-            className="flex items-center gap-2 flex-1 min-w-0 px-3 py-1.5 text-left"
-            title={it.path}
-          >
-            {kind === 'note'
-              ? <FileText size={13} className="text-[var(--text-muted)] shrink-0" />
-              : it.is_git
-                ? <FolderGit2 size={13} className="text-[var(--accent-green-text)] shrink-0" />
-                : <Folder size={13} className="text-[var(--text-muted)] shrink-0" />}
-            <span className="truncate text-xs text-[var(--text-primary)]">{it.display}</span>
-            {it.hint && (
-              <span className="truncate text-[10px] text-[var(--text-muted)] shrink min-w-0">{it.hint}</span>
+    <ul className="border-b border-[var(--border)] max-h-72 overflow-y-auto">
+      {items.map(it => {
+        const key = `${it.path}|${it.agent}`
+        return (
+          <li key={key} className="relative border-b border-[var(--border)] last:border-b-0">
+            <div className="flex items-stretch">
+              {/* 整行 = 唯一主目标。min-h-[48px] 满足触控最小尺寸（v1 的 py-1.5 只有约 28px）。 */}
+              <button
+                type="button"
+                onClick={() => pick(it)}
+                className="flex items-start gap-2 flex-1 min-w-0 px-3 py-2 min-h-[48px] text-left hover:bg-[var(--bg-hover)] transition-colors"
+                title={it.path}
+              >
+                <span className="mt-0.5"><RowIcon kind={it.kind} agent={it.agent} /></span>
+                <span className="flex flex-col min-w-0 flex-1">
+                  <span className="truncate text-xs text-[var(--text-primary)]">{it.display}</span>
+                  {/* hint 独占第 2 行：内联时在 224px 下必被截成 "…"，而它唯一的作用
+                      就是区分同名（vault 里多个 _index.md）。 */}
+                  {it.hint && (
+                    <span className="truncate text-[10px] text-[var(--text-muted)]">{it.hint}</span>
+                  )}
+                </span>
+              </button>
+              {/* 行级操作单入口。刻意不用 opacity-0 group-hover:opacity-100 —— Tailwind v4
+                  把它编译进 @media (hover:hover)，手机上整条规则不生效，元素会永久
+                  opacity:0 但仍可点击（隐形按钮）。用户主设备是手机。 */}
+              <button
+                type="button"
+                data-testid="qt-menu"
+                onClick={() => setOpenMenu(cur => (cur === key ? null : key))}
+                className="shrink-0 w-8 flex items-center justify-center text-[var(--text-secondary)] hover:text-[var(--text-primary)] hover:bg-[var(--bg-hover)] transition-colors"
+                title="更多操作"
+              >
+                <MoreVertical size={14} />
+              </button>
+            </div>
+
+            {/* 展开的操作单：每项 ≥44px 整行 + 文字标签。破坏性操作下沉一层，
+                这一层本身即确认（故不再加 confirm 弹窗）。 */}
+            {openMenu === key && (
+              <div className="border-t border-[var(--border)] bg-[var(--bg-secondary)]">
+                {it.kind === 'dir' && onChangeAgent && (
+                  <button
+                    type="button"
+                    data-testid="qt-changeagent"
+                    onClick={() => { setOpenMenu(null); onChangeAgent(it.path) }}
+                    className="flex items-center gap-2 w-full px-3 py-2.5 text-[11px] text-[var(--text-secondary)] hover:bg-[var(--bg-hover)]"
+                  >
+                    <Repeat size={13} className="shrink-0" />换 agent 类型
+                  </button>
+                )}
+                {it.kind === 'dir' && onPickWithPrompt && (
+                  <button
+                    type="button"
+                    data-testid="qt-withprompt"
+                    onClick={() => { setOpenMenu(null); onPickWithPrompt(it.path, coerceAgent(it.agent)) }}
+                    className="flex items-center gap-2 w-full px-3 py-2.5 text-[11px] text-[var(--text-secondary)] hover:bg-[var(--bg-hover)]"
+                  >
+                    <MessageSquarePlus size={13} className="shrink-0" />带 prompt 打开
+                  </button>
+                )}
+                <button
+                  type="button"
+                  data-testid="qt-forget"
+                  onClick={() => forget(it)}
+                  className="flex items-center gap-2 w-full px-3 py-2.5 text-[11px] text-[var(--text-secondary)] hover:text-[var(--accent-red)] hover:bg-[var(--bg-hover)]"
+                >
+                  <X size={13} className="shrink-0" />从列表移除
+                </button>
+              </div>
             )}
-            {kind === 'dir' && coerceAgent(it.last_agent) && (
-              <span className="ml-auto shrink-0 text-[10px] text-[var(--text-muted)] uppercase">
-                {coerceAgent(it.last_agent)}
-              </span>
-            )}
-          </button>
-          {kind === 'dir' && onPickType && (
-            <button
-              type="button"
-              data-testid="qt-picktype"
-              onClick={() => onPickType(it.path)}
-              className="p-0.5 opacity-0 group-hover:opacity-100 text-[var(--text-secondary)] hover:text-[var(--text-primary)]"
-              title="改用其它类型"
-            >
-              <ChevronRight size={12} />
-            </button>
-          )}
-          <button
-            type="button"
-            data-testid="qt-pin"
-            data-pinned={it.pinned ? 'true' : 'false'}
-            onClick={() => togglePin(it)}
-            className="p-0.5 text-[var(--text-secondary)] hover:text-[var(--text-primary)]"
-            title={it.pinned ? '取消置顶' : '置顶'}
-          >
-            {it.pinned ? <Pin size={12} /> : <PinOff size={12} className="opacity-0 group-hover:opacity-100" />}
-          </button>
-          <button
-            type="button"
-            data-testid="qt-forget"
-            onClick={() => forget(it)}
-            className="p-0.5 opacity-0 group-hover:opacity-100 text-[var(--text-secondary)] hover:text-[var(--accent-red)]"
-            title="从列表移除"
-          >
-            <X size={12} />
-          </button>
-        </li>
-      ))}
+          </li>
+        )
+      })}
     </ul>
   )
 }
@@ -1302,43 +1462,88 @@ export default function QuickTargets({ kind, onPick, onPickType, emptyHint }: {
 
 - [ ] **Step 4: 跑测试确认通过**
 
-Run: `cd frontend && npx vitest run src/components/__tests__/QuickTargets.stale.test.tsx`
-Expected: PASS，4 个绿。
+Run: `cd frontend && npx vitest run src/components/__tests__/QuickTargets.test.tsx`
+Expected: PASS，8 个绿。
 
-- [ ] **Step 5: Commit**
+- [ ] **Step 5: 验证 stale 测试不是空转（可证伪性检查）**
+
+临时把 `forget` 里的 `reqRef.current++` 那一行注释掉，重跑：
+
+Run: `cd frontend && npx vitest run src/components/__tests__/QuickTargets.test.tsx 2>&1 | tail -12`
+Expected: **「forget 在途期间到达的陈旧 GET 不得让已移除的行重新出现」这条变红**，
+报 `expected document not to contain element, found <span ...>gone</span>`。
+
+**这一步不是形式主义 —— 写本计划时的前两版测试都在无守卫时仍然绿**（即空转），
+原因见该测试上方注释的三点时序要求。若它仍然绿，说明测试没有真正覆盖守卫，
+必须修测试而不是接受它。确认变红后恢复那一行，再跑一次确认全绿。
+
+- [ ] **Step 6: Commit**
 
 ```bash
-git add frontend/src/components/QuickTargets.tsx frontend/src/components/__tests__/QuickTargets.stale.test.tsx
-git commit -m "feat(quick-targets): QuickTargets 组件(第一版即带 stale-response 防护)
+git add frontend/src/components/QuickTargets.tsx frontend/src/components/__tests__/QuickTargets.test.tsx
+git commit -m "feat(quick-targets): QuickTargets 组件(两行版式 + 行级操作单 + 事件驱动)
 
-本组件同时具备慢 GET 与乐观 mutation 两个条件,是本 repo 修过 12 次的
-stale-response clobber 教科书场景:reqRef 在 fetch 顶部与每个乐观写前双侧 bump。
-last_agent 经 coerceAgent 白名单收敛,不合法则退化到选类型。
+版式:整行是唯一主目标(min-h-[48px],v1 的 py-1.5 只有约 28px 不达触控标准),
+右侧一个 32px 的操作单入口,hint 独占第 2 行(内联时在 224px 弹层里必被截成
+省略号,而它唯一作用就是区分同名 _index.md)。行首图标 = 这行会开出什么,替掉
+行尾约 44px 的大写 agent 标签。
+
+禁止 hover-only:Tailwind v4 把 group-hover:* 编译进 @media (hover:hover),
+手机上整条规则不生效 → 元素永久 opacity:0 但仍可点击(隐形按钮),而用户主设备
+是手机。破坏性操作下沉进操作单,这一层本身即确认。
+
+reqRef 在 fetch 顶部与每个乐观写前双侧 bump;stale 测试构造的是「乐观写之前发出、
+写之后到达」的 GET(由 mutation 自己触发的 refetch 是权威响应必须接受),并附
+可证伪性检查步骤——注释掉守卫必须变红。
 
 Co-Authored-By: Claude Opus 5 (1M context) <noreply@anthropic.com>"
 ```
 
 ---
-
-### Task 6: 接入三个入口
+### Task 6: 接入三个入口 + 修 5 个导航/可用性缺陷
 
 **Files:**
-- Modify: `frontend/src/components/Sidebar.tsx`（新增 step `quick` 作首屏 + `pick-dir` 顶部嵌入）
+- Modify: `frontend/src/components/Sidebar.tsx`（新增 step `quick`；弹层宽度；`pick-type` 返回键；
+  `pick-prompt` 返回分流；`pick-dir` 的 disabled 守卫；`selectNewShell` 尊重已定目录）
 - Modify: `frontend/src/components/DirectoryPicker.tsx`（顶部嵌入）
-- Modify: `frontend/src/components/VaultReader.tsx:121`（「最近打开」换后端源 + 显示父目录）
+- Modify: `frontend/src/components/VaultReader.tsx`（「最近打开」换后端源 + 发射刷新事件）
+- Modify: `frontend/src/App.tsx`（`handleCreate` 成功后发射刷新事件）
 - Modify: `frontend/src/lib/vault.ts`（删除 localStorage recent 三函数 + KEY）
 - Modify: `frontend/src/lib/__tests__/vault.test.ts`（删除对应测试）
 
 **Interfaces:**
-- Consumes: Task 5 的 `QuickTargets` 组件；既有 `onCreate(type, workDir, tmuxTarget, initialPrompt)`（`Sidebar.tsx:22`）
+- Consumes: Task 5 的 `QuickTargets`；Task 4 的 `notifyQuickTargetsChanged`；
+  既有 `onCreate(type, workDir, tmuxTarget, initialPrompt)`（`Sidebar.tsx:22`）
 - Produces: 无新导出（纯接线）
 
-- [ ] **Step 1: Sidebar 首屏改为 `quick`**
+- [ ] **Step 1: 弹层宽度随 mobile（根因先修）**
+
+`Sidebar.tsx` 有**三处**硬编码 `w-56` 的弹层（`L472` 新建会话、`L798`、`L837`），
+而侧栏面板本身是 `mobile ? 'w-64' : 'w-56'`（`L320`）。手机上侧栏已是全屏遮罩，
+却把内容塞进 224px 浮层。
+
+三处的 `w-56` 都改为：
+
+```tsx
+${mobile ? 'w-[calc(100vw-1rem)]' : 'w-56'}
+```
+
+（把这些 `className` 字符串改成模板字符串。`mobile` 已是组件 prop，`Sidebar.tsx:78`。）
+
+这一行改动让整个宽度危机消失，并顺带缓解既有的 `pick-dir`/`pick-prompt` 拥挤。
+
+- [ ] **Step 2: 新增 step `quick` 作首屏**
 
 `Sidebar.tsx:63` 的 step 联合类型加 `'quick'`：
 
 ```ts
 type NewSessionStep = 'closed' | 'quick' | 'pick-type' | 'pick-terminal-mode' | 'pick-dir' | 'pick-tmux' | 'pick-prompt' | 'manage-prompts'
+```
+
+顶部 import 加：
+
+```ts
+import QuickTargets from './QuickTargets'
 ```
 
 `openTypePicker`（`Sidebar.tsx:172`）改为开在 `quick`：
@@ -1347,44 +1552,86 @@ type NewSessionStep = 'closed' | 'quick' | 'pick-type' | 'pick-terminal-mode' | 
   const openTypePicker = () => {
     setStep('quick')
     setPendingType(null)
+    setPendingDir(null)   // 每次重新打开都从干净状态开始，避免上次残留的目录泄漏
   }
 ```
 
-在 `step === 'pick-type'` 的 JSX 块**之前**加入 `quick` 块：
+在 `step === 'pick-type'` 的 JSX 块**之前**插入 `quick` 块：
 
 ```tsx
               {step === 'quick' && (
                 <>
-                  <div className="flex items-center gap-1 px-2 py-1.5 border-b border-[var(--border)]">
-                    <span className="text-[10px] font-semibold text-[var(--text-muted)] uppercase tracking-wider truncate flex-1">
-                      新建会话
-                    </span>
+                  <div className="px-3 py-1.5 text-[10px] font-semibold text-[var(--text-muted)] uppercase tracking-wider">
+                    新建会话
                   </div>
-                  {/* 一击直达：点一行 = 用该目录上次的 agent 类型直接创建，
-                      0 次列目录请求。刻意跳过 prompt 页——中间插一页就退化成
-                      「少点两下的老流程」，带 prompt 的场景走 ▸ 或「其他目录…」。 */}
+                  {/* 一击直达：点一行 = 用该行的 agent 直接创建，0 次列目录请求。
+                      刻意跳过 prompt 页——中间插一页就退化成「少点两下的老流程」，
+                      而且信息零丢失：会话建好后 AcpChatView 的 composer 里有一模一样的
+                      preset 选择器。要带 prompt 的场景走行级操作单。 */}
                   <QuickTargets
                     kind="dir"
                     onPick={(path, agent) => {
-                      if (!agent) { setPendingType(null); setStep('pick-type'); return }
+                      if (!agent) { setPendingDir(path); setStep('pick-type'); return }
                       onCreate(agent, path)
-                      setStep('closed')
+                      closeAfterCreate()
                     }}
-                    onPickType={(path) => { setPendingDir(path); setStep('pick-type') }}
+                    onChangeAgent={(path) => { setPendingDir(path); setStep('pick-type') }}
+                    onPickWithPrompt={(path, agent) => {
+                      setPendingDir(path)
+                      setPendingType(agent ?? null)
+                      setPromptDraft('')
+                      presetStore.reload()
+                      setStep(agent ? 'pick-prompt' : 'pick-type')
+                    }}
+                    // 列表为空（全新库）时直接跳到类型选择器，而不是给出一个只有标题
+                    // 加一行「其他目录…」的空壳首屏——那比改动前更差。
+                    onEmpty={() => setStep('pick-type')}
                   />
                   <button
                     type="button"
                     onClick={() => { setPendingDir(null); setStep('pick-type') }}
-                    className="flex items-center gap-2 w-full px-3 py-1.5 text-xs text-[var(--text-secondary)] hover:bg-[var(--bg-hover)] transition-colors"
+                    className="flex items-center gap-2 w-full px-3 py-2.5 min-h-[44px] text-xs text-[var(--text-secondary)] hover:bg-[var(--bg-hover)] transition-colors"
                   >
                     <Folder size={13} className="shrink-0" />
                     <span>其他目录…</span>
                   </button>
+                  {/* Obsidian 显式保底入口：'vault' 在 App.tsx:240-244 于前端短路，
+                      不经过 create_session，所以它永远不会出现在 dir 榜上。若只靠
+                      「其他目录…」里的那份，入口会从今天的 2 tap 退化到 3 tap。 */}
+                  {vaultEnabled && (
+                    <button
+                      type="button"
+                      onClick={() => { onCreate('vault'); closeAfterCreate() }}
+                      className="flex items-center gap-2 w-full px-3 py-2.5 min-h-[44px] text-xs text-[var(--text-secondary)] hover:bg-[var(--bg-hover)] transition-colors"
+                    >
+                      <BookOpen size={13} className="shrink-0" />
+                      <span>Obsidian 笔记库</span>
+                    </button>
+                  )}
                 </>
               )}
 ```
 
-`selectType`（`Sidebar.tsx:176`）需要照顾「从 ▸ 进来时已有 pendingDir」的情况——改为：
+- [ ] **Step 3: 加 `closeAfterCreate`（手机上同时关侧栏）**
+
+在 `close`（`Sidebar.tsx:215`）附近加：
+
+```ts
+  // 创建后收尾：关弹层，手机上还要关掉全屏侧栏 —— 否则用户建完会话正对着一块
+  // 遮住新会话的遮罩（手机侧栏是 fixed 全屏），「1 次点击」这句话就不成立。
+  // 既有的 handleSelect 只在「选择已有会话」时 onToggle，不覆盖创建路径。
+  const closeAfterCreate = () => {
+    close()
+    if (mobile) onToggle()
+  }
+```
+
+并把 `attachTmuxSession`、`submitWithPrompt`、`submitSkip`、`selectDir`（tmux 分支）
+里的 `setStep('closed')` 都换成 `closeAfterCreate()`（这几处都是「创建完成」语义）。
+
+- [ ] **Step 4: `selectType` 支持「目录已定」**
+
+`selectType`（`Sidebar.tsx:176`）改为：
 
 ```ts
   const selectType = (type: SessionType) => {
@@ -1392,7 +1639,7 @@ type NewSessionStep = 'closed' | 'quick' | 'pick-type' | 'pick-terminal-mode' | 
     if (type === 'tmux') {
       setStep('pick-terminal-mode')
     } else if (pendingDir) {
-      // 从快速卡片的 ▸ 进来：目录已定，只是改类型 → 直接进 prompt 页
+      // 从快速卡片的「换 agent 类型」进来：目录已定，只是改类型 → 直接进 prompt 页
       setPromptDraft('')
       presetStore.reload()
       setStep('pick-prompt')
@@ -1403,26 +1650,65 @@ type NewSessionStep = 'closed' | 'quick' | 'pick-type' | 'pick-terminal-mode' | 
   }
 ```
 
-同时 `pick-type` 块里的「返回」按钮（若存在）目标改为 `setStep('quick')`；`close()`（`Sidebar.tsx:215`）保持不变（已清 `pendingDir`）。
-
-顶部 import 加：
+`selectNewShell`（`Sidebar.tsx:187`）改为尊重已定目录 —— 否则用户从快速卡片说
+「用终端打开目录 A」，会被扔回 5 层目录浏览：
 
 ```ts
-import QuickTargets from './QuickTargets'
+  const selectNewShell = () => {
+    if (pendingDir) { onCreate('tmux', pendingDir); closeAfterCreate(); return }
+    setStep('pick-dir')
+    loadDirs()
+  }
 ```
 
-- [ ] **Step 2: Sidebar `pick-dir` 顶部嵌入**
+- [ ] **Step 5: `pick-type` 加返回键**
 
-在 `pick-dir` 块的「Current path display + use-this button」`</div>` 之后、「Navigation: parent」之前插入：
+`quick` 现在是首屏，`pick-type` 成了第二屏却没有返回路径（已核实
+`Sidebar.tsx:473-528` 只有一个 "Select type" 标签，没有返回按钮）。
+把那个标签行改为与 `pick-terminal-mode`（`L534`）/`pick-dir`（`L609`）一致的形态：
 
 ```tsx
-                  {/* 已选定类型后的捷径：命中就是 1 次点击 0 次列目录 */}
-                  <QuickTargets kind="dir" onPick={(path) => selectDir(path)} />
+                  <div className="flex items-center gap-1 px-2 py-1.5 border-b border-[var(--border)]">
+                    <button
+                      onClick={() => { setPendingDir(null); setStep('quick') }}
+                      className="p-0.5 text-[var(--text-secondary)] hover:text-[var(--text-primary)] rounded transition-colors"
+                      title="返回"
+                    >
+                      <ChevronLeft size={14} />
+                    </button>
+                    <span className="text-[10px] font-semibold text-[var(--text-muted)] uppercase tracking-wider truncate flex-1">
+                      Select type
+                    </span>
+                  </div>
 ```
 
-- [ ] **Step 3: DirectoryPicker 顶部嵌入**
+- [ ] **Step 6: `pick-prompt` 的返回按来源分流 + `pick-dir` 补 disabled 守卫**
 
-`DirectoryPicker.tsx` 的「Current path + use-this button」`</div>` 之后插入同一行（该组件的提交语义是 `onSelect`）：
+`pick-prompt` 的返回按钮硬编码 `setStep('pick-dir')`（`Sidebar.tsx:693`）。走
+「换 agent 类型」→ `pick-type` → `pick-prompt` 这条新路径时 `pick-dir` 从未
+`loadDirs()`，返回后会落在 `currentPath === ''`、`dirs === []` 的空浏览器上。改为：
+
+```tsx
+                      onClick={() => setStep(currentPath ? 'pick-dir' : 'pick-type')}
+```
+
+并给 `pick-dir` 的「Use this directory」补 disabled 守卫（`Sidebar.tsx:634-639`）——
+`DirectoryPicker.tsx:86` 早就有 `disabled={!currentPath}`，Sidebar 这一份漏了，
+会把 `''` 当 work_dir 提交：
+
+```tsx
+                    <button
+                      onClick={() => selectDir(currentPath)}
+                      disabled={!currentPath}
+                      className="w-full py-1 text-[10px] font-semibold bg-[var(--accent-blue)] hover:bg-[var(--accent-blue-hover)] text-white rounded transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
+                    >
+                      Use this directory
+                    </button>
+```
+
+- [ ] **Step 7: `DirectoryPicker` 顶部嵌入**
+
+`DirectoryPicker.tsx` 的「Current path + use-this button」`</div>` 之后插入：
 
 ```tsx
       <QuickTargets kind="dir" onPick={(path) => onSelect(path)} />
@@ -1434,59 +1720,82 @@ import QuickTargets from './QuickTargets'
 import QuickTargets from './QuickTargets'
 ```
 
-- [ ] **Step 4: VaultReader 换后端源**
+（**注意**：Sidebar 内联 `pick-dir` 顶部**不加** —— 能走到那一屏的用户，路径必然是
+`quick` →「其他目录…」→ 选类型 → `pick-dir`，即他刚刚才明确选择了「不用快速目标」。
+在下一屏把同样 5 行再摆一遍是噪音。`DirectoryPicker` 这一份保留：定时任务表单是低频、
+易填错的表单，真受益。）
 
-`VaultReader.tsx` 改动三处：
+- [ ] **Step 8: `App.tsx` 发射刷新事件**
 
-(a) 删除 `recent` state 与 localStorage 调用。把
+`handleCreate`（`App.tsx:239`）的 `await createSession(...)` 之后加：
+
 ```ts
-import { filterVaultEntries, resolveVaultImageSrc, getRecentNotes, pushRecentNote, removeRecentNote } from '../lib/vault'
+    notifyQuickTargetsChanged()   // 后端刚 bump 过，让挂载中的快速列表重排
 ```
-改为
+
+import 加：
+
+```ts
+import { notifyQuickTargetsChanged } from './lib/quickTargetsBus'
+```
+
+（**只在 `createSession` 成功之后**发。`type === 'vault'` 的早退分支**不发** ——
+它在前端短路，后端没有 bump。）
+
+- [ ] **Step 9: `VaultReader` 换后端源 + 发射事件**
+
+(a) import 改为：
 ```ts
 import { filterVaultEntries, resolveVaultImageSrc } from '../lib/vault'
-```
-并加
-```ts
 import QuickTargets from './QuickTargets'
+import { notifyQuickTargetsChanged } from '../lib/quickTargetsBus'
 ```
 
 (b) 删除 `const [recent, setRecent] = useState<string[]>(() => getRecentNotes())`。
 
-(c) `openNote` 内删掉 `pushRecentNote(path); setRecent(getRecentNotes())`（后端 `vault_file` 已在成功分支 bump），以及 catch 里的 `removeRecentNote(path); setRecent(getRecentNotes())`（读出时守卫已自愈删行）。catch 保留 alert：
+(c) `openNote` 的 `.then()` 里，把 `pushRecentNote(path); setRecent(getRecentNotes())`
+换成 `notifyQuickTargetsChanged()`（后端 `vault_file` 已在成功分支 bump）；
+catch 里删掉 `removeRecentNote(path); setRecent(getRecentNotes())`（读出时守卫已自愈删行），
+保留 alert：
 
 ```ts
     }).catch(() => {
       if (openReqRef.current !== req) return
-      // 一条失效的历史条目（笔记已在 Obsidian 中删除/移动）会 404。后端的读出
-      // 守卫会在下次列表时剔除并删行，这里只需告知用户。
+      // 一条失效的历史条目（笔记已在 Obsidian 中删除/移动）会 404。后端的读出守卫
+      // 会在下次列表时剔除并删行，这里只需告知用户。
       alert('无法打开笔记(可能已被删除或移动):' + path)
     })
 ```
 
-(d) 把「最近打开」那段（`L119-125` 区域）整体替换为：
+(d) 把「最近打开」那段（`L119-125` 区域）替换为 —— **用 `hidden` 而非条件渲染**，
+因为 `VaultReader` 在 `App.tsx:396` 是常驻挂载（用 `hidden` 切可见性、刻意不 unmount
+以保留滚动状态），条件渲染会让切目录时 unmount/remount，每次重付一遍全量 note 校验的 IO：
 
 ```tsx
-            {cwd === '' && (
+            <div className={cwd === '' ? '' : 'hidden'}>
               <QuickTargets kind="note" onPick={(path) => openNote(path)} />
-            )}
+            </div>
 ```
 
-- [ ] **Step 5: 删除 vault.ts 的 localStorage recent**
+- [ ] **Step 10: 删除 vault.ts 的 localStorage recent**
 
-`frontend/src/lib/vault.ts` 删除 `RECENT_KEY`、`getRecentNotes`、`pushRecentNote`、`removeRecentNote` 四项（本次改动使其成为死代码，属清理自己造成的 mess）。
+`frontend/src/lib/vault.ts` 删除 `RECENT_KEY`、`getRecentNotes`、`pushRecentNote`、
+`removeRecentNote` 四项（本次改动使其成为死代码，属清理自己造成的 mess）。
 
-同步删除 `frontend/src/lib/__tests__/vault.test.ts` 中针对这三个函数的 describe 块。先跑 `grep -n "RecentNote" frontend/src/lib/__tests__/vault.test.ts` 定位。
+同步删除 `frontend/src/lib/__tests__/vault.test.ts` 中针对这三个函数的 describe 块
+（先 `grep -n "RecentNote" frontend/src/lib/__tests__/vault.test.ts` 定位）。
 
-- [ ] **Step 6: 跑全量前端测试**
+**不做 localStorage → 后端的迁移**：那需要一个能批量写入任意 path + last_ms 的端点，
+与被否决的公开 bump 端点是同一个洞。现存 ≤10 条 recent 打开一次笔记就自然重建。
+
+- [ ] **Step 11: 跑全量前端测试 + lint + build**
 
 Run: `cd frontend && npm test 2>&1 | tail -25`
-Expected: 全绿。若 `VaultReader.test.tsx` 因「最近打开」断言失败，更新该断言为新的 `QuickTargets` 渲染（它在无数据时返回 `null`，故需 mock `listQuickTargets` 返回空 list）。
+Expected: 全绿。若 `VaultReader.test.tsx` 因「最近打开」断言失败，更新该断言 ——
+`QuickTargets` 在无数据时返回 `null`，故需 mock `listQuickTargets` 返回 `{ top: [] }`。
 
 Run: `cd frontend && npm run lint 2>&1 | tail -10`
 Expected: 无 error。
-
-- [ ] **Step 7: 构建验证（前端必须先 build）**
 
 Run: `cd frontend && npm run build 2>&1 | tail -5`
 Expected: 成功产出 `frontend/dist/`。
@@ -1494,17 +1803,27 @@ Expected: 成功产出 `frontend/dist/`。
 Run: `cargo check 2>&1 | tail -5`
 Expected: 无错误。
 
-- [ ] **Step 8: Commit**
+- [ ] **Step 12: Commit**
 
 ```bash
-git add frontend/src/components/Sidebar.tsx frontend/src/components/DirectoryPicker.tsx frontend/src/components/VaultReader.tsx frontend/src/lib/vault.ts frontend/src/lib/__tests__/vault.test.ts
-git commit -m "feat(quick-targets): 接入 New Session 首屏 / pick-dir 顶部 / Obsidian 最近打开
+git add frontend/src/components/Sidebar.tsx frontend/src/components/DirectoryPicker.tsx frontend/src/components/VaultReader.tsx frontend/src/App.tsx frontend/src/lib/vault.ts frontend/src/lib/__tests__/vault.test.ts
+git commit -m "feat(quick-targets): 接入三个入口 + 修 5 个导航/可用性缺陷
 
-New Session 首屏改为快速卡片(点一行=用该目录上次的 agent 直接创建,跳过
-prompt 页),「其他目录…」兜底走原 类型→目录 流程;pick-dir 与 DirectoryPicker
-顶部同样嵌入。VaultReader 的「最近打开」从 localStorage 换到后端 frecency,
-并显示父目录以区分同名 _index.md;vault.ts 的 localStorage recent 三函数
-随之删除(本次改动使其成为死代码)。
+入口:New Session 首屏(快速卡片 + 其他目录… + Obsidian 保底入口)、DirectoryPicker
+顶部、VaultReader 的最近打开。Sidebar 内联 pick-dir 顶部刻意不加——走到那屏的用户
+刚刚才明确选择了「不用快速目标」。
+
+Obsidian 保底入口是必需的:'vault' 在 App.tsx:240-244 前端短路不经 create_session,
+永远不会出现在 dir 榜上;只靠「其他目录…」里那份会让入口从 2 tap 退化到 3 tap。
+
+同时修 5 个缺陷:①三处弹层硬编码 w-56 不随 mobile(侧栏面板本身是 mobile?w-64)
+②pick-type 缺返回键(quick 成首屏后它是第二屏却无路可回)③pick-prompt 返回硬编码
+到未 loadDirs 的 pick-dir + 那屏的 Use this directory 缺 disabled 守卫(会把 ''
+当 work_dir 提交,DirectoryPicker:86 早有这个守卫)④selectNewShell 丢弃已定目录
+⑤手机创建后不关全屏侧栏(用户对着遮罩看不到新会话)。
+
+VaultReader 用 hidden 而非条件渲染:它在 App.tsx:396 常驻挂载,条件渲染会让切目录
+时 remount 重付全量 note 校验 IO。
 
 Co-Authored-By: Claude Opus 5 (1M context) <noreply@anthropic.com>"
 ```
@@ -1532,54 +1851,96 @@ Expected: 全绿。
 
 Run: `cd frontend && npm run build && cd .. && cargo build && ./target/debug/zeromux --port 8099 --password test`
 
-在浏览器打开 `http://localhost:8099`，逐条验证（对应 spec 的验证标准第 4 项）：
+浏览器打开 `http://localhost:8099`，逐条验证：
 
-1. 全新库：点 ＋ 新建会话 → 首屏应显示「其他目录…」且无快速卡片（空列表返回 `null`）
-2. 走「其他目录…」创建 3 个不同目录的 claude 会话
-3. 重开 ＋ → 首屏出现 3 条，最近创建的在最前，每条右侧显示 `CLAUDE`
-4. 点第 1 条 → 应**直接创建**会话（不经过 prompt 页），且新会话 work_dir 正确
-5. hover 第 2 条点 pin 图标 → 该条移到最前且 pin 图标常亮
-6. 创建 ≥6 个不同目录的会话后重开 → pin 的那条仍在最前，且未 pin 部分显示 **5** 条（pin 不占名额）
-7. hover 某条点 × → 该条消失；重开面板确认未复活
-8. 点某条的 ▸ → 进类型选择，选 codex → 进 prompt 页（目录已定，不再让选目录）
-9. Obsidian（需 `--vault-dir`）：打开 2 篇不同目录的 `_index.md` → 列表两条能通过 hint 父目录区分
+1. **全新库**：点 ＋ → 因列表为空，**直接看到类型选择器**（不是只有标题的空壳）
+2. 走类型选择器创建 3 个不同目录的 claude 会话
+3. 重开 ＋ → 首屏出现 3 条，最近创建的在最前，每条行首是 Claude 图标、第 2 行是父路径
+4. 点第 1 条 → **直接创建**（不经 prompt 页），work_dir 正确
+5. **同一目录先用 claude 再用 codex** → 重开 ＋ 应看到**该目录的 2 行**，
+   一行 Claude 图标一行 Codex 图标，**标签不漂移**
+6. 点某行的 `⋮` → 展开操作单，三项（换 agent 类型 / 带 prompt 打开 / 从列表移除）
+   **都可见**（不需 hover）
+7. 点「从列表移除」→ 该行消失；重开面板确认未复活
+8. 点「换 agent 类型」→ 进类型选择，选 codex → 进 prompt 页（目录已定，不再选目录）
+9. 点「换 agent 类型」→ 选 Terminal → **直接用该目录开终端**（不被扔回目录浏览）
+10. 在 `pick-type` 点返回 → 回到快速列表
+11. 首屏点「Obsidian 笔记库」→ 直接打开阅读器（**2 tap，未退化**）
+12. **Obsidian 里连开 3 篇笔记 → 不离开该页面，列表顺序实时重排**（事件驱动生效）
+13. 打开 2 篇同名 `_index.md` → 列表能通过第 2 行父目录区分
 
-- [ ] **Step 3: 验证定时任务不污染**
+- [ ] **Step 3: 手机视口验证（Chrome DevTools 触屏模拟）**
 
-在 Settings → 定时任务里建一个 5 分钟后触发的任务，work_dir 指向一个**从未手动开过会话**的目录。等它触发一次后重开 ＋ 面板。
+DevTools → Toggle device toolbar → 选 iPhone → 勾选 touch 模拟。
 
-Expected: 该目录**不**出现在快速卡片中（bump 只在 `web.rs` 的交互式 handler，定时任务走 `create_acp_session_tagged` 独立路径）。
+1. 弹层宽度应接近全屏宽（不是 224px）
+2. 行高 ≥48px，`⋮` 可见
+3. 点一行创建 → **侧栏自动关闭**，能立刻看到新会话
+4. 操作单三项都可见可点（这一条是 hover-only 回归的守门测试）
 
-- [ ] **Step 4: 验证守卫自愈**
+- [ ] **Step 4: 验证定时任务与 attach tmux 不污染**
+
+在 Settings → 定时任务里建一个 5 分钟后触发的任务，work_dir 指向一个**从未手动开过
+会话**的目录。等它触发一次后重开 ＋ 面板。
+
+Expected: 该目录**不**出现在快速卡片中（bump 只在 `web.rs` 的交互式 handler，
+定时任务走 `create_acp_session_tagged` 独立路径）。
+
+再验证 attach：`tmux new -s probe -d`，然后 ＋ → Terminal → Attach existing → `probe`。
+
+Expected: `~`（即 `--work-dir` 的兜底值）**不**出现在榜上。
+
+- [ ] **Step 5: 验证三态守卫自愈**
 
 ```bash
-# 手动往表里插一条指向 ~/.ssh 的行（模拟历史行 + 守卫加严）
+NOW=$(date +%s000)
+# ① 指向 ~/.ssh（确定性拒绝 → 应删行）
 sqlite3 ~/.zeromux/zeromux.db \
-  "INSERT INTO quick_targets (user_id,kind,path,hits,last_ms,score_raw,pinned,last_agent)
-   VALUES ('legacy','dir','$HOME/.ssh',9,$(date +%s000),9.0,0,'claude');"
-# 再插一条不存在的目录
+  "INSERT INTO quick_targets (user_id,kind,path,agent,hits,last_ms,score_raw)
+   VALUES ('legacy','dir','$HOME/.ssh','claude',9,$NOW,9.0);"
+# ② 不存在的目录（NotFound → 应删行）
 sqlite3 ~/.zeromux/zeromux.db \
-  "INSERT INTO quick_targets (user_id,kind,path,hits,last_ms,score_raw,pinned,last_agent)
-   VALUES ('legacy','dir','$HOME/definitely-not-here-$RANDOM',9,$(date +%s000),9.0,0,'claude');"
+  "INSERT INTO quick_targets (user_id,kind,path,agent,hits,last_ms,score_raw)
+   VALUES ('legacy','dir','$HOME/definitely-not-here-$RANDOM','claude',9,$NOW,9.0);"
 ```
 
-重开 ＋ 面板 → 两条都**不**显示。然后确认已被删行：
+重开 ＋ 面板 → 两条都**不**显示。确认已删行：
 
 ```bash
 sqlite3 ~/.zeromux/zeromux.db \
   "SELECT path FROM quick_targets WHERE path LIKE '%.ssh%' OR path LIKE '%definitely-not-here%';"
 ```
-Expected: 空输出（读出时剔除 + 删行生效）。
+Expected: 空输出。
 
-- [ ] **Step 5: 部署**
+**再验证 Unknown 态不删行**（这是 v2 新增的保护，防止一次 JuiceFS 抖动清掉累积分）：
+构造一个存在但不可 canonicalize 的路径 —— 建一个自指的 symlink 环：
+
+```bash
+ln -s ~/qt-loop ~/qt-loop 2>/dev/null || true
+sqlite3 ~/.zeromux/zeromux.db \
+  "INSERT INTO quick_targets (user_id,kind,path,agent,hits,last_ms,score_raw)
+   VALUES ('legacy','dir','$HOME/qt-loop','claude',9,$(date +%s000),9.0);"
+```
+
+重开面板 → 该条不显示；然后确认**行仍在**：
+
+```bash
+sqlite3 ~/.zeromux/zeromux.db "SELECT path FROM quick_targets WHERE path LIKE '%qt-loop%';"
+```
+Expected: **非空**（symlink 环使 `canonicalize` 返回 `ELOOP` 而非 `NotFound`
+→ `Unknown` → 只剔除不删行）。清理：`rm -f ~/qt-loop` 并删掉该行。
+
+- [ ] **Step 6: 部署**
 
 Run: `./deploy.sh --build`
 
-**必须用 `./deploy.sh`。** 绝不手跑 `systemctl stop` + `cp` + `start`——尤其不要从 zeromux 终端里跑（cgroup 自杀陷阱，见项目 CLAUDE.md）。`deploy.sh` 会自动逃出 cgroup 并自带健康检查 + 自动回滚。
+**必须用 `./deploy.sh`。** 绝不手跑 `systemctl stop` + `cp` + `start` —— 尤其不要从
+zeromux 终端里跑（cgroup 自杀陷阱，见项目 CLAUDE.md）。`deploy.sh` 会自动逃出 cgroup
+并自带健康检查 + 自动回滚。
 
-Expected: 输出健康检查通过；`https://zeromux.keithyu.cloud` 可访问且快速卡片可见。
+Expected: 健康检查通过；`https://zeromux.keithyu.cloud` 可访问且快速卡片可见。
 
-- [ ] **Step 6: Commit（若手测有修补）**
+- [ ] **Step 7: Commit（若手测有修补）**
 
 ```bash
 git add -A

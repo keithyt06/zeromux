@@ -12,6 +12,7 @@ mod oauth;
 mod prompts;
 mod prompts_seed;
 mod pty_bridge;
+mod quick_targets;
 mod run_metrics;
 mod scheduled_tasks;
 mod session_manager;

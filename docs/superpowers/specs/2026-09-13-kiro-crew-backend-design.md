@@ -1,54 +1,87 @@
-# Kiro Crew 后端接入设计（第一阶段）
+# Kiro Crew 接入设计 —— zeromux v2「有记忆的驾驶舱」
 
 - **日期**：2026-09-13
-- **状态**：待实现
-- **范围**：新增 `SessionType::Crew` 作为第 5 种会话后端；**保留** 现有 `SessionType::Kiro` 不变
-- **决策依据**：本文档所有接口行为均在本机（Ubuntu 24.04，KiroCrew 0.6.0，kiro-cli 2.3.0）实测确认，非文档推测
+- **状态**：待实现（已过 CTO + 产品总监交叉评审）
+- **范围**：新增 `SessionType::Crew`；**删除 Kiro 后端**；扩展 `AcpEvent`（审批 + 上下文用量）；新增记忆的第一方 UI
+- **决策依据**：所有接口行为均在本机实测（Ubuntu 24.04 / KiroCrew 0.6.0 / kiro-cli 2.3.0）；所有代码论断均给出 `文件:行号`
+- **本文档经过一次自我纠错**：初稿 §5.2 的安全分析事实错误，已在该节推翻并说明原因
+
+## 0. 定位（评审确立）
+
+> **zeromux 是你口袋里的 agent 驾驶舱 —— Crew 负责记住与思考，zeromux 负责让你在任何地方看见它、并在关键时刻按下那个按钮。**
+
+分工：**Crew dashboard 是工作台**（桌面、配置、深度管理），**zeromux 是驾驶舱**（手机、监督、介入）。
+
+三条不可替代的理由（均为实测，非偏好）：
+
+1. **Crew 在公网上不存在。** 它绑 `localhost:5476` + unix socket，手机要用得开隧道。zeromux 有完整公网身份栈（`oauth.rs` 443 行 / `auth.rs` 599 行 / PWA / `zeromux.keithyu.cloud`）。
+2. **Crew 没有 Web Push。** `grep -rli vapid` 在整个 `kiro_crew` 包内**零命中**。而 `push.rs`（935 行）有完整 VAPID 实现且已有 `confirm` 触发类型（`push.rs:353`，归入 `lvl_important`：`push.rs:380-381`）。**"agent 停下来等你"这件事只有 zeromux 能推到锁屏。**
+3. **Crew 只有一个后端且没有终端。** `agent.provider` 硬定为 acp、只跑 kiro-cli。zeromux 有 PTY（`TerminalView.tsx` + `MobileKeyBar.tsx`）与 Claude/Codex。
+
+这三条同时否决了「把 zeromux 改造成 Crew 的一个 App」—— 详见 §10。
 
 ---
 
 ## 1. 背景与决策
 
-### 1.1 为什么不是"替换 Kiro"
+### 1.1 Crew 替代不了 zeromux 的编排层，但要替代 Kiro 后端
 
-Kiro Crew **不是更好的 Kiro CLI，而是与 zeromux 同层的编排器**。实测证据：
+**这是两个不同的问题，初稿把它们混为一谈了。**
 
-Gateway 拉起的子进程是
+**问题一：Crew 能不能替代 zeromux？不能。** Gateway 拉起的子进程是
 ```
 kiro-cli acp --agent kirocrew-lite
 ```
-而 `~/.kiro/agents/kirocrew-lite.json` 内容为 `{"tools": [], "mcpServers": {}, "prompt": ""}` —— 一个空壳 agent。
+而 `~/.kiro/agents/kirocrew-lite.json` 是 `{"tools":[],"mcpServers":{},"prompt":""}` —— 一个空壳。Crew 的全部价值都在 Gateway 那个 Python 进程内，因此：
 
-**结论**：Crew 的全部价值（记忆、lessons、技能进化、上下文装配、审批闸、cron、subagent）都在 Gateway 那个 Python 进程里，不在 agent config 里。因此：
+- 「把 zeromux 的 `--trust-all-tools` 改成 `--agent kirocrew` 白拿 Crew 能力」不存在；kiro-cli 2.3.0 更是**拒绝解析** `kirocrew.json`（`unknown field 'permissions'`）。
+- 「真替换」= 把 zeromux 降级成 Crew 前端 = 丢掉 PTY / 多后端 / 多用户 / Web Push。
 
-- 「把 zeromux 的 `kiro-cli acp --trust-all-tools` 改成 `--agent kirocrew` 就白拿 Crew 能力」这条廉价路径**不存在**。
-- 额外证据：kiro-cli 2.3.0 已**拒绝解析** `kirocrew.json`（`unknown field 'permissions'`），该路径当场不可行。
-- 「真替换」等于把 zeromux 降级成 Crew 的前端，需重写 `session_manager.rs` 的核心抽象，并丢弃 PTY、多后端、多用户等 zeromux 独有资产 —— 负和。
+**问题二：zeromux 该不该保留 Kiro 后端？不该。** 这与问题一无关 —— Crew 会话在**底层就是** kiro-cli 会话，只是多了记忆、技能、审批。裸 Kiro 被**严格支配**：没有任何场景你会理性地选它。
 
-### 1.2 能力对比（决定"并存"而非"替换"）
+实证依据：
+
+| 证据 | 数据 |
+|---|---|
+| 线上 Kiro 会话 | **1 个**（`zeromux.db`：claude 3、kiro 1，且那 1 个 work_dir 是 `/home/ubuntu`，随手开的） |
+| Kiro 驱动的定时任务 | **0 个**（唯一任务 `agent_type=claude` 且 `enabled=0`） |
+| 代码自证 | `session_manager.rs:3175/3244/3248` 注释原文："**Kiro runs no scheduled tasks**"、"kiro 当前不跑调度，留此分支保持三 fanout 对称" |
+| auto-titler | `auto_titler.rs:5-9`：Kiro **无法**安全降为无工具 → Kiro 会话**永远拿不到自动标题** |
+| 前端早已预留退路 | `lib/quickTargets.ts:3` 注释原文："某个 agent 类型日后被移除时（**如 kiro**）" |
+
+**删除代价**：约 1045 行（`kiro_process.rs` 677 + `spawn_kiro_fanout` 278 + 其余）+ 70 处引用 + 前端 5 文件；**持久化代价 1 行 DB 记录**（`from_str_lenient`（`session_manager.rs:70-77`）对未知值回落 Tmux，不会 panic；一条 `UPDATE` 即可清理）。
+
+**两个必须说清的前提**：
+
+1. **`kiro-cli` 二进制不能删** —— 它是 Crew 的运行时依赖（Gateway 靠它跑）。删的是 zeromux 的 Kiro **后端路径**，`--kiro-path` 参数保留无害。
+2. **顺带消除一个并发风险**：当前 `ps` 显示 `kiro-cli acp --trust-all-tools`（zeromux 的）与 `kiro-cli acp --agent kirocrew-lite`（Crew 的）**同时在跑**，两者共享 `~/.kiro/sessions/`。删掉 Kiro 后端顺手消掉这个共享状态。
+
+### 1.2 能力对比
 
 | 能力 | zeromux | Kiro Crew | 归属 |
 |---|---|---|---|
-| Web 终端 (PTY/tmux) | ✅ | ❌ | zeromux 独有 |
-| 多 agent 后端 | ✅ Claude/Kiro/Codex | ❌ 仅 kiro-cli（`agent.provider` 硬定为 acp） | zeromux 强 |
-| 多用户 / OAuth / per-owner 授权 | ✅ | ❌ 单用户 | zeromux 强 |
-| PWA + Web Push + 移动布局 | ✅ | 需隧道 | zeromux 强 |
-| 定时任务 | ✅ `scheduled_tasks.rs` | ✅ cron | 重叠，各自保留 |
+| Web 终端 (PTY/tmux) | ✅ | ❌ | **zeromux 独有** |
+| **Web Push / PWA** | ✅ `push.rs` 935 行 | ❌ **零 vapid 命中** | **zeromux 独有** |
+| 公网可达 / OAuth 多用户 | ✅ | ❌ 单用户 loopback | **zeromux 独有** |
+| 多 agent 后端 | ✅ Claude / Codex | ❌ 仅 kiro-cli | zeromux 强 |
+| **定时任务（带工作目录）** | ✅ `work_dir` 必填 | ❌ **cron 零 cwd 字段** | **zeromux 独有**（见 §11） |
 | 跨会话记忆 / 自学习 / 技能进化 | ❌ | ✅ | **Crew 强** |
 | IM 渠道（含微信） | ❌ | ✅ 10 个 | **Crew 独有** |
 | Subagent 并行 | ❌ | ✅ | **Crew 强** |
 | PreToolUse 审批闸 + OS 沙箱 | ⚠️ 仅路径守卫 | ✅ | **Crew 强** |
+| 上下文用量统计 | ❌ | ✅ `context_usage` 事件 | **Crew 强**（白拿） |
 
-**决策**：新增第 5 种会话类型（正和），而非替换第 3 种（负和）。
+### 1.3 已确认的产品决策（含两处评审推翻）
 
-### 1.3 已确认的产品决策
-
-| 决策 | 选择 | 理由 |
+| 决策 | 选择 | 说明 |
 |---|---|---|
-| 架构 | 方案 A：WS 广播 + slot 过滤 + 复用 `AcpEvent` | 保持 fan-out 不变量，前端零改动 |
-| Token 获取 | zeromux 自动读 secret 并 mint | 个人项目，避免手动换 token |
-| 审批模式 | `trust`（自动批准） | 与现有 Kiro `--trust-all-tools` 体验一致 |
-| 微信范围 | 共享记忆，不共享对话 | 第一期范围，降低复杂度 |
+| 架构 | WS 广播 + slot 过滤 + 复用 `AcpEvent` | 保持 fan-out 不变量 |
+| Token 获取 | zeromux 自动读 secret 并 mint | 见 §5 的边界约束 |
+| **审批模式** | ~~`mode:trust`~~ → **走 `Approval` 事件 + UI 批准** | **评审推翻，见 §4.4** —— `mode:trust` 不带 slot 会把整个 Gateway（含微信）永久设为 auto-approve |
+| **Kiro 后端** | ~~保留~~ → **删除** | **评审推翻，见 §1.1** |
+| **定时任务** | 保留 zeromux 的，不迁移 | Crew cron 零 cwd + 拆 E1 门，见 §11 |
+| 微信范围 | 共享记忆，不共享对话 | 且**永远**不共享（`two-way = ❌`，见 §12） |
+| Gateway 守护 | fail fast + systemd 声明依赖 | **不由 zeromux 拉起**，见 §13 |
 
 ---
 
@@ -256,6 +289,60 @@ Gateway 自己会排队（实测忙时返回 `queued:true`）。zeromux 的 `Que
 
 **理由**：Gateway 已实现排队且带 `queue_id`，zeromux 侧再合并一层会产生两套队列语义冲突。第一期直接委托。
 
+### 4.4 `AcpEvent` 扩展两个变体（评审新增）
+
+`AcpEvent` 是 `#[serde(tag="type")]`（`process.rs:26`），加变体对现有后端**零影响**（它们不发）。
+
+| 新变体 | 来源 | 为什么必须加 |
+|---|---|---|
+| `Approval { id, tool, purpose, slot }` | Gateway 的 approval 请求（已在 fan-out 订阅的那条 WS 里） | 替代 `mode:trust`，见下 |
+| `ContextUsage { used, total }` | `context_usage` 帧 | zeromux **自己没有**这个能力，纯白拿的新功能。初稿把它列为"丢弃"是信息损失 |
+
+#### ⚠️ 实现陷阱（必须先读，否则会浪费一整轮调试）
+
+**前端对未知事件是静默丢弃，不是降级显示。** 两处实测确认：
+
+- `BlockView` 的 `default: return null`（`AcpChatView.tsx:967-968`）→ 未知 `block_type` **渲染为空**。
+- `handleEvent` 的 switch **没有 `default` 分支**（`AcpChatView.tsx:307-437`）→ 未知顶层 `type` 静默忽略。
+
+**含义**：任何"先改后端、前端以后补"的增量策略都会表现为"**什么都没发生**" —— 这是最难 debug 的失败模式。**后端加变体与前端加 case 必须同一个 commit。**
+
+### 4.5 审批：为什么必须推翻 `mode:trust`
+
+初稿 §1.3 选 `mode:trust`，理由是"与现有 Kiro `--trust-all-tools` 一致"。**这个类比是错的。** 读 handler（`chat_handlers.py:9016-9040`）：
+
+```python
+if slot is not None:
+    for _sharing in state._slots.values():
+        if effective_session_key(_sharing) == _granted_key: _sharing._trust = True
+    if mgr and linked_ch and linked_ch in mgr._channels:
+        mgr._channels[linked_ch].trusted = True
+        mgr._channels[linked_ch]._save()          # ← 持久化落盘
+else:                                              # ← slot 为 None
+    for s in state._slots.values(): s._trust = True
+    if mgr:
+        for ch in mgr._channels.values():
+            ch.trusted = True; ch._save()          # ← 全部 IM 渠道永久 trusted
+```
+
+**不带 `slot` 的 mode 请求 = 把 Gateway 上所有 slot 和所有 IM 渠道（含微信）永久设为 auto-approve 并落盘。** 而 `--trust-all-tools` 只影响 zeromux 自己 spawn 的那一个进程。作用域差了几个数量级。
+
+**决策：第一期不发 mode 请求，改为 `Approval` 事件 + UI 批准。** 三条理由：
+
+1. **审批闸是 §1.2 自己列为"Crew 强"的能力** —— 花力气接入 Crew 然后一键关掉它最有价值的差异化，是自相矛盾。
+2. **审批是 zeromux 相对 Crew 全部 10 个 IM 渠道的唯一结构性优势。** 实测 `kiro_crew/docs/channel-capabilities.md` 的矩阵：
+
+   | | Slack | Discord | Telegram | Teams | Webex | WeCom | **Weixin** | iMessage | WhatsApp | Feishu |
+   |---|---|---|---|---|---|---|---|---|---|---|
+   | Tappable choices | 10 | 25 | 25 | 5 | 5 | 0 | **0** | 0 | 0 | 0 |
+   | Approval waits | 120s | 300s | 300s | 300s | 300s | — | **—** | — | 300s | — |
+
+   微信**根本不装 approval decider**。一个 44px 的「批准」按钮 + Web Push，是 10 个渠道全都做不到、只有 zeromux 能做到的事。
+3. **不会卡死** —— 审批超时 7200s（`state.py:5799`）。
+
+**若日后仍要发 mode，请求体必须带 `slot`，并写成不变量 I4 + 单测钉死。**
+
+
 ---
 
 ## 5. 安全边界
@@ -275,50 +362,73 @@ fan-out 启动 / WS 重连
 2. 错误信息中**不得**包含 secret 或 token 内容（连长度也不必报）。
 3. 每次 WS 重连都重新 mint（token 有 TTL，实测 `exp` ≈ 5 分钟、`session_exp` ≈ 20 小时）。
 
-### 5.2 必须补的守卫 pin（已确认是真实缺口）
+### 5.2 守卫现状：`.kiro` 已被覆盖，不要加 pin（本节为纠错）
 
-接入 Crew 后，`~/.kiro/crew/` 成为高价值凭证目录，其下存有：`.local_secret`、`run/gateway-*.secret`、`memory.db`（全部记忆）、`gateway.log`、以及 IM 渠道凭证（`.env` 中的 `SLACK_BOT_TOKEN` 等）。
+> **本节推翻了本 spec 初稿的结论。** 初稿主张给 `SENSITIVE_DIR_NAMES` 加 `".kiro"`，
+> 理由是"base_dir 覆盖为 `~/.kiro/crew` 后守卫看不见 dot 段"。**该分析是错的**，
+> 由 CTO 评审指出，并经我把谓词抄出来单独编译验证。
 
-**现状盘点（逐条读码确认，不是推测）**：
+**错在哪**：`read_hits_home_dotdir`（`web.rs:1509-1531`）`strip_prefix` 的锚点是 **`$HOME`**（`web.rs:1518`），**不是 base**。因此 base 设成什么都不影响它 —— `~/.kiro/...` 的首段永远是 `.kiro`。
 
-`src/web.rs:1468` 的 `SENSITIVE_DIR_NAMES` 当前为
-```rust
-".ssh", ".aws", ".gnupg", ".git", ".zeromux", ".zeromux-worktrees",
+**编译实测**（把该函数原样抄出、`HOME=/home/ubuntu` 运行）：
+
 ```
-`.kiro` 不在其中。但**并非所有路径都因此敞开** —— 必须区分两种情形，否则会补错 pin：
+/home/ubuntu/.kiro                                  → true
+/home/ubuntu/.kiro/crew                             → true
+/home/ubuntu/.kiro/crew/.local_secret               → true
+/home/ubuntu/.kiro/crew/run/gateway-5476.secret     → true
+/home/ubuntu/.kiro/crew/memory.db                   → true
+/home/ubuntu/.kiro/agents/kirocrew.json             → true
+```
 
-| 情形 | 现状 | 是否缺口 |
-|---|---|---|
-| base_dir 在 `$HOME`，读 `~/.kiro/...` | `read_hits_home_dotdir`（`web.rs:1509`）拒绝任何首段为 dot 的 `~/.*` 路径 | ❌ **已覆盖** |
-| **base_dir 直接设为 `~/.kiro` 或 `~/.kiro/crew`** | `validate_browse_root` → `base_dir_at_or_in_sensitive`（`web.rs:1585`）只比对 `SENSITIVE_DIR_NAMES` 那 6 个名字 → **放行**；此后 `read_hits_home_dotdir` 收到的路径首段已是 `crew`/`run` 而非 dot 段 → 也放行 | ✅ **真实缺口** |
-| 写 / 重命名 / 删除 `~/.kiro` 下文件 | 写守卫同样以 `SENSITIVE_DIR_NAMES` 为基础 | ✅ **真实缺口** |
-| `git diff` 仓库根设为 `~/.kiro` | `git_diff_root_unsafe` 系列同样基于该名单 | ✅ **真实缺口** |
+**全部 true。** 读、写、diff 三条路径都已被覆盖：
 
-**动作**：`SENSITIVE_DIR_NAMES` 增加 `".kiro"`。
+| 情形 | 实际状态 |
+|---|---|
+| 读 `~/.kiro/**`（任何 base） | ✅ 已拒 —— `read_hits_home_dotdir` 锚定 `$HOME` |
+| 写 / 重命名 / 删除 `~/.kiro/**` | ✅ 已拒 —— 写守卫派生同一谓词集 |
+| `git diff` 根设为 `~/.kiro` | ✅ 已拒 —— `git_diff_root_unsafe` 末支即 `read_hits_home_dotdir`（`web.rs:1648`） |
+| `validate_browse_root("~/.kiro")` | ⚠️ 返回 `Ok`，但随后 `list_dir_entries`（`web.rs:1843`）首行即 `read_hits_home_dotdir` → **403，只是晚一跳** |
 
-**理由**：这与 2026-06-26 `.zeromux` 那轮是**同型漏洞** —— 当时的缺口也正是"base_dir 覆盖为数据目录后，descent guard 剥掉 base 前缀便看不见 `.zeromux` 这一段"（见 `web.rs:1361` 注释原文）。当时的修法就是并入 `SENSITIVE_DIR_NAMES`，此处照同一形状处理，避免守卫谱系分叉。
+**与 `.zeromux` 那轮不是同型**：`.zeromux` 的缺口在 `path_hits_sensitive_dir`（锚定 **base**，剥前缀后确实看不见）；`read_hits_home_dotdir` 锚定 `$HOME`，天生免疫 base 覆盖。初稿把这两个谓词的锚点混为一谈。
 
-**测试**：对齐既有 `.zeromux` 测试的形状，断言
-- `validate_browse_root("~/.kiro")` 与 `validate_browse_root("~/.kiro/crew")` 均 403（这是真正的缺口，必须先写红）；
-- `~/.kiro/crew/.local_secret`、`~/.kiro/crew/memory.db` 的读、写、枚举三处均被拒。
+**结论：不加 `.kiro`。** 收益为零，代价是初稿 5.2.1 自己承认的副作用（仓库内 `<repo>/.kiro/` 从 file-browser 与 diff 中消失）。**纯负收益。** 原 T9 / T11 / T12 / T13 四个测试作废 —— 其中 T9 根本写不出红，它已经是绿的，只是 403 来自另一个谓词。
 
-#### 5.2.1 加 pin 的已知副作用（取舍，非疏漏）
+#### 5.2.1 真正该补的缺口：`is_credential_path` 漏 `.secret`
 
-`SENSITIVE_DIR_NAMES` 被**两类守卫共用**，语义不同：
+**编译实测**（把 `is_credential_path`（`web.rs:1413`）原样抄出运行）：
 
-- `base_dir_at_or_in_sensitive` —— 锚定 `$HOME`，管"base 能不能设在这儿"（这是我们要修的缺口）；
-- `path_hits_sensitive_dir` / `worktree_path_excluded` —— 锚定 **base**，管"base 之下能不能下钻"。
+```
+gateway-5476.secret   → false      ← 缺口
+.local_secret         → false      ← 缺口
+memory.db             → false      ← 缺口（记忆全文）
+vapid.json            → false      ← 缺口（zeromux 自己的推送私钥！）
+token_signing.key     → true       （靠 .key 后缀恰好命中）
+.env / id_rsa         → true       （既有覆盖）
+```
 
-因此加入 `.kiro` 会**连带**产生一个副作用：**任何仓库内的 `<repo>/.kiro/` 目录也会从 file-browser 和 diff 中被排除。**
+**可达性**：在 `$HOME` 之下有 `read_hits_home_dotdir` 兜底，所以**今天不可达**。但这是**叶名 denylist 轴**，与 base 轴正交 —— 一旦这些文件出现在仓库内（`KIROCREW_HOME` 可覆盖 crew home 到任意目录，`config/loader.py:3-4`；或用户把 crew home 挪进工作区），`.secret` 就会被 `list_dir` 枚举、被 `get_file_raw` 读出、被 diff 逐字打印。
 
-**实测确认这不是假设**：本仓库当前就有 `./.kiro/settings/`（kiro-cli 的项目级配置目录），加 pin 后它将不可浏览、不出现在工作区改动里。
+**动作**：`is_credential_path` 增加
 
-**为什么仍然接受**：
-1. 这与 `.git` 的既有行为**完全同型** —— `.git` 也在名单里，仓库内的 `.git/` 同样被排除，从未有人认为那是 bug。
-2. `<repo>/.kiro/` 装的是 agent 配置与 steering 文件，恰恰是**可能含敏感内容**的一类（`.kiro/settings/` 可存 MCP OAuth token）。排除它是收益而非损失。
-3. 想编辑项目级 kiro 配置，用终端会话（PTY）即可 —— 与编辑 `.git/config` 的路径一致。
+```rust
+|| n.ends_with(".secret") || n == ".local_secret"
+```
 
-**不采取的替代方案**：只在 `base_dir_at_or_in_sensitive` 侧加 `.kiro`、而在下钻侧豁免。这会让守卫谱系分叉成"两份不同的名单"，正是既有代码注释反复警告的漂移根源（`web.rs:2643` 原文：*"deriving both ... from this one predicate keeps them from drifting"*）。第一期不引入这种分叉。
+**为什么这条值得做而 `.kiro` 那条不值得**：它是叶名判断，不触及 base / descent 语义，**不产生任何"仓库内目录消失"的副作用**；而且它顺带保护 zeromux 自己的 `vapid.json` 之外的任何 `*.secret`（`vapid.json` 因在 `~/.zeromux/` 内而已被 `SENSITIVE_DIR_NAMES` 覆盖，此处不重复）。
+
+#### 5.2.2 `--crew-home` 启动校验
+
+若 `crew_home` 落在 `vault_dir` 或任何 work_dir 之下，secret 就进入了 file-browser 的可读区（绕过 `$HOME` 兜底）。**动作**：启动时检测，命中则 fail fast。
+
+#### 5.2.3 secret 的内存边界（比初稿更严）
+
+初稿 5.1 的三条约束正确，补两条**结构性**约束：
+
+- **secret 与 token 不得进 `AppState`** —— `AppState` 被 `web.rs`（6481 行）的所有 handler 共享，任何一处调试打印即泄漏。
+- **不得进 `Session` 结构体** —— 它会被 `session_store` 持久化到 SQLite。
+
+只在 `crew_process.rs` 的 fan-out 任务栈上存活。
 
 ### 5.3 授权模型
 
@@ -344,34 +454,22 @@ Crew 会话与其他会话一视同仁：`owner_id` 隔离，仅所有者或管�
 
 ---
 
-## 7. 明确不做（YAGNI）
+## 7. 明确不做（含评审推翻的两项）
 
-| 项 | 原因 |
-|---|---|
-| 审批 UI | 已决定用 `mode:trust`，与现有 Kiro `--trust-all-tools` 一致 |
-| worktree 隔离 | Crew 的 cwd 由 Gateway 管，`--worktree-isolation` 对 Crew 会话不生效 |
-| 合并两套定时任务 | zeromux 的 `scheduled_tasks.rs` 与 Crew cron 各管各的。zeromux 定时任务可驱动 Crew 会话（走同一个 `SessionInput::Prompt`），自然继承，不额外做 |
-| 微信配置 UI | 微信在 Crew dashboard 配（`localhost:5476` → Settings → Channels）。zeromux 不碰 IM 凭证 |
-| 同一 slot 双入口（微信接续 zeromux 对话） | 第二期。第一期为"共享记忆、不共享对话" |
-| Crew 的 subagent / artifact / workflow 面板 | 第二期。第一期只做会话对话 |
-| 镜像 Crew 的 slot 列表到 zeromux 侧边栏 | 第二期 |
-
-### 7.1 微信在第一期的实际形态
-
-```
-微信 → Gateway 的某个 slot ──┐
-                            ├── 共享同一份记忆 / lessons / 技能
-zeromux Crew 会话 → 另一 slot ┘
-```
-
-**两边不是同一个对话，但共享记忆层。** 配好微信后 zeromux 侧**无需任何改动**即自动获得该能力 —— 因为两者指向同一个 Gateway。
-
-**微信渠道的已知限制**（来自 Crew 官方文档 `weixin-integration.md`，需知情后再启用）：
-- 走 iLink bot API，**非 Tencent 官方开发者产品**；文档明示可能违反微信 ToS，账号存在被限制或封禁风险。业务关键场景应改用 WeCom（企业微信，官方 WebSocket 通道）。
-- **仅私聊**，不支持群聊（iLink bot 身份收不到群事件）。
-- **不能流式**（iLink 无法编辑已发消息，整轮 buffer 后一次性发出）。
-- **无审批按钮**；`interactive` 模式在该渠道为 deny-by-default。
-- 默认 `dm_policy=allowlist` 且列表为空 —— 即**默认谁都不授权**，需手动加 user id。
+| 项 | 判定 | 原因 |
+|---|---|---|
+| ~~审批 UI~~ | **改为要做** | **评审推翻**。它是 zeromux 相对 10 个 IM 渠道的唯一结构性优势，见 §4.5 |
+| **废弃 / 合并 zeromux 定时任务** | **坚决不做** | Crew cron **零 `cwd` 字段** + 会拆掉 auto-update 的 E1 门，见 §11 |
+| **zeromux 变成 Crew 的 App** | **技术上不可行** | PTY 无法穿过 HMAC 反代，见 §10 |
+| **第二事件通道** | 不做 | 要配第二套 scrollback / replay / 重连，memory 里那十几轮 stale-response bug 会全部重演 |
+| subagent / workflow / artifact 面板 | 第一期不做 | **理由不是"以后再说"**：它们是树状数据，塞进线性 transcript 必然错。要做就做独立面板走 REST，不污染 `AcpEvent`。且实测 `/api/spawn` = `{"agents":[]}`，用户一次都没 spawn 过 —— 给空数据建面板是浪费 |
+| Crew cron / script-cron 的 UI | 坚决不做 | zeromux 已有 `ScheduledTasksPanel`（633 行）+ 确认队列 + replay + 看门狗；第二套定时语义是灾难级复杂度 |
+| 技能（skill）的增删改 | 坚决不做 | 手机上编辑 skill 的 markdown 是伪需求 |
+| IM 渠道配置 UI | 坚决不做 | 碰凭证，违反 workspace CLAUDE.md 的 no-secrets |
+| worktree 隔离 | 不适用 | Crew 的 cwd 由 Gateway 管，`--worktree-isolation` 对 Crew 会话不生效 |
+| 同一 slot 双入口（微信接续 zeromux 对话） | **永远不做** | 实测 `two-way = ❌`，微信回复**必开新 session**。做这个 UI 等于撒谎，见 §12 |
+| zeromux 拉起 / 守护 Gateway | 坚决不做 | 已有 systemd；两个 `KillMode=control-group` 互拉 = cgroup 陷阱，见 §13 |
+| **prompt presets** | **保留**（评审建议删，被数据推翻） | 见 §9.2 |
 
 ---
 
@@ -394,52 +492,382 @@ zeromux Crew 会话 → 另一 slot ┘
 
 ### 8.2 Rust 单元测试（`src/web.rs`）
 
+> 初稿的 T9 / T11 / T12 / T13 **已作废** —— 它们建立在 5.2 那个被推翻的分析上。
+> 尤其 T9 根本写不出红：`validate_browse_root("~/.kiro")` 确实返回 `Ok`，
+> 但 403 由随后的 `read_hits_home_dotdir` 给出，行为已正确。
+
 | # | 测试 | 断言 |
 |---|---|---|
-| T9 | **base_dir 覆盖（真实缺口，须先验红）** | `validate_browse_root("~/.kiro")` 与 `validate_browse_root("~/.kiro/crew")` 均返回 403 |
-| T10 | `.kiro` 读守卫 | `~/.kiro/crew/.local_secret`、`~/.kiro/crew/memory.db` 读被拒 |
-| T11 | `.kiro` 写守卫 | 同上路径的写/重命名/删除被拒 |
-| T12 | `.kiro` 目录枚举 | `/api/directories` 不列举 `~/.kiro` 内容 |
-| T13 | in-repo `.kiro` 的副作用（**已知取舍，见 5.2.1**） | 断言 `<repo>/.kiro/**` 在 file-browser 与 diff 中被排除 —— 这是加 pin 的**预期代价**，测试固定该行为以免日后误判为 bug |
+| T9 | **`.secret` 叶名守卫（真实缺口，须先验红）** | `is_credential_path("gateway-5476.secret")` 与 `is_credential_path(".local_secret")` 均为 `true`（修改前为 `false`，即先红后绿） |
+| T10 | `.kiro` 已覆盖的回归钉 | `read_hits_home_dotdir` 对 `~/.kiro`、`~/.kiro/crew/.local_secret`、`~/.kiro/crew/memory.db` 均返回 `true`。**此测试当场即绿** —— 它的作用是钉住"不需要加 pin"这个事实，防止日后有人重犯初稿的误读 |
+| T11 | in-repo `.kiro` 不受影响 | `<repo>/.kiro/settings/cli.json` **仍可**被 file-browser 读取（证明我们没有引入 5.2 初稿那个副作用） |
+| T12 | `--crew-home` 越界 fail fast | `crew_home` 位于 `vault_dir` 或 work_dir 之下时启动校验报错 |
 
 ### 8.3 前端测试（vitest）
 
 | # | 测试 | 断言 |
 |---|---|---|
-| T14 | `SessionType` 含 `'crew'` | 类型与图标映射不漏 |
+| T13 | `SessionType` 含 `'crew'` | 类型与图标映射五处不漏：`api.ts:1`、`SessionTypeIcon`（`Sidebar.tsx:69-77`）、`RowIcon`（`QuickTargets.tsx:11-20`）、`agentType`（`AcpChatView.tsx:57`）、`AGENT_KEYS`（`MobileKeyBar.tsx:260-264`） |
+| T14 | `AcpEvent` 新变体前端有 case | 断言 `Approval` 与 `ContextUsage` 在 `handleEvent` / `BlockView` 中均有对应分支 —— **防的是 §4.4 那个"静默丢弃"陷阱**（`BlockView` 的 `default: return null`） |
+| T15 | 记忆写入的三个隐藏约束 | key 自动加 `pref.` 前缀；请求带 `X-Session-Key`；PUT 路径不带 key（见 §9.2 实测契约） |
 
 ### 8.4 手工验收（需 Gateway 运行）
 
-1. New Session 菜单出现 5 项，选 Kiro Crew 能建会话。
-2. 发一个 prompt，流式文本正常渲染。
-3. 让它跑一个 bash 命令，`tool_use` 块渲染一次（**非 3 次**）。
-4. 轮次结束后活动看板有摘要（证明 `Result.text` 非空）。
-5. 开两个 Crew 会话同时发 prompt，**输出不串台**（I1 的端到端验证）。
-6. 停掉 Gateway，会话报错且不 hang；重启 Gateway 后重连恢复。
-7. 删除会话后 `GET /api/chat/slots` 中对应 slot 消失（无泄漏）。
-8. file-browser 无法浏览到 `~/.kiro`。
+**批次 1（Crew 会话跑通）：**
+1. New Session 类型菜单是 **4 项**（Terminal / Claude Code / **Kiro Crew** / Codex，+ Obsidian），原 Kiro 位置已被 Crew 取代。
+2. 选 Kiro Crew 能建会话，且 `GET /api/chat/slots/{key}` 的 `project` 等于所选 work_dir。
+3. 发一个 prompt，流式文本正常渲染。
+4. 让它跑一个 bash 命令，`tool_use` 块渲染 **一次**（非 3 次 —— I2）。
+5. 轮次结束后活动看板有摘要（证明 `Result.text` 非空 —— I3）。
+6. 开两个 Crew 会话同时发 prompt，**输出不串台**（I1 端到端）。
+7. 忙时再发一条 prompt，两轮都完整出现且顺序正确（验证 §2.4 的"丢弃 SSE 响应体"决策）。
+8. 停掉 Gateway：会话报错且不 hang，侧边栏出现降级标记；重启后重连恢复。
+9. 删除会话后 `GET /api/chat/slots` 中对应 slot 消失（无泄漏）。
+
+**批次 2（审批）：**
+10. 手机锁屏收到「需要批准」推送 → 点击 → 落在该会话对话里，审批卡片可见 → 点「批准」后 agent 继续。
+11. 拒绝路径同样生效，且不卡死后续轮次。
+
+**批次 0 / 5（安全与清理）：**
+12. file-browser 无法浏览 `~/.kiro`（**注意：这一条修改前就应通过** —— 见 §5.2，它由 `read_hits_home_dotdir` 保证，不是本次新增的保护）。
+13. 仓库内 `<repo>/.kiro/settings/cli.json` **仍可**浏览（证明没有引入初稿那个副作用）。
+14. 删 Kiro 后端后，历史 kiro 会话不 panic（回落 tmux 或经 SQL 迁移为 crew）。
 
 ### 8.5 验证门（成功判据）
 
 - `cargo test` 全绿，`npm test` 全绿，`npm run lint` 无新增告警。
-- `cargo build --release` + `npm run build` 成功。
-- 8.4 的 8 条手工验收全部通过。
+- `cargo build --release` + `npm run build` 成功（**注意**：`rust-embed` 读 `frontend/dist/`，前端必须先构建）。
+- 8.4 的 **14 条**手工验收按批次全部通过。
 - 现有测试**零回归**（改动前后对比 `cargo test` / `npm test` 计数）。
+- **产品判据（批次 3）**：用户一周内成功写入 ≥3 条记忆。这是唯一能证明"接 Crew 有意义"的行为指标 —— 因为记忆现在是空的（§9.2）。
 
 ---
 
-## 9. 已知遗留与第二期候选
+## 9. UI 与交互设计（评审新增）
+
+### 9.1 菜单：不是 4→5，是原位换项
+
+**先纠正一个题设**：New Session 的类型菜单**已经不是主入口**。`Sidebar.tsx:64` 的状态机第一屏是 `'quick'`，`Sidebar.tsx:502-520` 渲染 `QuickTargets`（注释："一击直达：点一行 = 用该行的 agent 直接创建，0 次列目录请求"）；只有 `onEmpty` 或用户主动点"其他目录…"才会落到 `pick-type`。实测 `zeromux.db` 的 `quick_targets` 有 6 行且今天仍在写 —— 快速入口是活的，日常 90% 走不到类型菜单。
+
+**所以"4 变 5 会不会选择瘫痪"在日常路径上几乎无感。真正的成本在别处**：每加一个类型，`SessionTypeIcon`（`Sidebar.tsx:69-77`）、`AcpChatView` 的 `agentType`（`AcpChatView.tsx:57`）、`RowIcon`（`QuickTargets.tsx:11-20`）、`MobileKeyBar` 的 `AGENT_KEYS`（`MobileKeyBar.tsx:260-264`）都要永久多带一个分支。
+
+**设计：Kiro 原位替换为 Crew，仍是 4 项。**
+
+```
+Select type
+──────────────────────────────
+[Terminal]   Terminal          bash / tmux shell
+[Claude]     Claude Code       AI coding agent
+[Crew]       Kiro Crew         有记忆的 AI agent      ← 原 Kiro 位置(Sidebar.tsx:581-590)
+[Codex]      Codex             AI coding agent (MCP)
+[BookOpen]   Obsidian 文档      笔记库（vaultEnabled 门控）
+──────────────────────────────
+```
+
+三处改动：
+
+1. `Sidebar.tsx:581-590` 整块替换。副标题写 **"有记忆的 AI agent"** —— 这是唯一能解释"它和 Claude 有何不同"的位置，别浪费成 "AI coding agent (Crew)"。
+2. **不重排顺序**。弹层是 `absolute bottom-full`（`Sidebar.tsx:492`），理论上拇指最易达处在列表底部，但现有 4 项顺序已是肌肉记忆，为一个 10% 路径重排全表不值得。**少改一处是一处。**
+3. `BrandIcons.tsx` 加 `CrewIcon`。**不要直接复用 `KiroIcon`**（`BrandIcons.tsx:324-339`，紫色幽灵 `#9046FF`）—— 历史 kiro 会话仍存在于会话列表（`Sidebar.tsx:412`），同图标无法区分。建议同色系 + 可区分形状（如幽灵加一圈"记忆环"）。
+
+### 9.2 记忆的产品化 —— 本次更新的核心
+
+#### 前提：记忆现在是空的（这改变了设计重心）
+
+实测：
+
+| 对象 | 实际值 |
+|---|---|
+| `memory/preferences.md` | **56 字节**（只有标题和一行注释） |
+| `memory/projects.md` | **49 字节** |
+| `GET /api/memory/semantic` | `{"entries": []}` |
+| `GET /api/memory/episodic` | `{"entries": []}` |
+| `GET /api/lessons` | `{"lessons": []}` |
+| `memory.db` → `memory_events` | **1 行**，且是 `migration` 事件 |
+
+**"用户怎么知道 agent 记住了什么"是第二个问题；第一个问题是它什么都没记住。** 任何只做"查看/纠正"的设计，用户打开看到空面板，会直接判定这个功能是假的。
+
+**结论：记忆产品化的第一要务是写入，不是可见。** 因此下面 9.2.1（就地写入）的优先级**高于** 9.2.2（面板）。
+
+#### 记忆 API 的完整实测契约
+
+**认证：只认 `?token=`**（`X-Internal-Secret` 一律 403，见附录 A.1）。
+
+| 操作 | 请求 | 实测 |
+|---|---|---|
+| 读偏好 | `GET /api/memory/preferences` | 200 `{"content":"# User Preferences\n..."}` |
+| 写偏好 | `PUT /api/memory/preferences` | 整文件 `{"content":...}`（`routes/memory.py:20-21`） |
+| 读语义记忆 | `GET /api/memory/semantic` | 200 `{"entries":[...]}` |
+| **写语义记忆** | `PUT /api/memory/semantic`（**无 key 后缀**） | 需 `X-Session-Key: <真实 slot>`；key 需匹配 `^[a-z][a-z0-9_.]*[a-z0-9]$` **且带前缀 `pref.*` / `project.*` / `user.*` / `lesson.*`** |
+| **删语义记忆** | `DELETE /api/memory/semantic/{key}` | 同样需 `X-Session-Key` |
+
+实测成功样例：
+
+```
+PUT /api/memory/semantic   X-Session-Key: zmx-mem
+{"key":"pref.pkg_manager","value":"pnpm","source":"user_explicit","confidence":1.0}
+→ {"ok": true}
+
+GET /api/memory/semantic →
+{"entries":[{"key":"pref.pkg_manager","value_json":"\"pnpm\"","confidence":1.0,
+  "source":"user_explicit","created_at":"...","updated_at":"...","is_deleted":0}]}
+```
+
+**三个隐藏约束**（每一个都会让第一次实现失败）：
+1. `PUT` 路径**不带** key（带 key 是 405）。
+2. 必须有 `X-Session-Key`，且值必须是**已存在的 slot**（否则 `unknown session`）。
+3. key 必须带命名空间前缀，否则 `Key must match an allowed prefix`。
+
+**`source` 字段可读** —— 这是 §12 微信可见性方案的基础。
+
+#### 9.2.1 就地写入 —— composer 的记忆入口（P0，先做）
+
+**为什么在 composer**：人只在**被冒犯的那一刻**想纠正记忆（agent 刚用了 npm 而你说过 pnpm）。那一刻拇指在输入框上。要求用户"打开设置去配置偏好"= 问卷 = 没人填。
+
+`AcpChatView.tsx:792-810` 的 `rightSlot` 现有 2 个按钮（`ListPlus`:794 预设、`Paperclip`:805 附件）。加第 3 个 `Brain`，popover 与 `presetOpen` 同构（`AcpChatView.tsx:736-785`：`fixed inset-0 z-10` 捕获层 + `absolute bottom-full left-0 right-0 mb-2 mx-2` 弹层）。
+
+```
+┌ 记忆 ───────────────────────────────┐
+│ ┌───────────────────────────────┐  │
+│ │ 让它记住…                      │  │ ← PUT semantic (pref.* 前缀自动加)
+│ └───────────────────────────────┘  │
+│ 它记错了？(最近 5 条)                │
+│  · pref.pkg_manager = pnpm    [✕]  │
+│  · pref.test_before_commit    [✕]  │
+│                        [ 全部 → ]   │ ← 跳 9.2.2 面板
+└────────────────────────────────────┘
+```
+
+**动线：1 tap 开 → 最近 5 条直接可见（0 tap）→ 2 tap 点 ✕ → 3 tap 确认。3 tap，不离开对话，不加载新页。**
+
+**宽度核算**（必须算）：现有 2 按钮各 `p-2`+`size 16` ≈ 32px，加发送键 40px = 104px；375px 屏下 textarea 约 246px。加 Brain → 136px，textarea 剩 **~214px**。可接受但接近极限 —— **这是 §9.3 讨论合并 `ListPlus` 的动机**。
+
+#### 9.2.2 记忆面板 = 第 5 个 overlay view（P1）
+
+**为什么用 overlay 而非新框架**：`App.tsx:21` 已有 `type OverlayView = 'none'|'files'|'git'|'events'`，`App.tsx:296-301` 的 `toggleOverlay` 是泛型的，`App.tsx:388-390` 是三个渲染点。加一个 `'memory'` 是**纯增量、零新导航概念**，并自动继承 `App.tsx:379-381` 的 CSS 可见性保留（对话状态不丢）。
+
+**入口**：`SessionInfoBar.tsx:162-209` 已是 4 图标横排（FileText / GitBranch / Activity / BarChart3）。加第 5 个 `Brain`，用 `{onToggleMemory && ...}` 门控（照 `SessionInfoBar.tsx:196` 的现成 idiom），仅 `type === 'crew'` 时传入。
+
+**手机宽度核算**：折叠条 `h-9`（`SessionInfoBar.tsx:130`），图标 `p-1`+`size 14` ≈ 22px，`gap-1` = 4px。5 图标 = 126px；加汉堡 22 + chevron 18 + StatusDot 8 + 内边距 24 ≈ 198px。375px 屏下 description 余 ~177px，`truncate` 生效。**6 个图标就会崩 —— 这是硬上限，所以审批不占图标位。**
+
+**内容**（单列，结构照 `AgentDashboard.tsx:87-176`）：分区显示 偏好 / 项目上下文 / 教训 / 语义记忆，每条一行 + 常驻 `✕`，并显示 `信度 · 来源`。
+
+**三条交互决策**：
+
+1. **纠正的原语是"删一行"，不是"编辑"。** `preferences` 的 PUT body 是整文件 —— 手机上做 markdown 编辑器是灾难。方案：前端渲染成行，删除时本地重组 markdown 再整体 PUT。而 `semantic` 有真正的 `DELETE /{key}`，**因此引导用户把重要偏好写进 semantic 而非 preferences**（9.2.1 的"让它记住"就写 semantic），长期可纠正性更好。
+2. **`✕` 常驻，绝不用 `group-hover`。** 依据 `QuickTargets.tsx:118-120` 的教训原文：Tailwind v4 把它编译进 `@media (hover:hover)`，手机上元素永久 `opacity:0` 但仍可点击（隐形按钮）。**注意 `SessionInfoBar.tsx:319` 的 `NoteItem` 和 `AgentDashboard.tsx:226` 都用了 `hovered` state —— 那两个按钮在手机上实际摸不到。新面板不要重复这个错。**
+3. **二段确认，不用 `window.confirm`。** 点 `✕` → 该行下沉展开「确认移除」，照 `QuickTargets.tsx:134-165` 的行级操作单形状（注释："这一层本身即确认，故不再加 confirm 弹窗"）；`PromptManager.tsx:64` 也有同样先例（"no window.confirm — bad on mobile"）。
+
+**空状态是本设计最重要的一屏**（因为今天必然是空的）：居中一个输入框 + 「记住这条」按钮，占位文案给例子（"例：提交前必须先跑 npm test"），输入框用 `text-base`(16px) —— 依据 `Composer.tsx:225-226` 的教训：低于 16px 时 iOS Safari 聚焦会自动放大整页，把发送键挤出视口。
+
+**额外入口**：记忆在 Crew 侧是**全局的**（一份 Gateway 一份记忆），而 overlay 是 per-session（`App.tsx:33` 按 session id 存 key）。若当前无 Crew 会话就没有入口 —— 在 `Sidebar.tsx:881-918` 的 settings popover 补一项（照 `:893-899` 推送通知那条的形状），复用同一组件。
+
+**Token 生命周期约束**：记忆面板走 token（附录 A.1），而 token `exp ≈ 5 分钟`。**面板若轮询必须有 re-mint 逻辑** —— 这是初稿缺失的承重约束。
+
+#### 9.2.3 可见性靠"回执"，不靠面板
+
+用户不会主动去查记忆面板（一天 0 次）。所以"怎么知道 agent 记住了什么"的正解**不是造更好的面板，而是让记忆每次生效时留下痕迹**：
+
+**写入回执** —— 记忆写入时在对话流留一行轻量提示。**现成组件已存在**：`AcpChatView.tsx:865-868` 的 `NoticeBubble` 的 `system` 分支正是 `text-[11px] text-[var(--text-muted)] italic`。写「已记住：包管理器用 pnpm」。
+
+**生效回执**（P2，不进第一批）：实测存在 `GET /api/memory/context-preview`，可在 turn 开始时显示「本轮注入了 3 条记忆」。它把记忆从黑箱变成每轮可审计，但需额外请求，第一批不做。
+
+### 9.3 审批 UI —— 白拿三条现成管道
+
+这是性价比最高的一项，因为三条基础设施已存在且形状匹配：
+
+1. **事件通路零新增**：crew fan-out **已经独占订阅 Gateway 的全局 WS**，approval 请求就在那条流里 → 走既有 `broadcast::Sender` → `/ws/acp/{id}` → `handleEvent`。**不新开连接、不新增轮询。**
+2. **渲染位置**：审批天然属于某个 turn 的某个 tool_call，所以必须在对话内联。`BlockView`（`AcpChatView.tsx:887-969`）加 `case 'approval'`，视觉照 `tool_use` 分支（`:928-946`，左边框 `border-l-2`），底部两个 `min-h-[44px]` 按钮。上行照 `interrupt` 的形状（`AcpChatView.tsx:589-595`），后端 fan-out 代理 `POST /api/approvals/{id}/{action}`（实测 `GET /api/approvals` 返回 `[]`，只认 token）。
+3. **通知**：`push.rs:353` 已有 `confirm` kind 且归 `lvl_important`（`push.rs:380-381`）；`sw.js:31` 用 `${session_id}:${kind}` 做 tag，`sw.js:45` postMessage `open_session`，`App.tsx:176-189` 接收后 `setActiveId` deep-link。**整条"锁屏通知→点击→落到那个会话"的链路已经通了。**
+
+**完整体验**：手机锁屏收到「Crew 要执行 rm -rf /tmp/build，需要批准」→ 点开 → 直接落在该会话对话里，审批卡片就在眼前 → 拇指点「批准」。**全程 3 秒。**
+
+**默认值**：在 `SessionInfoBar` 展开面板加一个 select，与 queue mode 完全同构（`SessionInfoBar.tsx:236-252`）。**per-session、默认沿用 Crew 自身的 interactive**（不发 mode 请求，见 §4.5）。
+
+---
+
+## 10. 否决：zeromux 变成 Crew 的 App（三个硬阻断）
+
+评审读透 App Kit 后的结论 —— 这条路**技术上不可行**，不是取舍：
+
+1. **原始 WebSocket 无法穿过反代。** `/apps/{name}/api/` 走 `session.request()`（`apps/routes.py:3737`），`upgrade` 在 `_PROXY_HOP_HEADERS`（`routes.py:3557`）里被删，且 `_PROXY_TIMEOUT = 30`（`routes.py:3520`）。**PTY 直接死。** App 唯一能碰的 WS 是宿主 `/api/ws`，而它是经 `permissions.events` 过滤 + payload 脱敏的事件总线（`event_bus.py:114`），不是字节管道。
+2. **`.html` 被拒 + 无 splat 路由。** `_ALLOWED_EXTENSIONS`（`routes.py:2148`）不含 `.html` → 403；React Router 入口 `path:"/apps/:name"` 无 splat，`_APPS_SPA_EXCLUDED_RE`（`token_auth.py:657`）把其余路径送回 Crew 自己的 shell。SPA 必须重写成挂在宿主 React 上的 ESM 模块。
+3. **多用户 OAuth 无法表达。** 反代**删掉 `cookie` 和 `authorization`**（`routes.py:3562-3567`，注释原文："app backends use X-KiroCrew-Proxy HMAC, not user cookies"），转发的 HMAC 签的是 `ts:method:target:sha256(body)` —— **app 域，无用户身份**。
+
+**加上 §0 的第 2 条（Crew 无 Web Push，App 也拿不到自己的 SW/VAPID 域）：这条路要放弃 PTY、重写前端、放弃多用户、放弃推送。不是重构，是产品自杀。**
+
+---
+
+## 11. 否决：废弃 zeromux 定时任务（两条硬理由）
+
+### 11.1 Crew cron 没有工作目录概念（架构级不可替代）
+
+```
+grep -c 'cwd' cron.py        → 0      （4849 行，零命中）
+grep 'cwd' mcp_cron.py       → 0
+CronJob 字段：folder_id / timezone / timeout_secs / script / command / env /
+  session_key / channel / thread_ts …  无 cwd / project / work_dir
+```
+
+而 zeromux 的 `TaskConfig.work_dir`（`scheduled_tasks.rs:358`）是**必填**，`trigger_run(&run.id, nm, &task.work_dir, …)`（`scheduled_tasks.rs:1160`）把它传进 spawn。zeromux 的定时任务本质是「**在这个仓库**跑这个 prompt」，Crew cron 表达不了。
+
+### 11.2 它是 auto-update 的 E1 安全门
+
+`active_run_count()`（`scheduled_tasks.rs:600-605`：`SELECT COUNT(*) FROM agent_task_runs WHERE state IN ('claimed','running')`）是 `running_summary().scheduled` 的来源，而 auto-update 的 E1 不变量完全建立在它上面（`auto_update.rs:126` 的 `if summary.scheduled > 0`、`:313` 的 `scheduled_read_failed` fail-closed 分支）。
+
+**废弃 `scheduled_tasks.rs` = 拆掉 auto-update 的安全门 = 重演 memory 里那一串 502 / E1 事故。** 这一条单独就否决了废弃方案。
+
+### 11.3 正确做法：不迁移，只加一臂
+
+让 `TaskConfig.agent_type` 支持 `"crew"` —— 定时任务用 Crew 会话执行，走同一个 `SessionInput::Prompt`，**照旧进 E1 门**。`agent_type` 已是自由字符串，只需 `trigger_run` 的 spawn 分派加一臂。**（S）**
+
+**分工**：zeromux 调度 = 仓库内的定时 agent 任务（有 cwd、进 E1 门、有确认队列/replay）；Crew cron = 无仓库上下文的运维/观察任务（script-cron + irq 轮询 + IM 投递）。
+
+**Crew 的 jitter（`cron.py:3801`）与 folders（`cron.py:648`）不抄** —— 单用户单任务无所谓（YAGNI）。
+
+---
+
+## 12. 微信：正确用法与"诚实版"可见性
+
+### 12.1 实测限制（读代码，非抄文档）
+
+| 限制 | 证据 |
+|---|---|
+| 不能流式 | `weixin/transport.py:67` = `streaming=False` |
+| 仅私聊 | `weixin/transport.py:23` "DM-only" |
+| 无可点按钮 | `channel-capabilities.md`：Tappable choices = **0** |
+| 不问审批 | 同矩阵：Approval waits = **—**（不装 decider） |
+| **回复开新会话** | 同矩阵：Dashboard link is two-way = **❌** |
+| 不能回传文件 | 同矩阵 ❌（但能接收你发的文件 ✅） |
+| **反而能渲染表格** | 同矩阵：Renders markdown tables natively = **✅**（比 Slack 强） |
+
+### 12.2 定位：投递口 + 播报口，不是对话终端
+
+**适合从微信发起**（须同时满足：一句话说完、不需看过程、结果是一段文字）：
+- 「把这条记进项目上下文：zeromux 部署只走 ./deploy.sh」—— **最佳用例**，写记忆天然一次性，且正好解决 §9.2 的"记忆是空的"
+- 「昨天那轮 review 有 HIGH 结论吗，给结论就行」
+
+**适合从微信接收**：cron / script-cron 播报、run 结束摘要、日报 —— **因为它原生渲染 markdown 表格**，表格型日报在微信里比 Slack 好看。
+
+**必须回到 zeromux 的四类**：
+1. 任何需要批准的操作 —— 0 可点按钮且不装 decider，从微信发起会**直接被拒、任务卡死**，且你看不出为什么。
+2. 任何要看过程的 —— 不能流式，发出去就是几分钟静默然后一整段，中途无法判断跑偏。
+3. 任何要看 diff / 文件 / git 的 —— 不能回传文件。
+4. 任何多轮追问的 —— two-way ❌，你的回复**开新 session**，上下文丢失。**这是最容易踩的坑**，表现为"agent 突然失忆"。
+
+**封号风险的产品结论**：不放在任何关键路径上；**zeromux 侧绝不做微信配置 UI**（也符合 no-secrets），且**绝不让任何 zeromux 功能依赖微信可用**。
+
+### 12.3 不做「这个会话也能从微信继续」的 UI
+
+那句话是**假的** —— 实测 `two-way = ❌`，微信回复必开新 session，第二期也不成立。做这个 UI 就是撒谎，用户信了会踩坑 4。
+
+**诚实且免费的替代：在记忆面板显示 `source` 字段。** 实测 `semantic` 条目已含 `source`（见 §9.2 的实测样例），把它渲染成「信度 1.0 · 来自 微信」。这样"共享记忆"从一句空话变成**看得见的事实**：你在微信里教它的那条，出现在 zeromux 的记忆面板里，标着来自微信。**零后端改动，且它说真话。**
+
+---
+
+## 13. Gateway 守护：fail fast + systemd 声明依赖
+
+初稿 §9 把"无自动拉起"列为遗留。**实测：这不是遗留，Gateway 已有 systemd 守护**：
+
+```
+kirocrew.service  loaded active running
+Restart=on-failure   RestartSec=10   StartLimitBurst=3/300s   KillMode=control-group
+```
+
+**zeromux 绝不该管它**，三条理由：
+
+1. **已有更好的守护者** —— systemd 的 `Restart=on-failure` 比任何自写 supervisor 可靠。
+2. **`KillMode=control-group` + zeromux 拉起 = 重演 cgroup 自杀陷阱** —— 见 CLAUDE.md 里那段 502 事故记录。两个 `KillMode=control-group` 的服务互相拉起 = 事故工厂。
+3. **正确做法是声明依赖，不是写代码**：`zeromux.service` 加 `After=kirocrew.service` + `Wants=kirocrew.service`（**不是 `Requires`** —— Crew 挂了，zeromux 的 PTY/Claude/Codex 会话应照常活）。**零 Rust 代码。**
+
+初稿的 fail fast 决策**正确**，只需把 §9 的"Gateway 单点=遗留"改成"由 systemd 负责，zeromux 只做 health check + 明确报错 + 侧边栏降级标记"（避免用户在 Gateway 挂掉时反复点 New Session）。
+
+---
+
+## 14. 删除清单（不破不立，逐条附数据）
+
+### 14.1 Kiro 后端 —— 删（菜单 + 后端路径）
+
+见 §1.1。约 1045 行 + 70 处引用 + 前端 5 文件；DB 代价 1 行。**排在 Crew 跑通并通过手工验收之后再删**，避免同时改两处。
+
+`quickTargets.ts:3` 的 `AGENTS` 数组去掉 `'kiro'` —— 该文件注释早已预言这一天。
+
+### 14.2 Prompt Presets —— **保留**（评审建议删，被数据推翻）
+
+产品总监建议删除，理由是"8 条与种子逐字相同、近 3 个月零改动、用户从未新增 → 用脚投票"。**我核实后推翻这个结论**：
+
+- 8 条 body 与种子一致 ✓，用户确实没新增 ✓
+- 但 `updated_at != created_at` 的有 **8/8 条**（created 全为 2026-06-16，updated 6 条为 06-25）→ **不是"零改动"**
+- **决定性反证**：这 8 条是 2026-06-16 经**专门 PE/CE 调研 + CTO 评审锁定原则**后写的（4 行骨架 Task/Approach/Done-when），且当时的决策记录明确写着 **"不新增（owner 要 better 不是 more，加 chip 稀释）"**
+
+**"只有 8 条、没有新增"是设计意图，不是废弃信号。** 保留。
+
+**可考虑的最大动作**：把 composer 的 `ListPlus` 与 `Brain` 合并进同一个 popover（省一个按钮位，缓解 §9.2.1 的宽度压力），**功能保留**。此项列为可选。
+
+### 14.3 Notes —— 建议删，**但需你拍板**
+
+**数据**：`notes.db` 的 `notes` = **1 行**（标题「帮我全选」，`2026-06-06T12:00:19Z`）。**3 个月 7 天，没有第二条。**
+
+**功能重叠**：notes 的设计目标"按工作目录聚合、跨会话留住上下文"（README_ZH.md:19）**逐字就是** Crew `memory/projects.md` 的定义。
+
+**删除范围**：`notes.rs`(342 行)、3 个 API、`SessionInfoBar.tsx:254-285`（notes 段）+ `:44-45,90-113`（state/handler）+ `:292-329`（`NoteItem`）+ `:331-342`（`formatNoteDate`）。
+
+**三重收益**：
+- `SessionInfoBar` 展开面板腾空，正好放 §9.3 的审批 select
+- **删掉一整套 stale-guard** —— `SessionInfoBar.tsx:55-113` 那段 `reqRef` 是 2026-08-15 修的 MED 级 stale-response bug。**删功能比维护 bug 修复划算**
+- 消灭一个隐形按钮（`NoteItem` 的删除键用 `hovered`，手机上摸不到）
+
+**这是不可逆动作，且可能有习惯因素，需你确认后再执行。**
+
+### 14.4 zeromux 定时任务面板 —— 不删，入口降级 + 徽章合并
+
+**反对删除**：`agent_task_runs` = **20 行真实运行**，跨 2026-07-28→08-16，含真实的 `succeeded` / `aborted(orphaned_restart)` / `confirm_status=confirmed_done` 历史；且 §11 已证明 Crew cron 替代不了它。
+
+**支持降级**：唯一任务 `enabled=0`，最后运行 2026-08-16（近 1 个月未跑），却在 Sidebar 顶栏占一个常驻位（`Sidebar.tsx:354-371`）。
+
+**动作**：
+- 入口从顶栏常驻移入 settings popover（`Sidebar.tsx:881-918`）
+- **腾出的顶栏位给「待你处理」合并徽章** —— 现在 `App.tsx:134-146` 每 30s 轮询 `listConfirmations` → `confirmCount` → `Sidebar.tsx:363-370` 红色徽章；而 §9.3 的待审批需要一个**完全同构**的东西。两者语义一致（agent 停下来等你），push 分类也一致（都归 `lvl_important`）。合并成一个「待你处理 N」，点开是统一列表（定时任务待确认 + Crew 待审批）。
+- 复用 `ConfirmationQueue`（`ScheduledTasksPanel.tsx:199-236`）的卡片形状 —— 它已是"标题+时间+原因+output_tail+两个动作按钮"，**审批卡片就是同一形状换两个按钮**。
+
+**这是本清单里唯一的真正简化：两条"等你处理"的管道合成一条。**
+
+### 14.5 活动看板 —— 保留
+
+`events.db` 的 `agent_events` = **130 行，今天仍在写**（最新 `2026-09-13T15:35Z`）。**数据证明的活功能。** 它也是未来 subagent 面板的宿主。
+
+### 14.6 只报告不动
+
+`--codex-reasoning`：README_ZH.md:92,99 自述"仅当模型/供应商支持并传递 `thinking` 才生效，否则为空操作"，而 gpt-5.5/5.4 上游 404。疑似长期空操作，但它是 CLI flag 非 UI，维护成本≈0。按 CLAUDE.md「注意到无关死代码要提，不要删」处理：**提出，不动。**
+
+---
+
+## 15. 交付顺序
+
+| 批次 | 内容 | 验收判据 |
+|---|---|---|
+| **0（先做，负工作量）** | 删掉 §5.2 初稿的 `.kiro` pin 计划；`is_credential_path` 加 `.secret`（先验红）；`--crew-home` 越界校验；systemd `After=/Wants=` | T9 先红后绿；T10/T11 绿 |
+| **1** | `crew_process.rs` + `SessionType::Crew` + fan-out（I1/I2/I3 + T1-T8）；菜单 Kiro→Crew 原位替换 | 手工验收 8 条全过（见 §8.4） |
+| **2** | `AcpEvent::Approval` + `ContextUsage` + 前端 2 个 case（**同一 commit**）；审批内联卡片 + 「待你处理」合并徽章 | 手机锁屏收到审批推送 → 3 tap 内完成批准 |
+| **3** | composer 的 `Brain` 就地记忆入口（9.2.1）+ 写入回执 | **用户一周内成功写入 ≥3 条记忆** |
+| **4** | 记忆面板 overlay（9.2.2）+ `source` 来源标注（12.3） | 打开面板能看到第 3 批写入的记忆，且标出来源 |
+| **5** | 删 Kiro 后端（含 DB 清理）；notes 删除（**待你确认**）；定时任务入口降级 | `cargo test` / `npm test` 零回归 |
+| **6** | 观察是否真的用 subagent / TaskRunner；**没发生就不做** | — |
+
+**批次 3 先于批次 4**：因为记忆现在是空的，先造面板会看到空面板。**先解决写入，再解决查看。**
+
+---
+
+## 16. 已知遗留
 
 | 项 | 说明 |
 |---|---|
-| 记忆跨用户共享 | 多用户部署下所有人共享同一份 Crew 记忆（5.3）。开放多用户前必须处理 |
-| Gateway 单点 | Gateway 挂 → 所有 Crew 会话不可用。已有降级路径（第 6 节），但无自动拉起 |
-| 认证不对称 | REST 用 secret、WS 用 token，是 Crew 侧的既有设计，zeromux 只能适配 |
-| ~~`interrupt` / `mode` 未实测~~ | **已实测并修正**：取消轮次用 `/stop`（`/interrupt` 只清队列）；`mode:trust` 确认可用。见 2.2 |
-| 同 slot 双入口 | 第二期 |
-| Crew subagent / workflow 面板 | 第二期 |
-
----
+| **记忆跨用户共享** | 多用户部署下所有人共享同一份 Crew 记忆。更强的结论：**任何能在 zeromux 里跑 shell 的人 = Crew 的 owner**（因为 zeromux 持有 Gateway 的 internal secret）。而 Crew 自己把 `.local_secret` 列入敏感路径（`security/paths.py:496`）并从 agent 环境剥离 `KIROCREW_INTERNAL_SECRET` —— 它的威胁模型明确假设 agent 不该拿到这个 secret。**必须写进 README。** 开放多用户前必须重新评估 |
+| Gateway 单点 | 由 systemd 负责（§13）；zeromux 只 health check + 降级标记 |
+| 认证不对称 | Crew 侧既有设计，zeromux 只能适配（附录 A.1） |
+| token TTL ≈ 5 分钟 | 记忆面板若轮询需 re-mint 逻辑（§9.2.2） |
+| 同 slot 双入口 | **永不做**（§12.3） |
+| Crew subagent / workflow 面板 | 待真实使用后再评估（§7） |
 
 ## 附录 A：第二轮实测发现（2026-09-13，交叉评审期间）
 

@@ -85,8 +85,9 @@ Header: X-Local-Secret: <SEC>
 | 删 slot | `DELETE /api/chat/slots/{key}` | 200 |
 | **设工作目录** | `POST /api/chat/slots/{key}/project` `{"project":"<abs>"}` | 200 `{"ok":true,"project":"..."}` |
 | 发 prompt | `POST /api/chat` `{"slot":"<key>","message":"<text>"}` | 见 2.4 |
-| 中断 | `POST /api/chat/slots/{key}/interrupt` | 未实测（路由已确认存在） |
-| 审批模式 | `POST /api/chat/mode` `{"mode":"trust"}` | 未实测（handler 已确认：`normal`/`trust`/`yolo`） |
+| **取消当前轮次** | `POST /api/chat/slots/{key}/stop` | 200 `{"ok":true}`，slot 随即 `running:false` |
+| **清空排队** | `POST /api/chat/slots/{key}/interrupt` | 队列为空时 **400** `{"error":"queue empty, use /stop instead"}` |
+| 审批模式 | `POST /api/chat/mode` `{"mode":"trust","slot":"<key>"}` | 200 `{"ok":true,"mode":"trust"}` |
 
 ### 2.3 `project` 字段就是 agent 的真实 cwd（关键，已实测）
 
@@ -161,7 +162,7 @@ zeromux (Rust, :8090)                        KiroCrew Gateway (Python, :5476)
 │  │ 归一化 → AcpEvent         │  │          │                              │
 │  │ broadcast::Sender ──────▶ │  │          │                              │
 │  │ mpsc<SessionInput> ───────│─REST────▶  │ POST /api/chat（丢弃响应体）  │
-│  └──────────────────────────┘  │ +secret  │ POST .../interrupt           │
+│  └──────────────────────────┘  │ +secret  │ POST .../stop（取消轮次）     │
 └────────────────────────────────┘          └──────────────────────────────┘
         ↑ 前端 /ws/acp/{id} 与 AcpEvent 完全不变
 ```
@@ -250,7 +251,7 @@ Gateway 自己会排队（实测忙时返回 `queued:true`）。zeromux 的 `Que
 | zeromux QueueMode | Crew 行为 |
 |---|---|
 | `Collect`（默认） | 直接 `POST /api/chat`，让 Gateway 排队。**不在 zeromux 侧合并** |
-| `Interrupt` | 先 `POST .../interrupt`，再 `POST /api/chat` |
+| `Interrupt` | 先 `POST .../stop`（取消当前轮次），再 `POST /api/chat`。**不是 `/interrupt`** —— 见 2.2 |
 | `Passthrough` | 同 `Collect`（Gateway 已是顺序执行，无 passthrough 语义差别） |
 
 **理由**：Gateway 已实现排队且带 `queue_id`，zeromux 侧再合并一层会产生两套队列语义冲突。第一期直接委托。
@@ -434,6 +435,6 @@ zeromux Crew 会话 → 另一 slot ┘
 | 记忆跨用户共享 | 多用户部署下所有人共享同一份 Crew 记忆（5.3）。开放多用户前必须处理 |
 | Gateway 单点 | Gateway 挂 → 所有 Crew 会话不可用。已有降级路径（第 6 节），但无自动拉起 |
 | 认证不对称 | REST 用 secret、WS 用 token，是 Crew 侧的既有设计，zeromux 只能适配 |
-| `interrupt` / `mode` 未实测 | 两个端点的路由与 handler 已确认存在，但未跑通实测。实现时首先验证；若行为与预期不符，按实测结果修正本 spec |
+| ~~`interrupt` / `mode` 未实测~~ | **已实测并修正**：取消轮次用 `/stop`（`/interrupt` 只清队列）；`mode:trust` 确认可用。见 2.2 |
 | 同 slot 双入口 | 第二期 |
 | Crew subagent / workflow 面板 | 第二期 |

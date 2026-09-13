@@ -438,3 +438,104 @@ zeromux Crew 会话 → 另一 slot ┘
 | ~~`interrupt` / `mode` 未实测~~ | **已实测并修正**：取消轮次用 `/stop`（`/interrupt` 只清队列）；`mode:trust` 确认可用。见 2.2 |
 | 同 slot 双入口 | 第二期 |
 | Crew subagent / workflow 面板 | 第二期 |
+
+---
+
+## 附录 A：第二轮实测发现（2026-09-13，交叉评审期间）
+
+> 本附录记录在 CTO / 产品总监交叉评审期间新做的实测。**这些事实会重塑第一阶段范围**，
+> 正文中与之冲突的表述以本附录为准。
+
+### A.1 认证矩阵完全互补 —— zeromux 必须同时持有两种凭证
+
+正文 2.1 只说了"两套并存"，实测发现更强的结论：**两套凭证覆盖的端点集合完全不相交**。
+
+| 端点 | `X-Internal-Secret` | `?token=` |
+|---|---|---|
+| `/api/chat/slots`、`/api/chat`、`/api/spawn`、`/api/crons`、`/api/lessons`、`/api/taskrunner`、`/api/workflows/runs`、`/api/artifacts` | **200** | 403 |
+| `/api/approvals`、`/api/memory/*`、`/api/notifications`、`/api/sessions`、`/api/models`、`/api/status`、`/api/monitors` | 403 | **200** |
+
+**含义**：会话/cron/subagent 面只认 secret；**记忆面与状态面只认 token**。任何跨这两组的功能（例如"对话页 + 记忆查看"）都必须双持凭证。这不是可选优化，是硬约束。
+
+### A.2 Crew **没有** Web Push（zeromux 不可替代性的最硬证据）
+
+`grep -rli vapid` 在整个 `kiro_crew` 包内**零命中**，无 `pywebpush` / `web-push` 依赖。Crew 的 `/api/notifications*` 只是 dashboard 内的通知列表（`ack`/`unack`/`ack-all`）加 IM 渠道投递。
+
+zeromux 有完整的 PWA + VAPID Web Push（`push.rs` 935 行，三类触发 + SW 前台抑制）。
+
+**结论**：**"agent 干完活主动叫醒手机"这件事只有 zeromux 能做。** 这既是"为什么不直接用 `localhost:5476`"的答案，也直接否决了"把 zeromux 改造成 Crew 的一个 App"的路线 —— App 跑在 Crew dashboard 里，没有自己的 Service Worker 作用域和 VAPID 身份，会丢掉这个唯一的移动端优势。
+
+### A.3 subagent 需要一个"能显示审批的已连接 surface"
+
+实测 `POST /api/spawn` 后，subagent 以 `outcome: failed` 结束，错误原文：
+
+> `spawn rejected: no surface could show the approval prompt, so nobody could answer it (no dashboard client is connected). The spawn was refused now rather than held until the reaper's deadline.`
+
+**但这不是死局**：`hooks.auto_approve_sources`（`hooks.py:307,393,427`）与 `defaults.json` 的 `hooks.auto_approve_tools` 可放开自动批准（当前用户 `config.json` 的 `hooks` 为空 `{}`）。
+
+**含义**：审批 UI 从"subagent 的必需前置"降级为"可选增强"。第一期若不做审批 UI，需配置 auto-approve 才能用 subagent；两条路都通，取舍交由评审决定。
+
+### A.4 Crew cron 的能力与体量远超 zeromux 版
+
+| | zeromux | Crew |
+|---|---|---|
+| 实现 | `scheduled_tasks.rs` 1736 行 | `cron.py` **4849 行** |
+| 触发 | cron 表达式 | `every`（最小 60s）/ `at` / cron 表达式 |
+| 特性 | run_id 贯穿、看门狗、终态精化、幂等 finalize | timezone、`agent_id`、**script cron**（不花 model call）、跨进程文件锁、连续失败 5 次自动暂停（`_AUTO_PAUSE_THRESHOLD`）、per-wake 超时预算 |
+
+关键机制：cron 运行在自己的 slot `cron:{job.id}`（`cron.py:743,805-812`），并可 `set_origin` 指向发起会话（`cron.py:3003`）。
+
+**含义**：Crew cron 能驱动 zeromux 中可见的 Crew 会话 —— "让位给 Crew cron"的迁移路径在技术上成立。
+
+### A.5 存量数据现实：删除 Kiro 的迁移代价≈0，定时任务实际闲置
+
+实测生产库：
+
+```
+~/.zeromux/zeromux.db  sessions  →  claude: 3, kiro: 1   （无 codex / tmux 存量）
+~/.zeromux/scheduled.db agent_runs_config → 共 1 行:
+    'zeromux Code Review', cron '0 0 6 * * *', agent_type=claude, enabled=0（已禁用）
+  agent_task_runs → 历史 20 次
+```
+
+两个结论：
+
+1. **删除 Kiro 后端的存量代价近乎为零** —— 只有 1 个 kiro 会话，且 `from_str_lenient`（`session_manager.rs:71-77`）对未知类型回落 Tmux（注释原文："最保守，PTY 无 resume 副作用"），即便不写迁移也不会崩。要干净则一条 `UPDATE sessions SET type='crew' WHERE type='kiro'` 即可。
+2. **zeromux 的定时任务链在真实使用中是闲置资产** —— 唯一任务已禁用。这不代表它没价值（作者在其上修了十几轮 bug、积累了大量不变量），但意味着"改用 Crew cron"的**用户侧迁移成本为零：没有活跃任务需要搬迁**。
+
+### A.6 记忆可读可写，且是纯 markdown（手机端 UI 成本极低）
+
+实测（**只认 token**，见 A.1）：
+
+- `GET /api/memory/preferences` → 200 `{"content":"# User Preferences\n..."}`
+- `PUT /api/memory/preferences` → 同路径支持写（`routes/memory.py:20-21`）
+- `GET /api/memory/projects` → 200 `{"content":"# Active Projects\n..."}`
+- `GET /api/memory/stats` → 200 semantic / episodic / embedded 计数
+- 另有 23 个 `/api/memory/*` 端点（episodic / semantic / graph / promote / consolidate / context-preview / settings / observability …）
+
+**含义**：`preferences` 与 `projects` 是**纯 markdown 文本** —— 手机上一个 textarea 加保存按钮，就能完成"查看 agent 记住了什么 / 纠正一条错误记忆"。这是记忆可见化的技术基础，成本极低、收益极高。
+
+### A.7 渠道状态一个端点全给（微信可见性成本≈0）
+
+`GET /api/status?token=` 的 `channels` 字段一次返回全部 10 个渠道，每个含 `{connected, error}`：
+
+```
+slack, wecom, telegram, discord, webex, teams, weixin, imessage, whatsapp, feishu
+```
+
+当前全部 `connected: false`（未配置）。同一端点还给 `uptime` / `sessions` / `update_available`，可一并用于 Gateway 健康指示（对应第 6 节的降级 UI）。
+
+### A.8 TaskRunner 可用，且支持内联 spec
+
+`GET /api/taskrunner` → `{"running":false,"available":true,"default_workspace_dir":"..."}`。
+
+`POST /api/taskrunner` 接受 `{"spec":"path/to/file.md"}` 或 **`{"spec":"__inline__:# Task content..."}`**（`handlers/taskrunner.py:131-151`）—— 内联 spec 会被写入工作目录的临时文件。
+
+**含义**：zeromux 可以把一段 markdown 直接交给 TaskRunner，无需先落盘。
+
+### A.9 WS 无 per-slot 订阅 —— I1 过滤不变量必需且不可绕过
+
+`websocket_hub.py` 只有 `_ws_log_subscribers` / `_ws_subagent_subscribers` 两类订阅集合，**没有按 slot 订阅的机制**；事件作用域门（`ws_event_scope.py`）是按 app / owner 而非按 slot 过滤。
+
+**含义**：客户端侧按 `data.slot` 过滤（正文 4.2 的 I1）**是唯一手段**，无法通过服务端订阅规避。I1 因此从"实现细节"升格为"协议层必需不变量"。
+

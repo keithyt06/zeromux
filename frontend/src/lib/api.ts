@@ -186,6 +186,29 @@ export async function listDirectories(path?: string): Promise<DirListing> {
   }
 }
 
+// ── Quick targets（常用目录/笔记 frecency）──
+
+export interface QuickTarget {
+  kind: 'dir' | 'note'
+  path: string
+  /** dir: claude|kiro|codex|tmux；note: 空串 */
+  agent: string
+  display: string
+  hint: string
+}
+
+export async function listQuickTargets(kind: 'dir' | 'note'): Promise<{ top: QuickTarget[] }> {
+  const res = await api(`/api/quick-targets?kind=${kind}`)
+  if (!res.ok) throw new Error(await res.text())
+  return res.json()
+}
+
+export async function forgetQuickTarget(kind: 'dir' | 'note', path: string, agent: string): Promise<void> {
+  const params = new URLSearchParams({ kind, path, agent })
+  const res = await api(`/api/quick-targets?${params}`, { method: 'DELETE' })
+  if (!res.ok) throw new Error(await res.text())
+}
+
 export async function deleteSession(id: string): Promise<void> {
   await api(`/api/sessions/${id}`, { method: 'DELETE' })
 }

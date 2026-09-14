@@ -1112,7 +1112,9 @@ EOF
 
 Run: `cd frontend && npx vitest run crewEventCases 2>&1 | tail -12`
 
-Expected: 全红 —— `需要你批准` 找不到（`BlockView` 无 `approval` 分支 → `default: return null`）。
+Expected: **4 红 / 2 空过**（不是全红）。红的四条都因 `需要你批准` 找不到（`BlockView` 无 `approval` 分支 → `default: return null`）。
+
+> **为什么不是全红**（订正）：六条里有两条是**负向断言** —— 「`approval_id` 缺失时不渲染按钮」与「`total:0` 时不渲染 ctx」。功能不存在时什么都不渲染，所以它们**空过**（vacuously pass）。这是这套测试集固有的性质，不是测试写错了。**不要为了让它们变红而改测试。**
 
 - [ ] **Step 3: 后端加变体与归一化两臂**
 
@@ -3377,8 +3379,11 @@ export interface Block {
         break
       }
 
-// handleEvent 的 deps 加 resolveApproval
-  }, [pushNotice, appendEvent, bumpMetrics, adoptQueueMode, settleActiveTurn, resolveApproval])
+// handleEvent 的 deps **保持不变** —— 本条已订正（原写"加 resolveApproval"，是错的）：
+// handleEvent **不调用** resolveApproval（实测该函数名在 handleEvent 体内零命中）——
+// 审批上行由 BlockView 的按钮经 onResolveApproval prop 触发，不经 handleEvent。
+// 加进 deps 会让 eslint 报 react-hooks/exhaustive-deps: unnecessary dependency。
+  }, [pushNotice, appendEvent, bumpMetrics, adoptQueueMode, settleActiveTurn])
 
 // BlockView 的 case 'approval'（插在 case 'tool_result' 之前，:948 之前）
     case 'approval': {
@@ -3590,7 +3595,7 @@ describe('T14 Crew 新事件变体在前端有 case（防静默丢弃）', () =>
 
 | 退化 | Expected |
 |---|---|
-| 删 `BlockView` 的 `case 'approval'`（落回 `default: return null`） | **4 红** |
+| 删 `BlockView` 的 `case 'approval'`（落回 `default: return null`） | **3 红**（原写 4，已订正 —— 两条负向断言在功能缺失时空过，见 Step 2 的说明） |
 | 删 `handleEvent` 的两个 case | **6 红** |
 | `memo` 比较器不加 `resolvedApprovals` | 「点批准收起按钮」那条红 |
 

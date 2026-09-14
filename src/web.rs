@@ -47,9 +47,6 @@ pub fn build_router(state: Arc<AppState>) -> Router {
         .route("/api/vault/resolve", get(vault_resolve))
         .route("/api/sessions/{id}/runs", get(get_session_runs))
         .route("/api/sessions/{id}/runs/{run_id}/verdict", post(post_run_verdict))
-        .route("/api/sessions/{id}/notes", get(list_notes))
-        .route("/api/sessions/{id}/notes", post(create_note))
-        .route("/api/sessions/{id}/notes/{note_id}", delete(delete_note))
         .route("/api/prompts", get(list_prompts).post(create_prompt))
         .route("/api/prompts/{id}", put(update_prompt).delete(delete_prompt))
         .route("/api/events", get(list_events))
@@ -905,14 +902,7 @@ async fn update_session(
     }
 }
 
-// ── Notes API ──
-
-#[derive(serde::Deserialize)]
-struct CreateNoteReq {
-    text: String,
-    #[serde(default)]
-    tags: Vec<String>,
-}
+// ── Prompt preset request bodies ──
 
 #[derive(serde::Deserialize)]
 struct CreatePromptReq {
@@ -924,72 +914,6 @@ struct CreatePromptReq {
 struct UpdatePromptReq {
     title: Option<String>,
     body: Option<String>,
-}
-
-async fn list_notes(
-    State(state): State<Arc<AppState>>,
-    user: axum::Extension<CurrentUser>,
-    axum::extract::Path(id): axum::extract::Path<String>,
-) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
-    require_session_access(&state, &user, &id)?;
-    let work_dir = state
-        .sessions
-        .work_dir(&id)
-        .ok_or((StatusCode::NOT_FOUND, "Session not found".to_string()))?;
-
-    let notes = state
-        .notes
-        .list_notes(&work_dir)
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
-
-    Ok(Json(serde_json::json!({
-        "notes": notes,
-        "work_dir": work_dir,
-    })))
-}
-
-async fn create_note(
-    State(state): State<Arc<AppState>>,
-    user: axum::Extension<CurrentUser>,
-    axum::extract::Path(id): axum::extract::Path<String>,
-    Json(req): Json<CreateNoteReq>,
-) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
-    require_session_access(&state, &user, &id)?;
-    let work_dir = state
-        .sessions
-        .work_dir(&id)
-        .ok_or((StatusCode::NOT_FOUND, "Session not found".to_string()))?;
-
-    let note = state
-        .notes
-        .create_note(&work_dir, &req.text, &req.tags, &id, &user.login)
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
-
-    Ok(Json(serde_json::json!(note)))
-}
-
-async fn delete_note(
-    State(state): State<Arc<AppState>>,
-    user: axum::Extension<CurrentUser>,
-    axum::extract::Path((session_id, note_id)): axum::extract::Path<(String, String)>,
-) -> StatusCode {
-    // Two-layer authz. (1) The caller must own the session in the route.
-    // (2) The delete is scoped to that session's work_dir, so even an owned
-    // session can only remove notes that legitimately belong to its work_dir —
-    // previously the handler discarded the session id and deleted by bare
-    // note_id, letting any note be removed regardless of session.
-    if require_session_access(&state, &user, &session_id).is_err() {
-        return StatusCode::FORBIDDEN;
-    }
-    let work_dir = match state.sessions.work_dir(&session_id) {
-        Some(d) => d,
-        None => return StatusCode::NOT_FOUND,
-    };
-    match state.notes.delete_note(&note_id, &work_dir) {
-        Ok(true) => StatusCode::OK,
-        Ok(false) => StatusCode::NOT_FOUND,
-        Err(_) => StatusCode::INTERNAL_SERVER_ERROR,
-    }
 }
 
 // ── Per-run metrics (owner-scoped) ──

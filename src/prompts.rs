@@ -229,7 +229,7 @@ impl PromptPresetStore {
     }
 }
 
-// Private to notes.rs — duplicated here (two tiny fns, not worth a shared util).
+// Local helpers (two tiny fns, not worth a shared util).
 fn short_uuid() -> String {
     uuid::Uuid::new_v4().to_string().replace('-', "")[..8].to_string()
 }

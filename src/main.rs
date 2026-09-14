@@ -7,7 +7,6 @@ mod crew_memory;
 mod db;
 mod events;
 mod logger;
-mod notes;
 mod push;
 mod oauth;
 mod prompts;
@@ -191,7 +190,6 @@ pub struct AppState {
     pub default_rows: u16,
     pub logger: Option<logger::Logger>,
     pub db: Option<db::Database>,
-    pub notes: notes::NotesStore,
     pub prompts: prompts::PromptPresetStore,
     pub events: Arc<events::EventStore>,
     pub scheduled_tasks: Arc<scheduled_tasks::ScheduledStore>,
@@ -289,9 +287,6 @@ async fn main() {
     if logger.is_some() {
         println!("Logging enabled: {}", args.log_dir.as_deref().unwrap_or(""));
     }
-
-    let notes_store = notes::NotesStore::open(std::path::Path::new(&data_dir_str))
-        .expect("Failed to initialize notes store");
 
     let prompts_store = prompts::PromptPresetStore::open(std::path::Path::new(&data_dir_str))
         .expect("Failed to open prompts store");
@@ -487,7 +482,6 @@ async fn main() {
         default_rows: args.rows,
         logger,
         db: database,
-        notes: notes_store,
         prompts: prompts_store,
         events: event_store,
         scheduled_tasks: scheduled_store.clone(),

@@ -92,6 +92,38 @@ pub enum AcpEvent {
     Exit {
         code: i32,
     },
+    /// Crew 的 PreToolUse 审批请求。走 fan-out 已独占订阅的那条 Gateway 全局 WS，
+    /// 零新增连接。**这是 zeromux 相对 Crew 全部 10 个 IM 渠道的唯一结构性优势** ——
+    /// 实测微信 Tappable choices = 0 且不装 approval decider，一个 44px 的「批准」
+    /// 按钮 + Web Push 是它们全都做不到的事。
+    ///
+    /// 第一期**不发** `POST /api/chat/mode {"mode":"trust"}`：不带 `slot` 的 mode
+    /// 请求会把 Gateway 上所有 slot 和所有 IM 渠道（含微信）永久设为 auto-approve
+    /// 并落盘（chat_handlers.py:9016-9040），作用域与 Kiro 的 `--trust-all-tools`
+    /// 差几个数量级。前端 `BlockView` 渲染成内联卡片 + 两个 `min-h-[44px]` 按钮。
+    ///
+    /// 字段名照 Gateway 的 payload（interaction_coordinator.py:40-48）：是
+    /// `tool_purpose`/`tool_input`，不是 `purpose`/`input`。三者在 Gateway 侧
+    /// **已 redact**（凭证与 exfil URL 已抹），此处不再处理。
+    Approval {
+        /// Gateway 侧的 approval id，回执时用（`POST /api/approvals/{id}/{action}`）。
+        id: String,
+        /// 待批准的工具/命令，如 `rm -rf /tmp/build`。
+        tool: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        tool_input: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        tool_purpose: Option<String>,
+        /// 来源 slot。同一浏览器可能同时开多个 Crew 会话，前端据此二次校验归属。
+        slot: String,
+    },
+    /// 上下文用量。来自 Crew 的 `context_usage` 帧 —— zeromux **自己没有**这个能力，
+    /// 是接入 Crew 白拿的新功能。`total` 恒 > 0（进程层已滤掉 0/缺失，见
+    /// crew_process::normalize_frame），前端可直接做分母。
+    ContextUsage {
+        used: u64,
+        total: u64,
+    },
 }
 
 /// Events the CLI can produce are all top-level JSON objects with a `type` field.

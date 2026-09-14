@@ -4362,6 +4362,34 @@ EOF
 
 ---
 
+## 遗留项：Crew 定时任务（本次**未交付**）
+
+Task 14 只交付了架构改动（`trigger_run` 从此**读 `agent_type`** 而非硬编码 Claude），`scheduled_session_type` 目前把**所有值都映射到 Claude**。原因是执行时发现按计划原样放行 `"crew"` 会造成一个**永久卡死升级门**的缺陷。
+
+**实测依据**（三个 fanout 的函数体内计数）：
+
+```
+spawn_acp_fanout    active_run_id=17  finalize_run=3   ← 只有 Claude 这条路完整
+spawn_crew_fanout   active_run_id=1   finalize_run=0   ← 仅一条注释
+spawn_codex_fanout  active_run_id=1   finalize_run=0
+```
+
+**放行后会发生什么**：Crew 定时 run 能正常发 prompt，但 fanout 丢弃 `run_id`、边界到来时无人调 `finalize_run` → `agent_task_runs` 那行永停 `state='running'` → `active_run_count()`（`scheduled_tasks.rs:600-604` 数 `state IN ('claimed','running')`）**永久 ≥1** → `auto_update.rs:126` 的 `gate_decision` 返回 `BlockedByScheduled`，而那行注释写着「**永不强制穿透**」→ **自动升级永久阻塞**；同时该任务的 overlap guard 永久 wedge、后续每次触发被 skip，直到看门狗（默认 60 分钟）记 `aborted` + `watchdog_timeout`。
+
+**放行的三个前置条件**（缺一不可）：
+
+1. 把 `active_run_id` + `finalize_run` + `finalize_active_run_if_scheduled` + `maybe_push_turn_done` 的 `active_run_id.is_none()` 门移植进 `spawn_crew_fanout`（约 60-80 行，是 Claude 那套的移植 —— **注意这正是 repo 里最容易出错的一套机制**，per-run metrics 的 FIFO 配对与 turn_done push 的 intent 抑制都在里面）
+2. 加 `create_crew_session_tagged`（现在只有 `create_acp_session_tagged`）
+3. **`web.rs:3065` 硬编码 `agent_type: "claude"`** —— 所以当前**根本没有 API 路径**能创建非 Claude 的定时任务，这一处不改，功能即使放行也不可达
+
+放行后还要：把 `SessionType::Crew` 从 `trigger_run` 的共享臂里移出，并翻转 `scheduled_agent_type_maps_to_session_type` 里那两条**刻意断言 Claude** 的用例。
+
+**Codex 存在同一个缺口**，同样未放行。
+
+**当前不做的判断依据**：生产库里唯一的定时任务是 `enabled=0`、`agent_type='claude'` —— **没有任何现存任务会走这条路径**，而用户要的核心能力（Crew 会话 + 记忆 + 审批）已由批次 1-4 交付。
+
+---
+
 ## 附：交付顺序与验证门
 
 | 批次 | 任务 | 完成判据 |

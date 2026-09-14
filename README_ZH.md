@@ -98,6 +98,19 @@ docker run -p 8080:8080 -v zeromux-data:/root/.zeromux zeromux --password "my-se
 
 > **`--codex-reasoning`** 会在每次 Codex `tools/call` 中注入 `model_reasoning_effort`。仅当底层模型/供应商（如 LiteLLM → Bedrock Claude）支持并传递 `thinking` 参数时才生效，否则为空操作。
 
+### Kiro Crew 依赖
+
+| 参数 | 默认值 | 说明 |
+|---|---|---|
+| `--crew-port` | `5476` | Kiro Crew Gateway 的 dashboard 端口（仅 loopback） |
+| `--crew-home` | `~/.kiro/crew` | Crew 数据目录，zeromux 从其中读 IPC secret 来换取 Gateway token |
+
+Crew 会话需要 Kiro Crew Gateway 在本机运行。它由自己的 systemd unit（`kirocrew.service`）守护，**zeromux 不负责拉起它**：两个 unit 都是 `KillMode=control-group`，互相拉起会触发 cgroup 自杀陷阱（见 `CLAUDE.md` 的部署章节）。`zeromux.service` 只声明软依赖（`After=` + `Wants=`，**不是** `Requires=`）—— Gateway 挂掉时 PTY / Claude / Codex 会话照常工作，只有 Crew 会话降级。
+
+**启动时的 fail-fast**：若 `--crew-home` 落在 `--work-dir` 或 `--vault-dir` 之下，进程会打印 `FATAL` 并 `exit 1` —— 那样放置会让 secret 进入文件浏览器的可读区。
+
+> **安全边界**：zeromux 读 `<crew_home>/run/gateway-<port>.secret` 来换取 Gateway token，因此**任何能在 zeromux 里跑 shell 的人等价于 Crew 的 owner**。Crew 自己的威胁模型假设 agent 拿不到这个 secret（它把 `.local_secret` 列入敏感路径并从 agent 环境剥离 `KIROCREW_INTERNAL_SECRET`）。当前是单用户部署，可接受；**开放多用户前必须重新评估** —— 那时所有用户会共享同一份 Crew 记忆。
+
 ### GitHub OAuth 配置
 
 适用于多用户 GitHub 认证场景：

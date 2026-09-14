@@ -17,6 +17,8 @@
 - **语言规范**：用户可见字符串与文档用中文；代码与注释用英文（本 repo 双语惯例）。
 - **Gateway 端口默认 5476**，可用 `--crew-port` 覆盖；crew home 默认 `~/.kiro/crew`，可用 `--crew-home` 覆盖。
 - **认证：token 是超集，只需持有 token 一种凭证**（订正后的实测，见 spec 附录 A.1）。用 `X-Local-Secret: <secret>` 打 `GET /api/token/local?ttl=20h` 换 token，之后 15/15 端点全通。secret 的唯一用途就是换 token。**唯一例外：WebSocket 只认 `?token=`**（secret 在 WS 上 403）。
+- **`?token=` 是一次性登录链接，REST 复用必须走 `Cookie: mc_token_<port>=<jwt>`**（实测：15 轮×4 并发下 `?token=` 有 1/60 的 403，Cookie 是 0/60）。Gateway 首次使用 URL 携带的 token 就把其 nonce 写进持久化 denylist（`token_auth.py:2805-2810`）。串行复用不触发，只有并发/高频才暴露。**WS 仍用 `?token=`** —— 每次连接新 mint，一次性语义正好相容。见 spec 附录 A.1.0。
+- **文档写入（`preferences`/`projects`）不需要 `X-Session-Key`**，只有两个 `semantic` 操作需要 —— 所以没有 Crew 会话的用户仍能编辑 markdown 文档，409 门不该拦文档写入。
 - **`?ttl=` 收 duration 字符串不是秒数**：`ttl=300` 会**静默回落**到上限 20h，`ttl=5m` 才得 300 秒。一律写 `?ttl=20h`。因此**记忆面板不需要 re-mint 逻辑**；但 fan-out 每次 WS 重连仍应重新 mint（廉价，且覆盖 token 被 revoke 的情形）。
 - **approval 帧字段名是 `tool_purpose` / `tool_input`**（不是 `purpose`/`input`），且这三者在 Gateway 侧**已 redact**。帧含 `data.slot`，故 I1 过滤适用。`POST /api/approvals/{id}/{action}` 接受 `approve`/`reject`/`reject_once`，404 = 已过期。
 - **第一期不做 `auto_read` 审批档、不做审批 select**：approval payload **不带只读标记**（`source` 是来源标识，`tool_call.kind` 只在 `tool_call` 帧上）。只做「每次询问」一档 → select 会是单值死控件，故连 select 一起砍。

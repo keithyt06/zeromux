@@ -894,6 +894,33 @@ Restart=on-failure   RestartSec=10   StartLimitBurst=3/300s   KillMode=control-g
 - secret 的唯一用途是**换取 token**（`GET /api/token/local`，头 `X-Local-Secret`）。
 - 例外：**WebSocket 只认 `?token=`**（secret 在 WS 上 403）—— 这一条初版是对的。
 
+### A.1.0 `?token=` 是**一次性登录链接** —— REST 复用必须走 Cookie（**二次订正**）
+
+> **本节再次订正 A.1。** A.1 说"token 是超集、15/15 端点全通"——**那是一次调用一个 token 测出来的**，
+> 掩盖了一个会造成间歇性故障的行为。由执行 Task 8 的 subagent 发现，我实测复现。
+
+**Gateway 把 URL 携带的 token 当一次性登录链接**：首次使用就把它的 `nonce` 写进**持久化**的
+revoked denylist（`token_auth.py:2805-2810`，`await asyncio.to_thread(_get_revoked_store().revoke, ...)`）。
+Cookie 路径不走这个分支（它以 `use_session_exp=True` 校验，只读 denylist、不自我吊销）。
+
+**实测（15 轮 × 4 并发，模拟 `GET /api/crew/memory` 的四发）**：
+
+| 传输方式 | 失败数 |
+|---|---|
+| `?token=<jwt>` | **1 / 60**（403，随机落在后到的那个请求上） |
+| `Cookie: mc_token_5476=<jwt>` | **0 / 60** |
+
+串行复用 4 次不会触发（我测过 4/4 全 200）—— **只有并发或高频复用才暴露**，这正是它容易被漏掉的原因。
+
+**含义**：
+1. **任何用一个 token 发多个请求的地方都必须走 Cookie**，不能用 `?token=`。`GET /api/crew/memory` 并发四发，属于必须。
+2. Cookie 方式还有个附带好处：token 不进 URL，所以任何回显请求 URL 的上游错误都不会泄漏它。
+3. **WS 仍然只能用 `?token=`**（浏览器无法在 WS upgrade 上设头）—— 但 WS 每次连接都新 mint 一个 token，一次性语义正好相容，不受影响。
+
+**顺带订正两处**：
+- A.1 表里 `/api/lessons` 标"token 200"**不可靠** —— 它在 `_MIXED_INTERNAL_API_PATHS` 里，token 路径正是暴露自我吊销的那条。用 Cookie 或 secret。
+- 文档写入（`preferences` / `projects`）**不需要** `X-Session-Key`，只有两个 `semantic` 操作需要。所以没有 Crew 会话的用户仍能编辑 markdown 文档（Task 9/10 的 409 门不该拦文档写入）。
+
 ### A.1.1 `?ttl=` 收的是 duration 字符串，不是秒数（**关键**）
 
 实测：

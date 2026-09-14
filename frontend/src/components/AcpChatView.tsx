@@ -1,6 +1,6 @@
 import { useState, useEffect, useRef, useCallback, useMemo, memo, createElement } from 'react'
 import { wsUrl, uploadSessionFile, getSessionRuns } from '../lib/api'
-import { ChevronDown, Wrench, Brain, AlertCircle, FileText, Terminal, Search, Bot, Paperclip, ListPlus, X, type LucideIcon } from 'lucide-react'
+import { ChevronDown, Wrench, Brain, AlertCircle, FileText, Terminal, Search, Bot, Paperclip, ListPlus, X, Ban, Check, type LucideIcon } from 'lucide-react'
 import MarkdownContent from './markdown/MarkdownContent'
 import Composer from './Composer'
 import PromptManager from './PromptManager'
@@ -49,6 +49,14 @@ interface ServerEvent {
   running?: boolean
   last_activity_ms?: number
   queue_mode?: string
+  // Crew: approval 请求 / 上下文用量。后端加变体与前端加 case 必须同一 commit ——
+  // handleEvent 的 switch 没有 default 分支，未知 type 是**静默丢弃**。
+  approval_id?: string
+  tool?: string
+  tool_purpose?: string
+  tool_input?: string
+  used?: number
+  total?: number
 }
 
 interface Props {
@@ -103,6 +111,12 @@ export default function AcpChatView({ sessionId, agentType = 'claude', onRegiste
   const [presetOpen, setPresetOpen] = useState(false)
   const [presetManaging, setPresetManaging] = useState(false)
   const closePreset = useCallback(() => { setPresetOpen(false); setPresetManaging(false) }, [])
+  // approval id → 本端已作出的决定。Gateway 不广播「已解决」帧，所以按钮是否
+  // 收起只能由本端记账；replay 后一个已解决的 approval 会重新出现按钮，点第二次
+  // 得到 404（后端忽略），这是可接受的降级 —— 好过永久卡住一个无法回答的卡片。
+  const [resolvedApprovals, setResolvedApprovals] = useState<Record<string, 'approve' | 'reject'>>({})
+  // 上下文用量（Crew 白拿的新能力：zeromux 自己没有）。
+  const [ctxUsage, setCtxUsage] = useState<{ used: number; total: number } | null>(null)
   const [busy, setBusy] = useState(false)
   const [pending, setPending] = useState<string[]>([])   // 已上传待发的实际路径
   const [uploading, setUploading] = useState(0)           // 上传中计数
@@ -210,6 +224,16 @@ export default function AcpChatView({ sessionId, agentType = 'claude', onRegiste
     scrollBottom(force)
   }, [scrollBottom])
 
+  // 审批上行。照 interrupt 的形状（同一条 /ws/acp socket，后端 fan-out 代理
+  // POST /api/approvals/{id}/{action}）—— 不新开连接、不新增轮询。
+  // resolve 后本地把该块标 resolved，按钮消失（不等服务端回帧，Gateway 不回执）。
+  const resolveApproval = useCallback((approvalId: string, action: 'approve' | 'reject') => {
+    if (wsRef.current?.readyState === WebSocket.OPEN) {
+      wsRef.current.send(JSON.stringify({ type: 'approval', approval_id: approvalId, action }))
+    }
+    setResolvedApprovals(prev => (prev[approvalId] ? prev : { ...prev, [approvalId]: action }))
+  }, [])
+
   // Mark the in-flight turn's group complete when a turn ends via error/exit rather
   // than a clean `result`. Injects an empty synthetic `result` for the last observed
   // turn_id (empty text → foldTranscript sets complete without appending). No-op if no
@@ -316,6 +340,37 @@ export default function AcpChatView({ sessionId, agentType = 'claude', onRegiste
         // also mirrors it to App so the SessionInfoBar dropdown reflects it (2026-07-28).
         if (typeof evt.queue_mode === 'string') {
           adoptQueueMode(evt.queue_mode)
+        }
+        break
+      }
+
+      case 'approval': {
+        // **必须有这个 case** —— handleEvent 的 switch 没有 default 分支，未知顶层
+        // type 是静默忽略：后端发了、前端没接 = 「什么都没发生」。
+        const aid = evt.approval_id
+        if (!aid) break
+        // 作为一个 content_block 折进它所属的 turn，与那次 tool_use 相邻渲染。
+        appendEvent({
+          type: 'content_block',
+          block_type: 'approval',
+          turn_id: evt.turn_id ?? activeTurnIdRef.current ?? 0,
+          approval_id: aid,
+          name: evt.tool,
+          summary: evt.tool_purpose,
+          text: evt.tool_input,
+        })
+        // 审批请求是**真实的前进信号**（agent 在等人），刷新静默基线。
+        // stuck 是静默判定（:585 的 STUCK_SILENCE_MS）：approval 弹出后 agent 就不再
+        // 产出任何输出，不刷基线的话 60s 后 UI 显示「可能卡住」+ 中断按钮，用户点
+        // 中断会白白杀掉一个只需点「批准」的轮次。与 chat_status（纯噪音）方向相反。
+        setLastEventMs(Date.now())
+        break
+      }
+
+      case 'context_usage': {
+        // Crew 独有的能力，zeromux 自己没有 —— 纯白拿。
+        if (typeof evt.used === 'number' && typeof evt.total === 'number' && evt.total > 0) {
+          setCtxUsage({ used: evt.used, total: evt.total })
         }
         break
       }
@@ -636,9 +691,14 @@ export default function AcpChatView({ sessionId, agentType = 'claude', onRegiste
 
   return (
     <div className="flex flex-col h-full">
-      {lifetime.turns > 0 && (
-        <div className="px-5 pt-2 pb-0 flex justify-end">
-          <SessionLifetimeBadge agentType={agentType} lifetime={lifetime} />
+      {(lifetime.turns > 0 || ctxUsage) && (
+        <div className="px-5 pt-2 pb-0 flex justify-end items-center gap-2">
+          {ctxUsage && (
+            <span className="text-[10px] text-[var(--text-muted)]" title="上下文用量（Crew 提供）">
+              ctx {Math.round((ctxUsage.used / ctxUsage.total) * 100)}%
+            </span>
+          )}
+          {lifetime.turns > 0 && <SessionLifetimeBadge agentType={agentType} lifetime={lifetime} />}
         </div>
       )}
       {showMetrics && (
@@ -682,6 +742,8 @@ export default function AcpChatView({ sessionId, agentType = 'claude', onRegiste
             agentName={agentType === 'crew' ? 'Crew' : agentType === 'codex' ? 'Codex' : 'Claude'}
             density={density}
             onExpand={expandDensity}
+            resolvedApprovals={resolvedApprovals}
+            onResolveApproval={resolveApproval}
           />
         ))}
         {notices.map(n => <NoticeBubble key={n.id} notice={n} />)}
@@ -820,8 +882,11 @@ export default function AcpChatView({ sessionId, agentType = 'claude', onRegiste
 // collect-merged turn has N userPrompts (P1) → N "You" bubbles, then one
 // assistant section. A turn with no blocks yet (prompt sent, nothing streamed)
 // renders just the user bubble(s).
-function TurnGroupViewImpl({ group, agentName = 'Claude', density = 'concise', onExpand }: {
+function TurnGroupViewImpl({ group, agentName = 'Claude', density = 'concise', onExpand, resolvedApprovals, onResolveApproval }: {
   group: TurnGroup; agentName?: string; density?: Density; onExpand?: () => void
+  /** approval id → 本端已作出的决定；有值则卡片收起按钮，显示结果。 */
+  resolvedApprovals?: Record<string, 'approve' | 'reject'>
+  onResolveApproval?: (approvalId: string, action: 'approve' | 'reject') => void
 }) {
   const { visible, collapsedCount } = partitionBlocks(group.blocks, density)
   return (
@@ -835,7 +900,15 @@ function TurnGroupViewImpl({ group, agentName = 'Claude', density = 'concise', o
       {group.blocks.length > 0 && (
         <div className="space-y-2">
           <p className="text-[11px] font-semibold text-[var(--accent-purple)] mb-0.5">{agentName}</p>
-          {visible.map((b, i) => <BlockView key={i} block={b} isComplete={group.complete} />)}
+          {visible.map((b, i) => (
+            <BlockView
+              key={i}
+              block={b}
+              isComplete={group.complete}
+              approvalDecision={b.approvalId ? resolvedApprovals?.[b.approvalId] : undefined}
+              onResolveApproval={onResolveApproval}
+            />
+          ))}
           {collapsedCount > 0 && (
             <button onClick={onExpand}
               className="text-[11px] text-[var(--text-muted)] hover:text-[var(--accent-blue)] border border-[var(--border)] rounded px-2 py-0.5 transition-colors">
@@ -859,7 +932,12 @@ const TurnGroupView = memo(
     prev.group === next.group &&
     prev.agentName === next.agentName &&
     prev.density === next.density &&
-    prev.onExpand === next.onExpand
+    prev.onExpand === next.onExpand &&
+    // Must be compared, or answering an approval would not re-render the card:
+    // stabilizeGroups (:92, 2026-08-03 F-perf) deliberately keeps a completed
+    // turn's object identity, so nothing else changes when the decision lands.
+    prev.resolvedApprovals === next.resolvedApprovals &&
+    prev.onResolveApproval === next.onResolveApproval
 )
 
 function NoticeBubble({ notice }: { notice: Notice }) {
@@ -884,7 +962,12 @@ const TOOL_ICONS: Record<string, LucideIcon> = {
 const iconFor = (name?: string): LucideIcon =>
   (name && TOOL_ICONS[name]) || Wrench
 
-function BlockView({ block, isComplete }: { block: ContentBlock; isComplete: boolean }) {
+function BlockView({ block, isComplete, approvalDecision, onResolveApproval }: {
+  block: ContentBlock
+  isComplete: boolean
+  approvalDecision?: 'approve' | 'reject'
+  onResolveApproval?: (approvalId: string, action: 'approve' | 'reject') => void
+}) {
   switch (block.type) {
     case 'text':
       return (
@@ -941,6 +1024,58 @@ function BlockView({ block, isComplete }: { block: ContentBlock; isComplete: boo
                 {truncated}
               </pre>
             </details>
+          )}
+        </div>
+      )
+    }
+
+    case 'approval': {
+      // 内联而非图标位：审批天然属于某个 turn 的某个 tool_call，且 SessionInfoBar
+      // 的 5 图标已是硬上限。**必须有这个 case** —— BlockView 的 default 是
+      // `return null`，未知 block_type 渲染为空 = 什么都没发生。
+      const aid = block.approvalId
+      return (
+        <div className="border-l-2 border-[var(--accent-red)] pl-2.5 py-1.5 text-xs">
+          <div className="flex items-center gap-1 text-[var(--accent-red)] font-medium">
+            <AlertCircle size={12} className="shrink-0" />
+            <span>需要你批准</span>
+            {block.name && (
+              <span className="text-[var(--text-primary)] font-normal truncate min-w-0 flex-1">· {block.name}</span>
+            )}
+          </div>
+          {block.summary && (
+            <p className="mt-1 text-[11px] text-[var(--text-secondary)] break-words leading-snug">{block.summary}</p>
+          )}
+          {block.text && (
+            <pre className="mt-1 text-[11px] text-[var(--text-secondary)] whitespace-pre-wrap break-words bg-[var(--bg-secondary)] rounded p-2 border border-[var(--border)] overflow-x-auto max-h-40 overflow-y-auto">
+              {block.text.length > 2000 ? block.text.substring(0, 2000) + '\n...(truncated)' : block.text}
+            </pre>
+          )}
+          {approvalDecision ? (
+            <p className="mt-1.5 text-[11px] text-[var(--text-muted)] italic">
+              {approvalDecision === 'approve' ? '已批准' : '已拒绝'}
+            </p>
+          ) : aid ? (
+            /* min-h-[44px] 触控目标。 */
+            <div className="mt-2 flex gap-2">
+              <button
+                data-testid="approval-reject"
+                onClick={() => onResolveApproval?.(aid, 'reject')}
+                className="flex-1 min-h-[44px] rounded-lg border border-[var(--border)] text-[var(--text-secondary)] hover:text-[var(--accent-red)] hover:border-[var(--accent-red)] text-xs font-medium transition-colors inline-flex items-center justify-center gap-1"
+              >
+                <Ban size={13} />拒绝
+              </button>
+              <button
+                data-testid="approval-approve"
+                onClick={() => onResolveApproval?.(aid, 'approve')}
+                className="flex-1 min-h-[44px] rounded-lg bg-[var(--accent-green)] hover:bg-[var(--accent-green-hover)] text-white text-xs font-medium transition-colors inline-flex items-center justify-center gap-1"
+              >
+                <Check size={13} />批准
+              </button>
+            </div>
+          ) : (
+            /* approval_id 缺失 = 后端 bug。绝不渲染两个点了没反应的按钮。 */
+            <p className="mt-1.5 text-[11px] text-[var(--accent-yellow)]">审批 id 缺失，无法在此回答</p>
           )}
         </div>
       )

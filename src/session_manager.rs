@@ -141,6 +141,9 @@ pub enum SessionInput {
     /// Watchdog→fan-out: 超时终结当前 run。让超时和完成/错/取消一样从 fan-out
     /// 单一出口走,run_metrics 与 finalize_run 天然一致(评审 P0)。
     TimeoutKill { run_id: Option<String> },
+    /// Crew: 审批回执（approve / reject）。仅 Crew fan-out 消费；其余 fan-out
+    /// 静默丢弃（与 PtyData 对 agent fan-out 的处理同构）。
+    Approval { approval_id: String, action: String },
 }
 
 /// How a fan-out handles a new prompt that arrives while a turn is running.
@@ -3794,12 +3797,24 @@ fn spawn_crew_fanout(
                             turn_starts.set_live_intent(crate::run_metrics::RunOutcome::Timeout);
                             process.kill().await;
                         }
+                        Some(SessionInput::Approval { approval_id, action }) => {
+                            // Crew-only: proxy the browser's decision to
+                            // `POST /api/approvals/{id}/{action}`. The process layer
+                            // spawns it detached (it must not queue behind a Prompt
+                            // POST that blocks for the whole turn), so this await
+                            // only hands it to the event loop. Deliberately NOT
+                            // gated on `local_running` and deliberately no
+                            // set_live_intent: answering an approval CONTINUES the
+                            // turn — it is neither a cancel nor a completion, so it
+                            // must not touch the turn_starts FIFO intent.
+                            if let Err(e) = process.resolve_approval(&approval_id, &action).await {
+                                tracing::warn!("crew approval failed for {}: {}", sid, e);
+                            }
+                        }
                         None => break,
                         // PtyData / PtyResize aren't meaningful for a Gateway-backed
                         // agent session — they only apply to PTY/tmux. Drop
                         // silently rather than mis-route into send_prompt.
-                        // (`SessionInput::Approval` lands here too until Task 7
-                        // wires it to `CrewProcess::resolve_approval`.)
                         _ => {}
                     }
                 }

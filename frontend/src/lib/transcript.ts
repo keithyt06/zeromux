@@ -15,17 +15,24 @@ export interface WireEvent {
   turn_id?: number
   client_id?: string
   cost_usd?: number
+  /** 仅 block_type==='approval'：Crew 的 approval id，上行 resolve 时用。 */
+  approval_id?: string
 }
 
 export interface Block {
   // 'error': a non-terminal mid-turn agent error (e.g. a transient Codex
   // codex/event error while the turn keeps running). Rendered inline as a red
   // note; unlike the top-level 'error' event it does NOT end the turn (F-CODEX-1).
-  type: 'text' | 'thinking' | 'tool_use' | 'tool_result' | 'error'
+  // 'approval': a Crew tool-approval request. Inline (not an overlay/icon) because
+  // it belongs to a specific tool_call of a specific turn — and because 5 icons is
+  // the hard width limit in SessionInfoBar. Answered over the SAME /ws/acp socket.
+  type: 'text' | 'thinking' | 'tool_use' | 'tool_result' | 'error' | 'approval'
   text?: string
   name?: string
   input?: unknown
   summary?: string
+  /** 仅 approval：Crew 的 approval id。resolve 后本地置 resolved 隐藏按钮。 */
+  approvalId?: string
 }
 
 export interface TurnGroup {
@@ -88,7 +95,7 @@ export function foldTranscript(
       if (e.streaming && mergeable && last && last.type === bt) {
         last.text = (last.text ?? '') + (e.text ?? '')
       } else {
-        g.blocks.push({ type: bt, text: e.text, name: e.name, input: e.input, summary: e.summary })
+        g.blocks.push({ type: bt, text: e.text, name: e.name, input: e.input, summary: e.summary, approvalId: e.approval_id })
       }
     } else if (e.type === 'result') {
       const g = group(tid)

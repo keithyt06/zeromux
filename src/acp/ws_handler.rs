@@ -29,6 +29,10 @@ enum ClientMsg {
     Interrupt,
     #[serde(rename = "set_queue_mode")]
     SetQueueMode { mode: String },
+    /// Crew 审批回执。沿用同一条 /ws/acp socket（不新开连接、不新增轮询）；
+    /// fan-out 代理到 `POST /api/approvals/{id}/{action}`。
+    #[serde(rename = "approval")]
+    Approval { approval_id: String, action: String },
 }
 
 pub async fn ws_acp(
@@ -195,6 +199,13 @@ async fn handle_acp_ws(socket: WebSocket, session_id: String, state: Arc<AppStat
                                 }
                                 ClientMsg::SetQueueMode { mode } => {
                                     let _ = input_tx.send(SessionInput::SetQueueMode(QueueMode::from_str(&mode))).await;
+                                }
+                                ClientMsg::Approval { approval_id, action } => {
+                                    // Not logged: an approval carries the (already
+                                    // Gateway-redacted) tool text only in the DOWN
+                                    // direction; the up-message is just an opaque id
+                                    // plus a verb, so there is nothing to log.
+                                    let _ = input_tx.send(SessionInput::Approval { approval_id, action }).await;
                                 }
                             }
                         }

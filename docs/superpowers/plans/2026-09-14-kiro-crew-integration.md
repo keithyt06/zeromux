@@ -488,7 +488,28 @@ Expected: 编译失败 —— `cannot find function 'normalize_frame'` / `cannot
 > （验红输出里会出现 `no variant named 'Approval' found for enum AcpEvent`）。
 > 我验证代码的那个临时 crate 两者都有，所以没暴露这个顺序依赖。
 
-先按**附录 D** 在 `src/acp/process.rs` 的 `Exit` 变体（`:92-94`）之后插入两个新变体，再按**附录 N** 实现纯函数。三条不变量的落点：
+先按**附录 D** 在 `src/acp/process.rs` 的 `Exit` 变体（`:92-94`）之后插入两个新变体，再按**附录 N** 实现纯函数。
+
+**并且从附录 I 里提前取三样东西到本 Step**（否则 Step 5 的 11 passed 达不到）：
+
+1. 三个重连常量 `RECONNECT_INITIAL` / `RECONNECT_MAX` / `STABLE_AFTER`
+2. `struct Backoff` + `impl Backoff`
+3. `pub fn read_gateway_secret`
+
+> **为什么**（本条是订正）：附录 T 的 11 个测试里只有 **9 个**是归一化测试
+> （T1-T8 + `context_usage_and_approval`）。另 2 个 —— `backoff_only_resets_after_a_connection_proves_stable`
+> 与 `secret_falls_back_and_errors_never_echo_content` —— 测的是上面这三样，
+> 而它们**被归到了附录 I**。
+>
+> 关键：这**不是** I/O 依赖问题。`Backoff` 是纯算术（无 `async`/`await`/IO），
+> `read_gateway_secret` 只做同步 `std::fs::read_to_string` —— 两者都**不需要
+> Gateway 在跑**，这正是它们能进这套「不用跑 Gateway」测试集的原因。它们只是
+> 在附录划分上归错了位置。
+>
+> 提前取这三样后，Step 5 的「11 passed」字面成立；Step 6 插入附录 I 的其余部分，
+> 最终文件布局仍按附录 I 的顺序（header/uses → N → I → tests）。
+
+三条不变量的落点：
 
 | 不变量 | 落点 | 漏了的后果 |
 |---|---|---|
@@ -504,7 +525,7 @@ Expected: 11 passed。
 
 - [ ] **Step 6: 实现 I/O 部分（secret 读取 / token mint / REST / WS 事件循环）**
 
-代码见附录 I。**三个必须遵守的点**（都是 Global Constraints 里那两条真 bug 的落地）：
+代码见附录 I —— **除 Step 4 已提前取走的三样**（三个重连常量 + `Backoff` + `read_gateway_secret`）。**三个必须遵守的点**（都是 Global Constraints 里那两条真 bug 的落地）：
 
 1. `POST /api/chat` 走串行 `prompt_worker`，**不在 `select!` 臂里 await**。
 2. `Cmd::Cancel` 走 **detached spawn**，不排在 prompt 后面。

@@ -1,5 +1,7 @@
 import { useState, useEffect, useRef, useCallback, useMemo, memo, createElement } from 'react'
-import { wsUrl, uploadSessionFile, getSessionRuns } from '../lib/api'
+import { wsUrl, uploadSessionFile, getSessionRuns, getCrewMemory, putCrewSemantic, deleteCrewSemantic } from '../lib/api'
+import type { SemanticEntry } from '../lib/api'
+import { normalizeMemoryKey, parseSemanticValue } from '../lib/crewMemory'
 import { ChevronDown, Wrench, Brain, AlertCircle, FileText, Terminal, Search, Bot, Paperclip, ListPlus, X, Ban, Check, type LucideIcon } from 'lucide-react'
 import MarkdownContent from './markdown/MarkdownContent'
 import Composer from './Composer'
@@ -74,12 +76,15 @@ interface Props {
   onQueueModeChange?: (sessionId: string, mode: string) => void
   // Inline run-metrics panel visibility, owned by App (toggled from SessionInfoBar).
   showMetrics?: boolean
+  // 「全部 →」跳记忆面板（第 5 个 overlay view，由 App 拥有）。未传时 popover 里
+  // 那个入口仅关弹层，不报错 —— composer 的就地写入不依赖面板存在。
+  onOpenMemory?: () => void
 }
 
 // `active` is accepted (App passes it for all session views) but no longer used:
 // the Composer owns its own textarea and we intentionally don't auto-focus it,
 // so switching to a chat session doesn't pop the mobile keyboard.
-export default function AcpChatView({ sessionId, agentType = 'claude', onRegisterControls, onQueueModeChange, showMetrics }: Props) {
+export default function AcpChatView({ sessionId, agentType = 'claude', onRegisterControls, onQueueModeChange, showMetrics, onOpenMemory }: Props) {
   // Raw wire-event log; the rendered transcript is DERIVED from it by grouping
   // on turn_id (T1). This is what fixes "send while streaming" misalignment:
   // a new prompt carries the NEXT turn_id, so it folds into its own group
@@ -111,6 +116,19 @@ export default function AcpChatView({ sessionId, agentType = 'claude', onRegiste
   const [presetOpen, setPresetOpen] = useState(false)
   const [presetManaging, setPresetManaging] = useState(false)
   const closePreset = useCallback(() => { setPresetOpen(false); setPresetManaging(false) }, [])
+  // ── 就地记忆写入（composer 第 3 个按钮）──
+  // 人只在「被冒犯的那一刻」想纠正记忆（agent 刚用了 npm 而你说过 pnpm），那一刻
+  // 拇指在输入框上。要求用户「打开设置去配置偏好」= 问卷 = 没人填。
+  const [memOpen, setMemOpen] = useState(false)
+  const [memDraft, setMemDraft] = useState('')
+  const [memRecent, setMemRecent] = useState<SemanticEntry[]>([])
+  const [memBusy, setMemBusy] = useState(false)
+  const [memErr, setMemErr] = useState<string | null>(null)
+  const [memConfirming, setMemConfirming] = useState<string | null>(null)
+  // 单调请求令牌：popover 一开就冷 GET，同时用户可能立刻写/删（乐观 setMemRecent）。
+  // 没有它，写入前发出的旧快照迟到会盖掉刚加的条目 / 复活刚删的 ghost。
+  const memReqRef = useRef(0)
+  const closeMem = useCallback(() => { setMemOpen(false); setMemConfirming(null); setMemErr(null) }, [])
   // approval id → 本端已作出的决定。Gateway 不广播「已解决」帧，所以按钮是否
   // 收起只能由本端记账；replay 后一个已解决的 approval 会重新出现按钮，点第二次
   // 得到 404（后端忽略），这是可接受的降级 —— 好过永久卡住一个无法回答的卡片。
@@ -218,6 +236,61 @@ export default function AcpChatView({ sessionId, agentType = 'claude', onRegiste
     setNotices(prev => [...prev, notice])
     scrollBottom()
   }, [scrollBottom])
+
+  // 记忆的读/写/删。**必须放在 pushNotice 之后** —— 它们依赖它，放前面会 TDZ 报错。
+  const loadMemRecent = useCallback(async () => {
+    const req = ++memReqRef.current
+    try {
+      const data = await getCrewMemory()
+      if (memReqRef.current !== req) return
+      // 最近 5 条：updated_at 倒序（Gateway 不保证顺序）。
+      setMemRecent([...data.semantic]
+        .sort((a, b) => b.updated_at.localeCompare(a.updated_at))
+        .slice(0, 5))
+      setMemErr(null)
+    } catch (e) {
+      if (memReqRef.current !== req) return
+      setMemErr(e instanceof Error ? e.message : String(e))
+    }
+  }, [])
+
+  const rememberMem = useCallback(async () => {
+    const text = memDraft.trim()
+    if (!text || memBusy) return
+    setMemBusy(true)
+    setMemErr(null)
+    try {
+      const { key, value } = normalizeMemoryKey(text)
+      await putCrewSemantic(key, value)
+      memReqRef.current++
+      const now = new Date().toISOString()
+      setMemRecent(prev => [
+        { key, value_json: JSON.stringify(value), confidence: 1.0, source: 'user_explicit',
+          created_at: now, updated_at: now, is_deleted: 0 },
+        ...prev.filter(e => e.key !== key),
+      ].slice(0, 5))
+      setMemDraft('')
+      // 写入回执：在对话流留一行轻量提示。可见性靠回执，不靠面板 —— 用户一天不会
+      // 主动打开记忆面板。NoticeBubble 的 system 分支正是这个视觉。
+      pushNotice({ id: newId(), kind: 'system', text: `已记住：${value}` })
+    } catch (e) {
+      setMemErr(e instanceof Error ? e.message : String(e))
+    }
+    setMemBusy(false)
+  }, [memDraft, memBusy, pushNotice])
+
+  const forgetMem = useCallback(async (key: string) => {
+    setMemConfirming(null)
+    memReqRef.current++
+    setMemRecent(prev => prev.filter(e => e.key !== key))
+    try {
+      await deleteCrewSemantic(key)
+      pushNotice({ id: newId(), kind: 'system', text: `已忘掉：${key}` })
+    } catch (e) {
+      setMemErr(e instanceof Error ? e.message : String(e))
+    }
+    loadMemRecent()
+  }, [pushNotice, loadMemRecent])
 
   const appendEvent = useCallback((evt: WireEvent, force = false) => {
     setEvents(prev => [...prev, evt])
@@ -679,6 +752,14 @@ export default function AcpChatView({ sessionId, agentType = 'claude', onRegiste
     return () => window.removeEventListener('keydown', onKey)
   }, [presetOpen, closePreset])
 
+  // Esc 同样关记忆 popover（与 preset 一致，否则桌面端两个弹层行为不一致）。
+  useEffect(() => {
+    if (!memOpen) return
+    const onKey = (e: KeyboardEvent) => { if (e.key === 'Escape') closeMem() }
+    window.addEventListener('keydown', onKey)
+    return () => window.removeEventListener('keydown', onKey)
+  }, [memOpen, closeMem])
+
   // Clear the pending metrics-refresh timer on unmount.
   useEffect(() => () => { if (metricsDebounce.current) clearTimeout(metricsDebounce.current) }, [])
 
@@ -845,6 +926,82 @@ export default function AcpChatView({ sessionId, agentType = 'claude', onRegiste
             )}
           </div>
         )}
+        {memOpen && (
+          <div className="fixed inset-0 z-10" onClick={closeMem} aria-hidden="true" />
+        )}
+        {memOpen && (
+          <div className="absolute bottom-full left-0 right-0 mb-2 mx-2 rounded-lg border border-[var(--border)] bg-[var(--bg-primary)] shadow-lg z-20">
+            <div className="p-2 flex flex-col gap-2">
+              <div className="flex items-center gap-1.5">
+                <Brain size={12} className="text-[var(--accent-purple)] shrink-0" />
+                <span className="text-[10px] font-semibold text-[var(--text-muted)] uppercase tracking-wider flex-1">记忆</span>
+              </div>
+              <div className="flex gap-2">
+                <input
+                  value={memDraft}
+                  onChange={e => setMemDraft(e.target.value)}
+                  onKeyDown={e => { if (e.key === 'Enter') { e.preventDefault(); rememberMem() } }}
+                  placeholder="让它记住…"
+                  aria-label="memory draft"
+                  /* text-base = 16px：低于 16px 时 iOS Safari 聚焦会自动放大整页，
+                     把发送键挤出视口（Composer.tsx 的既有教训）。 */
+                  className="flex-1 min-w-0 text-base bg-[var(--bg-secondary)] border border-[var(--border)] rounded-lg px-3 py-2 min-h-[44px] text-[var(--text-primary)] outline-none focus:border-[var(--accent-purple)] placeholder-[var(--text-muted)]"
+                />
+                <button
+                  onClick={rememberMem}
+                  disabled={!memDraft.trim() || memBusy}
+                  className="shrink-0 px-3 min-h-[44px] rounded-lg bg-[var(--accent-purple)] disabled:bg-[var(--btn-disabled-bg)] disabled:text-[var(--btn-disabled-text)] text-white text-xs font-medium transition-colors"
+                >
+                  {memBusy ? '写入中' : '记住'}
+                </button>
+              </div>
+              {memErr && <p className="text-[10px] text-[var(--accent-red)] break-words">{memErr}</p>}
+              <div className="text-[10px] text-[var(--text-muted)]">
+                {memRecent.length > 0 ? `它记错了？(最近 ${memRecent.length} 条)` : '还没有记住任何偏好'}
+              </div>
+              {/* ✕ 常驻，绝不 group-hover（Tailwind v4 编进 @media (hover:hover)，
+                  手机上 = 隐形按钮）。点 ✕ → 该行下沉展开确认，不用 window.confirm。 */}
+              {memRecent.map(e => (
+                <div key={e.key} className="rounded border border-[var(--border)]">
+                  <div className="flex items-center gap-2 px-2 py-1.5 min-h-[44px]">
+                    <span className="flex-1 min-w-0 text-[11px] text-[var(--text-primary)] break-words leading-snug">
+                      {e.key.replace(/^(pref|project|user|lesson)\./, '')}
+                      <span className="text-[var(--accent-purple)]"> = {parseSemanticValue(e.value_json)}</span>
+                    </span>
+                    <button
+                      onClick={() => setMemConfirming(cur => cur === e.key ? null : e.key)}
+                      data-testid="mem-forget"
+                      aria-label={`forget ${e.key}`}
+                      className="shrink-0 w-8 min-h-[44px] -my-1.5 flex items-center justify-center text-[var(--text-secondary)] hover:text-[var(--accent-red)] transition-colors"
+                    >
+                      <X size={13} />
+                    </button>
+                  </div>
+                  {memConfirming === e.key && (
+                    <button
+                      data-testid="mem-forget-confirm"
+                      onClick={() => forgetMem(e.key)}
+                      className="flex items-center gap-2 w-full px-2 py-2 min-h-[44px] border-t border-[var(--border)] text-[11px] text-[var(--text-secondary)] hover:text-[var(--accent-red)] hover:bg-[var(--bg-hover)]"
+                    >
+                      <X size={12} className="shrink-0" />确认移除，让它忘掉
+                    </button>
+                  )}
+                </div>
+              ))}
+              <div className="flex justify-between">
+                <button
+                  onClick={() => { closeMem(); onOpenMemory?.() }}
+                  className="px-2 py-1 text-[10px] font-semibold text-[var(--accent-purple)] hover:opacity-80"
+                >
+                  全部 →
+                </button>
+                <button onClick={closeMem} className="px-2 py-1 text-[10px] text-[var(--text-muted)] hover:text-[var(--text-primary)]">
+                  关闭
+                </button>
+              </div>
+            </div>
+          </div>
+        )}
         <Composer
           value={input}
           onChange={setInput}
@@ -856,6 +1013,8 @@ export default function AcpChatView({ sessionId, agentType = 'claude', onRegiste
               <button
                 onClick={() => {
                   setPresetManaging(false)
+                  // 两个 popover 都是 absolute bottom-full，同时开会重叠 —— 互斥。
+                  setMemOpen(false)
                   setPresetOpen(o => { if (!o) presetStore.reload(); return !o })
                 }}
                 aria-label="prompt presets"
@@ -868,6 +1027,23 @@ export default function AcpChatView({ sessionId, agentType = 'claude', onRegiste
                 className="self-end p-2 text-[var(--text-muted)] hover:text-[var(--text-primary)] rounded-lg transition-colors" title="附件">
                 <Paperclip size={16} />
               </button>
+              {/* 仅 Crew 会话。宽度核算：现有 2 按钮各 p-2+size16 ≈ 32px 加发送键
+                  40px = 104px；375px 屏下 textarea 约 246px。加这个 → 136px，
+                  textarea 剩 ~214px。接近极限，故其它后端不渲染。 */}
+              {agentType === 'crew' && (
+                <button
+                  onClick={() => {
+                    setMemConfirming(null)
+                    closePreset()
+                    setMemOpen(o => { if (!o) loadMemRecent(); return !o })
+                  }}
+                  aria-label="memory"
+                  className="self-end p-2 text-[var(--text-muted)] hover:text-[var(--accent-purple)] rounded-lg transition-colors"
+                  title="记忆"
+                >
+                  <Brain size={16} />
+                </button>
+              )}
             </div>
           }
         />

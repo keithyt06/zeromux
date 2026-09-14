@@ -1780,7 +1780,7 @@ Expected: 无输出（`terminalInput.ts` 的 `LAUNCH.crew = 'kirocrew chat'` 含
 
 Run: `cargo test 2>&1 | tail -3`
 
-Expected: `399 passed`（Task 8 的 402 − kiro_process.rs 的 3 个内联测试）。**必须精确** —— 多减了说明误删。
+Expected: `397 passed`（Task 8 的 402 − kiro_process.rs 的 **5** 个内联测试）。**原写 3 个是错的**（实测 `git show 8197ed2^:src/acp/kiro_process.rs | grep -c '#\[test\]'` = 5），整条下游计数链因此 −2。**必须精确** —— 多减了说明误删。
 
 Run: `cd frontend && npx tsc --noEmit && npx vitest run 2>&1 | tail -6`
 
@@ -1878,7 +1878,7 @@ Expected: 无输出（`quick_targets.rs` 的 `kind='note'` 是 Obsidian vault �
 
 Run: `cargo test 2>&1 | tail -3`
 
-Expected: `396 passed`（Task 11 后的 399 − notes.rs 的 3 个内联测试）。**必须精确等于 396** —— 多减了说明误删了别的测试。
+Expected: `394 passed`（Task 11 后的 397 − notes.rs 的 3 个内联测试）。**必须精确等于 394** —— 多减了说明误删了别的测试。
 
 - [ ] **Step 5: Commit**
 
@@ -4325,7 +4325,7 @@ fn scheduled_session_type(agent_type: &str) -> SessionType {
 
 Run: `cargo test scheduled_agent_type 2>&1 | tail -5` → Expected 1 passed。
 
-Run: `cargo test 2>&1 | tail -3` → Expected `397 passed`（Task 13 后的 396 + 本任务 1）。
+Run: `cargo test 2>&1 | tail -3` → Expected `395 passed`（Task 13 后的 394 + 本任务 1）。
 
 - [ ] **Step 5: 手工验收**
 
@@ -4375,8 +4375,8 @@ EOF
 | **附加** | Task 14 | `cargo test` 397；E1 门验证通过 |
 
 **总验证门**：
-- `cargo test` 最终 **397 passed**。逐批核算：382（基线）→383（T1 +1）→386（T2 +3）→397（T4 +11）→400（T5 +3）→402（T8 +2）→399（T11 −3）→396（T12 −3）→**397**（T14 +1）
-- 前端最终 **48 文件 / 290 测试**
+- `cargo test` 最终 **395 passed**（实测）。逐批核算：382（基线）→383（T1 +1）→386（T2 +3）→397（T4 +11）→400（T5 +3）→402（T8 +2）→**397**（T11 −5，原以为 −3）→394（T12 −3）→394（T13 前端）→**395**（T14 +1）
+- 前端最终 **48 文件 / 290 测试**（实测确认）
 - `npm run lint` 无新增告警；`npx tsc --noEmit` 零错误
 - `npm run build` + `cargo build` 成功（**前端必须先 build** —— `rust-embed` 编译期读 `frontend/dist/`）
 - **产品判据**：一周内成功写入 ≥3 条记忆（spec §9.2 —— 这是唯一能证明"接 Crew 有意义"的行为指标）

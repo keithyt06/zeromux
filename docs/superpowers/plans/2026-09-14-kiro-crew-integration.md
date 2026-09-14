@@ -1021,8 +1021,18 @@ Expected: **③b 那条红**（精确命中第 6 处映射）。改回来。
 ```bash
 systemctl is-active kirocrew   # 必须 active
 cd frontend && npm run build && cd .. && cargo build
-cargo run -- --port 18099 --password t --work-dir /home/ubuntu
+# --data-dir 是必需的：不带它,测试实例会挂载**生产的 ~/.zeromux**
+# (session store / scheduled.db / events.db 全共享),并在启动时跑
+# reconcile_orphans。用隔离目录。
+mkdir -p /tmp/crew-e2e/data
+./target/debug/zeromux --port 18099 --password t \
+  --work-dir /home/ubuntu/crew-e2e-wd --data-dir /tmp/crew-e2e/data
 ```
+
+**legacy 密码模式的认证方式**（省得摸索）：没有 `/api/login`，直接带
+`Authorization: Bearer <password>` 或 `?token=<password>`（`auth.rs:216-234`）。
+**会话的 prompt 只能走 WebSocket** `/ws/acp/{id}?token=<password>` —— 没有 REST
+的 prompt 端点。
 
 浏览器开 `http://127.0.0.1:18099`：
 

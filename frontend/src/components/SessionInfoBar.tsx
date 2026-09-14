@@ -1,7 +1,7 @@
-import { useState, useEffect, useCallback, useRef } from 'react'
-import type { SessionInfo, SessionMetaStatus, NoteEntry } from '../lib/api'
-import { updateSession, listNotes, createNote, deleteNote } from '../lib/api'
-import { ChevronDown, ChevronRight, FileText, StickyNote, GitBranch, X, Activity, BarChart3, Brain } from 'lucide-react'
+import { useState, useCallback } from 'react'
+import type { SessionInfo, SessionMetaStatus } from '../lib/api'
+import { updateSession } from '../lib/api'
+import { ChevronDown, ChevronRight, FileText, GitBranch, Activity, BarChart3, Brain } from 'lucide-react'
 
 interface Props {
   session: SessionInfo
@@ -48,9 +48,6 @@ export function StatusDot({ status }: { status: SessionMetaStatus }) {
 export default function SessionInfoBar({ session, onUpdate, onToggleFiles, onToggleGit, onToggleEvents, showFiles, showGit, showEvents, onOpenSidebar, onQueueMode, queueMode = 'collect', onToggleMetrics, showMetrics, onToggleMemory, showMemory }: Props) {
   const [expanded, setExpanded] = useState(false)
   const [desc, setDesc] = useState(session.description)
-  const [notes, setNotes] = useState<NoteEntry[]>([])
-  const [noteInput, setNoteInput] = useState('')
-  const [submitting, setSubmitting] = useState(false)
 
   const save = useCallback(async (data: { description?: string; status?: SessionMetaStatus }) => {
     try {
@@ -58,31 +55,6 @@ export default function SessionInfoBar({ session, onUpdate, onToggleFiles, onTog
       onUpdate(data)
     } catch { /* ignore */ }
   }, [session.id, onUpdate])
-
-  // Notes list is fetched from `~/.zeromux/notes/{dir_hash}/` — a multi-second
-  // JuiceFS/S3 directory read — every time the info bar is expanded. The note
-  // input + delete buttons live INSIDE that just-expanded panel, so the user can
-  // add/delete a note (optimistic `setNotes` below) BEFORE the expand's `loadNotes`
-  // resolves. Without a stale guard the slow list (a pre-mutation snapshot) would
-  // resolve last and unconditionally overwrite state: an added note vanishes (though
-  // it persisted server-side → user re-adds → duplicate), or a deleted note reappears
-  // as a ghost row (delete again 404s, swallowed). Same optimistic-mutation-vs-
-  // in-flight-refresh race AgentDashboard was hardened against (reqRef, review
-  // 2026-08-11): bump at the top of loadNotes and before each optimistic write, drop
-  // superseded responses. (review 2026-08-15, F-FE.)
-  const reqRef = useRef(0)
-  const loadNotes = useCallback(async () => {
-    const req = ++reqRef.current
-    try {
-      const data = await listNotes(session.id)
-      if (reqRef.current !== req) return
-      setNotes(data.notes)
-    } catch { /* ignore */ }
-  }, [session.id])
-
-  useEffect(() => {
-    if (expanded) loadNotes()
-  }, [expanded, loadNotes])
 
   const handleDescBlur = () => {
     if (desc !== session.description) {
@@ -92,38 +64,6 @@ export default function SessionInfoBar({ session, onUpdate, onToggleFiles, onTog
 
   const handleStatusChange = (status: SessionMetaStatus) => {
     save({ status })
-  }
-
-  const handleAddNote = async () => {
-    const text = noteInput.trim()
-    if (!text || submitting) return
-    setSubmitting(true)
-    try {
-      const note = await createNote(session.id, text)
-      // Invalidate any loadNotes already in flight so its pre-add snapshot can't
-      // clobber the note we're optimistically prepending.
-      reqRef.current++
-      setNotes(prev => [note, ...prev])
-      setNoteInput('')
-    } catch { /* ignore */ }
-    setSubmitting(false)
-  }
-
-  const handleDeleteNote = async (noteId: string) => {
-    try {
-      await deleteNote(session.id, noteId)
-      // Invalidate any in-flight loadNotes so its pre-delete snapshot can't
-      // resurrect the row we're optimistically removing.
-      reqRef.current++
-      setNotes(prev => prev.filter(n => n.id !== noteId))
-    } catch { /* ignore */ }
-  }
-
-  const handleKeyDown = (e: React.KeyboardEvent) => {
-    if (e.key === 'Enter' && !e.shiftKey) {
-      e.preventDefault()
-      handleAddNote()
-    }
   }
 
   // Sync description from props
@@ -272,92 +212,8 @@ export default function SessionInfoBar({ session, onUpdate, onToggleFiles, onTog
             </div>
           )}
 
-          {/* Notes */}
-          <div>
-            <div className="flex items-center gap-1 mb-1">
-              <StickyNote size={10} className="text-[var(--text-muted)]" />
-              <span className="text-[10px] text-[var(--text-muted)] uppercase">
-                Notes {notes.length > 0 && `(${notes.length})`}
-              </span>
-            </div>
-
-            {/* Input */}
-            <input
-              value={noteInput}
-              onChange={e => setNoteInput(e.target.value)}
-              onKeyDown={handleKeyDown}
-              placeholder="Add a note... (Enter to save)"
-              disabled={submitting}
-              className="w-full text-xs bg-[var(--bg-primary)] border border-[var(--border)] rounded-md px-2 py-1.5 text-[var(--text-primary)] outline-none focus:border-[var(--accent-blue)] placeholder-[var(--text-muted)] mb-1"
-            />
-
-            {/* Notes list */}
-            {notes.length > 0 && (
-              <div className="max-h-40 overflow-y-auto space-y-0.5">
-                {notes.map(note => (
-                  <NoteItem
-                    key={note.id}
-                    note={note}
-                    onDelete={() => handleDeleteNote(note.id)}
-                  />
-                ))}
-              </div>
-            )}
-          </div>
         </div>
       )}
     </div>
   )
-}
-
-function NoteItem({ note, onDelete }: { note: NoteEntry; onDelete: () => void }) {
-  const [hovered, setHovered] = useState(false)
-
-  return (
-    <div
-      className="flex items-start gap-1.5 px-1.5 py-1 rounded hover:bg-[var(--bg-primary)] group"
-      onMouseEnter={() => setHovered(true)}
-      onMouseLeave={() => setHovered(false)}
-    >
-      <span className="text-[10px] text-[var(--text-muted)] shrink-0 w-[72px] pt-px">
-        {formatNoteDate(note.created_at)}
-      </span>
-      <span className="text-[11px] text-[var(--text-primary)] flex-1 break-words leading-snug">
-        {note.text}
-      </span>
-      {note.tags.length > 0 && (
-        <span className="flex gap-0.5 shrink-0">
-          {note.tags.map(tag => (
-            <span
-              key={tag}
-              className="text-[9px] px-1 py-0 rounded bg-[var(--bg-tertiary)] text-[var(--accent-blue)]"
-            >
-              {tag}
-            </span>
-          ))}
-        </span>
-      )}
-      {hovered && (
-        <button
-          onClick={e => { e.stopPropagation(); onDelete() }}
-          className="p-0.5 text-[var(--text-muted)] hover:text-[var(--accent-red)] shrink-0 transition-colors"
-        >
-          <X size={10} />
-        </button>
-      )}
-    </div>
-  )
-}
-
-function formatNoteDate(iso: string): string {
-  try {
-    const d = new Date(iso)
-    const mo = String(d.getMonth() + 1).padStart(2, '0')
-    const day = String(d.getDate()).padStart(2, '0')
-    const h = String(d.getHours()).padStart(2, '0')
-    const m = String(d.getMinutes()).padStart(2, '0')
-    return `${mo}-${day} ${h}:${m}`
-  } catch {
-    return iso.slice(0, 16)
-  }
 }

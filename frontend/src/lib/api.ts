@@ -19,16 +19,6 @@ export interface SessionInfo {
   source_task_id?: string | null
 }
 
-export interface NoteEntry {
-  id: string
-  work_dir: string
-  text: string
-  created_at: string
-  session_id: string
-  author: string
-  tags: string[]
-}
-
 export interface SessionStatus {
   work_dir: string
   git_branch: string | null
@@ -271,29 +261,6 @@ export async function updateSession(id: string, data: {
 
 export async function renameSession(id: string, name: string): Promise<void> {
   return updateSession(id, { name })
-}
-
-// Notes API
-export async function listNotes(sessionId: string): Promise<{ notes: NoteEntry[]; work_dir: string }> {
-  const res = await api(`/api/sessions/${sessionId}/notes`)
-  if (!res.ok) throw new Error('Failed to list notes')
-  return res.json()
-}
-
-export async function createNote(sessionId: string, text: string, tags?: string[]): Promise<NoteEntry> {
-  const res = await api(`/api/sessions/${sessionId}/notes`, {
-    method: 'POST',
-    body: JSON.stringify({ text, tags: tags || [] }),
-  })
-  if (!res.ok) throw new Error('Failed to create note')
-  return res.json()
-}
-
-export async function deleteNote(sessionId: string, noteId: string): Promise<void> {
-  const res = await api(`/api/sessions/${sessionId}/notes/${noteId}`, {
-    method: 'DELETE',
-  })
-  if (!res.ok) throw new Error('Failed to delete note')
 }
 
 // ── Crew memory proxy（zeromux 后端代理 Crew Gateway :5476 的记忆面）──

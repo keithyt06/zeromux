@@ -3,12 +3,10 @@ import { render, screen, fireEvent } from '@testing-library/react'
 import SessionInfoBar from '../SessionInfoBar'
 import type { SessionInfo } from '../../lib/api'
 
-// Notes only load when the panel is expanded; stub the api so the mount is inert.
+// The panel's only api call is the description/status save; stub it so the mount
+// is inert. (The notes fetch this used to stub is gone — Task 13 removed notes.)
 vi.mock('../../lib/api', () => ({
   updateSession: vi.fn(),
-  listNotes: vi.fn().mockResolvedValue({ notes: [] }),
-  createNote: vi.fn(),
-  deleteNote: vi.fn(),
 }))
 
 const session: SessionInfo = {

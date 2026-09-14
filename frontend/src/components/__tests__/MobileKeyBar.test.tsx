@@ -5,7 +5,7 @@ import MobileKeyBar from '../MobileKeyBar'
 describe('MobileKeyBar', () => {
   it('渲染 ↑↓↩ + ^C + 三个 agent 启动键', () => {
     render(<MobileKeyBar onKey={() => {}} />)
-    for (const k of ['up', 'down', 'enter', 'ctrl-c', 'claude', 'codex', 'kiro']) {
+    for (const k of ['up', 'down', 'enter', 'ctrl-c', 'claude', 'codex', 'crew']) {
       expect(screen.getByLabelText(k)).toBeInTheDocument()
     }
   })

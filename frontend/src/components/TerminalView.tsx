@@ -125,7 +125,7 @@ export default function TerminalView({ sessionId, active, theme }: Props) {
     term.scrollToBottom()
     if (key === 'ctrl-c') {
       sendInput(controlSequence(key))
-    } else if (key === 'claude' || key === 'codex' || key === 'kiro') {
+    } else if (key === 'claude' || key === 'codex' || key === 'crew') {
       sendInput(launchSequence(key))
     } else {
       sendInput(arrowSequence(key as ArrowKey, term.modes.applicationCursorKeysMode))

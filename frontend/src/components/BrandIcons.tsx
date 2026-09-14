@@ -57,3 +57,26 @@ export function CodexIcon({ size = 14, className }: BrandIconProps) {
     </svg>
   )
 }
+
+/** Kiro Crew — the Kiro ghost inside a "memory ring". Same purple family
+ *  (#9046FF) so it reads as a Kiro-lineage backend, but the ring makes it
+ *  distinguishable at 14px from KiroIcon — historical `kiro` sessions still
+ *  exist in the session list until Task 11 removes them, so the two marks
+ *  must not collide. */
+export function CrewIcon({ size = 14, className }: BrandIconProps) {
+  return (
+    <svg width={size} height={size} viewBox="0 0 24 24" className={className} fill="none" xmlns="http://www.w3.org/2000/svg">
+      <title>Kiro Crew</title>
+      {/* memory ring: dashed orbit = persisted knowledge around the agent */}
+      <circle cx="12" cy="12" r="11" stroke="#9046FF" strokeWidth="1.6" strokeDasharray="3.2 2.4" />
+      {/* ghost body, same silhouette family as KiroIcon but solid-purple */}
+      <path
+        fill="#9046FF"
+        d="M12 4.2c-3.02 0-5.2 2.2-5.2 5.32v6.9c0 .62.72.95 1.19.55l1.06-.9a.79.79 0 011.03.01l.87.75a.79.79 0 001.03 0l.87-.75a.79.79 0 011.03 0l.87.75a.79.79 0 001.03 0l.87-.75a.79.79 0 011.03.01l1.06.9c.47.4 1.19.07 1.19-.55v-6.9C17.2 6.4 15.02 4.2 12 4.2z"
+      />
+      {/* eyes punched out so the mark stays legible on both themes */}
+      <circle cx="10.1" cy="9.6" r="1.05" fill="#fff" />
+      <circle cx="13.9" cy="9.6" r="1.05" fill="#fff" />
+    </svg>
+  )
+}

@@ -6,7 +6,7 @@ describe('coerceAgent', () => {
   it('接受当前四种 SessionType', () => {
     expect(coerceAgent('claude')).toBe('claude')
     expect(coerceAgent('codex')).toBe('codex')
-    expect(coerceAgent('kiro')).toBe('kiro')
+    expect(coerceAgent('crew')).toBe('crew')
     expect(coerceAgent('tmux')).toBe('tmux')
   })
 
@@ -22,6 +22,9 @@ describe('coerceAgent', () => {
   it('未知字符串 → null，绝不把脏值发给后端', () => {
     // 某个 agent 类型日后被移除时，库里的旧行会留下已失效的字符串。
     expect(coerceAgent('gemini')).toBeNull()
+    // 'kiro' 正是这个场景的实例：后端已换成 crew，库里 quick_targets 的历史
+    // kiro 行必须收敛为 null（→ 让用户重选类型），不能原样发给 create_session。
+    expect(coerceAgent('kiro')).toBeNull()
     expect(coerceAgent('CLAUDE')).toBeNull()   // 大小写敏感，不做宽松匹配
   })
 })

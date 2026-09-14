@@ -76,14 +76,16 @@ export function controlSequence(key: ControlKey): string {
 }
 
 // agent CLI 一键启动 → 发命令 + 回车，在当前 shell 立即运行。
-// claude/codex 裸命令即进交互会话；kiro 的真实二进制是 kiro-cli，裸命令只出菜单，
-// 交互入口是 `kiro-cli chat`。命令已配置为最高权限模式，不带其它参数。
-export type AgentKey = 'claude' | 'codex' | 'kiro'
+// claude/codex 裸命令即进交互会话；crew 的裸命令只出菜单，交互入口是 `kirocrew chat`。
+// 命令已配置为最高权限模式，不带其它参数。
+export type AgentKey = 'claude' | 'codex' | 'crew'
 
 const LAUNCH: Record<AgentKey, string> = {
   claude: 'claude',
   codex: 'codex',
-  kiro: 'kiro-cli chat',
+  // Crew 的交互 CLI 入口。`kirocrew chat` 连本机 gateway(:5476)，与 Crew 会话
+  // 后端同源。（已实测存在于 `kirocrew --help` 的 "Work with the agent" 段。）
+  crew: 'kirocrew chat',
 }
 
 export function launchSequence(agent: AgentKey): string {

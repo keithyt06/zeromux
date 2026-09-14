@@ -1,4 +1,4 @@
-export type SessionType = 'tmux' | 'claude' | 'kiro' | 'codex'
+export type SessionType = 'tmux' | 'claude' | 'crew' | 'codex'
 
 export type SessionMetaStatus = 'running' | 'done' | 'blocked' | 'idle'
 
@@ -191,7 +191,7 @@ export async function listDirectories(path?: string): Promise<DirListing> {
 export interface QuickTarget {
   kind: 'dir' | 'note'
   path: string
-  /** dir: claude|kiro|codex|tmux；note: 空串 */
+  /** dir: claude|crew|codex|tmux；note: 空串 */
   agent: string
   display: string
   hint: string

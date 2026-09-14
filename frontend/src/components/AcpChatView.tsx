@@ -54,7 +54,7 @@ interface ServerEvent {
 interface Props {
   sessionId: string
   active: boolean
-  agentType?: 'claude' | 'kiro' | 'codex'
+  agentType?: 'claude' | 'crew' | 'codex'
   // Lets the parent (App→SessionInfoBar) drive WS-only controls that live in
   // this component. Registered on mount, cleared on unmount. (G2b queue mode.)
   onRegisterControls?: (sessionId: string, api: { setQueueMode: (mode: string) => void; sendPrompt: (text: string) => void } | null) => void
@@ -679,7 +679,7 @@ export default function AcpChatView({ sessionId, agentType = 'claude', onRegiste
           <TurnGroupView
             key={g.turnId}
             group={g}
-            agentName={agentType === 'kiro' ? 'Kiro' : agentType === 'codex' ? 'Codex' : 'Claude'}
+            agentName={agentType === 'crew' ? 'Crew' : agentType === 'codex' ? 'Codex' : 'Claude'}
             density={density}
             onExpand={expandDensity}
           />
@@ -788,7 +788,7 @@ export default function AcpChatView({ sessionId, agentType = 'claude', onRegiste
           onChange={setInput}
           onSend={sendPrompt}
           submitOnEnter={true}
-          placeholder={`Send a message to ${agentType === 'kiro' ? 'Kiro' : agentType === 'codex' ? 'Codex' : 'Claude'}...`}
+          placeholder={`Send a message to ${agentType === 'crew' ? 'Crew' : agentType === 'codex' ? 'Codex' : 'Claude'}...`}
           rightSlot={
             <div className="flex items-end gap-1">
               <button

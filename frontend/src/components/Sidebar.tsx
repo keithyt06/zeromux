@@ -12,7 +12,7 @@ import PushSettings from './PushSettings'
 import { usePromptPresets } from '../lib/usePromptPresets'
 import { applyPreset } from '../lib/applyPreset'
 import { isStuck } from '../lib/stuck'
-import { ClaudeCodeIcon, KiroIcon, CodexIcon } from './BrandIcons'
+import { ClaudeCodeIcon, CrewIcon, CodexIcon } from './BrandIcons'
 import QuickTargets from './QuickTargets'
 
 interface Props {
@@ -69,7 +69,7 @@ type NewSessionStep = 'closed' | 'quick' | 'pick-type' | 'pick-terminal-mode' | 
 function SessionTypeIcon({ type, size = 14, className }: { type: SessionType; size?: number; className?: string }) {
   switch (type) {
     case 'claude': return <ClaudeCodeIcon size={size} className={className} />
-    case 'kiro':   return <KiroIcon size={size} className={className} />
+    case 'crew':   return <CrewIcon size={size} className={className} />
     case 'codex':  return <CodexIcon size={size} className={className} />
     case 'tmux':
     default:       return <Terminal size={size} className={className} />
@@ -578,14 +578,17 @@ export default function Sidebar({ sessions, docTabs, activeId, onSelect, onCreat
                       <div className="text-[10px] text-[var(--text-secondary)]">AI coding agent</div>
                     </div>
                   </button>
+                  {/* 原位替换。仍是 4 项、不重排顺序 —— 现有顺序已是肌肉记忆，
+                      为一个 10% 路径（QuickTargets 才是日常入口）重排全表不值得。
+                      副标题是唯一能解释「它和 Claude 有何不同」的位置。 */}
                   <button
-                    onClick={() => selectType('kiro')}
+                    onClick={() => selectType('crew')}
                     className="flex items-center gap-2.5 w-full px-3 py-2 text-xs text-[var(--text-primary)] hover:bg-[var(--bg-hover)] transition-colors"
                   >
-                    <KiroIcon size={14} className="shrink-0" />
+                    <CrewIcon size={14} className="shrink-0" />
                     <div className="text-left">
-                      <div className="font-medium">Kiro</div>
-                      <div className="text-[10px] text-[var(--text-secondary)]">AI coding agent (ACP)</div>
+                      <div className="font-medium">Kiro Crew</div>
+                      <div className="text-[10px] text-[var(--text-secondary)]">有记忆的 AI agent</div>
                     </div>
                   </button>
                   <button

@@ -131,7 +131,9 @@ async fn run_titler(
             }
         }
         // 无法安全保证无工具 → 按设计放弃,保留默认会话名。
-        TitlerBackend::Kiro | TitlerBackend::Codex => {
+        // Crew 更彻底:它根本不 spawn 本地进程(会话是 Gateway 上的一个 slot),
+        // 没有「无工具临时进程」这回事,故同样按设计返回 None。
+        TitlerBackend::Kiro | TitlerBackend::Codex | TitlerBackend::Crew => {
             tracing::info!("titler[{}]: backend {:?} not supported (tool-less spawn unsafe), keeping default name by design", sid, backend);
             None
         }

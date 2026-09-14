@@ -54,7 +54,7 @@ pub enum SessionType {
 
 /// 自动命名器后端：决定 auto-titler 调用哪个 CLI。
 #[derive(Debug, Clone, Copy)]
-pub enum TitlerBackend { Claude, Kiro, Codex }
+pub enum TitlerBackend { Claude, Kiro, Codex, Crew }
 
 impl std::fmt::Display for SessionType {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -3116,10 +3116,20 @@ fn emit(
     // such path calls `mark_turn(Running)` → `apply_turn`, which stamps
     // `last_activity_ms` fresh (so an idle-then-prompted turn is still spared for the
     // full idle window before the agent's first token). (review 2026-08-05)
+    //
+    // Third exclusion, same class: Crew's `System{subtype:"status"}` is the Gateway's
+    // "Thinking…" heartbeat, emitted on a timer regardless of whether the agent is
+    // producing anything. Letting it bump the clock would keep a turn wedged on a
+    // never-returning tool call looking alive forever, defeating the idle watchdog.
+    // Placed here rather than in the crew fan-out because `emit` is the sole
+    // emit/persist chokepoint (T2/D2, :2932-2939), and the predicate is vacuously
+    // true for the other three backends — their `System` only ever carries
+    // "init" / "queued", never "status".
     let bump_activity = !matches!(
         evt,
         AcpEvent::ContentBlock { block_type, .. } if block_type == "error"
-    ) && !matches!(evt, AcpEvent::UserPrompt { .. });
+    ) && !matches!(evt, AcpEvent::UserPrompt { .. })
+      && crate::acp::crew_process::crew_event_is_forward_progress(evt);
     let json = match serde_json::to_string(evt) {
         Ok(j) => j,
         Err(_) => return,

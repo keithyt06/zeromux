@@ -88,7 +88,7 @@ describe('launchSequence', () => {
     expect(launchSequence('claude')).toBe('claude\r')
     expect(launchSequence('codex')).toBe('codex\r')
   })
-  it('kiro 真实命令是 kiro-cli，裸命令只出菜单，交互入口是 kiro-cli chat', () => {
-    expect(launchSequence('kiro')).toBe('kiro-cli chat\r')
+  it('crew 的交互入口是 kirocrew chat（连本机 gateway，与 Crew 会话后端同源）', () => {
+    expect(launchSequence('crew')).toBe('kirocrew chat\r')
   })
 })

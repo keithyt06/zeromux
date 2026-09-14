@@ -4,7 +4,7 @@ import type { SessionType, QuickTarget } from '../lib/api'
 import { listQuickTargets, forgetQuickTarget } from '../lib/api'
 import { coerceAgent } from '../lib/quickTargets'
 import { subscribeQuickTargets } from '../lib/quickTargetsBus'
-import { ClaudeCodeIcon, KiroIcon, CodexIcon } from './BrandIcons'
+import { ClaudeCodeIcon, CrewIcon, CodexIcon } from './BrandIcons'
 
 /** 行首图标 = 这一行会开出什么。比行尾一个小写标签的信息量更高，且省下约 44px 宽度
  *  给目录名和 hint（224px 弹层里这是决定性的）。 */
@@ -12,7 +12,7 @@ function RowIcon({ kind, agent, size = 15 }: { kind: 'dir' | 'note'; agent: stri
   if (kind === 'note') return <FileText size={size} className="text-[var(--accent-blue)] shrink-0" />
   switch (coerceAgent(agent)) {
     case 'claude': return <ClaudeCodeIcon size={size} className="shrink-0" />
-    case 'kiro':   return <KiroIcon size={size} className="shrink-0" />
+    case 'crew':   return <CrewIcon size={size} className="shrink-0" />
     case 'codex':  return <CodexIcon size={size} className="shrink-0" />
     case 'tmux':   return <Terminal size={size} className="text-[var(--accent-green-text)] shrink-0" />
     default:       return <Terminal size={size} className="text-[var(--text-muted)] shrink-0" />

@@ -18,7 +18,7 @@ const CONTROL_KEYS: { key: 'ctrl-c'; label: string }[] = [
 const AGENT_KEYS: { key: AgentKey; label: string }[] = [
   { key: 'claude', label: 'claude' },
   { key: 'codex', label: 'codex' },
-  { key: 'kiro', label: 'kiro' },
+  { key: 'crew', label: 'crew' },
 ]
 
 export default function MobileKeyBar({ onKey }: { onKey: (key: BarKey) => void }) {

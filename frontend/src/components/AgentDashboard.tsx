@@ -28,7 +28,7 @@ const EVENT_COLORS: Record<string, string> = {
 const AGENT_COLORS: Record<string, string> = {
   'claude-code': 'bg-orange-500/20 text-orange-300',
   'codex': 'bg-green-500/20 text-green-300',
-  'kiro': 'bg-blue-500/20 text-blue-300',
+  'crew': 'bg-purple-500/20 text-purple-300',
 }
 
 export default function AgentDashboard({ sessionId }: Props) {

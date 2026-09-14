@@ -584,6 +584,11 @@ EOF
 fan-out 从「独占一个子进程」变为「**独占一条 WS 连接 + 一个 slot_key**」。这与 Codex 走 rmcp client 的先例同构，CLAUDE.md 的「fan-out 是进程唯一所有者」不变量以此形式保持。
 
 **Files:**
+- Modify: `src/session_manager.rs:313-335`（`SessionManager` 结构体加 `crew_port: u16` + `crew_home: String`，紧跟 `codex_reasoning`）
+- Modify: `src/session_manager.rs:605-632`（`SessionManager::new` 参数列表加同两项）
+- Modify: `src/main.rs:463`（`SessionManager::new` 调用点传 `args.crew_port` / `crew_home.clone()`）
+- Modify: `src/session_manager.rs`（4 个测试 helper 的 `new` 调用点：`:3946` / `:4111` / `:4600` / `:5331`）
+- Modify: `src/web.rs:663`（会话创建分派加 Crew 臂 —— **从 Task 6 提前到这里**，见下方说明）
 - Modify: `src/session_manager.rs:47-52`（`SessionType` 加 `Crew`）
 - Modify: `src/session_manager.rs:58-67`（`Display`）
 - Modify: `src/session_manager.rs:71-78`（`from_str_lenient`）
@@ -603,6 +608,27 @@ fan-out 从「独占一个子进程」变为「**独占一条 WS 连接 + 一个
   - `SessionManager::create_crew_session(name, work_dir, cols, rows, owner_id) -> Result<String, String>`
   - `fn crew_slot_key(evt: &AcpEvent) -> Option<String>`
 
+> **本任务的范围已订正三处**（由执行时的 subagent 发现，我逐条核实后确认）：
+>
+> **① `SessionManager` 需要 crew 字段，Task 2 只加到了 `AppState`。** 计划里 `spawn_crew`
+> 读 `self.crew_home` / `self.crew_port`，但 `SessionManager`（`:313-335`）只有
+> `claude_path`/`kiro_path`/`codex_path`/`codex_reasoning`。**不能改成传参**：`spawn_crew`
+> 由 `ensure_running` 调用（`:1634`/`:1663` 的形态是 `spawn_codex(id, &work_dir, &owner_id, r)`），
+> 那里只有 session id + 存储的元数据 —— 结构体注释本身就说明路径在构造时捕获正是为此。
+> 所以按 `codex_reasoning` 的形状加两个字段 + 改构造器 + 更新 5 个调用点。
+> **secret 不跨这个边界**：`crew_home` 是路径、`crew_port` 是整数，secret 仍只在
+> `crew_process.rs` 的 fan-out 栈上读 —— Global Constraint 仍成立。
+>
+> **② `web.rs:663` 的 Crew 臂从 Task 6 提前到本任务。** 加 `SessionType::Crew` 变体会让
+> 三处 `match` 变非穷尽（实测 `E0004`）：`session_manager.rs:1614` / `:1660`（本任务范围内）
+> 与 **`web.rs:663`**（原属 Task 6）。不提前的话 Task 5 无法独立编译。Task 6 Step 4 的
+> 那 6 行因此变成 no-op（保留其余部分）。
+>
+> **③ 测试里那条 `from_str_lenient("kiro") == Tmux` 已删除。** 它与本任务 Step 3 自相矛盾：
+> Step 3 明确说在 `"codex"` 之后加 `"crew"` 而**保留** `"kiro" => SessionType::Kiro`，
+> kiro 回落 Tmux 只在 **Task 11** 删掉该后端后才成立。已改为断言 `"nonsense"` 回落，
+> 那条 kiro 断言移到 Task 11 Step 2。
+
 - [ ] **Step 1: 写失败测试**
 
 在 `src/session_manager.rs` 的既有 `#[cfg(test)] mod tests` 内追加：
@@ -614,8 +640,10 @@ fan-out 从「独占一个子进程」变为「**独占一条 WS 连接 + 一个
         // 一个 Crew 会话在服务重启后变成终端，且 resume_token 被当成垃圾丢掉）。
         assert_eq!(SessionType::Crew.to_string(), "crew");
         assert!(matches!(SessionType::from_str_lenient("crew"), SessionType::Crew));
-        // 已删除的 kiro：未知值回落 Tmux（from_str_lenient 的既有约定，最保守）。
-        assert!(matches!(SessionType::from_str_lenient("kiro"), SessionType::Tmux));
+        // 未知值回落 Tmux（既有约定，最保守：PTY 无 resume 副作用）。
+        assert!(matches!(SessionType::from_str_lenient("nonsense"), SessionType::Tmux));
+        // 注意：`"kiro"` 此时仍映射 `SessionType::Kiro`（Task 11 才删除该后端），
+        // 所以**不能**在这里断言它回落 Tmux —— 那条断言属于 Task 11 Step 2。
     }
 
     #[test]
@@ -664,7 +692,7 @@ fan-out 从「独占一个子进程」变为「**独占一条 WS 连接 + 一个
 
 - [ ] **Step 2: 运行确认失败**
 
-Run: `cargo test crew_session_type_roundtrips crew_resume_token crew_slot_key 2>&1 | tail -10`
+Run: `cargo test crew_ 2>&1 | tail -10`（**`cargo test` 只接受一个位置参数 TESTNAME** —— 传多个会 `unexpected argument`；用前缀 `crew_` 一次匹配三个）
 
 Expected: 编译失败 —— `no variant named 'Crew'`。
 
@@ -718,11 +746,28 @@ fn crew_slot_key(evt: &AcpEvent) -> Option<String> {
 
 - [ ] **Step 4: 运行测试确认通过**
 
-Run: `cargo test crew_session_type_roundtrips crew_resume_token crew_slot_key 2>&1 | tail -6`
+Run: `cargo test crew_ 2>&1 | tail -6`
 
 Expected: 3 passed。
 
-- [ ] **Step 5: 加 `spawn_crew` / `create_crew_session`**
+- [ ] **Step 5: 加 crew 字段与构造器参数，再加 `spawn_crew` / `create_crew_session`**
+
+**5a. 先加字段**（`SessionManager` 结构体，紧跟 `codex_reasoning`）：
+
+```rust
+    /// Kiro Crew Gateway 的端口与数据目录。与 `codex_reasoning` 同理在构造时捕获：
+    /// `ensure_running` 重生一个会话时只有 session id + 存储的元数据，没有调用者
+    /// 能供给这些值。**secret 不在此处** —— 它由 `crew_process.rs` 在 fan-out 栈上
+    /// 从 `crew_home` 现读，绝不进这个结构体（它会被共享）。
+    crew_port: u16,
+    crew_home: String,
+```
+
+`SessionManager::new` 的参数列表加同两项（在 `worktree_isolation` 之前），并在结构体初始化里填上。
+
+**5b. 更新 5 个调用点**：`src/main.rs:463`（传 `args.crew_port` / `crew_home.clone()`）+ 4 个测试 helper（`session_manager.rs:3946` / `:4111` / `:4600` / `:5331`，传 `5476` / `"/tmp/crew".into()` 之类的占位值即可 —— 那些测试不碰 Crew）。
+
+**5c. 再加两个方法**：
 
 ```rust
     /// Spawn a Crew session for `id` at `work_dir`, start its fan-out, return the
@@ -1639,6 +1684,14 @@ Expected: 无 `kiro` 行。**`resume_kind`/`resume_value` 必须一并清空** �
     expect(line).not.toContain("'kiro'")      // api.ts 的 SessionType
     expect(t).not.toContain('KiroIcon')        // Sidebar
     expect(coerceAgent('kiro')).toBeNull()     // quickTargets 白名单
+```
+
+后端同时补上 Task 5 挪过来的那条断言（加进 `crew_session_type_roundtrips`）：
+
+```rust
+        // Task 11 起 `"kiro"` 不再是已知类型 → 走未知值回落 Tmux（最保守，
+        // PTY 无 resume 副作用）。这条在 Task 5 时不成立，故当时未写。
+        assert!(matches!(SessionType::from_str_lenient("kiro"), SessionType::Tmux));
 ```
 
 Run: `cd frontend && npx vitest run crewSessionType 2>&1 | tail -6`

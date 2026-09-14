@@ -455,9 +455,19 @@ EOF
 tokio-tungstenite = { version = "0.29", default-features = false, features = ["connect"] }
 ```
 
-Run: `cargo check 2>&1 | tail -3 && git diff --stat Cargo.lock`
+Run: `cargo check 2>&1 | tail -3 && git diff Cargo.lock`
 
-Expected: 编译通过；**`Cargo.lock` 零变化**（`git diff --stat` 无输出）—— 因为 axum 已启用同一组 feature。若 lock 变了，说明 feature 写错了，回退重试。
+Expected: 编译通过；`Cargo.lock` 恰好**多一行** `+ "tokio-tungstenite",`（在 `zeromux` 包自己的 `dependencies` 列表里），**无新增/删除 `[[package]]` 块、无删除行**。
+
+> **本条 Expected 已订正**（原写"lock 零变化"，是计划的文档错误）：把一个传递依赖提为**直接**依赖时，Cargo **必然**要在 `zeromux` 的依赖列表里记录这条边，与 feature 拼写无关。真正要验的是**解析结果没变**。
+>
+> 判据（实测确认）：`tokio-tungstenite 0.29.0` 条目的 `checksum` 未变，其依赖列表仍是 `futures-util / log / tokio / tungstenite` —— **无 native-tls / rustls / openssl / webpki**，证明没有误开 TLS feature。用这条命令核对：
+>
+> ```bash
+> git diff Cargo.lock | grep -iE "^\+.*(tls|openssl|webpki)" || echo "无 TLS 相关新增 ✓"
+> ```
+>
+> 若出现 TLS 相关新增包，或出现任何 `[[package]]` 块的增删，那才是 feature 写错了，回退重试。
 
 - [ ] **Step 2: 写 8 个失败测试（先写测试，此时被测函数还不存在）**
 

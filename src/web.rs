@@ -678,12 +678,6 @@ async fn create_session(
                 .await
                 .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?
         }
-        crate::session_manager::SessionType::Kiro => {
-            state.sessions
-                .create_kiro_session(name.clone(), &state.kiro_path, &work_dir, state.default_cols, state.default_rows, &owner_id)
-                .await
-                .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?
-        }
         crate::session_manager::SessionType::Codex => {
             state.sessions
                 .create_codex_session(name.clone(), &state.codex_path, &state.codex_reasoning, &work_dir, state.default_cols, state.default_rows, &owner_id)
@@ -6492,7 +6486,7 @@ mod create_session_req_tests {
             Some("hi".to_string())
         );
         assert_eq!(
-            should_send_initial_prompt(SessionType::Kiro, Some("  x  ")),
+            should_send_initial_prompt(SessionType::Crew, Some("  x  ")),
             Some("x".to_string()),
             "应 trim 后发送"
         );

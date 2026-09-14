@@ -47,7 +47,7 @@ describe('foldTranscript — turn grouping (T1)', () => {
 
 describe('foldTranscript — result reconcile (F1: lossy Codex stream)', () => {
   it('does not duplicate: suppresses final result when the stream already carries it', () => {
-    // Healthy stream (Claude/Kiro/Codex no-drop): the concatenated deltas equal
+    // Healthy stream (Claude/Crew/Codex no-drop): the concatenated deltas equal
     // the authoritative result.text, so re-appending would double the message.
     const events: WireEvent[] = [
       { type: 'content_block', block_type: 'text', text: 'Hello ', streaming: true, turn_id: 1 },

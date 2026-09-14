@@ -319,7 +319,7 @@ mod tests {
         let store = mem_store();
         store.create(req("claude-code", "task_done", Some("sess-1")), "u1").unwrap();
         store.create(req("codex", "task_done", Some("sess-2")), "u1").unwrap();
-        store.create(req("kiro", "tool_use", Some("sess-1")), "u1").unwrap();
+        store.create(req("crew", "tool_use", Some("sess-1")), "u1").unwrap();
 
         let by_session = store.list(&EventsQuery {
             session_id: Some("sess-1".to_string()),
@@ -338,7 +338,7 @@ mod tests {
     #[test]
     fn delete_one_removes_event() {
         let store = mem_store();
-        let e = store.create(req("kiro", "task_done", None), "u1").unwrap();
+        let e = store.create(req("crew", "task_done", None), "u1").unwrap();
         assert!(store.delete_one(&e.id, None).unwrap());
         assert!(!store.delete_one(&e.id, None).unwrap());
         assert_eq!(store.list(&EventsQuery::default(), None).unwrap().len(), 0);
@@ -366,7 +366,7 @@ mod tests {
     #[test]
     fn delete_one_respects_owner_scope() {
         let store = mem_store();
-        let e = store.create(req("kiro", "task_done", None), "alice").unwrap();
+        let e = store.create(req("crew", "task_done", None), "alice").unwrap();
 
         // Bob cannot delete Alice's event.
         assert!(!store.delete_one(&e.id, Some("bob")).unwrap());

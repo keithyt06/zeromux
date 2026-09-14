@@ -29,7 +29,7 @@ const CANDIDATE_LIMIT: i64 = 16;
 pub struct QuickTargetRow {
     pub kind: String,
     pub path: String,
-    /// dir: 'claude'|'kiro'|'codex'|'tmux'；note: 空串。
+    /// dir: 'claude'|'crew'|'codex'|'tmux'；note: 空串。
     /// 空串而非 NULL 是刻意的：SQLite 的 PRIMARY KEY 列允许 NULL 且 NULL != NULL，
     /// 可空会让 note（agent 恒空）每打开一次就插一行。
     pub agent: String,

@@ -266,7 +266,7 @@ export default function SessionInfoBar({ session, onUpdate, onToggleFiles, onTog
                 <option value="collect">Collect</option>
                 <option value="interrupt">Interrupt</option>
                 {/* Passthrough removed: unsound under single-turn_seq machinery
-                    (Codex drops mid-turn prompt → wedge; Claude/Kiro mis-stamp).
+                    (Codex drops mid-turn prompt → wedge; Claude/Crew mis-stamp).
                     Server also degrades it to Collect. review 2026-06-11. */}
               </select>
             </div>

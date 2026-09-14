@@ -1,6 +1,7 @@
 /** Official brand logos for the AI agent backends, inlined as SVG so we avoid
  *  pulling @lobehub/icons (8MB + antd/@lobehub/ui peer deps). Paths are lifted
- *  verbatim from @lobehub/icons (ClaudeCode/Kiro `.Color`, Codex `.Mono`).
+ *  verbatim from @lobehub/icons (ClaudeCode `.Color`, Kiro `.Color` — now only
+ *  as the Crew mark's ghost silhouette, Codex `.Mono`).
  *  All use a 0 0 24 24 viewBox and accept the same { size, className } props
  *  as the lucide icons they replace. */
 
@@ -24,24 +25,6 @@ export function ClaudeCodeIcon({ size = 14, className }: BrandIconProps) {
   )
 }
 
-/** Kiro — ghost mascot in Kiro purple (#9046FF). */
-export function KiroIcon({ size = 14, className }: BrandIconProps) {
-  return (
-    <svg width={size} height={size} viewBox="0 0 24 24" className={className} xmlns="http://www.w3.org/2000/svg">
-      <title>Kiro</title>
-      <path fill="#9046FF" d="M18.8 0H5.2A5.2 5.2 0 000 5.2v13.6A5.2 5.2 0 005.2 24h13.6a5.2 5.2 0 005.2-5.2V5.2A5.2 5.2 0 0018.8 0z" />
-      <path
-        fill="#fff"
-        d="M7.97 16.376c-1.644 3.642 1.86 4.556 4.443 2.424.76 2.39 3.608.607 4.631-1.247 2.251-4.084 1.342-8.249 1.108-9.108-1.6-5.859-9.6-5.869-10.976.03-.323 1.033-.328 2.206-.507 3.423-.09.617-.16 1.009-.393 1.655-.139.373-.323.7-.62 1.257-.458.865-.264 2.53 2.101 1.665l.224-.1h-.01l-.001.001z"
-      />
-      <path
-        fill="#000"
-        d="M12.722 10.985c-.656 0-.755-.785-.755-1.252 0-.423.074-.756.218-.97a.61.61 0 01.537-.283c.229 0 .428.095.567.289.159.218.243.55.243.964 0 .785-.303 1.252-.805 1.252h-.005zm2.703 0c-.656 0-.755-.785-.755-1.252 0-.423.074-.756.219-.97a.61.61 0 01.536-.283c.229 0 .428.095.567.289.159.218.243.55.243.964 0 .785-.303 1.252-.805 1.252h-.005z"
-      />
-    </svg>
-  )
-}
-
 /** Codex — OpenAI blossom (mono variant, follows currentColor so it adapts
  *  to light/dark themes; the official .Color variant is a white square that
  *  disappears on light backgrounds). */
@@ -59,17 +42,15 @@ export function CodexIcon({ size = 14, className }: BrandIconProps) {
 }
 
 /** Kiro Crew — the Kiro ghost inside a "memory ring". Same purple family
- *  (#9046FF) so it reads as a Kiro-lineage backend, but the ring makes it
- *  distinguishable at 14px from KiroIcon — historical `kiro` sessions still
- *  exist in the session list until Task 11 removes them, so the two marks
- *  must not collide. */
+ *  (#9046FF) so it reads as a Kiro-lineage backend; the ring is what makes
+ *  a Crew session recognizable at 14px in the session list. */
 export function CrewIcon({ size = 14, className }: BrandIconProps) {
   return (
     <svg width={size} height={size} viewBox="0 0 24 24" className={className} fill="none" xmlns="http://www.w3.org/2000/svg">
       <title>Kiro Crew</title>
       {/* memory ring: dashed orbit = persisted knowledge around the agent */}
       <circle cx="12" cy="12" r="11" stroke="#9046FF" strokeWidth="1.6" strokeDasharray="3.2 2.4" />
-      {/* ghost body, same silhouette family as KiroIcon but solid-purple */}
+      {/* ghost body, Kiro's silhouette family but solid-purple */}
       <path
         fill="#9046FF"
         d="M12 4.2c-3.02 0-5.2 2.2-5.2 5.32v6.9c0 .62.72.95 1.19.55l1.06-.9a.79.79 0 011.03.01l.87.75a.79.79 0 001.03 0l.87-.75a.79.79 0 011.03 0l.87.75a.79.79 0 001.03 0l.87-.75a.79.79 0 011.03.01l1.06.9c.47.4 1.19.07 1.19-.55v-6.9C17.2 6.4 15.02 4.2 12 4.2z"

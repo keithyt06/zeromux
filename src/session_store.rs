@@ -197,8 +197,8 @@ mod tests {
     fn update_resume_token_roundtrip() {
         let (s, _d) = tmp_store();
         s.upsert(&sample("a", None)).unwrap();
-        s.update_resume_token("a", Some(&ResumeToken::Kiro("kid".into()))).unwrap();
-        assert_eq!(s.load_all().unwrap()[0].resume_token, Some(ResumeToken::Kiro("kid".into())));
+        s.update_resume_token("a", Some(&ResumeToken::Crew("zmx-kid".into()))).unwrap();
+        assert_eq!(s.load_all().unwrap()[0].resume_token, Some(ResumeToken::Crew("zmx-kid".into())));
         s.update_resume_token("a", None).unwrap();
         assert_eq!(s.load_all().unwrap()[0].resume_token, None);
     }

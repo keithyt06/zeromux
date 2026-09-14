@@ -12,7 +12,6 @@ const SCROLLBACK_MAX_BYTES: usize = 2 * 1024 * 1024;
 /// Broadcast channel capacity — slow clients that fall behind will get Lagged error
 const BROADCAST_CAPACITY: usize = 512;
 
-use crate::acp::kiro_process::KiroProcess;
 use crate::acp::process::{AcpEvent, AcpProcess};
 use crate::pty_bridge::PtyHandle;
 
@@ -47,21 +46,19 @@ impl std::fmt::Display for SessionMeta {
 pub enum SessionType {
     Tmux,
     Claude,
-    Kiro,
     Codex,
     Crew,
 }
 
 /// 自动命名器后端：决定 auto-titler 调用哪个 CLI。
 #[derive(Debug, Clone, Copy)]
-pub enum TitlerBackend { Claude, Kiro, Codex, Crew }
+pub enum TitlerBackend { Claude, Codex, Crew }
 
 impl std::fmt::Display for SessionType {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             SessionType::Tmux => write!(f, "tmux"),
             SessionType::Claude => write!(f, "claude"),
-            SessionType::Kiro => write!(f, "kiro"),
             SessionType::Codex => write!(f, "codex"),
             SessionType::Crew => write!(f, "crew"),
         }
@@ -73,7 +70,6 @@ impl SessionType {
     pub fn from_str_lenient(s: &str) -> Self {
         match s {
             "claude" => SessionType::Claude,
-            "kiro" => SessionType::Kiro,
             "codex" => SessionType::Codex,
             "crew" => SessionType::Crew,
             _ => SessionType::Tmux,
@@ -85,7 +81,6 @@ impl SessionType {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ResumeToken {
     Claude(String), // --resume <session_id>
-    Kiro(String),   // session/load <sessionId>
     Codex(String),  // codex-reply threadId
     Tmux(String),   // tmux attach -t <target>
     /// Crew: the Gateway slot key (`zmx-xxxxxxxx`). Not a session id — reconnect
@@ -100,7 +95,6 @@ impl ResumeToken {
     pub fn to_kind_value(&self) -> (&'static str, String) {
         match self {
             ResumeToken::Claude(v) => ("claude", v.clone()),
-            ResumeToken::Kiro(v) => ("kiro", v.clone()),
             ResumeToken::Codex(v) => ("codex", v.clone()),
             ResumeToken::Tmux(v) => ("tmux", v.clone()),
             ResumeToken::Crew(v) => ("crew", v.clone()),
@@ -111,7 +105,6 @@ impl ResumeToken {
     pub fn from_kind_value(kind: &str, value: &str) -> Option<Self> {
         match kind {
             "claude" => Some(ResumeToken::Claude(value.to_string())),
-            "kiro" => Some(ResumeToken::Kiro(value.to_string())),
             "codex" => Some(ResumeToken::Codex(value.to_string())),
             "tmux" => Some(ResumeToken::Tmux(value.to_string())),
             "crew" => Some(ResumeToken::Crew(value.to_string())),
@@ -126,16 +119,16 @@ pub enum SessionInput {
     PtyData(Vec<u8>),
     /// PTY: resize
     PtyResize(u16, u16),
-    /// ACP/Kiro: prompt text + optional scheduled-run id for exactly-once
+    /// ACP: prompt text + optional scheduled-run id for exactly-once
     /// finalization (None for manual user prompts). `client_id` is the optional
     /// browser-generated id used to dedupe the optimistic user bubble against the
     /// server echo (G3, T1); None for scheduled runs.
     Prompt { text: String, run_id: Option<String>, client_id: Option<String> },
-    /// ACP/Kiro: cancel/kill
+    /// ACP: cancel/kill
     Cancel,
-    /// ACP/Kiro: turn-level interrupt (abort current turn, keep process alive)
+    /// ACP: turn-level interrupt (abort current turn, keep process alive)
     Interrupt,
-    /// ACP/Kiro/Codex: switch the per-session queue handling mode for
+    /// ACP/Codex: switch the per-session queue handling mode for
     /// multiple in-flight prompts (collect / interrupt / passthrough).
     SetQueueMode(QueueMode),
     /// Watchdog→fan-out: 超时终结当前 run。让超时和完成/错/取消一样从 fan-out
@@ -184,7 +177,7 @@ impl QueueMode {
     /// - Codex (codex_process.rs): drops a prompt that arrives mid-turn, so the
     ///   2nd prompt is lost AND `turn_seq` was already bumped → `boundary_count`
     ///   can never catch up → the session wedges in Running ("thinking…") forever.
-    /// - Claude/Kiro: the single `turn_seq` stamps the still-streaming prior
+    /// - Claude/Crew: the single `turn_seq` stamps the still-streaming prior
     ///   turn's trailing ContentBlocks with the new turn's id → mis-grouping.
     /// So Passthrough degrades to Collect everywhere (review 2026-06-11). The UI
     /// no longer offers it; this is the server-side backstop for a stale client
@@ -309,7 +302,7 @@ pub struct Session {
     lifetime_cost_usd: f64,
     /// 运行态；None = 未运行（可按 resume_token 重生）。
     running: Option<RunningProcess>,
-    /// Output history for replay on reconnect (base64 for PTY, JSON for ACP/Kiro)
+    /// Output history for replay on reconnect (base64 for PTY, JSON for ACP agents)
     scrollback: VecDeque<String>,
     scrollback_bytes: usize,
 }
@@ -328,7 +321,6 @@ pub struct SessionManager {
     /// stored metadata). `create_*` still take the path as a param and forward
     /// it to the `spawn_<kind>` helper.
     claude_path: String,
-    kiro_path: String,
     codex_path: String,
     codex_reasoning: String,
     /// Kiro Crew Gateway 的端口与数据目录。与 `codex_reasoning` 同理在构造时捕获：
@@ -625,7 +617,6 @@ impl SessionManager {
         events: Arc<EventStore>,
         store: Arc<SessionStore>,
         claude_path: String,
-        kiro_path: String,
         codex_path: String,
         codex_reasoning: String,
         crew_port: u16,
@@ -639,7 +630,6 @@ impl SessionManager {
             store,
             self_weak: Mutex::new(Weak::new()),
             claude_path,
-            kiro_path,
             codex_path,
             codex_reasoning,
             crew_port,
@@ -1204,7 +1194,7 @@ impl SessionManager {
         let mut interactive = 0;
         for s in map.values() {
             if !matches!(s.session_type,
-                SessionType::Claude | SessionType::Kiro | SessionType::Codex | SessionType::Crew) {
+                SessionType::Claude | SessionType::Codex | SessionType::Crew) {
                 continue; // tmux 无 turn 概念,不阻塞升级
             }
             // 任何内存 turn_state==Running 的 agent 会话都算 interactive —— 包括对
@@ -1373,100 +1363,6 @@ impl SessionManager {
         } else {
             tracing::warn!("initial_prompt: no input channel for {}", id);
         }
-    }
-
-    /// Spawn a Kiro process for `id` at `work_dir`, start its fan-out, return the
-    /// live handle. `resume: Some(sid)` issues `session/load` to restore context.
-    async fn spawn_kiro(
-        &self,
-        id: &str,
-        work_dir: &str,
-        owner_id: &str,
-        resume: Option<&str>,
-    ) -> Result<RunningProcess, String> {
-        let process = KiroProcess::spawn(&self.kiro_path, work_dir, resume)
-            .await
-            .map_err(|e| format!("Failed to spawn Kiro: {}", e))?;
-
-        let (event_tx, _) = broadcast::channel(BROADCAST_CAPACITY);
-        let (input_tx, input_rx) = mpsc::channel::<SessionInput>(64);
-
-        spawn_kiro_fanout(
-            id.to_string(),
-            process,
-            event_tx.clone(),
-            input_rx,
-            self.events.clone(),
-            "kiro",
-            work_dir.to_string(),
-            owner_id.to_string(),
-            self.weak(),
-        );
-
-        Ok(RunningProcess {
-            event_tx,
-            input_tx,
-            pty_pid: None,
-            turn_state: TurnState::Idle,
-            turn_started_ms: None,
-            turn_seq: 0,
-            queue_mode: QueueMode::Collect,
-        })
-    }
-
-    pub async fn create_kiro_session(
-        &self,
-        name: String,
-        _kiro_path: &str,
-        work_dir: &str,
-        cols: u16,
-        rows: u16,
-        owner_id: &str,
-    ) -> Result<String, String> {
-        let id = uuid::Uuid::new_v4().to_string();
-        let (effective_dir, worktree_path) = resolve_work_dir(work_dir, &id, self.worktree_isolation);
-
-        let running = self
-            .spawn_kiro(&id, &effective_dir.to_string_lossy(), owner_id, None)
-            .await
-            .map_err(|e| {
-                if let Some(wt) = &worktree_path {
-                    let base = PathBuf::from(work_dir);
-                    remove_worktree(&base, wt);
-                }
-                e
-            })?;
-
-        let session = Session {
-            id: id.clone(),
-            name,
-            session_type: SessionType::Kiro,
-            cols,
-            rows,
-            work_dir: effective_dir.to_string_lossy().to_string(),
-            owner_id: owner_id.to_string(),
-            description: String::new(),
-            name_is_auto: true,
-            status: SessionMeta::Running,
-            resume_token: None,
-            worktree_path,
-            created_ms: now_millis(),
-            source_task_id: None,
-            spawning: false,
-            last_activity_ms: now_millis(),
-            turns_completed: 0,
-            run_metrics: VecDeque::new(),
-            lifetime_turns: 0,
-            lifetime_duration_ms: 0,
-            lifetime_cost_usd: 0.0,
-            running: Some(running),
-            scrollback: VecDeque::new(),
-            scrollback_bytes: 0,
-        };
-
-        self.persist_meta(&session);
-        self.sessions.lock().unwrap().insert(id.clone(), session);
-        Ok(id)
     }
 
     /// Spawn a Codex process for `id` at `work_dir`, start its fan-out, return
@@ -1721,7 +1617,6 @@ impl SessionManager {
         let attempted_resume = matches!(
             (stype, &token),
             (SessionType::Claude, Some(ResumeToken::Claude(_)))
-                | (SessionType::Kiro, Some(ResumeToken::Kiro(_)))
                 | (SessionType::Codex, Some(ResumeToken::Codex(_)))
                 | (SessionType::Tmux, Some(ResumeToken::Tmux(_)))
                 | (SessionType::Crew, Some(ResumeToken::Crew(_)))
@@ -1733,13 +1628,6 @@ impl SessionManager {
                     _ => None,
                 };
                 self.spawn_claude(id, &work_dir, &owner_id, r).await
-            }
-            SessionType::Kiro => {
-                let r = match &token {
-                    Some(ResumeToken::Kiro(s)) => Some(s.as_str()),
-                    _ => None,
-                };
-                self.spawn_kiro(id, &work_dir, &owner_id, r).await
             }
             SessionType::Codex => {
                 let r = match &token {
@@ -1781,7 +1669,6 @@ impl SessionManager {
                 );
                 let fresh = match stype {
                     SessionType::Claude => self.spawn_claude(id, &work_dir, &owner_id, None).await,
-                    SessionType::Kiro => self.spawn_kiro(id, &work_dir, &owner_id, None).await,
                     SessionType::Codex => self.spawn_codex(id, &work_dir, &owner_id, None).await,
                     SessionType::Crew => self.spawn_crew(id, &work_dir, &owner_id, None).await,
                     SessionType::Tmux => self.spawn_tmux(id, &work_dir, cols, rows, None),
@@ -2118,7 +2005,6 @@ impl SessionManager {
     pub fn titler_cli_for(&self, agent_label: &str) -> Option<(TitlerBackend, String)> {
         match agent_label {
             "claude-code" => Some((TitlerBackend::Claude, self.claude_path.clone())),
-            "kiro" => Some((TitlerBackend::Kiro, self.kiro_path.clone())),
             "codex" => Some((TitlerBackend::Codex, self.codex_path.clone())),
             _ => None,
         }
@@ -2212,7 +2098,7 @@ impl SessionManager {
         self.sessions.lock().unwrap().get(id).map(|s| s.session_type)
     }
 
-    /// Push output data to the scrollback buffer (base64 for PTY, JSON for ACP/Kiro)
+    /// Push output data to the scrollback buffer (base64 for PTY, JSON for ACP agents)
     pub fn push_scrollback(&self, id: &str, data: String) {
         if let Some(s) = self.sessions.lock().unwrap().get_mut(id) {
             let data_len = data.len();
@@ -2254,12 +2140,12 @@ impl SessionManager {
     }
 }
 
-// ── Fan-out tasks for ACP/Kiro processes ──
+// ── Fan-out tasks for ACP agent processes ──
 
 /// Auto-log a `task_done` agent event when a process reports a turn result.
 ///
 /// Called from every agent fan-out task on each emitted `AcpEvent`. Only the
-/// `Result` variant produces an event — all three agents (Claude/Kiro/Codex)
+/// `Result` variant produces an event — all agents (Claude/Crew/Codex)
 /// emit `AcpEvent::Result` at end-of-turn, so this is the single common hook
 /// for the activity dashboard. PTY sessions never reach here.
 fn log_result_event(
@@ -2328,15 +2214,6 @@ fn claude_session_id(evt: &AcpEvent) -> Option<String> {
     }
 }
 
-/// Extract Kiro's sessionId from an id-bearing event, for resume backfill.
-/// Kiro emits `System { subtype:"init", session_id: Some(sid) }` at spawn.
-fn kiro_session_id(evt: &AcpEvent) -> Option<String> {
-    match evt {
-        AcpEvent::System { session_id: Some(s), .. } => Some(s.clone()),
-        _ => None,
-    }
-}
-
 /// Crew 的 slot_key 来源有两个：spawn 开局那条 `System{init}`，与每轮的 `Result`。
 /// 双臂是必需的 —— 单看 Result 会让一个从未完成过一轮的会话拿不到 resume token。
 fn crew_slot_key(evt: &AcpEvent) -> Option<String> {
@@ -2393,8 +2270,8 @@ fn intent_suppresses_push(intent: Option<crate::run_metrics::RunOutcome>) -> boo
 
 /// Fire the "turn finished while you were away" Web Push for a settling
 /// interactive turn. Shared by all three agent fan-outs so the notification
-/// reaches Claude, Kiro AND Codex sessions identically — the block used to live
-/// only in `spawn_acp_fanout`, so Kiro/Codex turns silently never pushed
+/// reaches Claude, Crew AND Codex sessions identically — the block used to live
+/// only in `spawn_acp_fanout`, so Crew/Codex turns silently never pushed
 /// (review 2026-08-06, F4). Callers gate on the settling boundary and pass the
 /// turn duration (read from the FIFO front BEFORE `settle()` consumes it). The
 /// debounce/away-gate (`should_push_turn_done`) and the actual send run inside a
@@ -2653,7 +2530,7 @@ fn spawn_acp_fanout(
                                     first_cost_seen = new_seen;
                                     delta
                                 } else {
-                                    raw_cost // Kiro/Codex 恒 None,不动
+                                    raw_cost // Crew/Codex 恒 None,不动
                                 };
                                 let fk = match outcome {
                                     crate::run_metrics::RunOutcome::Errored => Some(
@@ -3280,286 +3157,7 @@ pub fn sanitize_title(raw: &str) -> Option<String> {
     }
 }
 
-fn spawn_kiro_fanout(
-    sid: String,
-    mut process: KiroProcess,
-    event_tx: broadcast::Sender<String>,
-    mut input_rx: mpsc::Receiver<SessionInput>,
-    events: Arc<EventStore>,
-    agent_label: &'static str,
-    work_dir: String,
-    owner_id: String,
-    mgr: Weak<SessionManager>,
-) {
-    tokio::spawn(async move {
-        let mut token_saved = false;
-        let mut turn_seq: u64 = 0;
-        let mut local_running = false;
-        let mut boundary_count: u64 = 0;
-        // ── collect 队列状态(镜像 spawn_acp_fanout;见那里的不变量注释) ──
-        let mut queue = PromptQueue::new();
-        // 队列模式(G2b):passthrough 经 effective() 降级为 collect(见 QueueMode::effective)。
-        let mut queue_mode = QueueMode::Collect;
-        // ── per-run metrics state (mirrors spawn_acp_fanout) ──
-        // Per-turn (start, intent) FIFO; intent stamped on the live turn via
-        // set_live_intent from the input branch (Cancel/Timeout). See TurnStarts.
-        let mut turn_starts = TurnStarts::default();
-        loop {
-            tokio::select! {
-                event = process.event_rx.recv() => {
-                    match event {
-                        Some(evt) => {
-                            log_result_event(&events, agent_label, &sid, &work_dir, &owner_id, &evt);
-                            // Backfill Kiro resume token (sessionId) on first id-bearing event.
-                            if !token_saved {
-                                if let Some(sid_val) = kiro_session_id(&evt) {
-                                    if let Some(m) = mgr.upgrade() {
-                                        m.set_resume_token(&sid, ResumeToken::Kiro(sid_val));
-                                    }
-                                    token_saved = true;
-                                }
-                            }
-                            let is_boundary = matches!(
-                                evt,
-                                AcpEvent::Result { .. } | AcpEvent::Error { .. } | AcpEvent::Exit { .. }
-                            );
-                            emit(&mgr, &sid, &event_tx, turn_seq, &evt);
-                            if is_boundary {
-                                // A turn can emit >1 boundary (Error+Exit /
-                                // Error+Result). Clamp boundary_count to turn_seq
-                                // on the settling boundary and mark Idle with
-                                // turn_seq (not boundary_count) so the count can't
-                                // run past turn_seq and wedge the session Running
-                                // forever. Stale interrupt-resend boundaries
-                                // (count < turn_seq) get no Idle mark. See the
-                                // detailed note in spawn_acp_fanout.
-                                boundary_count += 1;
-                                if boundary_count >= turn_seq {
-                                    boundary_count = turn_seq;
-                                    local_running = false;
-                                    if let Some(m) = mgr.upgrade() {
-                                        m.mark_turn(&sid, TurnState::Idle, turn_seq);
-                                    }
-                                    // turn_done push (parity with spawn_acp_fanout — F4).
-                                    // Kiro/Codex run no scheduled tasks, so every settling
-                                    // turn here is interactive (no active_run_id gate needed).
-                                    // dur AND intent read from the FIFO front (the settling
-                                    // turn's own entry) BEFORE settle() consumes it — so a
-                                    // Cancelled/Timeout turn is suppressed and coupled
-                                    // interrupt-resend turns don't cross-contaminate
-                                    // (review 2026-08-07 F3; 2026-08-08 F2).
-                                    let dur = turn_starts.front().map(|s| now_millis() - s).unwrap_or(0);
-                                    maybe_push_turn_done(&mgr, &sid, &owner_id, dur, turn_starts.front_intent());
-                                }
-                                // per-run metrics: one metric per boundary, intent overrides
-                                // event type (mirrors spawn_acp_fanout). Skipped when this
-                                // boundary has no matching turn-start stamp.
-                                let term = match &evt {
-                                    AcpEvent::Result { .. } => crate::run_metrics::TerminalEvt::Result,
-                                    AcpEvent::Error { .. } => crate::run_metrics::TerminalEvt::Error,
-                                    _ => crate::run_metrics::TerminalEvt::Exit,
-                                };
-                                // Consume THIS boundary's own (start, intent) from the FIFO
-                                // front; the per-turn intent can't be stolen by a coupled
-                                // interrupt-resend turn (review 2026-08-08, F2).
-                                let settled = turn_starts.settle();
-                                let outcome = crate::run_metrics::classify_outcome(
-                                    term, settled.and_then(|(_, o)| o));
-                                let (mc, mt_in, mt_out) = match &evt {
-                                    AcpEvent::Result { cost_usd, tokens_in, tokens_out, .. } => (*cost_usd, *tokens_in, *tokens_out),
-                                    _ => (None, None, None),
-                                };
-                                let fk = match outcome {
-                                    crate::run_metrics::RunOutcome::Errored => Some(
-                                        if matches!(evt, AcpEvent::Exit { .. }) { "cli_exited" } else { "cli_error" }.to_string()),
-                                    _ => None,
-                                };
-                                if let Some((started, _)) = settled {
-                                    if let Some(m) = mgr.upgrade() {
-                                        let rid = crate::run_metrics::new_run_id();
-                                        let metric = build_run_metric(&rid, &sid, &work_dir, agent_label, turn_seq,
-                                            started, now_millis(), outcome, fk, mc, mt_in, mt_out);
-                                        m.record_run_metric(&sid, metric);
-                                    }
-                                }
-                                // collect:turn 结束(已 Idle)且有排队追加 → arm 收集窗口。
-                                if !local_running {
-                                    queue.arm();
-                                }
-                            }
-                        }
-                        None => break,
-                    }
-                }
-                input = input_rx.recv() => {
-                    match input {
-                        Some(SessionInput::Prompt { text, run_id, client_id }) => {
-                            // Echo each user prompt as its own UserPrompt event (P1):
-                            // N collect-merged messages still surface as N bubbles.
-                            // turn_id = the turn this prompt will belong to. In the
-                            // idle/run_id branches turn_seq is incremented below to
-                            // start the turn, so prompt_turn (turn_seq+1) matches. In
-                            // the collect path queued prompts each use turn_seq+1; since
-                            // turn_seq stays fixed while running/in-window until the
-                            // merged flush does turn_seq+=1, all share the same next-turn
-                            // id, matching the merged assistant turn (T1).
-                            let prompt_turn = turn_seq + 1;
-                            emit(&mgr, &sid, &event_tx, prompt_turn, &AcpEvent::UserPrompt {
-                                text: truncate_prompt_for_scrollback(&text),
-                                turn_id: prompt_turn,
-                                client_id: client_id.clone(),
-                            });
-                            if run_id.is_some() {
-                                // C3:调度 prompt 绕过 collect(kiro 当前不跑调度,留此分支保持三 fanout 对称)
-                                queue.clear();
-                                if local_running {
-                                    // Latent parity hardening — see the Claude fan-out's run_id arm
-                                    // (review 2026-08-14, F2). Kiro runs no scheduled tasks so this is
-                                    // doubly dead, but the three fanouts are kept byte-symmetric.
-                                    turn_starts.set_live_intent(crate::run_metrics::RunOutcome::Cancelled);
-                                    if let Err(e) = process.interrupt().await {
-                                        tracing::warn!("interrupt before resend failed for {}: {}", sid, e);
-                                    }
-                                }
-                                turn_seq += 1;
-                                local_running = true;
-                                turn_starts.start(now_millis());
-                                if let Some(m) = mgr.upgrade() {
-                                    m.mark_turn(&sid, TurnState::Running, turn_seq);
-                                }
-                                if let Err(e) = process.send_prompt(&text).await {
-                                    tracing::warn!("Kiro send_prompt failed for {}: {}", sid, e);
-                                }
-                            } else {
-                                // 非调度 prompt:按队列模式分流(G2b)。Kiro 为 ACP,
-                                // passthrough 已在 SetQueueMode 处降级为 collect。
-                                match queue_mode {
-                                    QueueMode::Interrupt if local_running => {
-                                        // Stamp Cancelled intent on the live turn before starting
-                                        // the next — see the Claude fan-out. (review 2026-08-10)
-                                        turn_starts.set_live_intent(crate::run_metrics::RunOutcome::Cancelled);
-                                        if let Err(e) = process.interrupt().await {
-                                            tracing::warn!("interrupt (queue mode) failed for {}: {}", sid, e);
-                                        }
-                                        queue.clear();
-                                        turn_seq += 1;
-                                        local_running = true;
-                                        turn_starts.start(now_millis());
-                                        if let Some(m) = mgr.upgrade() {
-                                            m.mark_turn(&sid, TurnState::Running, turn_seq);
-                                        }
-                                        if let Err(e) = process.send_prompt(&text).await {
-                                            tracing::warn!("Kiro send_prompt failed for {}: {}", sid, e);
-                                        }
-                                    }
-                                    QueueMode::Passthrough => {
-                                        turn_seq += 1;
-                                        local_running = true;
-                                        turn_starts.start(now_millis());
-                                        if let Some(m) = mgr.upgrade() {
-                                            m.mark_turn(&sid, TurnState::Running, turn_seq);
-                                        }
-                                        if let Err(e) = process.send_prompt(&text).await {
-                                            tracing::warn!("Kiro send_prompt failed for {}: {}", sid, e);
-                                        }
-                                    }
-                                    _ => {
-                                        if local_running {
-                                            queue.enqueue(text);
-                                            emit_queued(&event_tx, queue.pending.len());
-                                        } else if queue.debounce.is_some() {
-                                            queue.enqueue(text);
-                                            queue.bump_debounce();
-                                            emit_queued(&event_tx, queue.pending.len());
-                                        } else {
-                                            turn_seq += 1;
-                                            local_running = true;
-                                            turn_starts.start(now_millis());
-                                            if let Some(m) = mgr.upgrade() {
-                                                m.mark_turn(&sid, TurnState::Running, turn_seq);
-                                            }
-                                            if let Err(e) = process.send_prompt(&text).await {
-                                                tracing::warn!("Kiro send_prompt failed for {}: {}", sid, e);
-                                            }
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                        Some(SessionInput::SetQueueMode(m)) => {
-                            queue_mode = m.effective();
-                            // Mirror the authoritative mode into the Session so a
-                            // reconnecting/observer client can read it from replay_done
-                            // instead of guessing (review 2026-07-26).
-                            if let Some(mgr) = mgr.upgrade() {
-                                mgr.mark_queue_mode(&sid, queue_mode);
-                            }
-                            // Also broadcast it LIVE so an already-connected tab adopts
-                            // the new mode without a reconnect (review 2026-07-27,
-                            // F-OBS-LIVE). replay_done only delivers it at connect time.
-                            emit_queue_mode(&event_tx, queue_mode);
-                        }
-                        Some(SessionInput::Interrupt) => {
-                            if local_running {
-                                // Intent: the LIVE turn (FIFO back) is not a completion
-                                // (per-entry so a coupled resend can't misattribute — F2).
-                                turn_starts.set_live_intent(crate::run_metrics::RunOutcome::Cancelled);
-                                if let Err(e) = process.interrupt().await {
-                                    tracing::warn!("interrupt failed for {}: {}", sid, e);
-                                }
-                            }
-                            // E5:无条件清队列 + 取消窗口
-                            queue.clear();
-                        }
-                        Some(SessionInput::Cancel) => {
-                            // Intent before kill: classify the LIVE turn as Cancelled
-                            // (FIFO back entry — see spawn_acp_fanout, F2).
-                            turn_starts.set_live_intent(crate::run_metrics::RunOutcome::Cancelled);
-                            process.kill().await;
-                        }
-                        Some(SessionInput::TimeoutKill { .. }) => {
-                            // Intent before kill: classify the LIVE turn as Timeout
-                            // (FIFO back entry — see spawn_acp_fanout, F2).
-                            turn_starts.set_live_intent(crate::run_metrics::RunOutcome::Timeout);
-                            process.kill().await;
-                        }
-                        None => break,
-                        // PtyData / PtyResize aren't meaningful for an MCP
-                        // agent session — they only apply to PTY/tmux. Drop
-                        // silently rather than mis-route into send_prompt.
-                        _ => {}
-                    }
-                }
-                _ = async {
-                    match (queue.debounce.as_mut(), queue.hard_cap.as_mut()) {
-                        (Some(d), Some(h)) => { tokio::select! { _ = d.as_mut() => {}, _ = h.as_mut() => {} } }
-                        (Some(d), None) => d.as_mut().await,
-                        (None, Some(h)) => h.as_mut().await,
-                        (None, None) => std::future::pending::<()>().await,
-                    }
-                }, if queue.debounce.is_some() => {
-                    queue.disarm();
-                    if !queue.pending.is_empty() {
-                        let merged = queue.drain_merged();
-                        turn_seq += 1;
-                        local_running = true;
-                        turn_starts.start(now_millis());
-                        if let Some(m) = mgr.upgrade() {
-                            m.mark_turn(&sid, TurnState::Running, turn_seq);
-                        }
-                        if let Err(e) = process.send_prompt(&merged).await {
-                            tracing::warn!("collect flush send_prompt failed for {}: {}", sid, e);
-                        }
-                    }
-                }
-            }
-        }
-        mark_fanout_ended(&mgr, &sid);
-        tracing::info!("Kiro fan-out task ended for session {}", sid);
-    });
-}
-
-/// Crew fan-out. Mirrors `spawn_kiro_fanout` byte-for-byte in structure — the
+/// Crew fan-out. Mirrors `spawn_acp_fanout` byte-for-byte in structure — the
 /// only differences are the resume-token source (`crew_slot_key` → `ResumeToken::Crew`)
 /// and the backend name in log lines. The fan-out no longer owns a child process but
 /// **one Gateway WS connection + one slot_key**; `CrewProcess`'s `Drop` deletes the
@@ -3925,7 +3523,7 @@ fn spawn_codex_fanout(
                                         m.mark_turn(&sid, TurnState::Idle, turn_seq);
                                     }
                                     // turn_done push (parity with spawn_acp_fanout — F4).
-                                    // Kiro/Codex run no scheduled tasks, so every settling
+                                    // Codex runs no scheduled tasks, so every settling
                                     // turn here is interactive (no active_run_id gate needed).
                                     // dur AND intent read from the FIFO front (the settling
                                     // turn's own entry) BEFORE settle() consumes it — so a
@@ -4109,7 +3707,7 @@ fn spawn_codex_fanout(
                             process.kill().await;
                         }
                         None => break,
-                        // See note in spawn_kiro_fanout: PTY-style inputs
+                        // See note in spawn_acp_fanout: PTY-style inputs
                         // are silently dropped for MCP sessions.
                         _ => {}
                     }
@@ -4266,7 +3864,6 @@ mod resume_token_tests {
     fn roundtrip_all_variants() {
         let cases = [
             (ResumeToken::Claude("sid-1".into()), ("claude", "sid-1")),
-            (ResumeToken::Kiro("k-2".into()), ("kiro", "k-2")),
             (ResumeToken::Codex("t-3".into()), ("codex", "t-3")),
             (ResumeToken::Tmux("work".into()), ("tmux", "work")),
         ];
@@ -4398,7 +3995,6 @@ mod decide_spawn_tests {
             events,
             store,
             "claude".into(),
-            "kiro".into(),
             "codex".into(),
             "off".into(),
             5476,
@@ -4563,7 +4159,7 @@ mod turn_state_tests {
             let store = Arc::new(crate::session_store::SessionStore::open(dir.path()).unwrap());
             let mgr = SessionManager::new(
                 events, store,
-                "claude".into(), "kiro".into(), "codex".into(), "off".into(),
+                "claude".into(), "codex".into(), "off".into(),
                 5476, "/tmp/crew".into(), "bash".into(), false,
             );
             (mgr, dir)
@@ -4807,7 +4403,7 @@ mod turn_state_tests {
         // running turn and starts the next. Before the fix it did NOT stamp Cancelled
         // intent on the interrupted turn (only the explicit Interrupt button did), so
         // the aborted turn's boundary settled with no intent and classify_outcome
-        // recorded it Completed (Kiro's cancel→Result / Claude) or Errored (Codex's
+        // recorded it Completed (Claude's cancel→Result) or Errored (Codex's
         // cancel→Error) — the SAME user action ("interrupt the running turn") yielding
         // a different metric depending on which route triggered it.
         //
@@ -4820,7 +4416,7 @@ mod turn_state_tests {
         ts.start(2_000); // turn 2 (the resend) — fresh, no intent
 
         // Boundary #1 = the interrupted turn 1. Even though the backend delivers it as
-        // a Result (Kiro cancel) or Error (Codex), the stamped intent wins → Cancelled.
+        // a Result (Claude cancel) or Error (Codex), the stamped intent wins → Cancelled.
         assert_eq!(ts.front_intent(), Some(RunOutcome::Cancelled));
         let (start1, intent1) = ts.settle().unwrap();
         assert_eq!(start1, 1_000);
@@ -4921,7 +4517,7 @@ mod turn_state_tests {
     #[test]
     fn passthrough_degrades_to_collect_on_every_backend() {
         // Passthrough is unsound under the single-turn_seq machinery (Codex
-        // drops the mid-turn prompt → wedge; Claude/Kiro mis-stamp). effective()
+        // drops the mid-turn prompt → wedge; Claude/Crew mis-stamp). effective()
         // degrades it to Collect everywhere. Collect/Interrupt pass through.
         assert_eq!(QueueMode::Passthrough.effective(), QueueMode::Collect);
         assert_eq!(QueueMode::Collect.effective(), QueueMode::Collect);
@@ -5053,7 +4649,7 @@ mod running_summary_tests {
         let store = Arc::new(crate::session_store::SessionStore::open(dir.path()).unwrap());
         let m = SessionManager::new(
             events, store,
-            "claude".into(), "kiro-cli".into(), "codex".into(), "off".into(),
+            "claude".into(), "codex".into(), "off".into(),
             5476, "/tmp/crew".into(), "bash".into(), false,
         );
         // Wire a scheduled store: `scheduled` in the summary is now sourced from
@@ -5729,8 +5325,9 @@ mod tests {
         assert!(matches!(SessionType::from_str_lenient("crew"), SessionType::Crew));
         // 未知值回落 Tmux（既有约定，最保守：PTY 无 resume 副作用）。
         assert!(matches!(SessionType::from_str_lenient("nonsense"), SessionType::Tmux));
-        // 注意：`"kiro"` 此时仍映射 `SessionType::Kiro`（Task 11 才删除该后端），
-        // 所以**不能**在这里断言它回落 Tmux —— 那条断言属于 Task 11 Step 2。
+        // Task 11 起 `"kiro"` 不再是已知类型 → 走未知值回落 Tmux（最保守，
+        // PTY 无 resume 副作用）。这条在 Task 5 时不成立，故当时未写。
+        assert!(matches!(SessionType::from_str_lenient("kiro"), SessionType::Tmux));
     }
 
     #[test]
@@ -5787,7 +5384,7 @@ mod lifetime_tests {
         let store = Arc::new(crate::session_store::SessionStore::open(dir.path()).unwrap());
         let mgr = SessionManager::new(
             events, store,
-            "claude".into(), "kiro".into(), "codex".into(), "off".into(),
+            "claude".into(), "codex".into(), "off".into(),
             5476, "/tmp/crew".into(), "bash".into(), false,
         );
         (mgr, dir)
@@ -5872,8 +5469,8 @@ mod lifetime_tests {
     #[tokio::test]
     async fn maybe_push_turn_done_is_safe_noop_without_push_service() {
         // F4 (review 2026-08-06): the turn_done push was extracted into the shared
-        // `maybe_push_turn_done` so all three fan-outs (Claude/Kiro/Codex) notify
-        // identically — Kiro/Codex previously never pushed. This guards the common
+        // `maybe_push_turn_done` so all fan-outs (Claude/Crew/Codex) notify
+        // identically — Crew/Codex previously never pushed. This guards the common
         // path: with no PushService wired (push_handle() == None, the default) the
         // helper must be a clean no-op and never panic, for any backend's session.
         let (mgr, _dir) = make_manager();
@@ -6013,7 +5610,7 @@ mod lifetime_tests {
 mod cost_diff_integration_guard_tests {
     #[test]
     fn diff_cost_only_applies_to_claude_label() {
-        // 文档化不变量:非 claude-code label 不调用 diff_cost(Kiro/Codex cost 恒 None)。
+        // 文档化不变量:非 claude-code label 不调用 diff_cost(Crew/Codex cost 恒 None)。
         // 这里断言纯函数对 None 输入的恒等行为,作为接入处的回归锚点。
         let (d, p) = crate::run_metrics::diff_cost(Some(0.0), None, true, false);
         assert_eq!(d, None);

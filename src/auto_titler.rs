@@ -3,8 +3,7 @@
 //! 安全(C1/E10):临时进程在系统临时空目录运行 + 不授予工具 + 不 skip-permissions。
 //!
 //! 后端覆盖:仅 Claude 实现真正的无工具 spawn(`--allowedTools ""` + 不
-//! skip-permissions)。Kiro/Codex 的现有 spawn 会授予/自动放行工具(Kiro 的
-//! 共享事件循环 auto-approve 权限请求;Codex 的 per-call 配置写死
+//! skip-permissions)。Codex 的现有 spawn 会自动放行工具(per-call 配置写死
 //! sandbox=danger-full-access / approval=never),无法在不大改其事件循环的
 //! 前提下安全降为无工具,故按设计的失败模式直接返回 None —— 会话保留默认名。
 
@@ -77,7 +76,7 @@ pub fn spawn_titler(
 }
 
 /// 拉起对应后端的无工具临时进程,发 prompt,在超时内等 `Result` 文本,结束后 kill。
-/// 仅 Claude 完整支持;Kiro/Codex 暂降为 None(见模块头注释)。
+/// 仅 Claude 完整支持;Codex/Crew 降为 None(见模块头注释)。
 async fn run_titler(
     sid: &str,
     backend: TitlerBackend,
@@ -133,7 +132,7 @@ async fn run_titler(
         // 无法安全保证无工具 → 按设计放弃,保留默认会话名。
         // Crew 更彻底:它根本不 spawn 本地进程(会话是 Gateway 上的一个 slot),
         // 没有「无工具临时进程」这回事,故同样按设计返回 None。
-        TitlerBackend::Kiro | TitlerBackend::Codex | TitlerBackend::Crew => {
+        TitlerBackend::Codex | TitlerBackend::Crew => {
             tracing::info!("titler[{}]: backend {:?} not supported (tool-less spawn unsafe), keeping default name by design", sid, backend);
             None
         }

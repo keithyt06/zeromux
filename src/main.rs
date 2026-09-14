@@ -47,7 +47,11 @@ struct Args {
     #[arg(long, default_value = "claude")]
     claude_path: String,
 
-    /// Path to kiro-cli binary
+    /// Path to kiro-cli binary. Accepted for backward compatibility only —
+    /// zeromux no longer spawns kiro-cli itself (Task 11 removed the Kiro
+    /// backend); Kiro Crew's Gateway owns that process. Kept so existing
+    /// systemd units / scripts passing `--kiro-path` still start.
+    #[allow(dead_code)]
     #[arg(long, default_value = "kiro-cli")]
     kiro_path: String,
 
@@ -178,7 +182,6 @@ pub struct AppState {
     pub password_hash: Option<String>,
     pub shell: String,
     pub claude_path: String,
-    pub kiro_path: String,
     pub codex_path: String,
     pub codex_reasoning: String,
     pub crew_port: u16,
@@ -465,7 +468,6 @@ async fn main() {
             event_store.clone(),
             session_store.clone(),
             args.claude_path.clone(),
-            args.kiro_path.clone(),
             args.codex_path.clone(),
             args.codex_reasoning.clone(),
             args.crew_port,
@@ -476,7 +478,6 @@ async fn main() {
         password_hash,
         shell: args.shell,
         claude_path: args.claude_path,
-        kiro_path: args.kiro_path,
         codex_path: args.codex_path,
         codex_reasoning: args.codex_reasoning,
         crew_port: args.crew_port,

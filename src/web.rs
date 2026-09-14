@@ -1452,6 +1452,14 @@ fn is_credential_path(name: &str) -> bool {
         || n.ends_with(".tfstate") || n.ends_with(".tfstate.backup")
         || n.ends_with(".tfvars") || n.ends_with(".tfvars.json")
         || n == ".dockercfg"
+        // Gateway IPC secrets (Kiro Crew 接入, 2026-09-14). `<crew_home>/run/
+        // gateway-<port>.secret` and `<crew_home>/.local_secret` authenticate to
+        // Crew's internal API — holding one is equivalent to being the Crew owner
+        // (it mints a 20h all-endpoints token). The `~/.*` home form is separately
+        // refused by read_hits_home_dotdir, so this LEAF entry is what covers a
+        // crew home relocated INTO a repo via KIROCREW_HOME. Suffix match (not
+        // substring) so `secrets.md` / `secretsanta.ts` stay browsable.
+        || n.ends_with(".secret") || n == ".local_secret"
 }
 
 /// The single denylist of control / credential directory names. READ and WRITE
@@ -4188,6 +4196,25 @@ mod path_safety_tests {
         for n in ["server.crt", "ca.cert", "README.md"] {
             assert!(!is_credential_path(n), "{n} must NOT be flagged (public/non-secret)");
         }
+    }
+
+    #[test]
+    fn credential_leaf_covers_gateway_secrets() {
+        // Kiro Crew 的 IPC 凭证叶名（本次接入新增的一类）。`$HOME` 之下另有
+        // read_hits_home_dotdir 兜底，但那是 BASE 轴；这里补的是 LEAF 轴——
+        // KIROCREW_HOME 可把 crew home 指到仓库内（config/loader.py:3-4），
+        // 那时只有叶名 denylist 能挡住它被 list_dir 枚举 / diff 逐字打印。
+        // 持有这个 secret 等价于成为 Crew 的 owner（它能换取 20h 全权 token）。
+        for n in [
+            "gateway-5476.secret", ".local_secret",
+            "GATEWAY-8080.SECRET",   // case-insensitive
+            "app.secret",            // 任何 *.secret，不只 Crew 的
+        ] {
+            assert!(is_credential_path(n), "{n} must be flagged as a credential leaf");
+        }
+        // 反向：普通源文件不受影响（`.secret` 是后缀匹配，不是子串匹配）。
+        assert!(!is_credential_path("secretsanta.ts"));
+        assert!(!is_credential_path("secrets.md"));
     }
 
     #[test]

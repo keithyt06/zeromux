@@ -125,6 +125,51 @@ struct Args {
     /// omitted = vault reader disabled. Must be under $HOME and not sensitive.
     #[arg(long)]
     vault_dir: Option<String>,
+
+    /// Kiro Crew Gateway port (its dashboard port; loopback only).
+    #[arg(long, default_value = "5476")]
+    crew_port: u16,
+
+    /// Kiro Crew data home. Holds the IPC secret this process reads to mint
+    /// Gateway tokens. Defaults to `$HOME/.kiro/crew`. Refused at startup if it
+    /// sits inside --work-dir or --vault-dir (the secret would become readable
+    /// through the file browser).
+    #[arg(long)]
+    crew_home: Option<String>,
+}
+
+/// True when `crew_home` sits somewhere the file browser can read, which would
+/// expose Crew's IPC secret (holding it is equivalent to being the Crew owner —
+/// it mints a 20h all-endpoints Gateway token).
+///
+/// `$HOME/.kiro/...` is NOT exposed: its first segment below $HOME is a
+/// dot-entry, which `web::read_hits_home_dotdir` already refuses (that predicate
+/// anchors at $HOME, not at the base — verified by compiling it standalone, see
+/// the spec's §5.2). What IS exposed is a crew home relocated under a browsable
+/// base: `<work_dir>/.kiro` with work_dir deeper than $HOME, or anywhere under
+/// the vault.
+fn crew_home_is_exposed(
+    crew_home: &std::path::Path,
+    work_dir: &std::path::Path,
+    vault_dir: Option<&std::path::Path>,
+) -> bool {
+    if let Some(v) = vault_dir {
+        if crew_home.starts_with(v) {
+            return true;
+        }
+    }
+    // Under $HOME with a dot first segment => already guarded, not exposed.
+    if let Ok(home) = std::env::var("HOME") {
+        if let Ok(rel) = crew_home.strip_prefix(&home) {
+            if matches!(rel.components().next(),
+                Some(std::path::Component::Normal(s))
+                    if s.to_str().is_some_and(|n| n.starts_with('.')))
+            {
+                return false;
+            }
+        }
+    }
+    crew_home.starts_with(work_dir)
 }
 
 pub struct AppState {
@@ -135,6 +180,8 @@ pub struct AppState {
     pub kiro_path: String,
     pub codex_path: String,
     pub codex_reasoning: String,
+    pub crew_port: u16,
+    pub crew_home: String,
     pub work_dir: String,
     pub default_cols: u16,
     pub default_rows: u16,
@@ -389,6 +436,29 @@ async fn main() {
         std::sync::Arc::new(web::build_vault_index(std::path::Path::new(v)))
     });
 
+    // Resolve the Kiro Crew data home and refuse a placement that would expose
+    // its IPC secret. Fail FAST (exit 1) rather than degrade: a silently-readable
+    // secret is worse than not starting, because holding it is equivalent to
+    // being the Crew owner (it mints a 20h all-endpoints Gateway token).
+    let crew_home = args.crew_home.clone().unwrap_or_else(|| {
+        let home = std::env::var("HOME").unwrap_or_else(|_| "/root".to_string());
+        format!("{}/.kiro/crew", home)
+    });
+    {
+        let ch = std::path::Path::new(&crew_home);
+        let wd = std::path::Path::new(&args.work_dir);
+        let vd = vault_dir.as_deref().map(std::path::Path::new);
+        if crew_home_is_exposed(ch, wd, vd) {
+            eprintln!(
+                "FATAL: --crew-home ({}) sits inside --work-dir or --vault-dir; \
+                 Kiro Crew's IPC secret would be readable through the file browser. \
+                 Move the crew home outside the browsable tree.",
+                crew_home
+            );
+            std::process::exit(1);
+        }
+    }
+
     let state = Arc::new(AppState {
         sessions: session_manager::SessionManager::new(
             event_store.clone(),
@@ -406,6 +476,8 @@ async fn main() {
         kiro_path: args.kiro_path,
         codex_path: args.codex_path,
         codex_reasoning: args.codex_reasoning,
+        crew_port: args.crew_port,
+        crew_home: crew_home.clone(),
         work_dir: args.work_dir,
         default_cols: args.cols,
         default_rows: args.rows,
@@ -498,4 +570,61 @@ async fn main() {
 
     let listener = tokio::net::TcpListener::bind(&addr).await.unwrap();
     axum::serve(listener, app).await.unwrap();
+}
+
+#[cfg(test)]
+mod crew_arg_tests {
+    use super::crew_home_is_exposed;
+    use std::path::Path;
+
+    /// HOME 是进程级全局，与 session_manager 的测试共用一把锁避免互相干扰。
+    fn with_home<T>(home: &str, f: impl FnOnce() -> T) -> T {
+        let _guard = crate::session_manager::HOME_ENV_LOCK.lock().unwrap();
+        let prev = std::env::var("HOME").ok();
+        std::env::set_var("HOME", home);
+        let out = f();
+        match prev {
+            Some(p) => std::env::set_var("HOME", p),
+            None => std::env::remove_var("HOME"),
+        }
+        out
+    }
+
+    #[test]
+    fn crew_home_inside_work_dir_is_rejected() {
+        // secret 落在 work_dir 之下 => 进入 file-browser 可读区（绕过 $HOME
+        // dotdir 兜底，因为此时首段不再是 dot-entry 而是仓库名）。
+        with_home("/home/u", || {
+            assert!(crew_home_is_exposed(
+                Path::new("/home/u/repo/.kiro/crew"),
+                Path::new("/home/u/repo"),
+                None,
+            ));
+        });
+    }
+
+    #[test]
+    fn crew_home_inside_vault_dir_is_rejected() {
+        with_home("/home/u", || {
+            assert!(crew_home_is_exposed(
+                Path::new("/home/u/vault/.kiro/crew"),
+                Path::new("/home/u"),
+                Some(Path::new("/home/u/vault")),
+            ));
+        });
+    }
+
+    #[test]
+    fn default_crew_home_under_home_is_accepted() {
+        // ~/.kiro/crew 与 work_dir=$HOME：首段是 `.kiro` dot-entry，
+        // read_hits_home_dotdir 已拦住（该谓词单独编译实测过，见 spec §5.2），
+        // 不算暴露 —— 否则默认配置就启动不了。
+        with_home("/home/u", || {
+            assert!(!crew_home_is_exposed(
+                Path::new("/home/u/.kiro/crew"),
+                Path::new("/home/u"),
+                None,
+            ));
+        });
+    }
 }

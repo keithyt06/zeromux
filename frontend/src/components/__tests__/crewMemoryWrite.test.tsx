@@ -1,8 +1,10 @@
 import { render, screen, act, waitFor, fireEvent } from '@testing-library/react'
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
 import AcpChatView from '../AcpChatView'
+import MemoryPanel from '../MemoryPanel'
 import { installFakeWebSocket } from '../../test/fakeWs'
 import type { CrewMemory } from '../../lib/api'
+import { mdLines } from '../../lib/crewMemory'
 
 // T15:前两条约束由 zeromux 后端代理承担(浏览器不该持 Gateway token,也无法
 // 跨源),所以前端侧的断言是「打的是代理端点、路径不带 key」。
@@ -106,5 +108,85 @@ describe('T15-c 走代理端点：路径不带 key，凭证不进前端', () => 
     captureFetch()
     render(<AcpChatView sessionId="s2" active agentType="claude" />)
     expect(screen.queryByLabelText('memory')).not.toBeInTheDocument()
+  })
+})
+
+// T15-d 记忆面板（第 5 个 overlay view）。这一组全部是**面板级**断言 —— mdLines /
+// dropMdLine 的纯函数行为已由 lib/__tests__/crewMemory.test.ts 的 T15-b 钉死，这里
+// 测的是 MemoryPanel 有没有真的用上它们（历史上「纯函数对了但组件没接」的失败模式
+// 表现为面板把 markdown 骨架列成可删行，或删错行后整文件 PUT 不可逆）。
+describe('T15-d 记忆面板', () => {
+  const origFetch = globalThis.fetch
+  beforeEach(() => { vi.restoreAllMocks() })
+  afterEach(() => { globalThis.fetch = origFetch })
+
+  /** 拦 fetch 而不是 mock api.ts：约束在于**发出的 HTTP 形状**（哪个 doc、body 是什么）。 */
+  const fetchMemory = (mem: CrewMemory) => {
+    const calls: { url: string; init?: RequestInit }[] = []
+    globalThis.fetch = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = typeof input === 'string' ? input : input.toString()
+      calls.push({ url, init })
+      const isGet = !init?.method || init.method === 'GET'
+      return new Response(JSON.stringify(isGet ? mem : { ok: true }),
+        { status: 200, headers: { 'Content-Type': 'application/json' } })
+    }) as unknown as typeof fetch
+    return calls
+  }
+
+  it('全空时空状态本身就是写入表单（不是一块「暂无数据」）', async () => {
+    fetchMemory(memory())
+    render(<MemoryPanel />)
+    expect(await screen.findByText('它还什么都没记住')).toBeInTheDocument()
+    const input = screen.getByPlaceholderText('例：提交前必须先跑 npm test')
+    // iOS Safari 在 <16px 的输入框聚焦时会放大整页，把按钮挤出视口 → 必须 text-base(16px)。
+    expect(input.className).toMatch(/text-base/)
+    const btn = screen.getByText('记住这条')
+    expect(btn.className).toMatch(/min-h-\[44px\]/)
+  })
+
+  it('markdown 骨架不算记忆：56 字节的 preferences.md 仍是空态，而不是「已记 2 条」', async () => {
+    // 实测 preferences.md 只有一个标题 + 一行 HTML 注释。若面板把它们列成可删行，
+    // 用户会误以为已经记了两条，点删则删掉文件结构（PUT 是整文件覆盖，不可逆）。
+    fetchMemory(memory())
+    render(<MemoryPanel />)
+    expect(await screen.findByText('它还什么都没记住')).toBeInTheDocument()
+    expect(screen.queryByText(/User Preferences/)).not.toBeInTheDocument()
+    expect(screen.queryByText(/Active Projects/)).not.toBeInTheDocument()
+    expect(screen.queryByText(/偏好/)).not.toBeInTheDocument()
+  })
+
+  it('删 markdown 行按过滤后下标映射回原始行号，整文件 PUT 保留骨架', async () => {
+    const calls = fetchMemory(memory({
+      preferences: '# User Preferences\n\n<!-- note -->\n- 用 pnpm\n- 提交前跑测试\n',
+    }))
+    render(<MemoryPanel />)
+    // ✕ 常驻（绝不 group-hover：Tailwind v4 把它编进 @media (hover:hover)，
+    // 手机上元素永久 opacity:0 但仍可点击 = 隐形按钮）。
+    const x = await screen.findByLabelText('remove - 提交前跑测试')
+    expect(x.className).not.toMatch(/opacity-0|group-hover/)
+    // 二段确认：第一下只展开确认行，不发请求（破坏性操作不用 window.confirm）。
+    await act(async () => { x.click() })
+    expect(calls.some(c => c.init?.method === 'PUT')).toBe(false)
+    await act(async () => { screen.getByTestId('mem-remove-confirm').click() })
+
+    const put = await waitFor(() => {
+      const c = calls.find(c => c.init?.method === 'PUT')
+      if (!c) throw new Error('no PUT yet')
+      return c
+    })
+    expect(put.url).toBe('/api/crew/memory/preferences')
+    const body = JSON.parse(put.init!.body as string) as { content: string }
+    // 删的是**过滤后**第 1 条（「提交前跑测试」）；按原始行号 1 会删掉空行、留下两条。
+    expect(mdLines(body.content)).toEqual(['- 用 pnpm'])
+    expect(body.content).toContain('# User Preferences')
+    expect(body.content).toContain('<!-- note -->')
+  })
+
+  it('gateway_ok:false 显示黄色降级条，而不是「它还什么都没记住」（两者含义完全不同）', async () => {
+    fetchMemory(memory({ gateway_ok: false }))
+    render(<MemoryPanel />)
+    expect(await screen.findByText(/Gateway 未响应/)).toBeInTheDocument()
+    // 读不到 ≠ 真的空。此时显示空态写入表单，用户会以为记忆被清空（而且写必然失败）。
+    expect(screen.queryByText('它还什么都没记住')).not.toBeInTheDocument()
   })
 })

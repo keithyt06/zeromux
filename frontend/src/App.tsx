@@ -15,10 +15,11 @@ import FileBrowser from './components/FileBrowser'
 import GitViewer from './components/GitViewer'
 import AgentDashboard from './components/AgentDashboard'
 import VaultReader from './components/VaultReader'
+import MemoryPanel from './components/MemoryPanel'
 import { type DocTab, newDocTab, isDocTabId, loadDocTabs, saveDocTabs, resolveActivePane, DEFAULT_DOC_TITLE } from './lib/docTabs'
 
 type AuthState = 'loading' | 'unauthenticated' | 'pending' | 'active'
-type OverlayView = 'none' | 'files' | 'git' | 'events'
+type OverlayView = 'none' | 'files' | 'git' | 'events' | 'memory'
 
 export default function App() {
   const [authState, setAuthState] = useState<AuthState>('loading')
@@ -293,7 +294,7 @@ export default function App() {
     setSessions(prev => prev.map(s => s.id === id ? { ...s, ...updated } : s))
   }, [])
 
-  const toggleOverlay = useCallback((id: string, view: 'files' | 'git' | 'events') => {
+  const toggleOverlay = useCallback((id: string, view: 'files' | 'git' | 'events' | 'memory') => {
     setOverlay(prev => ({
       ...prev,
       [id]: prev[id] === view ? 'none' : view,
@@ -356,6 +357,13 @@ export default function App() {
               ? () => setMetricsOpen(m => ({ ...m, [activeSession.id]: !m[activeSession.id] }))
               : undefined}
             showMetrics={!!metricsOpen[activeSession.id]}
+            // 第 5 个图标只给 Crew：5 个是硬上限（375px 核算，见计划 Task 10）。
+            // 其余会话传 undefined → SessionInfoBar 的 {onToggleMemory && ...} 门控
+            // 直接不渲染，照 onToggleMetrics 的既有 idiom。
+            onToggleMemory={activeSession.type === 'crew'
+              ? () => toggleOverlay(activeSession.id, 'memory')
+              : undefined}
+            showMemory={(overlay[activeSession.id] || 'none') === 'memory'}
           />
         )}
         {/* Mobile: show menu button when no active session */}
@@ -382,12 +390,14 @@ export default function App() {
                   {s.type === 'tmux' ? (
                     <TerminalView sessionId={s.id} active={isActive && view === 'none'} theme={themeCtx.theme} />
                   ) : (
-                    <AcpChatView sessionId={s.id} active={isActive && view === 'none'} agentType={s.type} onRegisterControls={registerControls} onQueueModeChange={handleQueueModeChange} showMetrics={!!metricsOpen[s.id]} />
+                    <AcpChatView sessionId={s.id} active={isActive && view === 'none'} agentType={s.type} onRegisterControls={registerControls} onQueueModeChange={handleQueueModeChange} showMetrics={!!metricsOpen[s.id]} onOpenMemory={s.type === 'crew' ? () => toggleOverlay(s.id, 'memory') : undefined} />
                   )}
                 </div>
                 {view === 'files' && <FileBrowser sessionId={s.id} />}
                 {view === 'git' && <GitViewer sessionId={s.id} onForward={(t) => sessionControls.current[s.id]?.sendPrompt(t)} />}
                 {view === 'events' && <AgentDashboard sessionId={s.id} />}
+                {/* 记忆是 Crew 侧全局的（一份 Gateway 一份记忆），故不接 sessionId。 */}
+                {view === 'memory' && <MemoryPanel />}
               </div>
             )
           })}

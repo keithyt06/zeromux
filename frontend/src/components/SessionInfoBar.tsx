@@ -1,7 +1,7 @@
 import { useState, useEffect, useCallback, useRef } from 'react'
 import type { SessionInfo, SessionMetaStatus, NoteEntry } from '../lib/api'
 import { updateSession, listNotes, createNote, deleteNote } from '../lib/api'
-import { ChevronDown, ChevronRight, FileText, StickyNote, GitBranch, X, Activity, BarChart3 } from 'lucide-react'
+import { ChevronDown, ChevronRight, FileText, StickyNote, GitBranch, X, Activity, BarChart3, Brain } from 'lucide-react'
 
 interface Props {
   session: SessionInfo
@@ -24,6 +24,13 @@ interface Props {
   // overlay mode.
   onToggleMetrics?: () => void
   showMetrics?: boolean
+  // 记忆面板开关（第 5 个 overlay view）。仅 Crew 会话由 App 传入，其余会话为
+  // undefined → 第 5 个图标不渲染，照上面 onToggleMetrics 的门控 idiom。
+  // 5 个是硬上限（375px 宽度核算：5×22 + 4×4 = 126px，加汉堡 22 + chevron 18 +
+  // StatusDot 8 + 内边距 24 ≈ 198px，description 余 ~177px）。第 6 个会崩版 ——
+  // 所以审批不占图标位，内联在对话里。
+  onToggleMemory?: () => void
+  showMemory?: boolean
 }
 
 const STATUS_OPTIONS: { value: SessionMetaStatus; label: string; color: string }[] = [
@@ -38,7 +45,7 @@ export function StatusDot({ status }: { status: SessionMetaStatus }) {
   return <span className={`inline-block w-2 h-2 rounded-full ${opt?.color || 'bg-gray-400'} shrink-0`} />
 }
 
-export default function SessionInfoBar({ session, onUpdate, onToggleFiles, onToggleGit, onToggleEvents, showFiles, showGit, showEvents, onOpenSidebar, onQueueMode, queueMode = 'collect', onToggleMetrics, showMetrics }: Props) {
+export default function SessionInfoBar({ session, onUpdate, onToggleFiles, onToggleGit, onToggleEvents, showFiles, showGit, showEvents, onOpenSidebar, onQueueMode, queueMode = 'collect', onToggleMetrics, showMetrics, onToggleMemory, showMemory }: Props) {
   const [expanded, setExpanded] = useState(false)
   const [desc, setDesc] = useState(session.description)
   const [notes, setNotes] = useState<NoteEntry[]>([])
@@ -204,6 +211,20 @@ export default function SessionInfoBar({ session, onUpdate, onToggleFiles, onTog
               title="运行记录"
             >
               <BarChart3 size={14} />
+            </button>
+          )}
+          {onToggleMemory && (
+            <button
+              onClick={onToggleMemory}
+              aria-label="memory panel"
+              className={`p-1 rounded transition-colors ${
+                showMemory
+                  ? 'text-[var(--accent-purple)] bg-[var(--bg-primary)]'
+                  : 'text-[var(--text-secondary)] hover:text-[var(--text-primary)]'
+              }`}
+              title="记忆"
+            >
+              <Brain size={14} />
             </button>
           )}
         </div>

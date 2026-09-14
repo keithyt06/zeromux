@@ -467,6 +467,8 @@ async fn main() {
             args.kiro_path.clone(),
             args.codex_path.clone(),
             args.codex_reasoning.clone(),
+            args.crew_port,
+            crew_home.clone(),
             args.shell.clone(),
             args.worktree_isolation,
         ),

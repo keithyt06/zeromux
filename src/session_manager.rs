@@ -49,6 +49,7 @@ pub enum SessionType {
     Claude,
     Kiro,
     Codex,
+    Crew,
 }
 
 /// 自动命名器后端：决定 auto-titler 调用哪个 CLI。
@@ -62,6 +63,7 @@ impl std::fmt::Display for SessionType {
             SessionType::Claude => write!(f, "claude"),
             SessionType::Kiro => write!(f, "kiro"),
             SessionType::Codex => write!(f, "codex"),
+            SessionType::Crew => write!(f, "crew"),
         }
     }
 }
@@ -73,6 +75,7 @@ impl SessionType {
             "claude" => SessionType::Claude,
             "kiro" => SessionType::Kiro,
             "codex" => SessionType::Codex,
+            "crew" => SessionType::Crew,
             _ => SessionType::Tmux,
         }
     }
@@ -85,6 +88,11 @@ pub enum ResumeToken {
     Kiro(String),   // session/load <sessionId>
     Codex(String),  // codex-reply threadId
     Tmux(String),   // tmux attach -t <target>
+    /// Crew: the Gateway slot key (`zmx-xxxxxxxx`). Not a session id — reconnect
+    /// confirms it with `GET /api/chat/slots/{key}` and re-attaches; the
+    /// conversation state lives on the Gateway, so this is a MORE reliable resume
+    /// than the other three backends'.
+    Crew(String),
 }
 
 impl ResumeToken {
@@ -95,6 +103,7 @@ impl ResumeToken {
             ResumeToken::Kiro(v) => ("kiro", v.clone()),
             ResumeToken::Codex(v) => ("codex", v.clone()),
             ResumeToken::Tmux(v) => ("tmux", v.clone()),
+            ResumeToken::Crew(v) => ("crew", v.clone()),
         }
     }
 
@@ -105,6 +114,7 @@ impl ResumeToken {
             "kiro" => Some(ResumeToken::Kiro(value.to_string())),
             "codex" => Some(ResumeToken::Codex(value.to_string())),
             "tmux" => Some(ResumeToken::Tmux(value.to_string())),
+            "crew" => Some(ResumeToken::Crew(value.to_string())),
             _ => None,
         }
     }
@@ -318,6 +328,12 @@ pub struct SessionManager {
     kiro_path: String,
     codex_path: String,
     codex_reasoning: String,
+    /// Kiro Crew Gateway 的端口与数据目录。与 `codex_reasoning` 同理在构造时捕获：
+    /// `ensure_running` 重生一个会话时只有 session id + 存储的元数据，没有调用者
+    /// 能供给这些值。**secret 不在此处** —— 它由 `crew_process.rs` 在 fan-out 栈上
+    /// 从 `crew_home` 现读，绝不进这个结构体（它会被共享）。
+    crew_port: u16,
+    crew_home: String,
     shell: String,
     /// Whether agent sessions get an isolated git worktree. Off by default —
     /// `git worktree add` is prohibitively slow on JuiceFS / S3-backed FS.
@@ -609,6 +625,8 @@ impl SessionManager {
         kiro_path: String,
         codex_path: String,
         codex_reasoning: String,
+        crew_port: u16,
+        crew_home: String,
         shell: String,
         worktree_isolation: bool,
     ) -> Arc<Self> {
@@ -621,6 +639,8 @@ impl SessionManager {
             kiro_path,
             codex_path,
             codex_reasoning,
+            crew_port,
+            crew_home,
             shell,
             worktree_isolation,
             scheduled: Mutex::new(None),
@@ -1180,7 +1200,8 @@ impl SessionManager {
         let map = self.sessions.lock().unwrap();
         let mut interactive = 0;
         for s in map.values() {
-            if !matches!(s.session_type, SessionType::Claude | SessionType::Kiro | SessionType::Codex) {
+            if !matches!(s.session_type,
+                SessionType::Claude | SessionType::Kiro | SessionType::Codex | SessionType::Crew) {
                 continue; // tmux 无 turn 概念,不阻塞升级
             }
             // 任何内存 turn_state==Running 的 agent 会话都算 interactive —— 包括对
@@ -1552,6 +1573,107 @@ impl SessionManager {
         Ok(id)
     }
 
+    /// Spawn a Crew session for `id` at `work_dir`, start its fan-out, return the
+    /// live handle. `resume` carries a slot key from a previous run.
+    async fn spawn_crew(
+        &self,
+        id: &str,
+        work_dir: &str,
+        owner_id: &str,
+        resume: Option<String>,
+    ) -> Result<RunningProcess, String> {
+        let cfg = crate::acp::crew_process::CrewConfig::new(
+            std::path::PathBuf::from(&self.crew_home),
+            self.crew_port,
+        );
+        let process = crate::acp::crew_process::CrewProcess::spawn(
+            cfg, work_dir, resume.as_deref(),
+        )
+        .await
+        .map_err(|e| format!("Failed to start Crew session: {}", e))?;
+
+        let (event_tx, _) = broadcast::channel(BROADCAST_CAPACITY);
+        let (input_tx, input_rx) = mpsc::channel::<SessionInput>(64);
+
+        spawn_crew_fanout(
+            id.to_string(),
+            process,
+            event_tx.clone(),
+            input_rx,
+            self.events.clone(),
+            "crew",
+            work_dir.to_string(),
+            owner_id.to_string(),
+            self.weak(),
+        );
+
+        Ok(RunningProcess {
+            event_tx,
+            input_tx,
+            pty_pid: None,
+            turn_state: TurnState::Idle,
+            turn_started_ms: None,
+            turn_seq: 0,
+            queue_mode: QueueMode::Collect,
+        })
+    }
+
+    pub async fn create_crew_session(
+        &self,
+        name: String,
+        work_dir: &str,
+        cols: u16,
+        rows: u16,
+        owner_id: &str,
+    ) -> Result<String, String> {
+        let id = uuid::Uuid::new_v4().to_string();
+        // worktree 隔离对 Crew **不适用**：cwd 由 Gateway 管（我们 POST project），
+        // 所以传 false 而不是 self.worktree_isolation（spec §7）。
+        let (effective_dir, worktree_path) = resolve_work_dir(work_dir, &id, false);
+
+        let running = self
+            .spawn_crew(&id, &effective_dir.to_string_lossy(), owner_id, None)
+            .await
+            .map_err(|e| {
+                if let Some(wt) = &worktree_path {
+                    let base = PathBuf::from(work_dir);
+                    remove_worktree(&base, wt);
+                }
+                e
+            })?;
+
+        let session = Session {
+            id: id.clone(),
+            name,
+            session_type: SessionType::Crew,
+            cols,
+            rows,
+            work_dir: effective_dir.to_string_lossy().to_string(),
+            owner_id: owner_id.to_string(),
+            description: String::new(),
+            name_is_auto: true,
+            status: SessionMeta::Running,
+            resume_token: None,
+            worktree_path,
+            created_ms: now_millis(),
+            source_task_id: None,
+            spawning: false,
+            last_activity_ms: now_millis(),
+            turns_completed: 0,
+            run_metrics: VecDeque::new(),
+            lifetime_turns: 0,
+            lifetime_duration_ms: 0,
+            lifetime_cost_usd: 0.0,
+            running: Some(running),
+            scrollback: VecDeque::new(),
+            scrollback_bytes: 0,
+        };
+
+        self.persist_meta(&session);
+        self.sessions.lock().unwrap().insert(id.clone(), session);
+        Ok(id)
+    }
+
     /// 确保 session 有活进程；未运行则按 type 重生（Task 5：一律全新，无 resume）。
     /// 并发安全：spawning 标志防止两个并发请求双 spawn 同一 session。
     pub async fn ensure_running(&self, id: &str) -> Result<(), String> {
@@ -1599,6 +1721,7 @@ impl SessionManager {
                 | (SessionType::Kiro, Some(ResumeToken::Kiro(_)))
                 | (SessionType::Codex, Some(ResumeToken::Codex(_)))
                 | (SessionType::Tmux, Some(ResumeToken::Tmux(_)))
+                | (SessionType::Crew, Some(ResumeToken::Crew(_)))
         );
         let result = match stype {
             SessionType::Claude => {
@@ -1621,6 +1744,13 @@ impl SessionManager {
                     _ => None,
                 };
                 self.spawn_codex(id, &work_dir, &owner_id, r).await
+            }
+            SessionType::Crew => {
+                let r = match &token {
+                    Some(ResumeToken::Crew(s)) => Some(s.clone()),
+                    _ => None,
+                };
+                self.spawn_crew(id, &work_dir, &owner_id, r).await
             }
             SessionType::Tmux => {
                 let t = match &token {
@@ -1650,6 +1780,7 @@ impl SessionManager {
                     SessionType::Claude => self.spawn_claude(id, &work_dir, &owner_id, None).await,
                     SessionType::Kiro => self.spawn_kiro(id, &work_dir, &owner_id, None).await,
                     SessionType::Codex => self.spawn_codex(id, &work_dir, &owner_id, None).await,
+                    SessionType::Crew => self.spawn_crew(id, &work_dir, &owner_id, None).await,
                     SessionType::Tmux => self.spawn_tmux(id, &work_dir, cols, rows, None),
                 };
                 match fresh {
@@ -2184,6 +2315,16 @@ fn claude_session_id(evt: &AcpEvent) -> Option<String> {
 fn kiro_session_id(evt: &AcpEvent) -> Option<String> {
     match evt {
         AcpEvent::System { session_id: Some(s), .. } => Some(s.clone()),
+        _ => None,
+    }
+}
+
+/// Crew 的 slot_key 来源有两个：spawn 开局那条 `System{init}`，与每轮的 `Result`。
+/// 双臂是必需的 —— 单看 Result 会让一个从未完成过一轮的会话拿不到 resume token。
+fn crew_slot_key(evt: &AcpEvent) -> Option<String> {
+    match evt {
+        AcpEvent::System { session_id: Some(s), .. } if !s.is_empty() => Some(s.clone()),
+        AcpEvent::Result { session_id, .. } if !session_id.is_empty() => Some(session_id.clone()),
         _ => None,
     }
 }
@@ -3390,6 +3531,297 @@ fn spawn_kiro_fanout(
     });
 }
 
+/// Crew fan-out. Mirrors `spawn_kiro_fanout` byte-for-byte in structure — the
+/// only differences are the resume-token source (`crew_slot_key` → `ResumeToken::Crew`)
+/// and the backend name in log lines. The fan-out no longer owns a child process but
+/// **one Gateway WS connection + one slot_key**; `CrewProcess`'s `Drop` deletes the
+/// remote slot, so CLAUDE.md's "the fan-out task is the sole owner of the session's
+/// process" invariant holds in that form (same as Codex owning an rmcp client).
+fn spawn_crew_fanout(
+    sid: String,
+    mut process: crate::acp::crew_process::CrewProcess,
+    event_tx: broadcast::Sender<String>,
+    mut input_rx: mpsc::Receiver<SessionInput>,
+    events: Arc<EventStore>,
+    agent_label: &'static str,
+    work_dir: String,
+    owner_id: String,
+    mgr: Weak<SessionManager>,
+) {
+    tokio::spawn(async move {
+        let mut token_saved = false;
+        let mut turn_seq: u64 = 0;
+        let mut local_running = false;
+        let mut boundary_count: u64 = 0;
+        // ── collect 队列状态(镜像 spawn_acp_fanout;见那里的不变量注释) ──
+        let mut queue = PromptQueue::new();
+        // 队列模式(G2b):passthrough 经 effective() 降级为 collect(见 QueueMode::effective)。
+        let mut queue_mode = QueueMode::Collect;
+        // ── per-run metrics state (mirrors spawn_acp_fanout) ──
+        // Per-turn (start, intent) FIFO; intent stamped on the live turn via
+        // set_live_intent from the input branch (Cancel/Timeout). See TurnStarts.
+        let mut turn_starts = TurnStarts::default();
+        loop {
+            tokio::select! {
+                event = process.event_rx.recv() => {
+                    match event {
+                        Some(evt) => {
+                            log_result_event(&events, agent_label, &sid, &work_dir, &owner_id, &evt);
+                            // Backfill the Crew resume token (the Gateway slot_key) on the
+                            // first id-bearing event. Two sources — `System{init}` at spawn
+                            // and every `Result` — see crew_slot_key: a session that never
+                            // completed a turn would otherwise never get a resume token.
+                            if !token_saved {
+                                if let Some(slot) = crew_slot_key(&evt) {
+                                    if let Some(m) = mgr.upgrade() {
+                                        m.set_resume_token(&sid, ResumeToken::Crew(slot));
+                                    }
+                                    token_saved = true;
+                                }
+                            }
+                            let is_boundary = matches!(
+                                evt,
+                                AcpEvent::Result { .. } | AcpEvent::Error { .. } | AcpEvent::Exit { .. }
+                            );
+                            emit(&mgr, &sid, &event_tx, turn_seq, &evt);
+                            if is_boundary {
+                                // A turn can emit >1 boundary (Error+Exit /
+                                // Error+Result). Clamp boundary_count to turn_seq
+                                // on the settling boundary and mark Idle with
+                                // turn_seq (not boundary_count) so the count can't
+                                // run past turn_seq and wedge the session Running
+                                // forever. Stale interrupt-resend boundaries
+                                // (count < turn_seq) get no Idle mark. See the
+                                // detailed note in spawn_acp_fanout.
+                                boundary_count += 1;
+                                if boundary_count >= turn_seq {
+                                    boundary_count = turn_seq;
+                                    local_running = false;
+                                    if let Some(m) = mgr.upgrade() {
+                                        m.mark_turn(&sid, TurnState::Idle, turn_seq);
+                                    }
+                                    // turn_done push (parity with spawn_acp_fanout — F4).
+                                    // Crew runs no scheduled tasks yet (trigger_run still
+                                    // hardcodes Claude), so every settling turn here is
+                                    // interactive (no active_run_id gate needed).
+                                    // dur AND intent read from the FIFO front (the settling
+                                    // turn's own entry) BEFORE settle() consumes it — so a
+                                    // Cancelled/Timeout turn is suppressed and coupled
+                                    // interrupt-resend turns don't cross-contaminate
+                                    // (review 2026-08-07 F3; 2026-08-08 F2).
+                                    let dur = turn_starts.front().map(|s| now_millis() - s).unwrap_or(0);
+                                    maybe_push_turn_done(&mgr, &sid, &owner_id, dur, turn_starts.front_intent());
+                                }
+                                // per-run metrics: one metric per boundary, intent overrides
+                                // event type (mirrors spawn_acp_fanout). Skipped when this
+                                // boundary has no matching turn-start stamp.
+                                let term = match &evt {
+                                    AcpEvent::Result { .. } => crate::run_metrics::TerminalEvt::Result,
+                                    AcpEvent::Error { .. } => crate::run_metrics::TerminalEvt::Error,
+                                    _ => crate::run_metrics::TerminalEvt::Exit,
+                                };
+                                // Consume THIS boundary's own (start, intent) from the FIFO
+                                // front; the per-turn intent can't be stolen by a coupled
+                                // interrupt-resend turn (review 2026-08-08, F2).
+                                let settled = turn_starts.settle();
+                                let outcome = crate::run_metrics::classify_outcome(
+                                    term, settled.and_then(|(_, o)| o));
+                                let (mc, mt_in, mt_out) = match &evt {
+                                    AcpEvent::Result { cost_usd, tokens_in, tokens_out, .. } => (*cost_usd, *tokens_in, *tokens_out),
+                                    _ => (None, None, None),
+                                };
+                                let fk = match outcome {
+                                    crate::run_metrics::RunOutcome::Errored => Some(
+                                        if matches!(evt, AcpEvent::Exit { .. }) { "cli_exited" } else { "cli_error" }.to_string()),
+                                    _ => None,
+                                };
+                                if let Some((started, _)) = settled {
+                                    if let Some(m) = mgr.upgrade() {
+                                        let rid = crate::run_metrics::new_run_id();
+                                        let metric = build_run_metric(&rid, &sid, &work_dir, agent_label, turn_seq,
+                                            started, now_millis(), outcome, fk, mc, mt_in, mt_out);
+                                        m.record_run_metric(&sid, metric);
+                                    }
+                                }
+                                // collect:turn 结束(已 Idle)且有排队追加 → arm 收集窗口。
+                                if !local_running {
+                                    queue.arm();
+                                }
+                            }
+                        }
+                        None => break,
+                    }
+                }
+                input = input_rx.recv() => {
+                    match input {
+                        Some(SessionInput::Prompt { text, run_id, client_id }) => {
+                            // Echo each user prompt as its own UserPrompt event (P1):
+                            // N collect-merged messages still surface as N bubbles.
+                            // turn_id = the turn this prompt will belong to. In the
+                            // idle/run_id branches turn_seq is incremented below to
+                            // start the turn, so prompt_turn (turn_seq+1) matches. In
+                            // the collect path queued prompts each use turn_seq+1; since
+                            // turn_seq stays fixed while running/in-window until the
+                            // merged flush does turn_seq+=1, all share the same next-turn
+                            // id, matching the merged assistant turn (T1).
+                            let prompt_turn = turn_seq + 1;
+                            emit(&mgr, &sid, &event_tx, prompt_turn, &AcpEvent::UserPrompt {
+                                text: truncate_prompt_for_scrollback(&text),
+                                turn_id: prompt_turn,
+                                client_id: client_id.clone(),
+                            });
+                            if run_id.is_some() {
+                                // C3:调度 prompt 绕过 collect(crew 当前不跑调度,留此分支保持四 fanout 对称)
+                                queue.clear();
+                                if local_running {
+                                    // Latent parity hardening — see the Claude fan-out's run_id arm
+                                    // (review 2026-08-14, F2). Crew runs no scheduled tasks so this is
+                                    // doubly dead, but the fanouts are kept byte-symmetric.
+                                    turn_starts.set_live_intent(crate::run_metrics::RunOutcome::Cancelled);
+                                    if let Err(e) = process.interrupt().await {
+                                        tracing::warn!("interrupt before resend failed for {}: {}", sid, e);
+                                    }
+                                }
+                                turn_seq += 1;
+                                local_running = true;
+                                turn_starts.start(now_millis());
+                                if let Some(m) = mgr.upgrade() {
+                                    m.mark_turn(&sid, TurnState::Running, turn_seq);
+                                }
+                                if let Err(e) = process.send_prompt(&text).await {
+                                    tracing::warn!("Crew send_prompt failed for {}: {}", sid, e);
+                                }
+                            } else {
+                                // 非调度 prompt:按队列模式分流(G2b)。Crew 为 ACP,
+                                // passthrough 已在 SetQueueMode 处降级为 collect。
+                                match queue_mode {
+                                    QueueMode::Interrupt if local_running => {
+                                        // Stamp Cancelled intent on the live turn before starting
+                                        // the next — see the Claude fan-out. (review 2026-08-10)
+                                        turn_starts.set_live_intent(crate::run_metrics::RunOutcome::Cancelled);
+                                        if let Err(e) = process.interrupt().await {
+                                            tracing::warn!("interrupt (queue mode) failed for {}: {}", sid, e);
+                                        }
+                                        queue.clear();
+                                        turn_seq += 1;
+                                        local_running = true;
+                                        turn_starts.start(now_millis());
+                                        if let Some(m) = mgr.upgrade() {
+                                            m.mark_turn(&sid, TurnState::Running, turn_seq);
+                                        }
+                                        if let Err(e) = process.send_prompt(&text).await {
+                                            tracing::warn!("Crew send_prompt failed for {}: {}", sid, e);
+                                        }
+                                    }
+                                    QueueMode::Passthrough => {
+                                        turn_seq += 1;
+                                        local_running = true;
+                                        turn_starts.start(now_millis());
+                                        if let Some(m) = mgr.upgrade() {
+                                            m.mark_turn(&sid, TurnState::Running, turn_seq);
+                                        }
+                                        if let Err(e) = process.send_prompt(&text).await {
+                                            tracing::warn!("Crew send_prompt failed for {}: {}", sid, e);
+                                        }
+                                    }
+                                    _ => {
+                                        if local_running {
+                                            queue.enqueue(text);
+                                            emit_queued(&event_tx, queue.pending.len());
+                                        } else if queue.debounce.is_some() {
+                                            queue.enqueue(text);
+                                            queue.bump_debounce();
+                                            emit_queued(&event_tx, queue.pending.len());
+                                        } else {
+                                            turn_seq += 1;
+                                            local_running = true;
+                                            turn_starts.start(now_millis());
+                                            if let Some(m) = mgr.upgrade() {
+                                                m.mark_turn(&sid, TurnState::Running, turn_seq);
+                                            }
+                                            if let Err(e) = process.send_prompt(&text).await {
+                                                tracing::warn!("Crew send_prompt failed for {}: {}", sid, e);
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        Some(SessionInput::SetQueueMode(m)) => {
+                            queue_mode = m.effective();
+                            // Mirror the authoritative mode into the Session so a
+                            // reconnecting/observer client can read it from replay_done
+                            // instead of guessing (review 2026-07-26).
+                            if let Some(mgr) = mgr.upgrade() {
+                                mgr.mark_queue_mode(&sid, queue_mode);
+                            }
+                            // Also broadcast it LIVE so an already-connected tab adopts
+                            // the new mode without a reconnect (review 2026-07-27,
+                            // F-OBS-LIVE). replay_done only delivers it at connect time.
+                            emit_queue_mode(&event_tx, queue_mode);
+                        }
+                        Some(SessionInput::Interrupt) => {
+                            if local_running {
+                                // Intent: the LIVE turn (FIFO back) is not a completion
+                                // (per-entry so a coupled resend can't misattribute — F2).
+                                turn_starts.set_live_intent(crate::run_metrics::RunOutcome::Cancelled);
+                                if let Err(e) = process.interrupt().await {
+                                    tracing::warn!("interrupt failed for {}: {}", sid, e);
+                                }
+                            }
+                            // E5:无条件清队列 + 取消窗口
+                            queue.clear();
+                        }
+                        Some(SessionInput::Cancel) => {
+                            // Intent before kill: classify the LIVE turn as Cancelled
+                            // (FIFO back entry — see spawn_acp_fanout, F2).
+                            turn_starts.set_live_intent(crate::run_metrics::RunOutcome::Cancelled);
+                            process.kill().await;
+                        }
+                        Some(SessionInput::TimeoutKill { .. }) => {
+                            // Intent before kill: classify the LIVE turn as Timeout
+                            // (FIFO back entry — see spawn_acp_fanout, F2).
+                            turn_starts.set_live_intent(crate::run_metrics::RunOutcome::Timeout);
+                            process.kill().await;
+                        }
+                        None => break,
+                        // PtyData / PtyResize aren't meaningful for a Gateway-backed
+                        // agent session — they only apply to PTY/tmux. Drop
+                        // silently rather than mis-route into send_prompt.
+                        // (`SessionInput::Approval` lands here too until Task 7
+                        // wires it to `CrewProcess::resolve_approval`.)
+                        _ => {}
+                    }
+                }
+                _ = async {
+                    match (queue.debounce.as_mut(), queue.hard_cap.as_mut()) {
+                        (Some(d), Some(h)) => { tokio::select! { _ = d.as_mut() => {}, _ = h.as_mut() => {} } }
+                        (Some(d), None) => d.as_mut().await,
+                        (None, Some(h)) => h.as_mut().await,
+                        (None, None) => std::future::pending::<()>().await,
+                    }
+                }, if queue.debounce.is_some() => {
+                    queue.disarm();
+                    if !queue.pending.is_empty() {
+                        let merged = queue.drain_merged();
+                        turn_seq += 1;
+                        local_running = true;
+                        turn_starts.start(now_millis());
+                        if let Some(m) = mgr.upgrade() {
+                            m.mark_turn(&sid, TurnState::Running, turn_seq);
+                        }
+                        if let Err(e) = process.send_prompt(&merged).await {
+                            tracing::warn!("collect flush send_prompt failed for {}: {}", sid, e);
+                        }
+                    }
+                }
+            }
+        }
+        mark_fanout_ended(&mgr, &sid);
+        tracing::info!("Crew fan-out task ended for session {}", sid);
+    });
+}
+
 fn spawn_codex_fanout(
     sid: String,
     mut process: crate::acp::codex_process::CodexProcess,
@@ -3929,6 +4361,8 @@ mod decide_spawn_tests {
             "kiro".into(),
             "codex".into(),
             "off".into(),
+            5476,
+            "/tmp/crew".into(),
             "bash".into(),
             false,
         );
@@ -4089,7 +4523,8 @@ mod turn_state_tests {
             let store = Arc::new(crate::session_store::SessionStore::open(dir.path()).unwrap());
             let mgr = SessionManager::new(
                 events, store,
-                "claude".into(), "kiro".into(), "codex".into(), "off".into(), "bash".into(), false,
+                "claude".into(), "kiro".into(), "codex".into(), "off".into(),
+                5476, "/tmp/crew".into(), "bash".into(), false,
             );
             (mgr, dir)
         };
@@ -4578,7 +5013,8 @@ mod running_summary_tests {
         let store = Arc::new(crate::session_store::SessionStore::open(dir.path()).unwrap());
         let m = SessionManager::new(
             events, store,
-            "claude".into(), "kiro-cli".into(), "codex".into(), "off".into(), "bash".into(), false,
+            "claude".into(), "kiro-cli".into(), "codex".into(), "off".into(),
+            5476, "/tmp/crew".into(), "bash".into(), false,
         );
         // Wire a scheduled store: `scheduled` in the summary is now sourced from
         // the DB in-flight run count, so tests that exercise the scheduled gate
@@ -5244,6 +5680,61 @@ mod tests {
         assert_eq!(m.cost_usd, Some(0.05));
         assert_eq!(m.turn_seq, 3);
     }
+
+    #[test]
+    fn crew_session_type_roundtrips() {
+        // 持久化往返：DB 里存 "crew"，读回必须还是 Crew（而不是回落 Tmux —— 那会让
+        // 一个 Crew 会话在服务重启后变成终端，且 resume_token 被当成垃圾丢掉）。
+        assert_eq!(SessionType::Crew.to_string(), "crew");
+        assert!(matches!(SessionType::from_str_lenient("crew"), SessionType::Crew));
+        // 未知值回落 Tmux（既有约定，最保守：PTY 无 resume 副作用）。
+        assert!(matches!(SessionType::from_str_lenient("nonsense"), SessionType::Tmux));
+        // 注意：`"kiro"` 此时仍映射 `SessionType::Kiro`（Task 11 才删除该后端），
+        // 所以**不能**在这里断言它回落 Tmux —— 那条断言属于 Task 11 Step 2。
+    }
+
+    #[test]
+    fn crew_resume_token_roundtrips() {
+        // Crew 的 resume 载荷是 slot_key（不是 session id）—— 重生时用它
+        // `GET /api/chat/slots/{key}` 确认存活即接回。
+        let t = ResumeToken::Crew("zmx-abc12345".to_string());
+        let (kind, value) = t.to_kind_value();
+        assert_eq!(kind, "crew");
+        assert_eq!(value, "zmx-abc12345");
+        assert!(matches!(
+            ResumeToken::from_kind_value("crew", "zmx-abc12345"),
+            Some(ResumeToken::Crew(v)) if v == "zmx-abc12345"
+        ));
+    }
+
+    #[test]
+    fn crew_slot_key_reads_both_sources() {
+        // 两个源都填 slot_key：spawn 开局那条 System{init}，与每轮的 Result。
+        // 照 claude_session_id（:2174-2180）的双臂形状 —— 单臂会让一个从未完成
+        // 过一轮的会话（只有 init）拿不到 resume token。
+        let init = AcpEvent::System {
+            subtype: std::borrow::Cow::Borrowed("init"),
+            session_id: Some("zmx-abc12345".into()),
+            count: None,
+        };
+        assert_eq!(crew_slot_key(&init).as_deref(), Some("zmx-abc12345"));
+        let result = AcpEvent::Result {
+            text: "done".into(), turn_id: 1, session_id: "zmx-abc12345".into(),
+            cost_usd: None, tokens_in: None, tokens_out: None,
+        };
+        assert_eq!(crew_slot_key(&result).as_deref(), Some("zmx-abc12345"));
+        // 空 session_id 不算（否则会存一个空 token，重生时 GET /slots/ 变成列表请求）。
+        let empty = AcpEvent::Result {
+            text: String::new(), turn_id: 1, session_id: String::new(),
+            cost_usd: None, tokens_in: None, tokens_out: None,
+        };
+        assert!(crew_slot_key(&empty).is_none());
+        // 其它 System subtype 不带 slot_key。
+        let queued = AcpEvent::System {
+            subtype: std::borrow::Cow::Borrowed("queued"), session_id: None, count: Some(2),
+        };
+        assert!(crew_slot_key(&queued).is_none());
+    }
 }
 
 #[cfg(test)]
@@ -5256,7 +5747,8 @@ mod lifetime_tests {
         let store = Arc::new(crate::session_store::SessionStore::open(dir.path()).unwrap());
         let mgr = SessionManager::new(
             events, store,
-            "claude".into(), "kiro".into(), "codex".into(), "off".into(), "bash".into(), false,
+            "claude".into(), "kiro".into(), "codex".into(), "off".into(),
+            5476, "/tmp/crew".into(), "bash".into(), false,
         );
         (mgr, dir)
     }

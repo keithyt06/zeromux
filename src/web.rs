@@ -684,6 +684,12 @@ async fn create_session(
                 .await
                 .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?
         }
+        crate::session_manager::SessionType::Crew => {
+            state.sessions
+                .create_crew_session(name.clone(), &work_dir, state.default_cols, state.default_rows, &owner_id)
+                .await
+                .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?
+        }
     };
 
     // 启动 Prompt：gating 决策抽到 should_send_initial_prompt（已单测）。

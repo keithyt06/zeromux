@@ -1387,6 +1387,33 @@ HTTP 部分：一个 `async fn crew_token(state) -> Result<String, String>`（�
 
 **`X-Session-Key` 的取法**：从 `state.sessions` 里找当前 owner 的任一 `SessionType::Crew` 会话，取其 `ResumeToken::Crew(slot_key)`。**找不到就返回 409** + 明确提示「需要先开一个 Kiro Crew 会话」—— **绝不猜一个 slot 名**（会得到 `unknown session`，且用户看不懂）。
 
+> **⚠️ 前置缺口（我在派单前核实发现，计划原本漏了）**：`SessionManager` 只有
+> `set_resume_token`（`:2126`），**没有对应的读取方法**；`SessionInfo`（`:355-369`）
+> 也**不携带** resume token。所以本任务必须先加一个读取器，例如：
+>
+> ```rust
+>     /// 返回当前 owner 的任一活 Crew 会话的 Gateway slot key。
+>     /// 记忆写入需要 `X-Session-Key: <已存在的 slot>`（实测：缺头 →
+>     /// `missing_session_key`，给不存在的 slot → `unknown session`），而 slot key
+>     /// 只存在于 `ResumeToken::Crew` 里 —— `SessionInfo` 不带它，也不该带
+>     /// （那会把它暴露给前端，而前端无需知道 slot 命名）。
+>     pub fn any_crew_slot_key(&self, owner_id: &str) -> Option<String> {
+>         let map = self.sessions.lock().unwrap();
+>         map.values()
+>             .filter(|s| s.session_type == SessionType::Crew && s.owner_id == owner_id)
+>             .find_map(|s| match &s.resume_token {
+>                 Some(ResumeToken::Crew(k)) if !k.is_empty() => Some(k.clone()),
+>                 _ => None,
+>             })
+>     }
+> ```
+>
+> `SessionType` **已 derive `PartialEq`**（`:44`，实测确认），所以上面的 `==` 可直接用。
+>
+> 另：刚建的 Crew 会话在**第一个 `System{init}` 事件被 fan-out 处理之前**还没有
+> resume token（回填发生在 `spawn_crew_fanout` 的事件循环里）。所以 409 的提示语
+> 应写「需要先开一个 Kiro Crew 会话**并等它就绪**」，而不是让用户以为功能坏了。
+
 - [ ] **Step 4: 运行测试确认通过**
 
 Run: `cargo test crew_memory 2>&1 | tail -6` → Expected 2 passed。

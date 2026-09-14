@@ -1594,7 +1594,15 @@ EOF
 
 - [ ] **Step 1: 写失败测试**
 
-在 `crewMemoryWrite.test.tsx` 追加 `describe('T15-c 记忆面板')` 的 4 个测试（代码见附录 E4）：空状态即写入表单、骨架不算记忆、删行下标映射、`gateway_ok:false` 显示降级条而非空状态。
+在 `crewMemoryWrite.test.tsx` 追加 `describe('T15-d 记忆面板')` 的 **4 个面板级测试**：空状态即写入表单、骨架不算记忆、删行下标映射、`gateway_ok:false` 显示降级条**且空状态缺席**。
+
+> **两处订正**（由执行 Task 10 的 subagent 发现，我核实确认）：
+> 1. **没有"附录 E4"** —— 计划只有附录 E4-A（骨架 + 五个要点），不含这 4 条测试的代码。请自己写，参照下面第 2 点的要求。
+> 2. **describe 名用 `T15-d` 而非 `T15-c`** —— `T15-c` 已被附录 E3-D 的那组占用（Task 9 已落地）。且起草稿的 `T15-c` 块**不是 4 条面板测试**，而是 2 条面板 + 3 条纯函数，后 3 条已在 `lib/__tests__/crewMemory.test.ts`（T15-b）里 —— 照抄会重复 3 条、得 293 而非 292。
+>
+> **第 4 条测试必须同时断言两件事**：降级条**存在** `expect(await screen.findByText(/Gateway 未响应/))`，**且**空状态**缺席** `expect(screen.queryByText('它还什么都没记住')).not.toBeInTheDocument()`。
+>
+> **只断言前者会漏掉一个真缺陷**：后端的 `CrewMemoryResponse::unreachable()` 用 `..Default::default()`（`crew_memory.rs:57-59`），所以降级响应四段**必然全空** → 若 `isEmpty` 从数据推导，`gateway_ok:false` 必然使 `isEmpty==true`，降级条与空状态会**同时渲染**，而空状态里那个写入表单在 Gateway 不可达时是**死控件**。起草稿正是这样，且它自己那条测试只断言 banner 存在，所以没被发现。正确做法是 `let degraded = !!mem && !mem.gateway_ok; let isEmpty = !degraded && ...`，并为 degraded 单独一个渲染分支。
 
 - [ ] **Step 2: 运行确认失败**
 
@@ -4179,7 +4187,7 @@ describe('T15-c 走代理端点：路径不带 key，凭证不进前端', () => 
 
 ## 附录 E4-A：`MemoryPanel.tsx`
 
-见起草稿完整实现。**四个要点**（实施时逐条对照）：
+见下方骨架。**五个要点**（实施时逐条对照 —— 原写「四个」是笔误，实际列了 5 条）：
 
 1. **空状态本身就是写入表单**，不是「暂无数据」—— 实测记忆现在必然是空的（semantic `[]`、lessons `[]`、preferences 56 字节全骨架）。文案给因果（"下一轮起它会自动带上"）。输入框 `text-base` + 按钮 `min-h-[44px]`。
 2. **`gateway_ok:false` 显示黄色降级条，与"真的空"是两种完全不同的含义** —— 混淆了用户会以为记忆被清空。

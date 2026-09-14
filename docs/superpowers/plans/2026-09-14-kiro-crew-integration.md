@@ -479,9 +479,16 @@ Run: `cargo test crew_process 2>&1 | tail -10`
 
 Expected: 编译失败 —— `cannot find function 'normalize_frame'` / `cannot find type 'NormState'`。
 
-- [ ] **Step 4: 实现纯函数部分（`NormState` + `normalize_frame` + `crew_event_is_forward_progress`）**
+- [ ] **Step 4: 加 `AcpEvent` 两个变体（附录 D）+ 实现纯函数部分（附录 N）**
 
-代码见附录 N。三条不变量的落点：
+> **本 Step 已订正顺序**（原计划把附录 D 排在 Step 8，是真错误）：附录 N 的
+> `normalize_frame` 在 `"approval"` / `"context_usage"` 两臂里**构造** `AcpEvent::Approval{..}`
+> 与 `AcpEvent::ContextUsage{..}`，附录 T 的 `T-extra-2` 又 `match` 它们 —— 所以
+> **附录 D 是附录 N 的硬编译前提**，D 缺席时 Step 5 的「11 passed」不可能达成
+> （验红输出里会出现 `no variant named 'Approval' found for enum AcpEvent`）。
+> 我验证代码的那个临时 crate 两者都有，所以没暴露这个顺序依赖。
+
+先按**附录 D** 在 `src/acp/process.rs` 的 `Exit` 变体（`:92-94`）之后插入两个新变体，再按**附录 N** 实现纯函数。三条不变量的落点：
 
 | 不变量 | 落点 | 漏了的后果 |
 |---|---|---|
@@ -509,9 +516,9 @@ Run: `cargo test 2>&1 | tail -3`
 
 Expected: `397 passed`（Task 2 结束的 386 + 本任务 11）。
 
-- [ ] **Step 8: 加 `AcpEvent` 两个变体**
+- [ ] **Step 8: 确认两个新变体对全仓库零破损**
 
-在 `src/acp/process.rs` 的 `Exit`（`:92-94`）之后、闭合 `}` 之前插入（代码见附录 D）。
+变体本身已在 Step 4 插入（见那里的顺序订正）。本 Step 是**确认**：它们对全仓库 12 处 `match` 零破损。
 
 **加变体的安全性已实测**：我把这两个变体临时插进 `process.rs` 跑了 `cargo check` → `Finished dev profile`，**零错误**。原因：`AcpEvent` 只 `derive(Debug, Clone, Serialize)`（`process.rs:25`，**无 `Deserialize`**），且全仓库 12 处对它的 `match` 全部带 `_ =>` 兜底或用 `matches!`/`if let`（核对了 `session_manager.rs:2175/2185/2193/2417/2468/2486/2951/3188/3199/3469/3480`、`auto_titler.rs:107-110`、`run_metrics.rs:39`）。
 

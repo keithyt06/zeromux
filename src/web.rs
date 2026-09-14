@@ -3235,6 +3235,7 @@ async fn run_scheduled_now(
             &user.id,
             &id,
             cfg.prompt.clone(),
+            &cfg.agent_type,
         )
         .await
     {

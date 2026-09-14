@@ -1161,7 +1161,7 @@ pub fn spawn_scheduler(
                                         Ok(true) => {
                                             let nm = format!("{} · {}", task.name,
                                                 fire.with_timezone(&Shanghai).format("%H:%M"));
-                                            if let Err(err) = m.trigger_run(&run.id, nm, &task.work_dir, &task.owner_id, &task.id, task.prompt.clone()).await {
+                                            if let Err(err) = m.trigger_run(&run.id, nm, &task.work_dir, &task.owner_id, &task.id, task.prompt.clone(), &task.agent_type).await {
                                                 let _ = s.set_run_state(&run.id, "failed", None, None, Some("spawn_failed"), Some(now.timestamp_millis()));
                                                 tracing::warn!("trigger {} failed: {}", task.id, err);
                                             }

@@ -1217,8 +1217,13 @@ impl SessionManager {
         RunningSummary { interactive, scheduled, scheduled_read_failed }
     }
 
-    /// Create a Claude session for a scheduled run, mark the run running, and
+    /// Create the agent session for a scheduled run, mark the run running, and
     /// inject the goal prompt carrying the run_id (so the fan-out finalizes it).
+    ///
+    /// `agent_type` is the task's stored backend label. Before this it was a DEAD
+    /// field: `trigger_run` hardcoded `create_acp_session_tagged` (Claude) and never
+    /// read it. It is now read through `scheduled_session_type` — the single place
+    /// where a new scheduled backend gets wired in.
     pub async fn trigger_run(
         &self,
         run_id: &str,
@@ -1227,6 +1232,7 @@ impl SessionManager {
         owner_id: &str,
         task_id: &str,
         prompt: String,
+        agent_type: &str,
     ) -> Result<String, String> {
         // Last gate before a process + git worktree hit disk. The HTTP layer
         // validated work_dir at create/update, but stored paths can be pre-check
@@ -1253,17 +1259,31 @@ impl SessionManager {
         // `work_dir` string. Re-resolving the unvalidated string downstream would
         // let a symlink swapped in after the check escape HOME (the TOCTOU above).
         let canonical_str = canonical_dir.to_string_lossy();
-        // default terminal size for unattended sessions
-        let sid = self
-            .create_acp_session_tagged(
-                name,
-                &canonical_str,
-                80,
-                24,
-                owner_id,
-                Some(task_id.to_string()),
-            )
-            .await?;
+        // default terminal size for unattended sessions.
+        // 分派按 `scheduled_session_type(agent_type)` —— 在本任务之前这里硬编码
+        // Claude，`agent_type` 根本没被读。目前所有值都映射 Claude（见该函数的
+        // 文档注释：Crew/Codex 的 fan-out 缺 run 终结机制，放行会卡死 E1 门），
+        // 所以这是**行为等价**的重构 + 日后放行的接入点。
+        // 穷尽 match(不写 `_`)是刻意的:日后 scheduled_session_type 放行一个新
+        // SessionType 时,这里会**编译失败**而不是静默落进兜底臂开一个 Claude 会话。
+        let sid = match scheduled_session_type(agent_type) {
+            SessionType::Claude
+            // 这三个分支当前**不可达**(scheduled_session_type 只产出 Claude);
+            // 列出来是为了让穷尽性检查在放行时报错。放行某个后端时把它从这里
+            // 挪出去,配一个 create_<backend>_session_tagged。
+            | SessionType::Crew
+            | SessionType::Codex
+            | SessionType::Tmux => self
+                .create_acp_session_tagged(
+                    name,
+                    &canonical_str,
+                    80,
+                    24,
+                    owner_id,
+                    Some(task_id.to_string()),
+                )
+                .await?,
+        };
         if let Some(store) = self.scheduled.lock().unwrap().clone() {
             let _ = store.set_run_state(run_id, "running", Some(&sid), None, None, None);
         }
@@ -1274,7 +1294,9 @@ impl SessionManager {
             let snap = serde_json::json!({
                 "prompt": prompt,
                 "work_dir": canonical_str.as_ref(),
-                "agent_type": "claude",
+                // 记真实分派的类型（而不是 task 上存的字符串）—— replay 才不会
+                // 因为 config 被改成一个尚未放行的后端而换掉行为。
+                "agent_type": scheduled_session_type(agent_type).to_string(),
                 "secrets": [],
             }).to_string();
             let _ = store.set_input_snapshot(run_id, &snap);
@@ -1332,7 +1354,11 @@ impl SessionManager {
             .map_err(|e| format!("bad snapshot: {e}"))?;
         let prompt = v["prompt"].as_str().unwrap_or("").to_string();
         let work_dir = v["work_dir"].as_str().unwrap_or(".").to_string();
-        self.trigger_run(new_run_id, name, &work_dir, owner_id, task_id, prompt).await
+        // 快照里的 agent_type 是 trigger 时**真实分派**的类型（见 trigger_run 的
+        // set_input_snapshot），所以 replay 重放的是原 run 的后端，而不是 config
+        // 现在的值。缺字段的老快照回落 "claude"（当时唯一可能的分派）。
+        let agent_type = v["agent_type"].as_str().unwrap_or("claude").to_string();
+        self.trigger_run(new_run_id, name, &work_dir, owner_id, task_id, prompt, &agent_type).await
     }
 
     /// 交互式启动 prompt：把 `prompt` 作为第一条用户消息透传给 agent 会话。
@@ -2190,6 +2216,43 @@ fn finalize_active_run_if_scheduled(
         if let Some(m) = mgr.upgrade() {
             m.finalize_run(&rid, "failed", None, Some(failure_kind));
         }
+    }
+}
+
+/// 定时任务的 `agent_type` → `SessionType`。
+///
+/// `agent_type` 是 DB 里的自由字符串（`scheduled_tasks.rs:357`），所以映射必须显式
+/// 且有回落。**回落 Claude 是保持现状**：`trigger_run` 在本任务之前一直硬编码
+/// Claude，生产库里唯一一行也是 `'claude'`。
+///
+/// 未知值不 fail 而是回落，理由：定时任务是无人值守的，一个 fail 会让 run 静默
+/// 失败并进 failed 终态；回落到一个能跑的后端至少留下可读的输出。
+///
+/// **为什么 `"crew"` / `"codex"` 目前也回落 Claude（而不是各自的 SessionType）**：
+/// 只有 `spawn_acp_fanout`（Claude）实现了 scheduled-run 的终结机制 ——
+/// `active_run_id` 窗口 + 边界上按终态事件 `finalize_run(succeeded/failed)` +
+/// 被抢占时的 `finalize_active_run_if_scheduled`。`spawn_crew_fanout` 与
+/// `spawn_codex_fanout` **各自 `finalize_run` 出现 0 次**（它们的 `run_id.is_some()`
+/// 臂会正常发 prompt，但把 run_id 丢掉）。
+///
+/// 若在补齐 fan-out 之前放行，后果是确定性的、且无人值守时看不见：
+/// 1. `agent_task_runs` 那行永远停在 `state='running'`；
+/// 2. `active_run_count()`（数 `state IN ('claimed','running')`）永久 ≥1；
+/// 3. `auto_update.rs` 的门见 `summary.scheduled > 0` → **永久阻塞自动升级**
+///    （该分支注释原文「永不强制穿透」）；
+/// 4. 该任务的 overlap guard wedge → 后续每次触发都被记 `skipped`；
+/// 5. 直到看门狗按 `idle_timeout_min`（默认 60 分钟）把它标成
+///    `aborted` + `watchdog_timeout` —— 即每个这样的 run 都必然记为超时失败。
+///
+/// **放行的前置条件**：给对应 fan-out 补上 `active_run_id` + `finalize_run`
+/// （照 `spawn_acp_fanout` 的形状，含 `maybe_push_turn_done` 的
+/// `active_run_id.is_none()` 门，否则调度 run 会误发交互式 turn_done push），
+/// 然后把这里的臂改成对应 `SessionType`，并写 `create_<backend>_session_tagged`
+/// （目前只有 `create_acp_session_tagged` 存在）。
+fn scheduled_session_type(agent_type: &str) -> SessionType {
+    match agent_type {
+        // 放行时在此加臂 —— 见上面的前置条件。当前刻意没有 "crew" / "codex" 臂。
+        _ => SessionType::Claude,
     }
 }
 
@@ -5328,6 +5391,25 @@ mod tests {
         // Task 11 起 `"kiro"` 不再是已知类型 → 走未知值回落 Tmux（最保守，
         // PTY 无 resume 副作用）。这条在 Task 5 时不成立，故当时未写。
         assert!(matches!(SessionType::from_str_lenient("kiro"), SessionType::Tmux));
+    }
+
+    #[test]
+    fn scheduled_agent_type_maps_to_session_type() {
+        // agent_type 是自由字符串（DB 里存什么都行），所以必须有一个显式映射函数，
+        // 且未知值要有明确回落 —— 否则一个手改过 DB 的 agent_type 会静默变成
+        // 别的后端，而定时任务是无人值守的（错了没人当场看见）。
+        assert!(matches!(scheduled_session_type("claude"), SessionType::Claude));
+        // 未知/空 → 回落 Claude（既有行为:生产库里 1 行 agent_type='claude'，
+        // 且 trigger_run 在本任务之前一直硬编码 Claude，所以这个回落等于保持现状）。
+        assert!(matches!(scheduled_session_type("kiro"), SessionType::Claude));
+        assert!(matches!(scheduled_session_type(""), SessionType::Claude));
+        assert!(matches!(scheduled_session_type("nonsense"), SessionType::Claude));
+        // **下面两条断言 Claude 是刻意的，不是笔误。** `"crew"` / `"codex"` 目前
+        // 同样回落 Claude —— 见 `scheduled_session_type` 的文档注释：它们的 fan-out
+        // 还没有 `active_run_id` + `finalize_run` 机制，放行会让 run 永停 running。
+        // 放行时把这两条改成各自的 SessionType，并同时补 fan-out。
+        assert!(matches!(scheduled_session_type("crew"), SessionType::Claude));
+        assert!(matches!(scheduled_session_type("codex"), SessionType::Claude));
     }
 
     #[test]

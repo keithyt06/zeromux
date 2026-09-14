@@ -428,29 +428,51 @@ async fn sleep_or_stop(dur: std::time::Duration, cmd_rx: &mut mpsc::Receiver<Cmd
 /// 轮次结束才一次性涌出。**与 codex_process.rs:74-77 那条「回调必须 try_send，
 /// await 会锁死 rmcp 的 transport reader」是同一类错误。**
 async fn prompt_worker(
-    http_base: String, secret: String, http: reqwest::Client,
+    cfg: CrewConfig, http: reqwest::Client,
     slot_key: String, mut rx: mpsc::Receiver<String>,
 ) {
     while let Some(text) = rx.recv().await {
-        if let Err(e) = post_prompt(&http, &http_base, &secret, &slot_key, &text).await {
+        // **每次投递前现读 secret**（不缓存）：Gateway 每次重启都轮换
+        // `run/gateway-<port>.secret`（实测 6853ccebfa39 → c1a1086f71c9），
+        // 一份长期持有的 secret 在 Gateway 重启后就永久 403。这与 `Drop` 里
+        // 「同步栈上现读」是同一个模式。读的是本地 0600 文件，开销可忽略。
+        let secret = match read_gateway_secret(&cfg.crew_home, cfg.port) {
+            Ok(sec) => sec,
+            Err(e) => { tracing::warn!("crew send_prompt: {e}"); continue; }
+        };
+        if let Err(e) = post_prompt(&http, &cfg.http_base, &secret, &slot_key, &text).await {
             tracing::warn!("crew send_prompt: {e}");
         }
     }
 }
 
 async fn run_event_loop(
-    cfg: CrewConfig, secret: String, http: reqwest::Client, slot_key: String,
+    cfg: CrewConfig, http: reqwest::Client, slot_key: String,
     event_tx: mpsc::Sender<AcpEvent>, mut cmd_rx: mpsc::Receiver<Cmd>,
 ) {
     let (prompt_tx, prompt_rx) = mpsc::channel::<String>(64);
-    tokio::spawn(prompt_worker(cfg.http_base.clone(), secret.clone(), http.clone(),
-                              slot_key.clone(), prompt_rx));
+    tokio::spawn(prompt_worker(cfg.clone(), http.clone(), slot_key.clone(), prompt_rx));
 
     let mut backoff = Backoff::new();
     let mut st = NormState::new();
 
     // `let exit_code = 'outer: loop {…}` 保证 Exit 恰好从一个出口发一次。
     let exit_code = 'outer: loop {
+        // **每轮（重）连都现读 secret，不缓存**：Gateway 每次重启都轮换
+        // `run/gateway-<port>.secret`（实测重启前后 6853ccebfa39 → c1a1086f71c9）。
+        // 长期持有一份 secret 会让「Gateway 重启后会话永久 403、backoff 无限重试」
+        // —— 端到端验收第 8 条抓到的真 bug。`Drop` 里本来就是同步栈上现读，
+        // 「现读」是本模块已确立的模式，只是重连路径当初漏了。
+        let secret = match read_gateway_secret(&cfg.crew_home, cfg.port) {
+            Ok(sec) => sec,
+            Err(e) => {
+                if event_tx.send(AcpEvent::Error { message: e }).await.is_err() { return; }
+                match sleep_or_stop(backoff.next(), &mut cmd_rx).await {
+                    LoopStep::Continue => continue 'outer,
+                    LoopStep::Stop => break 'outer 0,
+                }
+            }
+        };
         // 每次（重）连都重新 mint token（廉价，且覆盖 token 被 revoke 的情形）。
         let token = match mint_ws_token(&http, &cfg.http_base, &secret).await {
             Ok(t) => t,
@@ -612,7 +634,7 @@ impl CrewProcess {
             count: None,
         }).await;
 
-        tokio::spawn(run_event_loop(cfg.clone(), secret, http, slot_key.clone(), event_tx, cmd_rx));
+        tokio::spawn(run_event_loop(cfg.clone(), http, slot_key.clone(), event_tx, cmd_rx));
         Ok(Self { cmd_tx, event_rx, cfg, slot_key })
     }
 

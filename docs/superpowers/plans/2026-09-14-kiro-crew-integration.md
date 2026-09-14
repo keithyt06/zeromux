@@ -1518,7 +1518,7 @@ Expected: 全红 —— 模块不存在。
 
 - [ ] **Step 5: 运行测试确认通过**
 
-Run: `cd frontend && npx vitest run crewMemory 2>&1 | tail -8` → Expected 13 passed（7 + 6）。
+Run: `cd frontend && npx vitest run crewMemory 2>&1 | tail -8` → Expected **14 passed**（附录 E3-D 实际是 7+3 纯函数 + 4 组件 = 14；原写「13（7+6）」是过时计数，已订正 —— Step 7 的 288/49 一直是对的）。
 
 - [ ] **Step 6: 退化验红（五条，逐条）**
 

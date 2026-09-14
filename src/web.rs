@@ -62,6 +62,12 @@ pub fn build_router(state: Arc<AppState>) -> Router {
         .route("/api/scheduled-tasks/{id}/run", post(run_scheduled_now))
         .route("/api/scheduled-tasks/{id}/runs", get(list_scheduled_runs))
         .route("/api/scheduler/health", get(scheduler_health))
+        // Crew 记忆代理。挂在 authed `/api/*` 组内 —— 自动继承 JWT 中间件，
+        // 写入侧的 slot key 由 `any_crew_slot_key(owner_id)` 按 owner 过滤。
+        .route("/api/crew/memory", get(crate::crew_memory::get_crew_memory))
+        .route("/api/crew/memory/semantic", put(crate::crew_memory::put_crew_semantic))
+        .route("/api/crew/memory/semantic/{key}", delete(crate::crew_memory::delete_crew_semantic))
+        .route("/api/crew/memory/{doc}", put(crate::crew_memory::put_crew_memory_doc))
         .route("/api/directories", get(list_directories))
         .route("/api/quick-targets", get(list_quick_targets).delete(forget_quick_target))
         .route("/api/push/vapid-key", get(push_vapid_key))

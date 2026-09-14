@@ -2142,6 +2142,21 @@ impl SessionManager {
         }
     }
 
+    /// 返回当前 owner 的任一活 Crew 会话的 Gateway slot key。
+    /// 记忆写入需要 `X-Session-Key: <已存在的 slot>`（实测：缺头 →
+    /// `missing_session_key`，给不存在的 slot → `unknown session`），而 slot key
+    /// 只存在于 `ResumeToken::Crew` 里 —— `SessionInfo` 不带它，也不该带
+    /// （那会把它暴露给前端，而前端无需知道 slot 命名）。
+    pub fn any_crew_slot_key(&self, owner_id: &str) -> Option<String> {
+        let map = self.sessions.lock().unwrap();
+        map.values()
+            .filter(|s| s.session_type == SessionType::Crew && s.owner_id == owner_id)
+            .find_map(|s| match &s.resume_token {
+                Some(ResumeToken::Crew(k)) if !k.is_empty() => Some(k.clone()),
+                _ => None,
+            })
+    }
+
     /// Load persisted session metadata from the store into memory on startup.
     /// Sessions are restored with `running: None` (no live process) — they can
     /// be respawned from their resume_token (Task 5+). Existing in-memory

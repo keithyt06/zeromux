@@ -3,6 +3,7 @@ mod admin;
 mod auth;
 mod auto_titler;
 mod auto_update;
+mod crew_memory;
 mod db;
 mod events;
 mod logger;

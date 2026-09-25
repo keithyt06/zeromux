@@ -339,6 +339,9 @@ pub struct SessionManager {
     /// Push notification service, wired at startup. None when push is disabled
     /// (VAPID key generation failed or no subscriptions configured).
     push: Mutex<Option<Arc<crate::push::PushService>>>,
+    /// Fuzzy-search indexes, wired at startup. The turn-end hook asks it to rescan
+    /// the session's work_dir when that lies inside the vault. None in tests.
+    search: Mutex<Option<Arc<crate::fuzzy_index::SearchIndexes>>>,
     /// Per-run metrics writer channel. `record_run_metric` pushes into the
     /// session's in-memory VecDeque (under lock) and then `try_send`s here
     /// (outside the lock) so the async writer fsyncs off the conversation path.
@@ -638,6 +641,7 @@ impl SessionManager {
             worktree_isolation,
             scheduled: Mutex::new(None),
             push: Mutex::new(None),
+            search: Mutex::new(None),
             run_metrics_tx: crate::run_metrics::spawn_writer(),
         });
         *mgr.self_weak.lock().unwrap() = Arc::downgrade(&mgr);
@@ -656,6 +660,11 @@ impl SessionManager {
     /// Wire push notification service (called once at startup). None = disabled.
     pub fn set_push(&self, p: Arc<crate::push::PushService>) {
         *self.push.lock().unwrap() = Some(p);
+    }
+
+    /// Wire the search indexes (called once at startup).
+    pub fn set_search(&self, s: Arc<crate::fuzzy_index::SearchIndexes>) {
+        *self.search.lock().unwrap() = Some(s);
     }
 
     /// Clone push handle (lock-in / lock-out pattern): acquire lock, clone Arc, release lock.
@@ -2331,6 +2340,19 @@ fn intent_suppresses_push(intent: Option<crate::run_metrics::RunOutcome>) -> boo
     )
 }
 
+/// Turn-end hook: if this session works inside the Obsidian vault, rescan its
+/// work_dir so notes the agent just wrote become searchable now (1a has no
+/// watcher). Deliberately NOT gated on active_run_id — scheduled runs write
+/// notes too. Reads only `work_dir`; never touches the process (fan-out
+/// invariant). Lock-in/lock-out: clone the Arc, release, then call.
+fn maybe_mark_vault_dirty(mgr: &Weak<SessionManager>, work_dir: &str) {
+    let Some(m) = mgr.upgrade() else { return };
+    let si = m.search.lock().unwrap().clone();
+    if let Some(si) = si {
+        si.reconcile_vault_dir(std::path::Path::new(work_dir));
+    }
+}
+
 /// Fire the "turn finished while you were away" Web Push for a settling
 /// interactive turn. Shared by all three agent fan-outs so the notification
 /// reaches Claude, Crew AND Codex sessions identically — the block used to live
@@ -2492,6 +2514,12 @@ fn spawn_acp_fanout(
                                 if boundary_count >= turn_seq && active_run_id.is_none() {
                                     let dur = turn_starts.front().map(|s| now_millis() - s).unwrap_or(0);
                                     maybe_push_turn_done(&mgr, &sid, &owner_id, dur, turn_starts.front_intent());
+                                }
+                                // Vault reconcile runs for EVERY settling turn (scheduled
+                                // runs write notes too), unlike the turn_done push above
+                                // which is gated on active_run_id.is_none().
+                                if boundary_count >= turn_seq {
+                                    maybe_mark_vault_dirty(&mgr, &work_dir);
                                 }
                                 // Whether the settling turn was DELIBERATELY aborted
                                 // (user Cancel / watchdog Timeout stamped its FIFO
@@ -3300,6 +3328,7 @@ fn spawn_crew_fanout(
                                     // (review 2026-08-07 F3; 2026-08-08 F2).
                                     let dur = turn_starts.front().map(|s| now_millis() - s).unwrap_or(0);
                                     maybe_push_turn_done(&mgr, &sid, &owner_id, dur, turn_starts.front_intent());
+                                    maybe_mark_vault_dirty(&mgr, &work_dir);
                                 }
                                 // per-run metrics: one metric per boundary, intent overrides
                                 // event type (mirrors spawn_acp_fanout). Skipped when this
@@ -3595,6 +3624,7 @@ fn spawn_codex_fanout(
                                     // (review 2026-08-07 F3; 2026-08-08 F2).
                                     let dur = turn_starts.front().map(|s| now_millis() - s).unwrap_or(0);
                                     maybe_push_turn_done(&mgr, &sid, &owner_id, dur, turn_starts.front_intent());
+                                    maybe_mark_vault_dirty(&mgr, &work_dir);
                                 }
                                 // per-run metrics: one metric per boundary, intent overrides
                                 // event type (mirrors spawn_acp_fanout). Skipped when this
@@ -5569,6 +5599,45 @@ mod lifetime_tests {
         maybe_push_turn_done(&weak, sid, "owner1", 120_000, Some(crate::run_metrics::RunOutcome::Timeout));
         tokio::task::yield_now().await; // let any (here: none) spawned task run
         assert!(mgr.session_name(sid).is_some(), "session state untouched by the no-op push");
+    }
+
+    #[tokio::test]
+    async fn maybe_mark_vault_dirty_reconciles_vault_work_dir_only() {
+        let (mgr, _dir) = make_manager();
+        let weak = Arc::downgrade(&mgr);
+        // No search wired → clean no-op.
+        maybe_mark_vault_dirty(&weak, "/tmp/anything");
+        maybe_mark_vault_dirty(&Weak::new(), "/tmp/anything");
+
+        let home = tempfile::tempdir().unwrap();
+        let vault = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(vault.path().join("单词")).unwrap();
+        let si = crate::fuzzy_index::SearchIndexes::start(home.path().into(), Some(vault.path().into()));
+        mgr.set_search(si.clone());
+        let slot = si.vault.clone().unwrap();
+        for _ in 0..200 {
+            if slot.current().is_some() && !slot.is_rebuilding() { break; }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        std::fs::write(vault.path().join("单词/2026-09-25-下午.md"), "x").unwrap();
+        maybe_mark_vault_dirty(&weak, &vault.path().join("单词").to_string_lossy());
+        let mut found = false;
+        for _ in 0..200 {
+            if slot.current().unwrap().index.entries.iter().any(|e| e.path == "单词/2026-09-25-下午.md") { found = true; break; }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert!(found, "a note written by the agent must be searchable after its turn ends");
+    }
+
+    #[test]
+    fn every_fanout_marks_vault_dirty_next_to_turn_done_push() {
+        // Parity guard (fan-out invariant): all three agent fan-outs must call the
+        // hook, exactly where they settle a turn. Missing one = that backend's
+        // notes silently stay unsearchable until the next warm-up.
+        let src = include_str!("session_manager.rs");
+        // concat! so this test's own literal doesn't count itself.
+        let calls = src.matches(concat!("maybe_mark_vault_dirty(&mgr, ", "&work_dir);")).count();
+        assert_eq!(calls, 3, "acp + crew + codex fan-outs");
     }
 
     #[test]

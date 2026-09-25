@@ -516,6 +516,7 @@ async fn main() {
     // Scheduled tasks: wire the store into the manager, reconcile orphans from a
     // prior process, then start the supervised scheduler loop.
     state.sessions.set_scheduled_store(state.scheduled_tasks.clone());
+    state.sessions.set_search(state.search.clone());
     let _ = state.scheduled_tasks.reconcile_orphans(None);
     scheduled_tasks::spawn_scheduler(
         state.sessions.clone(),

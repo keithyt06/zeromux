@@ -1,11 +1,29 @@
 # 模糊搜索 —— New Session 目录 + Obsidian 文件夹/笔记 — 设计
 
 日期：2026-09-25
-状态：v3.1（vault inotify 实时增量；已经 CTO + PM 增量 review 并修订，待用户审阅）
+状态：v4（Think Big 评审后扩展 + 分两批发布；用户已确认方向，待审阅 spec 文本）
 
 ## 修订记录
 
-**v3.1（本版）** —— CTO + PM 对 v3 增量 review。关键断言本人复核：`docker ps` 证实 Obsidian
+**v4（本版）** —— 用户要求 Think Big 交叉评审（CTO + CPO 并行）。关键断言本人复核：
+`events.db` 186 个 agent 事件中 100 个 `work_dir` 在 vault 内；`quick_targets` 中用户开过 Claude 的
+vault 目录深度 9（`考研英语/2018/英语二/阅读理解`）与 7（`管综数学/02-整式、分式`）> 目录索引 `maxdepth=6`；
+单词笔记由 Kiro Crew cron（`~/.kiro/sessions/cli/1963eee6…json`，cwd `kirocrew-workspace/cron_f40cef7f`）
+定时生成；8 个 prompt 预设全为编码类；`prompts.db` `user_version=1`（seed-once 已执行过）。
+
+用户决策：**B（分两批发布）+ Think Big 第 1–4 项全部纳入本期**。
+
+| # | 改动 | 来源 | 理由 |
+|---|---|---|---|
+| 1 | 笔记 / 笔记文件夹行加 **「⚡ 问 agent」**：work_dir = 笔记所在文件夹（或该文件夹），initial_prompt 预填笔记路径，进 prompt 页可选预设 | CPO 提案 1 / CTO 提案 2 | 100/186 个 agent 事件是「agent 加工 vault 笔记」；有「work_dir 开在 2018、内容是 2019」的错位实例——用户开在「够得着」而非正确的目录。这是相对 Obsidian 自带搜索的差异化：搜到即可让 agent 干活 |
+| 2 | vault 文件夹行可作为 work_dir 开会话（`⋮`「在此开 agent」）；接口给 vault 结果带 `abs_path` | CTO 提案 1 | 覆盖缺口：深度 7/9 的常用学习目录在目录段永远搜不到；不靠提高 maxdepth（深度 7 即 2462 目录 / 8s） |
+| 3 | 新增 4 条学习预设（出题 / 批改 / 背诵卡 / 抽背单词），对**已 seed 过的库**做一次性追加迁移 | CPO 提案 2 | 现有 8 条全是编码类；E2 中用户反复手打这四类指令。`seed_if_unseeded` 在 `user_version>=1` 时不再写入，需要 v2 迁移 |
+| 4 | 接口改为 `sections` 数组，`scope` 逗号列表 | CTO 提案 3 | 为下期全局命令面板 / 全文搜索留扩展点，本期几乎零成本 |
+| 5 | **分两批发布**：1a = 匹配 + 两个索引（vault 走轮询 slot）+ 前端 + 第 1–4 项；1b = inotify watcher（§1d） | CTO 提案 4（用户选 B） | 1d + 其测试约占 spec 40% 且风险最高；价值最大的部分不被它阻塞。1b 上线后用户要求的「新产生即可搜」完全兑现 |
+| 6 | 1a 期间 vault 新鲜度：打开弹层 / VaultReader 预热 + **agent turn 结束时若 work_dir 在 vault 内则标脏该目录** + 零结果兜底 | CPO 提案 3 | vault 中「新产生的文件」两大来源之一是 zeromux 自己的 agent（E2），turn 结束钩子精确覆盖；另一来源（Obsidian/Mac 同步）1a 期间为「下次打开刷新」 |
+| 7 | 非目标补：全文搜索、全局命令面板、搜索现有会话（下期或不做） | 两位 | 会话常驻仅 3 行；全文 7.1MB 可内存化但需扩 watcher 掩码 + 分词匹配，独立一期 |
+
+**v3.1** —— CTO + PM 对 v3 增量 review。关键断言本人复核：`docker ps` 证实 Obsidian
 跑在 `lscr.io/linuxserver/obsidian` 容器内（宿主无 `/opt/obsidian`，v3 写错）；`inotify-0.11.5/src/inotify.rs:128`
 证实 `read_events_blocking` 无超时、`:103/:112` 证实 `add_watch/rm_watch` 已 deprecated。改动：
 
@@ -102,8 +120,11 @@ nucleo 性能（CTO 实测）：128 字符 / 64 atom 最坏查询扫 7000 条 13
 - New Session 首屏搜索框：同一次输入出「目录」「笔记」两段结果，fzf 式子序列匹配 + 排序。
   - 点目录 = 以它为 work_dir 建会话（有历史 agent 则一击直达）。
   - 点笔记 = 在 Obsidian doc tab 打开；点笔记文件夹 = doc tab 定位到该文件夹。
+- 笔记 / 笔记文件夹结果可**一键带上下文开 agent**（「⚡ 问 agent」）；vault 文件夹可作为 work_dir。
+- 4 条学习场景 prompt 预设，对已有库一次性追加。
 - VaultReader 搜索框换成同一匹配器，结果含文件夹。
-- vault 索引异步 + **实时**（本机写入的新建/改名/删除笔记与文件夹约 1s 内可搜——防抖 300ms、最迟 1s 强制对账；修「新笔记重启前搜不到」
+- 接口 `sections` 形状，为全局命令面板 / 全文搜索留扩展点。
+- vault 索引异步（1a）+ **实时**（1b）（本机写入的新建/改名/删除笔记与文件夹约 1s 内可搜——防抖 300ms、最迟 1s 强制对账；修「新笔记重启前搜不到」
   + 启动 46s 阻塞）。
 
 非目标（明确不做）：
@@ -114,7 +135,23 @@ nucleo 性能（CTO 实测）：128 字符 / 64 atom 最坏查询扫 7000 条 13
 - 索引非 `.md` 文件（图片 / pdf / canvas / base）：VaultReader 打不开它们（`vault.ts:13` 只放行目录与 `.md`），
   搜到也无落点。以后若 VaultReader 支持打开，再扩展。
 - 命中字符高亮；↑/↓ 键盘导航（只做 Enter = 打开第一条）。
+- 笔记**全文**搜索、单词词条搜索（下期；实测全部 md 7.1MB 可常驻内存，但需扩 watcher 掩码订阅 `CLOSE_WRITE`
+  + 分词子串匹配 + 片段 UI，独立一期）。
+- 全局命令面板 / 顶栏常驻搜索入口（下期；复用本期 `/api/search` sections 与结果行组件）。
+- 搜索现有会话 / 定时任务 / 预设（常驻会话 3 个、定时任务 1 个、预设 12 个，前端即可，无需索引）。
+- 提高目录索引 `maxdepth` 以覆盖 vault 深层目录（改由 vault 文件夹行「在此开 agent」兜底）。
+- 把笔记**内容**内联进 initial_prompt（最大笔记 294KB；只传路径，agent 自行 Read）。
 - DirectoryPicker（定时任务表单，低频）与 Sidebar `pick-dir` 加搜索——接口通用，以后只是接线。
+
+## 发布批次
+
+| 批次 | 内容 | vault 新鲜度 |
+|---|---|---|
+| **1a** | §1a 目录索引、§1b 收录规则、§1c 状态机（vault 走**轮询 slot**，见 §1e）、§2 匹配、§3 接口（sections）、§4–§6 前端、§7 ⚡ 问 agent、§8 学习预设 | 打开弹层 / VaultReader 时快照 > 30s 即后台全量（~52s）；zeromux agent turn 结束即单目录对账（~27ms）；零结果兜底 |
+| **1b** | §1d inotify watcher 取代 §1e 的轮询触发 | 本机任何写入 ~1s |
+
+1a 与 1b 共用同一 `VaultSnapshot` 类型、同一发布函数、同一 `reconcile_dir` 单目录对账函数（1a 就实现，
+供 turn 结束钩子使用），1b 只新增事件源与 watch 管理——1a 的代码在 1b 中不被推翻。
 
 ## 后端
 
@@ -177,9 +214,9 @@ vault 快照由 1d 的 watcher 线程从其模型构建（初始全量与增量�
 | 全量重建中 | Some | true | 用旧快照正常匹配 + `refreshing: true`（**不是** indexing） |
 
 - **首建**：启动代码先 `rebuilding.store(true)` 再启动构建（目录 slot：`spawn_blocking`；vault slot：
-  watcher 线程），保证首建期间的请求 CAS 失败、不会并发第二次遍历。listener bind **不再等待** vault 遍历。
+  1a 为 `spawn_blocking`，1b 为 watcher 线程），保证首建期间的请求 CAS 失败、不会并发第二次遍历。listener bind **不再等待** vault 遍历。
 - **复位**：`rebuilding` 由构建闭包内持有的 Drop guard 复位——构建 panic 同样复位。
-  vault watcher 线程 panic：线程体内 `catch_unwind` 捕获、记录错误并重新全量（见 1d）。
+  （1b）vault watcher 线程 panic：线程体内 `catch_unwind` 捕获、记录错误并重新全量（见 1d）。
   构建成功才替换 `cur`，失败 / panic 保留旧快照。
 
 两个 slot 的**刷新触发**不同：
@@ -191,14 +228,13 @@ vault 快照由 1d 的 watcher 线程从其模型构建（初始全量与增量�
     （仅触发刷新、无返回体），重建约 3.7s，在用户打字期间完成。覆盖「刚 clone 的 repo 名被旧路径命中、
     零结果逃生口不触发」的情况。
   - 只由用户操作触发，空闲零遍历。
-- **vault slot（事件驱动，见 1d）**：增量事件直接改快照；只有以下情况走全量重建：
+- **vault slot**：1a 见 §1e（轮询 + turn 结束钩子）。1b（事件驱动，见 §1d）：增量事件直接改快照；只有以下情况走全量重建：
   - watcher 报告需要重扫（`Q_OVERFLOW`、根目录 `IGNORED`、`UNMOUNT`、watcher 线程 panic 重启）；
   - 距上次全量 > **6 小时**（兜底其他主机直写 JuiceFS；由 watcher 线程计时，不依赖搜索请求）。
   - 全量重建完成后**整体替换**快照与 `Inotify` 实例（见 1d）。
   - 全量重建期间（~52s）watcher 线程在遍历：事件照常记入 dirty，但**不发布**，期间新建的笔记在重建
     结束时一并出现（用旧快照照常搜索）。
 
-- `GET /api/search/warm`：已认证即可；只做目录 slot 的「> 30s 则 CAS 刷新」，立即返回 204。
 - `vault_resolve` 在首建中返回 503 `"vault indexing"`；前端 `resolveWikiLink` 对 503 提示
   「笔记索引建立中，请稍候」而非「未找到」。
 
@@ -275,6 +311,26 @@ deprecated）。不用 `notify` crate：watch 集合需与索引跳过规则逐�
 **资源**：watch 数 ≈ vault 目录数（~1900；uid 1000 当前已用 2232，上限 248967）；实例数 1–2
 （上限 128）。`watches().add` 失败（`ENOSPC` 等）记 warn、该目录仅靠 6h 全量兜底，不重试风暴。
 
+#### 1e. vault 轮询刷新（1a；1b 中由 §1d 取代触发源）
+
+1a 不起 watcher 线程。vault slot 与目录 slot 同为 `IndexSlot`，全量构建在 `spawn_blocking` 中执行，
+函数与 §1d 的 `full_scan` 同一个（1a 中不挂 watch：`full_scan(None)`）。触发：
+
+- `GET /api/search/warm?scope=dirs,notes`（New Session 弹层打开、VaultReader 挂载时调用）：各 slot 快照
+  年龄 > 30s 则 CAS 发起全量；
+- 搜索 notes 段零结果且快照年龄 > 30s：同上；
+- **agent turn 结束钩子**：三个 fanout（`spawn_acp_fanout` / `spawn_crew_fanout` / `spawn_codex_fanout`）在
+  现有 `maybe_push_turn_done` 调用点旁调用 `maybe_mark_vault_dirty(&mgr, &work_dir)`：若 `work_dir` 在
+  vault 内（词法 `strip_prefix`），把该相对目录交给 vault slot 的 `reconcile_dir`——对该目录做一次
+  `read_dir`（及其新增子目录的递归扫描），更新快照并发布（~27ms，`spawn_blocking`）。**不限定**
+  `active_run_id.is_none()`：定时任务写出的笔记同样该可搜。
+  - 钩子通过 `SessionManager` 上新增的 `vault_refresh: Mutex<Option<Arc<VaultRefresher>>>`（与 `push`
+    同一 lock-in/lock-out 模式）调用，未配置 vault 时为 None 即 no-op。
+  - agent 写到 work_dir **子目录**的文件：只对账 work_dir 本身会漏。故对账 work_dir 时递归到其全部
+    子目录（深度上限 3，学习笔记目录实测均为叶子或浅层）；更深的由下次打开预热兜底。
+- 1a 期间 Obsidian 桌面 / Mac 同步新建的笔记：下次打开弹层或 VaultReader 后约 52s 可搜（前端对 notes
+  `refreshing && 零结果` 显示「笔记索引刷新中…」并在 4s 后重查，与目录段一致）。
+
 ### 2. 匹配（`nucleo-matcher 0.3`）
 
 - 每请求 `Matcher::new(Config::DEFAULT.match_paths())`（`Send`，100 次 new 共 281µs，不共享、不加锁）；
@@ -295,21 +351,27 @@ deprecated）。不用 `notify` crate：watch 集合需与索引跳过规则逐�
      视为 0）——让「今天刚写的单词笔记」在 10 篇同分中排第一；
   3. haystack 长度升序。
 
-### 3. 接口 `GET /api/search?q=&scope=all|dirs|notes&limit=`
+### 3. 接口 `GET /api/search?q=&scope=dirs,notes&limit=`
 
 ```json
 {
-  "dirs":  [{ "path": "/home/ubuntu/…/zeromux", "display": "zeromux", "hint": "~/s3-workspace/…/ai", "agent": "claude" }],
-  "notes": [{ "path": "projects/x/_index.md", "kind": "note", "display": "_index", "hint": "projects/x" },
-            { "path": "projects/x", "kind": "folder", "display": "x", "hint": "projects" }],
-  "indexing":   { "dirs": false, "notes": false },
-  "refreshing": { "dirs": false, "notes": false },
-  "truncated":  { "dirs": false, "notes": false }
+  "sections": [
+    { "kind": "dirs", "indexing": false, "refreshing": false, "truncated": false,
+      "items": [{ "path": "/home/ubuntu/…/zeromux", "display": "zeromux", "hint": "~/s3-workspace/…/ai", "agent": "claude" }] },
+    { "kind": "notes", "indexing": false, "refreshing": false, "truncated": false,
+      "items": [{ "path": "projects/x/_index.md", "kind": "note",   "display": "_index", "hint": "projects/x", "abs_dir": "/home/ubuntu/…/obsidian/projects/x" },
+                { "path": "projects/x",          "kind": "folder", "display": "x",      "hint": "projects",   "abs_dir": "/home/ubuntu/…/obsidian/projects/x" }] }
+  ]
 }
 ```
 
+- `scope`：逗号分隔，取值 `dirs` / `notes`，缺省 = 两者；未知值 400。`sections` 按 `scope` 中的顺序返回
+  （前端按段内最高分重排显示）。以后新增实体 = 新增一个 `kind`，旧客户端忽略未知 kind。
+- 每个 section 带自己的 `indexing` / `refreshing` / `truncated`。
+- notes 项的 `abs_dir`：笔记取其父目录绝对路径，文件夹取自身绝对路径——供「⚡ 问 agent」/「在此开 agent」
+  作为 work_dir。仅 admin 可见 notes，故不构成新泄漏（vault 路径对 admin 本就可知）。
 - `display/hint` 复用 `dir_display_hint` / `note_display_hint`。
-- `limit` 默认 6，上限 50。
+- `limit`（每段）默认 6，上限 50。
 - `q`：trim 后为空 → 空结果；长度按 **`chars().count()` ≤ 128**（按字节会误伤中文），超出 400。
 - **authz**：
   - `dirs`：所有已认证用户，与 `/api/directories` 同级——后者本就允许非 admin 逐层枚举 `$HOME`
@@ -317,9 +379,10 @@ deprecated）。不用 `notify` crate：watch 集合需与索引跳过规则逐�
   - `notes`：沿用 `vault_base()`（admin + vault 已配置）；不满足时 `notes` 恒为空、不报错
     （New Session 首屏不因非 admin 整块失败）。
   - frecency 按 `user.id` 查（`candidates` 已 owner-scoped）。
+- `GET /api/search/warm?scope=dirs,notes`：已认证即可（notes 需 admin，否则忽略）；只做「快照 > 30s 则 CAS 刷新」，立即返回 204。
 - **删除** `/api/vault/search`、`vault_search`、`vault_search_filter` 及前端 `getVaultSearch`。
 
-依赖：`nucleo-matcher = "0.3"`（纯 Rust）、`inotify = "0.11"`（vault watcher）。
+依赖：`nucleo-matcher = "0.3"`（1a，纯 Rust）；`inotify = { version = "0.11", default-features = false }` + `libc`（1b）。
 
 ## 前端
 
@@ -342,7 +405,7 @@ deprecated）。不用 `notify` crate：watch 集合需与索引跳过规则逐�
 - 输入 `maxLength={128}`；防抖 150ms；monotonic `reqRef` 守卫（发请求前 bump，await 后比对）。
 - 查询词存 Sidebar 级 state：从结果进 `pick-type` 再返回 `quick` 时保留；`openTypePicker` 时清空。
 - Enter = 打开第一条结果。
-- 弹层打开时调一次 `warmSearchIndex()`（`GET /api/search/warm`，失败静默）。
+- 弹层打开时调一次 `warmSearchIndex('dirs,notes')`（失败静默）。
 
 结果呈现：
 - 空查询：保持现状（QuickTargets + 其他目录… + Obsidian）。
@@ -357,14 +420,17 @@ deprecated）。不用 `notify` crate：watch 集合需与索引跳过规则逐�
 - **目录行，`agent` 为 null** → `setPendingDir(path)` + `pick-type`，选完类型**直接创建**，不进
   prompt 页（新增 `pendingSkipPrompt` 标志；QuickTargets「换 agent 类型」的既有流程不变）。
   tmux 仍走 `pick-terminal-mode`。
-- **笔记行 / 笔记文件夹行** → `onOpenVault({ path, kind })` + `closeAfterCreate()`。
+- **笔记行 / 笔记文件夹行**（整行）→ `onOpenVault({ path, kind })` + `closeAfterCreate()`。
+  行尾 **「⚡」按钮**（≥44px 触控目标，独立于整行，非 hover-only）= 问 agent（§7）。
+  行尾 `⋮` 操作单（仅文件夹行）：「在此开 agent」→ `setPendingDir(abs_dir)` + `pick-type` + `pendingSkipPrompt`
+  （同无历史目录行）。
 
 边界态：
 
 | 状态 | 目录段 | 笔记段 |
 |---|---|---|
 | 首建中（`indexing`） | 「正在建立目录索引…」 | 「正在建立笔记索引…」 |
-| 刷新中且零结果 | 「索引刷新中…」，前端 4s 后自动重查一次 | 「无匹配笔记」（全量重建时仍用旧快照，零结果即真无匹配） |
+| 刷新中且零结果 | 「索引刷新中…」，前端 4s 后自动重查一次 | 1a：「笔记索引刷新中…」+ 4s 重查；1b：「无匹配笔记」 |
 | 零结果 | 「未找到（仅索引 6 层内）· 用「其他目录…」浏览」 | 「无匹配笔记」 |
 | `truncated` | 不提示（Top 6 远小于上限） | 不提示 |
 | 请求失败 | 结果区静默隐藏 + 行内「重试」；其余入口照常 | 同左 |
@@ -388,7 +454,46 @@ QuickTargets 清理：删除 `onEmpty` prop 与 `failed` state（`Sidebar.tsx:51
 - 搜索框改调 `/api/search?scope=notes&limit=50`，结果含文件夹（`Folder` 图标），显示 display + hint。
 - 点笔记 → `openNote`；点文件夹 → `setCwd(path)` **并 `setQuery('')`**（否则 `query` 非空时仍渲染
   结果列表，点击看似无反应）。
+- 挂载时调一次 `warmSearchIndex('notes')`；结果行同样带「⚡」（同 §7）。
 - 既有 `searchReqRef` 守卫保留；`indexing` 时显示「笔记索引建立中…」；截断提示改为「仅显示前 50 条」。
+
+### 7. ⚡ 问 agent（笔记 × Agent）
+
+交互（New Session 弹层与 VaultReader 搜索结果共用）：
+1. 点笔记 / 文件夹行的「⚡」→ Sidebar 进入 `pick-type`，`pendingDir = abs_dir`，`promptDraft` 预填：
+   - 笔记：`当前笔记：<vault 相对路径>\n\n`
+   - 文件夹：`当前目录：<vault 相对路径>/\n\n`
+2. 选类型（tmux 不可选：Terminal 项在 `pendingAgentContext` 时隐藏——tmux 忽略 initial_prompt）→ 进
+   **pick-prompt**（此处**不**跳过 prompt 页：带上下文开 agent 的意义就在 prompt；预设 chip 以 `{{input}}`
+   包裹已预填的上下文行）。
+3. 用户点预设或直接发送 → `onCreate(type, abs_dir, undefined, prompt)`，与现有 `submitWithPrompt` 同路径。
+
+从 VaultReader 发起：VaultReader 不持有 Sidebar 状态 → 新增 App 级回调 `onAskAgent({ absDir, relPath, kind })`，
+App 打开 Sidebar 的 New Session 弹层并注入同样的初始状态（Sidebar 新 prop `askAgentRequest?: { …, nonce }`，
+按 nonce 消费一次，同 §5 的 target 模式）。
+
+零后端改动：`create_session` 已接受 `initial_prompt`（`web.rs:585`），work_dir 过 `validate_work_dir_under_home`，
+vault 在 `$HOME` 下可通过。
+
+### 8. 学习场景预设
+
+`prompts_seed.rs` 新增 `SEED_PRESETS_V2`（4 条，`(title, body)`，与 v1 同风格：英文任务契约 + 中文输出指令 +
+`{{input}}`）：
+
+| 标题 | 用途 |
+|---|---|
+| `📝 基于笔记出题` | 读 `{{input}}` 指向的笔记，出 5 道题（覆盖要点，含答案折叠在末尾） |
+| `✅ 批改我的答案` | 对照 `{{input}}` 笔记 / 附图批改；若存在 `kaoyan-reading-review` skill 则按其流程 |
+| `🃏 生成背诵卡` | 把 `{{input}}` 笔记提炼为同目录下的 `<原名>-背诵卡.md` |
+| `🔁 抽背单词` | 从 `单词/` 最近 N 篇随机抽 20 词考我，逐个等我作答再判 |
+
+正文在实现计划中逐字给出；本 spec 的内容来源备案同 `2026-06-16-preset-content-library-design.md`。
+
+迁移：`PromptPresetStore::seed_v2_if_needed(presets)`：
+- `user_version == 1` → 在同一事务内**追加** 4 条（`sort_order` 接在当前最大值之后），并置 `user_version = 2`；
+  若库中已存在同标题的预设则跳过该条（用户手工建过同名不重复）。
+- `user_version == 0`（全新库）→ 先走既有 `seed_if_unseeded`（置 1），再走本迁移（置 2）：全新库得 12 条。
+- `user_version >= 2` → 不动。删除这 4 条后永不复活（同 v1 的 seed-once 原则）。
 
 ## 测试
 
@@ -401,7 +506,7 @@ Rust（`fuzzy_index.rs` `#[cfg(test)]`，临时目录 fixture）：
 - 状态机：首建中搜索不触发第二次构建；刷新中返回旧快照 + `refreshing`；构建 panic 后 `rebuilding` 复位
   且旧快照保留；目录 slot 2 分钟 TTL 与零结果 30s 下限。
 
-vault watcher（`vault_watch.rs` `#[cfg(test)]`）：对账核心为纯函数
+vault watcher（1b，`vault_watch.rs` `#[cfg(test)]`）：对账核心为纯函数
 `reconcile(dir, listing: &[(名字, Kind)], &mut Model) -> Vec<新子目录>` 做无 IO 单测；另用真实
 inotify + 临时目录做集成测：
 - 新建 `.md` / 新建空文件夹 → 防抖后可搜；非 `.md` 文件不入索引，但使父目录不再「空」（新建文件夹后拖入
@@ -419,6 +524,14 @@ inotify + 临时目录做集成测：
 - 排序：查「单词」同分时最新 mtime 笔记第一；查「阅读理解」空骨架排在有内容文件夹与笔记之后。
 - 接口：非 admin `notes` 为空；空 q；129 个汉字 400、128 个通过；`vault_resolve` 首建中 503。
 
+接口 / 钩子 / 预设（1a）：
+- `/api/search` sections 形状；`scope=notes` 只返回 notes 段；未知 scope 400；notes 项带正确 `abs_dir`（笔记=父目录，文件夹=自身）。
+- `/api/search/warm` 返回 204 且触发刷新（快照 > 30s）/ 不触发（≤ 30s）。
+- `maybe_mark_vault_dirty`：work_dir 在 vault 内 → 对账该目录，新 md 可搜；work_dir 在 vault 外 → no-op；
+  未配置 vault → no-op；work_dir 子目录（深度 ≤3）新建的 md 可搜。
+- `seed_v2_if_needed`：v1 库追加 4 条且 sort_order 接续；重复调用不再追加；删除后不复活；同名已存在则跳过；全新库得 12 条；
+  4 条内容过 `seed_content_within_caps` 同款断言。
+
 前端（vitest）：
 - 首屏：输入 → 两段渲染、段序按最高分；stale 响应被丢弃（**先注释守卫验红**）；
   有 agent 的目录行一击调用 `onCreate`；无 agent 行进 pick-type 后直接创建、不进 pick-prompt；
@@ -427,10 +540,16 @@ inotify + 临时目录做集成测：
 - 弹层打开调用一次 `warmSearchIndex`。
 - VaultReader：`target` nonce 变化打开笔记 / 定位文件夹并清空查询；搜索结果点文件夹清空查询。
 - App：已有 doc tab 时复用最近创建的，不新增 tab。
+- ⚡：笔记行点 ⚡ → pick-type 中无 Terminal 项；选 Claude → pick-prompt 且 promptDraft 以「当前笔记：<路径>」开头；
+  发送 → `onCreate('claude', abs_dir, undefined, prompt)`；⚡ 按钮非 hover-only（className 无 `opacity-0`/`group-hover`）。
+- 文件夹行 `⋮`「在此开 agent」→ 选类型后直接 `onCreate(type, abs_dir)`，不进 prompt 页。
+- VaultReader 结果行 ⚡ → 调用 `onAskAgent`；App 据此打开 New Session 弹层并注入初始状态。
 
 手机真机验收（iOS Safari）：键盘弹起时输入框与结果区前 3 条可见；结果区滚动不带动输入框。
 
 ## 风险
+
+- **1a 期间**：Obsidian 桌面 / Mac 同步新建的笔记要到下次打开搜索后约 52s 才可搜；zeromux agent 写出的笔记 turn 结束即可搜。1b 上线后消除。
 
 - vault 全量遍历 + 挂 watch ≈ 52s（实测 51.5s）JuiceFS 元数据操作：启动一次 + 每 6 小时一次 + 溢出时（间隔 ≥60s）。
 - inotify 只覆盖经本机 FUSE 挂载点的写入；其他主机直写同一 JuiceFS 的变更最迟 6 小时后可搜。

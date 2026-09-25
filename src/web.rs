@@ -43,7 +43,6 @@ pub fn build_router(state: Arc<AppState>) -> Router {
         .route("/api/vault/list", get(vault_list))
         .route("/api/vault/file", get(vault_file))
         .route("/api/vault/file/raw", get(vault_file_raw))
-        .route("/api/vault/search", get(vault_search))
         .route("/api/vault/resolve", get(vault_resolve))
         .route("/api/sessions/{id}/runs", get(get_session_runs))
         .route("/api/sessions/{id}/runs/{run_id}/verdict", post(post_run_verdict))
@@ -67,6 +66,8 @@ pub fn build_router(state: Arc<AppState>) -> Router {
         .route("/api/crew/memory/{doc}", put(crate::crew_memory::put_crew_memory_doc))
         .route("/api/directories", get(list_directories))
         .route("/api/quick-targets", get(list_quick_targets).delete(forget_quick_target))
+        .route("/api/search", get(search))
+        .route("/api/search/warm", get(search_warm))
         .route("/api/push/vapid-key", get(push_vapid_key))
         .route("/api/push/subscribe", post(push_subscribe))
         .route("/api/push/unsubscribe", post(push_unsubscribe))
@@ -423,6 +424,196 @@ fn validate_kind(kind: &str) -> Result<(), (StatusCode, String)> {
     } else {
         Err((StatusCode::BAD_REQUEST, "kind must be 'dir' or 'note'".into()))
     }
+}
+
+// ── Fuzzy search (/api/search) ──
+//
+// Shape: { sections: [{ kind, indexing, refreshing, truncated, items }] } — a new
+// searchable entity later is just a new section kind (old clients ignore it).
+
+#[derive(serde::Deserialize)]
+struct SearchQuery {
+    q: String,
+    scope: Option<String>,
+    limit: Option<usize>,
+}
+
+#[derive(serde::Deserialize)]
+struct WarmQuery {
+    scope: Option<String>,
+}
+
+const SEARCH_Q_MAX_CHARS: usize = 128;
+const SEARCH_LIMIT_DEFAULT: usize = 6;
+const SEARCH_LIMIT_MAX: usize = 50;
+
+fn parse_scope(s: Option<&str>) -> Result<Vec<&'static str>, (StatusCode, String)> {
+    let Some(s) = s.filter(|s| !s.trim().is_empty()) else { return Ok(vec!["dirs", "notes"]) };
+    s.split(',')
+        .map(|p| match p.trim() {
+            "dirs" => Ok("dirs"),
+            "notes" => Ok("notes"),
+            other => Err((StatusCode::BAD_REQUEST, format!("unknown scope: {other}"))),
+        })
+        .collect()
+}
+
+/// Length cap counted in chars: 128 CJK chars are 384 bytes and must pass.
+fn validate_query(q: &str) -> Result<(), (StatusCode, String)> {
+    if q.chars().count() > SEARCH_Q_MAX_CHARS {
+        return Err((StatusCode::BAD_REQUEST, format!("query longer than {SEARCH_Q_MAX_CHARS} chars")));
+    }
+    Ok(())
+}
+
+fn section_json(kind: &str, indexing: bool, refreshing: bool, truncated: bool, items: Vec<serde_json::Value>) -> serde_json::Value {
+    serde_json::json!({ "kind": kind, "indexing": indexing, "refreshing": refreshing, "truncated": truncated, "items": items })
+}
+
+fn dir_section(
+    snap: Option<&crate::fuzzy_index::DirSnapshot>,
+    rebuilding: bool,
+    q: &str,
+    limit: usize,
+    bonus: &std::collections::HashMap<String, f64>,
+    agents: &std::collections::HashMap<String, String>,
+    home: &str,
+) -> serde_json::Value {
+    let Some(snap) = snap else { return section_json("dirs", true, false, false, vec![]) };
+    let hits = crate::fuzzy_index::search(&snap.index, q, limit, &|p| {
+        crate::fuzzy_index::frecency_bonus(bonus.get(p).copied().unwrap_or(0.0))
+    });
+    let items = hits.iter().map(|h| {
+        let (display, hint) = dir_display_hint(&h.entry.path, home);
+        serde_json::json!({
+            "path": h.entry.path, "display": display, "hint": hint,
+            "agent": agents.get(&h.entry.path), "score": h.score,
+        })
+    }).collect();
+    section_json("dirs", false, rebuilding, snap.index.truncated, items)
+}
+
+fn notes_section(
+    snap: Option<&crate::fuzzy_index::VaultSnapshot>,
+    rebuilding: bool,
+    q: &str,
+    limit: usize,
+    bonus: &std::collections::HashMap<String, f64>,
+    vault_root: &str,
+) -> serde_json::Value {
+    use crate::fuzzy_index::EntryKind;
+    let Some(snap) = snap else { return section_json("notes", true, false, false, vec![]) };
+    let hits = crate::fuzzy_index::search(&snap.index, q, limit, &|p| {
+        crate::fuzzy_index::frecency_bonus(bonus.get(p).copied().unwrap_or(0.0))
+    });
+    let items = hits.iter().map(|h| {
+        let p = &h.entry.path;
+        let is_note = h.entry.kind == EntryKind::VaultNote;
+        let (display, hint) = if is_note {
+            note_display_hint(p)
+        } else {
+            match p.rfind('/') { Some(i) => (p[i + 1..].to_string(), p[..i].to_string()), None => (p.clone(), String::new()) }
+        };
+        let dir_rel = if is_note { p.rfind('/').map(|i| &p[..i]).unwrap_or("") } else { p.as_str() };
+        let abs_dir = if dir_rel.is_empty() { vault_root.to_string() } else { format!("{vault_root}/{dir_rel}") };
+        serde_json::json!({
+            "path": p, "kind": if is_note { "note" } else { "folder" },
+            "display": display, "hint": hint, "abs_dir": abs_dir, "score": h.score,
+        })
+    }).collect();
+    section_json("notes", false, rebuilding, snap.index.truncated, items)
+}
+
+/// Per-user frecency, aggregated by path: (sum of decayed scores, best agent).
+fn frecency_maps(
+    state: &AppState,
+    user_id: &str,
+    kind: &str,
+) -> (std::collections::HashMap<String, f64>, std::collections::HashMap<String, String>) {
+    frecency_maps_from(&state.quick_targets, user_id, kind)
+}
+
+fn frecency_maps_from(
+    store: &crate::quick_targets::QuickTargetStore,
+    user_id: &str,
+    kind: &str,
+) -> (std::collections::HashMap<String, f64>, std::collections::HashMap<String, String>) {
+    let now = crate::fuzzy_index::now_ms();
+    let mut sum = std::collections::HashMap::<String, f64>::new();
+    let mut best = std::collections::HashMap::<String, (f64, String)>::new();
+    for r in store.candidates(user_id, kind).unwrap_or_default() {
+        let d = crate::quick_targets::decayed_score(r.score_raw, r.last_ms, now);
+        *sum.entry(r.path.clone()).or_default() += d;
+        if matches!(r.agent.as_str(), "claude" | "crew" | "codex" | "tmux") {
+            let e = best.entry(r.path.clone()).or_insert((f64::MIN, String::new()));
+            if d > e.0 { *e = (d, r.agent.clone()); }
+        }
+    }
+    (sum, best.into_iter().map(|(k, (_, a))| (k, a)).collect())
+}
+
+async fn search(
+    State(state): State<Arc<AppState>>,
+    user: axum::Extension<CurrentUser>,
+    Query(q): Query<SearchQuery>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    validate_query(&q.q)?;
+    let scope = parse_scope(q.scope.as_deref())?;
+    let limit = q.limit.unwrap_or(SEARCH_LIMIT_DEFAULT).clamp(1, SEARCH_LIMIT_MAX);
+    let home = std::env::var("HOME").unwrap_or_else(|_| "/home/ubuntu".to_string());
+    let vault_ok = vault_base(&state, &user).is_ok();
+    let si = state.search.clone();
+    let mut sections = Vec::new();
+    for s in scope {
+        match s {
+            "dirs" => {
+                let (bonus, agents) = frecency_maps(&state, &user.id, "dir");
+                let snap = si.dirs.current();
+                let sec = dir_section(snap.as_deref(), si.dirs.is_rebuilding(), &q.q, limit, &bonus, &agents, &home);
+                // Only a REAL query's zero result is a staleness signal — a negation-only
+                // or metacharacter-only query is always empty and must not trigger rebuilds.
+                let zero = crate::fuzzy_index::has_positive_atom(&q.q)
+                    && sec["items"].as_array().is_some_and(|a| a.is_empty());
+                if zero { si.refresh_dirs_if_older(crate::fuzzy_index::ZERO_HIT_MIN_AGE_MS); }
+                else { si.refresh_dirs_if_older(crate::fuzzy_index::DIR_TTL_MS); }
+                sections.push(sec);
+            }
+            "notes" => {
+                let (Some(slot), Some(root), true) = (si.vault.as_ref(), si.vault_root(), vault_ok) else {
+                    sections.push(section_json("notes", false, false, false, vec![]));
+                    continue;
+                };
+                let (bonus, _) = frecency_maps(&state, &user.id, "note");
+                let snap = slot.current();
+                let sec = notes_section(snap.as_deref(), slot.is_rebuilding(), &q.q, limit, &bonus, &root.to_string_lossy());
+                if crate::fuzzy_index::has_positive_atom(&q.q) && sec["items"].as_array().is_some_and(|a| a.is_empty()) {
+                    si.refresh_vault_if_older(crate::fuzzy_index::ZERO_HIT_MIN_AGE_MS);
+                }
+                sections.push(sec);
+            }
+            _ => unreachable!("parse_scope only yields known kinds"),
+        }
+    }
+    Ok(Json(serde_json::json!({ "sections": sections })))
+}
+
+/// Opening the New Session popover / VaultReader warms stale indexes so a
+/// just-cloned repo or just-synced note is indexed while the user types.
+async fn search_warm(
+    State(state): State<Arc<AppState>>,
+    user: axum::Extension<CurrentUser>,
+    Query(q): Query<WarmQuery>,
+) -> Result<StatusCode, (StatusCode, String)> {
+    for s in parse_scope(q.scope.as_deref())? {
+        match s {
+            "dirs" => state.search.refresh_dirs_if_older(crate::fuzzy_index::WARM_MIN_AGE_MS),
+            "notes" if vault_base(&state, &user).is_ok() => {
+                state.search.refresh_vault_if_older(crate::fuzzy_index::WARM_MIN_AGE_MS)
+            }
+            _ => {}
+        }
+    }
+    Ok(StatusCode::NO_CONTENT)
 }
 
 async fn list_quick_targets(
@@ -3474,21 +3665,6 @@ pub(crate) fn vault_index_from_paths(paths: Vec<String>) -> VaultIndex {
     VaultIndex { by_basename, all_paths: paths, by_basename_lc }
 }
 
-/// Case-insensitive substring match over relative paths (filename + path).
-/// Empty query → no results. Caps at 100.
-fn vault_search_filter(paths: &[String], q: &str) -> Vec<String> {
-    if q.trim().is_empty() {
-        return Vec::new();
-    }
-    let ql = q.to_ascii_lowercase();
-    paths
-        .iter()
-        .filter(|p| p.to_ascii_lowercase().contains(&ql))
-        .take(100)
-        .cloned()
-        .collect()
-}
-
 /// True if any component of the vault-relative path starts with '.'. The vault is
 /// strictly a `.md` reader; `.obsidian/` (plugin data, sometimes plugin API tokens in
 /// `data.json`), `.trash/`, `.git/` are not notes. The startup index already skips
@@ -3709,44 +3885,6 @@ async fn vault_file_raw(
         }
     };
     Ok(resp)
-}
-
-#[derive(serde::Deserialize)]
-struct VaultSearchQuery {
-    q: String,
-}
-
-async fn vault_search(
-    State(state): State<Arc<AppState>>,
-    user: axum::Extension<CurrentUser>,
-    Query(query): Query<VaultSearchQuery>,
-) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
-    let _base = vault_base(&state, &user)?;
-    // Search the FULL path list, not by_basename.values() — the latter is deduped
-    // by basename (first-wins), so per-folder README.md / index.md / 2026.md would be
-    // unsearchable past the first one.
-    let paths: Vec<String> = state
-        .search
-        .vault
-        .as_ref()
-        .and_then(|s| s.current())
-        .map(|s| s.wiki.all_paths.clone())
-        .unwrap_or_default();
-    let hits = vault_search_filter(&paths, &query.q);
-    // Surface the 100-result cap so the UI can say "results truncated" instead of
-    // silently implying a note past #100 doesn't exist (mirrors the 1MB file banner).
-    let truncated = hits.len() >= 100;
-    let results: Vec<serde_json::Value> = hits
-        .into_iter()
-        .map(|p| {
-            let name = std::path::Path::new(&p)
-                .file_name()
-                .map(|n| n.to_string_lossy().to_string())
-                .unwrap_or_default();
-            serde_json::json!({ "path": p, "name": name })
-        })
-        .collect();
-    Ok(Json(serde_json::json!({ "results": results, "truncated": truncated })))
 }
 
 #[derive(serde::Deserialize)]
@@ -6083,21 +6221,6 @@ diff --git a/src/main.rs b/src/main.rs\n\
         }
     }
 
-    #[test]
-    fn vault_search_matches_name_and_path() {
-        let idx_paths = vec![
-            "knowledge/aws/EKS 网络模型.md".to_string(),
-            "journals/2026-06-29.md".to_string(),
-        ];
-        let r = vault_search_filter(&idx_paths, "eks");
-        assert_eq!(r.len(), 1);
-        assert_eq!(r[0], "knowledge/aws/EKS 网络模型.md");
-        let r2 = vault_search_filter(&idx_paths, "journals");
-        assert_eq!(r2.len(), 1);
-        let r3 = vault_search_filter(&idx_paths, "");
-        assert_eq!(r3.len(), 0); // empty query → no results
-    }
-
     fn wikilink_idx() -> VaultIndex {
         // Unique dir per call: all six resolve_wikilink_* tests call this helper, and a
         // shared pid-only path made them race (one test's remove_dir_all nuked another's
@@ -6182,6 +6305,124 @@ diff --git a/src/main.rs b/src/main.rs\n\
         let slot: crate::fuzzy_index::IndexSlot<crate::fuzzy_index::VaultSnapshot> = crate::fuzzy_index::IndexSlot::new();
         let r = vault_resolve_in(slot.current().as_deref(), "x");
         assert_eq!(r.unwrap_err().0, StatusCode::SERVICE_UNAVAILABLE);
+    }
+
+    fn dir_snap(paths: &[&str]) -> crate::fuzzy_index::DirSnapshot {
+        let h = "/home/u";
+        crate::fuzzy_index::DirSnapshot {
+            built_at_ms: 1,
+            index: crate::fuzzy_index::PathIndex {
+                truncated: false,
+                entries: paths.iter().map(|p| {
+                    let hay = format!("~{}", &p[h.len()..]);
+                    crate::fuzzy_index::IndexEntry {
+                        basename_off: hay.rfind('/').map(|i| i + 1).unwrap_or(0),
+                        haystack: hay, path: p.to_string(),
+                        kind: crate::fuzzy_index::EntryKind::Dir, mtime_ms: 0, is_empty_dir: false,
+                    }
+                }).collect(),
+            },
+        }
+    }
+
+    #[test]
+    fn parse_scope_defaults_and_rejects_unknown() {
+        assert_eq!(parse_scope(None).unwrap(), vec!["dirs", "notes"]);
+        assert_eq!(parse_scope(Some("notes")).unwrap(), vec!["notes"]);
+        assert_eq!(parse_scope(Some("notes,dirs")).unwrap(), vec!["notes", "dirs"]);
+        assert_eq!(parse_scope(Some("files")).unwrap_err().0, StatusCode::BAD_REQUEST);
+    }
+
+    #[test]
+    fn validate_query_counts_chars_not_bytes() {
+        assert!(validate_query(&"汉".repeat(128)).is_ok(), "128 CJK chars = 384 bytes must pass");
+        assert_eq!(validate_query(&"汉".repeat(129)).unwrap_err().0, StatusCode::BAD_REQUEST);
+    }
+
+    #[test]
+    fn dir_section_shape_agent_and_indexing() {
+        let snap = dir_snap(&["/home/u/s3/zeromux", "/home/u/s3/zeromux/docs"]);
+        let mut agents = std::collections::HashMap::new();
+        agents.insert("/home/u/s3/zeromux".to_string(), "claude".to_string());
+        let v = dir_section(Some(&snap), false, "zmx", 6, &Default::default(), &agents, "/home/u");
+        assert_eq!(v["kind"], "dirs");
+        assert_eq!(v["indexing"], false);
+        let it = &v["items"][0];
+        assert_eq!(it["path"], "/home/u/s3/zeromux");
+        assert_eq!(it["display"], "zeromux");
+        assert_eq!(it["hint"], "~/s3");
+        assert_eq!(it["agent"], "claude");
+        assert!(it["score"].as_u64().unwrap() > v["items"][1]["score"].as_u64().unwrap(),
+            "score is exposed so the client can order sections by their best hit");
+        assert!(v["items"][1]["agent"].is_null());
+        let none = dir_section(None, true, "zmx", 6, &Default::default(), &Default::default(), "/home/u");
+        assert_eq!(none["indexing"], true);
+        assert_eq!(none["items"].as_array().unwrap().len(), 0);
+        let refreshing = dir_section(Some(&snap), true, "zmx", 6, &Default::default(), &agents, "/home/u");
+        assert_eq!(refreshing["indexing"], false);
+        assert_eq!(refreshing["refreshing"], true);
+    }
+
+    #[test]
+    fn notes_section_abs_dir_for_note_and_folder() {
+        let d = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(d.path().join("projects/x")).unwrap();
+        std::fs::write(d.path().join("projects/x/_index.md"), "x").unwrap();
+        let snap = crate::fuzzy_index::VaultModel::full_scan(d.path()).unwrap().snapshot(1);
+        let root = d.path().to_string_lossy().to_string();
+        let v = notes_section(Some(&snap), false, "projects x", 50, &Default::default(), &root);
+        assert_eq!(v["kind"], "notes");
+        let items = v["items"].as_array().unwrap();
+        let note = items.iter().find(|i| i["kind"] == "note").unwrap();
+        let folder = items.iter().find(|i| i["kind"] == "folder" && i["path"] == "projects/x").unwrap();
+        assert_eq!(note["path"], "projects/x/_index.md");
+        assert_eq!(note["display"], "_index");
+        assert_eq!(note["hint"], "projects/x");
+        assert_eq!(note["abs_dir"], format!("{root}/projects/x"));
+        assert_eq!(folder["abs_dir"], format!("{root}/projects/x"));
+    }
+
+    #[test]
+    fn meta_only_query_yields_empty_sections() {
+        let snap = dir_snap(&["/home/u/a"]);
+        for q in ["!a", "'", "   "] {
+            let v = dir_section(Some(&snap), false, q, 6, &Default::default(), &Default::default(), "/home/u");
+            assert_eq!(v["items"].as_array().unwrap().len(), 0, "{q:?}");
+        }
+    }
+
+    #[test]
+    fn notes_section_indexing_and_refreshing() {
+        let none = notes_section(None, true, "x", 6, &Default::default(), "/v");
+        assert_eq!(none["indexing"], true);
+        assert_eq!(none["items"].as_array().unwrap().len(), 0);
+        let d = tempfile::tempdir().unwrap();
+        std::fs::write(d.path().join("a.md"), "x").unwrap();
+        let snap = crate::fuzzy_index::VaultModel::full_scan(d.path()).unwrap().snapshot(1);
+        let v = notes_section(Some(&snap), true, "a", 6, &Default::default(), "/v");
+        assert_eq!(v["indexing"], false);
+        assert_eq!(v["refreshing"], true);
+    }
+
+    #[test]
+    fn frecency_maps_aggregates_by_path_and_picks_best_valid_agent() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = crate::quick_targets::QuickTargetStore::open(dir.path()).unwrap();
+        let now = crate::fuzzy_index::now_ms();
+        store.bump("u1", "dir", "/h/p", "claude", now).unwrap();
+        store.bump("u1", "dir", "/h/p", "codex", now).unwrap();
+        store.bump("u1", "dir", "/h/p", "codex", now).unwrap();
+        store.bump("u1", "dir", "/h/p", "kiro", now).unwrap();   // legacy agent: not a valid pick
+        store.bump("u2", "dir", "/h/p", "crew", now).unwrap();   // other user: invisible
+        let (sum, best) = frecency_maps_from(&store, "u1", "dir");
+        assert!(sum["/h/p"] > 0.0);
+        assert_eq!(best.get("/h/p").map(|s| s.as_str()), Some("codex"));
+    }
+
+    #[test]
+    fn vault_search_endpoint_is_gone() {
+        let src = include_str!("web.rs");
+        assert!(!src.contains(concat!("\"/api/vault/", "search\"")), "legacy endpoint must be removed, not shimmed");
     }
 }
 

@@ -1,11 +1,31 @@
 # 模糊搜索 —— New Session 目录 + Obsidian 文件夹/笔记 — 设计
 
 日期：2026-09-25
-状态：v2（已经 CTO + PM 交叉 review 并修订，待用户审阅）
+状态：v3（vault 改为 inotify 实时增量，待 CTO + PM 增量 review）
 
 ## 修订记录
 
-**v2（本版）** —— CTO（技术）+ PM（产品）并行交叉 review。两位 reviewer 的关键断言
+**v3（本版）** —— 用户追加约束：「obsidian 是动态的，新产生的文件/文件夹也要能模糊搜」。
+调研（2026-09-25 本机实测）结论与决策：
+
+- **写入方全在本机**：近两周新增 `.md` 属主均为 `ubuntu`，来源是本机 zeromux agent、本机常驻
+  Obsidian 桌面端（`/opt/obsidian`，自 07-03 运行）、以及 Mac 端经 `remotely-save` 插件由本机
+  Obsidian 拉取落盘。均经本机 JuiceFS FUSE 挂载点写入。
+- **inotify 在 JuiceFS FUSE 挂载点上可用**：探针实测新建（含中文名）文件夹 / 新建 `.md` /
+  文件改名 / 文件夹改名（`MOVED_FROM`+`MOVED_TO` 成对，同 cookie）/ 删除，均 ≤50ms 送达。
+  局限：**其他主机**直写同一 JuiceFS 的变更本机收不到（当前无此写入方，靠周期全量兜底）。
+- **轮询不可行**：vault 全量遍历 42s；只 `stat` 1894 个目录的 mtime 也要 20s。
+- **v2「零结果才刷新」对 vault 失效**：新写 `2026-09-25-下午.md` 后搜「单词」，旧笔记照样命中 →
+  不零结果 → 不刷新，最坏 10 分钟后才可搜。这恰是用户最高频的场景（每天两篇单词笔记）。
+- **v2 文件夹规则漏新建空文件夹**：「子树含 .md 才收」→ 在 Obsidian 里刚建的文件夹搜不到。
+  实测 1894 个文件夹中 409 个子树含笔记、117 个为空。
+- **watch 成本可接受**：`projects/` 1548 个目录 `inotify_add_watch` 共 16s（后台一次性）；
+  `max_user_watches = 248967`。
+
+决策（用户选 A）：vault 用 **inotify 增量 + 周期/溢出全量兜底**；`$HOME` 目录索引保持轮询
+（遍历仅 3.7s，新目录多为新 clone 的 repo、名字不与旧目录重合，零结果触发有效），TTL 10→2 分钟。
+
+**v2** —— CTO（技术）+ PM（产品）并行交叉 review。两位 reviewer 的关键断言
 均由本人复核（本 repo 教训：reviewer 方向对但细节常编造，一律不采信未核实的断言）：
 线上 journal `06:23:33 serving vault → 06:24:19 listening` 证实 vault 同步遍历 46s；
 `deploy.sh:82` 注释证实健康检查 90s 窗口即为此；`~/.zeromux/zeromux.db` 中 12 个 dir
@@ -69,12 +89,14 @@ nucleo 性能（CTO 实测）：128 字符 / 64 atom 最坏查询扫 7000 条 13
   - 点目录 = 以它为 work_dir 建会话（有历史 agent 则一击直达）。
   - 点笔记 = 在 Obsidian doc tab 打开；点笔记文件夹 = doc tab 定位到该文件夹。
 - VaultReader 搜索框换成同一匹配器，结果含文件夹。
-- vault 索引异步 + 可刷新（修「新笔记重启前搜不到」+ 启动 46s 阻塞）。
+- vault 索引异步 + **实时**（新建/改名/删除的笔记与文件夹 ≤1s 可搜；修「新笔记重启前搜不到」
+  + 启动 46s 阻塞）。
 
 非目标（明确不做）：
 - 全文搜索（只搜路径/名字）；拼音匹配（`kaoyan` 不命中 `考研`）。
 - `$HOME` 之外的目录；dot 目录；vault 之外的 `.md` 文件（New Session 的「笔记」段只含 vault）。
-- 实时文件系统监听（inotify 在 JuiceFS 上不可靠）。
+- 对 `$HOME` 目录索引做文件系统监听（`target/`、`node_modules` 等噪音变动过多；轮询已够）。
+- 其他主机直写 JuiceFS 的 vault 变更做到实时（只保证 ≤6h 内被周期全量兜住）。
 - 命中字符高亮；↑/↓ 键盘导航（只做 Enter = 打开第一条）。
 - DirectoryPicker（定时任务表单，低频）与 Sidebar `pick-dir` 加搜索——接口通用，以后只是接线。
 
@@ -113,36 +135,95 @@ vault 的 `PathIndex` 与 wikilink 用的 `VaultIndex`（字段不变）**在同
   （纵深防御——跳过 `.` 开头已使其在构造上不命中）。**不 canonicalize**：JuiceFS 上约 10ms/次，
   650 条多 6.5s。
 
-#### 1b. vault 索引
+#### 1b. vault 索引（初始全量）
 
 - 扩展 `build_vault_index` 为一次遍历同时产出 `VaultIndex` 与 `PathIndex`：
   - `VaultNote`：现有 `.md` 规则不变。
-  - `VaultDir`：只收**子树含 `.md`** 的文件夹（遍历时对每个 `.md` 的祖先链打标记，零额外 IO），
-    并额外跳过 `node_modules | target | __pycache__`（仅影响 VaultDir 与后续下钻，不改变现有
-    `.md` 收录范围——这些目录下的 `.md` 本来就极少，且非笔记）。
+  - `VaultDir`：收 **「子树含 `.md`」或「空文件夹」**（无任何非 dot 子项）。前者覆盖笔记文件夹，
+    后者让 Obsidian 里刚建的空文件夹立即可搜；vault 内 Python 项目的代码目录两者都不满足，被滤掉。
+    遍历时对每个 `.md` 的祖先链打标记，零额外 IO。
+  - 额外跳过 `node_modules | target | __pycache__`（实测这三类目录下 `.md` 数为 0，不影响
+    wikilink 覆盖；测试 fixture 固定此行为）。
+- 该遍历在 watcher 线程内执行，并对每个遍历到的目录挂 watch（见 1d）——watch 集合 =
+  遍历集合，跳过规则只有一份。
 
-  > 注：跳过这三个名字确会让其中的 `.md` 从 wikilink 索引消失。实测 vault 中这三类目录下
-  > `.md` 数为 0（实现时以测试 fixture 固定此行为）。
+#### 1c. 状态机
 
-#### 1c. 状态机（两个 slot 共用）
+两个 slot 共用：
 
 | 状态 | `cur` | `rebuilding` | 搜索行为 |
 |---|---|---|---|
 | 首建中 | None | true | 返回该类空结果 + `indexing: true` |
 | 就绪 | Some | false | 正常匹配 |
-| 刷新中 | Some | true | 用旧快照正常匹配 + `refreshing: true`（**不是** indexing） |
+| 全量重建中 | Some | true | 用旧快照正常匹配 + `refreshing: true`（**不是** indexing） |
 
-- **首建**：启动代码先 `rebuilding.store(true)` 再 `spawn_blocking(build)`，保证首建期间的搜索
-  请求 CAS 失败、不会并发第二次遍历。listener bind **不再等待** vault 遍历。
-- **刷新触发**（CAS `false→true` 成功者发起，失败者什么都不做）：
-  - 快照年龄 > 10 分钟（stale-while-revalidate，本次请求用旧快照）；
+- **首建**：启动代码先 `rebuilding.store(true)` 再启动构建（目录 slot：`spawn_blocking`；vault slot：
+  watcher 线程），保证首建期间的请求 CAS 失败、不会并发第二次遍历。listener bind **不再等待** vault 遍历。
+- **复位**：`rebuilding` 由构建闭包内持有的 Drop guard 复位——构建 panic 同样复位。
+  vault watcher 线程若 panic 退出：由 `std::thread` 的 JoinHandle 监督者（一个 tokio 任务
+  `spawn_blocking(join)`）记录错误并重启 watcher（重新全量），重启间隔指数退避，上限 10 分钟。
+  构建成功才替换 `cur`，失败 / panic 保留旧快照。
+
+两个 slot 的**刷新触发**不同：
+
+- **目录 slot（轮询）**：CAS `false→true` 成功者发起，失败者什么都不做。
+  - 快照年龄 > **2 分钟**（stale-while-revalidate，本次请求用旧快照）；
   - 或：目录段**零结果**且快照年龄 > 30 秒（「刚 clone」逃生口，30s 下限防每次敲键都触发）。
-    vault 段同理（「刚写的笔记」）。
-- **复位**：`rebuilding` 由一个 Drop guard 复位，guard 在 `spawn_blocking` 闭包内持有——
-  构建 panic 同样复位，下次过期可重建。构建成功才替换 `cur`，失败/panic 保留旧快照。
-- 只有搜索请求会触发刷新：空闲时零遍历。vault 刷新一次约 45s 后台元数据遍历，最多每 10 分钟一次。
+  - 只由搜索请求触发，空闲零遍历；一次约 3.7s。
+- **vault slot（事件驱动，见 1d）**：增量事件直接改快照；只有以下情况走全量重建：
+  - watcher 报告需要重扫（`IN_Q_OVERFLOW`、watch 建立失败、watcher 线程退出）；
+  - 距上次全量 > **6 小时**（兜底其他主机直写 JuiceFS；由 watcher 线程计时，不依赖搜索请求）。
+  - 全量重建完成后**整体替换**快照与 `Inotify` 实例（见 1d）。
+
 - `vault_resolve` 在首建中返回 503 `"vault indexing"`；前端 `resolveWikiLink` 对 503 提示
   「笔记索引建立中，请稍候」而非「未找到」。
+
+#### 1d. vault watcher（`src/vault_watch.rs`，新模块）
+
+依赖 `inotify = "0.11"`（Linux 专用；本项目只部署 Linux）。不用 `notify` crate：需要让 watch 集合
+与索引的跳过规则逐项一致（不 watch `.obsidian` / `.trash` —— Obsidian 高频写 `workspace.json`；
+不跟 symlink；不进噪音目录），`notify` 的递归 watch 无法按规则剪枝。
+
+**线程模型**：一个专用 OS 线程（`std::thread::spawn`，阻塞 `read_events_blocking`），不占 tokio
+worker。它是 vault 快照的**唯一写者**；搜索请求只读 `Arc` 快照。
+
+**数据结构**（watcher 线程私有）：
+- `wd → 目录相对路径` 与 `目录相对路径 → wd` 双向表；
+- 当前快照的可变工作副本（`PathIndex` 条目集 + `VaultIndex` 的 basename 表）。
+
+**事件合并与发布**：读到一批事件后应用到工作副本，**防抖 300ms**（期间持续来事件则继续累积，
+上限 2s）后构建新 `Arc<VaultSnapshot>` 原子换入 slot。理由：Obsidian 保存 / `remotely-save`
+同步会连续产生一串事件，逐条发布会反复重建 basename 表。发布为 O(N) 克隆（N≈1000 条目，
+微秒到亚毫秒级），可接受。
+
+**事件处理**（掩码 `CREATE | DELETE | MOVED_FROM | MOVED_TO | DELETE_SELF | IGNORED`，
+加 `IN_ONLYDIR` 用于挂 watch；**不订阅 `MODIFY`/`CLOSE_WRITE`**——只搜路径，内容变化无关）：
+
+| 事件 | 条件 | 处理 |
+|---|---|---|
+| `CREATE` 文件 | 名以 `.md` 结尾（大小写不敏感）且非 dot | 加 `VaultNote`；祖先链标记「含 md」 |
+| `CREATE` 目录 | 非 dot、非噪音名、非 symlink（`symlink_metadata` 确认） | 先挂 watch，**再**扫一遍该目录（递归，同 1b 规则），把扫到的子目录也挂 watch、子项入索引——防「mkdir 后、watch 挂上前已写入文件」的竞态（`mkdir -p a/b/c && touch a/b/c/x.md`）。重复加入按 path 去重 |
+| `DELETE` 文件 | `.md` | 删条目；重算其祖先的「含 md / 空」状态 |
+| `DELETE` 目录 / `DELETE_SELF` / `IGNORED` | — | 删该目录及其所有子条目、清理 wd 表 |
+| `MOVED_FROM` + `MOVED_TO` | 同 cookie、同一批次内配对 | 视为改名：文件 → 改一条 path；目录 → 把旧前缀下所有条目与 wd 表条目**前缀改写**（inotify 的 watch 跟随 inode，子目录 wd 无需重挂） |
+| 仅 `MOVED_FROM` | 批次结束仍未配对 | 移出 vault：按 DELETE 处理（目录要 `rm_watch` 其子树） |
+| 仅 `MOVED_TO` | 未配对 | 移入 vault：按 CREATE 处理（目录走「挂 watch + 扫描」） |
+| `IN_Q_OVERFLOW` | — | 请求全量重建（1c） |
+
+- 改名到 dot 名（例如 Obsidian 删除到 `.trash` 的实现是 `rename` 到 `.trash/`）= 未配对的
+  `MOVED_FROM`（`.trash` 不被 watch）→ 按删除处理，正确。
+- 「空文件夹」与「含 md」状态随增删在祖先链上增量维护：计数器 `md_count(dir)`（子树内 md 数）+
+  `child_count(dir)`（直接非 dot 子项数）；`VaultDir` 收录条件 = `md_count > 0 || child_count == 0`。
+- `add_watch` 失败（`ENOSPC` 超出 `max_user_watches` 等）：记 warn 日志并请求全量重建；
+  连续失败时退化为仅 6 小时周期全量（不重试风暴）。
+- 所有路径在进入索引前做 1a 同款词法守卫（`vault_path_has_dot_component`），与读端点一致。
+
+**遍历与挂 watch 合一**（初始全量与全量重建走同一函数，在 watcher 线程内执行）：
+自顶向下 BFS，对每个目录**先 `add_watch` 再 `read_dir`**。事件从 watch 挂上那一刻起入队，
+遍历结束后先应用积压事件、再首次发布快照——无「遍历后、挂 watch 前」的漏事件窗口。
+总耗时 ≈ 遍历耗时（~42–58s，后台），不阻塞 listener。
+全量重建时新建一个 `Inotify` 实例完成新一轮遍历，成功后替换旧实例（drop 即释放全部旧 watch），
+失败则保留旧实例与旧快照。
 
 ### 2. 匹配（`nucleo-matcher 0.3`）
 
@@ -184,7 +265,7 @@ vault 的 `PathIndex` 与 wikilink 用的 `VaultIndex`（字段不变）**在同
   - frecency 按 `user.id` 查（`candidates` 已 owner-scoped）。
 - **删除** `/api/vault/search`、`vault_search`、`vault_search_filter` 及前端 `getVaultSearch`。
 
-依赖：`nucleo-matcher = "0.3"`（纯 Rust）。
+依赖：`nucleo-matcher = "0.3"`（纯 Rust）、`inotify = "0.11"`（vault watcher）。
 
 ## 前端
 
@@ -228,7 +309,7 @@ vault 的 `PathIndex` 与 wikilink 用的 `VaultIndex`（字段不变）**在同
 | 状态 | 目录段 | 笔记段 |
 |---|---|---|
 | 首建中（`indexing`） | 「正在建立目录索引…」 | 「正在建立笔记索引…」 |
-| 刷新中且零结果 | 「索引刷新中…」，前端 4s 后自动重查一次 | 同左 |
+| 刷新中且零结果 | 「索引刷新中…」，前端 4s 后自动重查一次 | 「索引重建中…」（仅全量重建时；增量无此态） |
 | 零结果 | 「未找到（仅索引 6 层内）· 用「其他目录…」浏览」 | 「无匹配笔记」 |
 | `truncated` | 不提示（Top 6 远小于上限） | 不提示 |
 | 请求失败 | 结果区静默隐藏 + 行内「重试」；其余入口照常 | 同左 |
@@ -258,12 +339,23 @@ QuickTargets 清理：删除 `onEmpty` prop 与 `failed` state（`Sidebar.tsx:51
 
 Rust（`fuzzy_index.rs` `#[cfg(test)]`，临时目录 fixture）：
 - 遍历：跳 dot / symlink / 噪音名；maxdepth；上限 + BFS 截断丢最深层；vault 子树**被包含**。
-- VaultDir：只收子树含 `.md` 的文件夹；`__pycache__` 不收。
+- VaultDir：收子树含 `.md` 的文件夹与空文件夹；只含非 md 文件的代码目录与 `__pycache__` 不收。
 - 同一次遍历产出的 `VaultIndex` 与现有 `build_vault_index` 行为一致（复用既有 wikilink 测试）。
 - 匹配：`zmx`→zeromux；`gsai`→github-search/ai；`考研`→考研英语；basename 加权使 repo 排在子目录前；
   `!docs` 不返回 score 0 条目；frecency 加分让等分者靠前但不压过多一个字符的更好匹配；按 path 聚合多 agent 行。
 - 状态机：首建中搜索不触发第二次构建；刷新中返回旧快照 + `refreshing`；构建 panic 后 `rebuilding` 复位
-  且旧快照保留；零结果 30s 下限。
+  且旧快照保留；目录 slot 2 分钟 TTL 与零结果 30s 下限。
+
+vault watcher（`vault_watch.rs` `#[cfg(test)]`，真实 inotify + 临时目录，事件处理核心抽成
+纯函数 `apply(events, &mut WorkingIndex)` 另做无 IO 单测）：
+- 新建 `.md` / 新建空文件夹 → 防抖窗口后可搜；非 `.md` 文件不入索引（但使父目录不再「空」）。
+- `mkdir -p a/b/c && touch a/b/c/x.md`（竞态）→ `a`、`a/b`、`a/b/c`、`x.md` 全部入索引。
+- 文件改名；文件夹改名 → 子路径全部前缀改写，改名后在子目录新建文件仍被捕获（wd 跟随 inode）。
+- 移出 vault / 删除到 `.trash`（未配对 `MOVED_FROM`）→ 按删除；移入 vault（未配对 `MOVED_TO`）→ 按新建。
+- 删除最后一个 md → 祖先 `md_count` 递减，文件夹按「空 / 非空」规则正确进出索引。
+- `.obsidian/workspace.json` 写入不产生任何事件（未 watch）。
+- 模拟 `IN_Q_OVERFLOW` → 触发全量重建，重建期间旧快照可搜。
+- watcher 线程 panic → 监督者重启，最终恢复可搜。
 - 接口：非 admin `notes` 为空；空 q；129 个汉字 400、128 个通过；`vault_resolve` 首建中 503。
 
 前端（vitest）：
@@ -277,7 +369,13 @@ Rust（`fuzzy_index.rs` `#[cfg(test)]`，临时目录 fixture）：
 
 ## 风险
 
-- vault 后台刷新 ≈ 45s JuiceFS 元数据遍历，最多每 10 分钟一次、仅在有人搜索时发生。
+- vault 全量遍历 + 挂 watch ≈ 42–58s JuiceFS 元数据操作：启动一次 + 每 6 小时一次 + 溢出时。
+- inotify 只覆盖经本机 FUSE 挂载点的写入；其他主机直写同一 JuiceFS 的变更最迟 6 小时后可搜。
+  当前所有写入方（zeromux agent、本机 Obsidian、remotely-save 同步落盘）均在本机。
+- watch 数 ≈ vault 目录数（~1900，上限 248967）；Obsidian 在 vault 内新建大量目录（如解压附件包）
+  时线性增长，`ENOSPC` 退化为 6 小时周期全量（1d）。
+- 本机 JuiceFS 重新挂载（`systemctl restart juicefs`）会使所有 watch 失效（`IN_IGNORED` / `DELETE_SELF`
+  于根）→ 根 watch 失效即请求全量重建。
 - 启动后前 ~46s 内 vault 搜索 / wikilink 解析不可用（`indexing` / 503）——相比现在整站 46s 不可用是净改善。
 - deploy.sh 的 90s 健康检查窗口可在本改动上线后另议缩短（本 spec 不改）。
 - 5000 条目录上限：当前 650，余量充足。

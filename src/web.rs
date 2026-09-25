@@ -541,7 +541,14 @@ fn frecency_maps_from(
     let now = crate::fuzzy_index::now_ms();
     let mut sum = std::collections::HashMap::<String, f64>::new();
     let mut best = std::collections::HashMap::<String, (f64, String)>::new();
-    for r in store.candidates(user_id, kind).unwrap_or_default() {
+    let rows = match store.candidates(user_id, kind) {
+        Ok(rows) => rows,
+        Err(e) => {
+            eprintln!("quick_targets candidates (search) skipped: {e}");
+            Vec::new()
+        }
+    };
+    for r in rows {
         let d = crate::quick_targets::decayed_score(r.score_raw, r.last_ms, now);
         *sum.entry(r.path.clone()).or_default() += d;
         if matches!(r.agent.as_str(), "claude" | "crew" | "codex" | "tmux") {
@@ -6409,13 +6416,29 @@ diff --git a/src/main.rs b/src/main.rs\n\
         let dir = tempfile::tempdir().unwrap();
         let store = crate::quick_targets::QuickTargetStore::open(dir.path()).unwrap();
         let now = crate::fuzzy_index::now_ms();
-        store.bump("u1", "dir", "/h/p", "claude", now).unwrap();
+        store.bump("u1", "dir", "/h/p", "claude", now).unwrap(); // score 1.0
         store.bump("u1", "dir", "/h/p", "codex", now).unwrap();
-        store.bump("u1", "dir", "/h/p", "codex", now).unwrap();
-        store.bump("u1", "dir", "/h/p", "kiro", now).unwrap();   // legacy agent: not a valid pick
-        store.bump("u2", "dir", "/h/p", "crew", now).unwrap();   // other user: invisible
+        store.bump("u1", "dir", "/h/p", "codex", now).unwrap(); // score 2.0
+        // kiro (legacy agent, u1) OUT-SCORES codex: if the claude|crew|codex|tmux
+        // whitelist in frecency_maps_from were deleted, kiro (not codex) would win "best".
+        for _ in 0..4 {
+            store.bump("u1", "dir", "/h/p", "kiro", now).unwrap(); // score 4.0
+        }
+        // crew (u2, SAME path) OUT-SCORES everyone: if candidates() ignored user_id
+        // scoping, crew would leak into u1's results, winning "best" and inflating "sum".
+        for _ in 0..6 {
+            store.bump("u2", "dir", "/h/p", "crew", now).unwrap(); // score 6.0
+        }
         let (sum, best) = frecency_maps_from(&store, "u1", "dir");
-        assert!(sum["/h/p"] > 0.0);
+        // u1-only total: claude(1.0) + codex(2.0) + kiro(4.0) = 7.0, modulo the sub-ms
+        // decay `frecency_maps_from` applies for the little wall-clock time that elapses
+        // between `now` (bump time) and its own now_ms() call — negligible against a
+        // 14-day half-life, so 1e-3 slack comfortably clears that jitter while staying
+        // two orders of magnitude below the 6.0 a leaked u2/crew row would add.
+        // If u2's crew(6.0) leaked in via broken scoping, this would be ~13.0 instead;
+        // this is a hardcoded expectation, not re-derived through the same candidates()
+        // call under test, so a scoping regression can't hide from it.
+        assert!((sum["/h/p"] - 7.0).abs() < 1e-3, "sum={}", sum["/h/p"]);
         assert_eq!(best.get("/h/p").map(|s| s.as_str()), Some("codex"));
     }
 

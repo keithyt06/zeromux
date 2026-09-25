@@ -13,6 +13,7 @@ use crate::fuzzy_index::{claim, now_ms, SearchIndexes, VaultModel};
 use inotify::{EventMask, Inotify, WatchMask};
 use std::collections::{BTreeSet, HashMap};
 use std::os::fd::AsRawFd;
+use std::os::unix::fs::MetadataExt;
 use std::path::Path;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -24,6 +25,19 @@ const MIN_REBUILD_GAP_MS: i64 = 60_000;
 const DRAIN_EVERY_DIRS: usize = 64;
 /// A watcher lifetime longer than this resets the restart backoff to 1s.
 const HEALTHY_LIFETIME: Duration = Duration::from_secs(600);
+/// A lazy unmount + remount of the vault's filesystem (JuiceFS) may deliver no
+/// IN_UNMOUNT/IGNORED, leaving every watch dead. Re-stat the root this often.
+const ROOT_CHECK_EVERY: Duration = Duration::from_secs(60);
+
+fn root_id(root: &Path) -> std::io::Result<(u64, u64)> {
+    let m = std::fs::metadata(root)?;
+    Ok((m.dev(), m.ino()))
+}
+
+/// The root is gone or is now a different inode/device → watches are stale.
+fn root_changed(prev: (u64, u64), now: std::io::Result<(u64, u64)>) -> bool {
+    !matches!(now, Ok(id) if id == prev)
+}
 
 fn mask() -> WatchMask {
     WatchMask::CREATE | WatchMask::DELETE | WatchMask::MOVED_FROM | WatchMask::MOVED_TO
@@ -209,6 +223,8 @@ fn run(si: &SearchIndexes) -> Result<std::convert::Infallible, String> {
         // extra walk). The guard only suppresses concurrent 1a rebuilds.
         let guard = claim(&slot);
         let mut dirty = BTreeSet::new();
+        // Taken before the walk: a remount mid-walk is then caught by the first check.
+        let root0 = root_id(&root).map_err(|e| format!("stat root: {e}"))?;
         let (mut w, fresh, restart) = Watcher::full(&root, &mut dirty).map_err(|e| format!("full scan: {e}"))?;
         last_full = now_ms();
         {
@@ -231,12 +247,15 @@ fn run(si: &SearchIndexes) -> Result<std::convert::Infallible, String> {
         // Event loop.
         let mut first_dirty: Option<Instant> = None;
         let mut last_event = Instant::now();
+        let mut next_root_check = Instant::now() + ROOT_CHECK_EVERY;
         loop {
             let until_full = Duration::from_millis((last_full + FULL_EVERY_MS - now_ms()).max(0) as u64);
             let timeout = match first_dirty {
                 Some(_) => Duration::from_millis(DEBOUNCE_MS).saturating_sub(last_event.elapsed()).min(until_full),
                 None => until_full,
-            };
+            }
+            // Bounded even when idle, so the root check below still runs.
+            .min(next_root_check.saturating_duration_since(Instant::now()));
             w.wait(timeout);
             let before = dirty.len();
             match w.drain(&mut dirty) {
@@ -258,6 +277,13 @@ fn run(si: &SearchIndexes) -> Result<std::convert::Infallible, String> {
                 w.reconcile(&mut m, &root, &mut dirty);
                 slot.publish(m.snapshot(now_ms()));
                 first_dirty = None;
+            }
+            if Instant::now() >= next_root_check {
+                if root_changed(root0, root_id(&root)) {
+                    eprintln!("[vault_watch] vault root remounted or gone; rebuilding");
+                    break; // → full rebuild
+                }
+                next_root_check = Instant::now() + ROOT_CHECK_EVERY;
             }
             if now_ms() - last_full >= FULL_EVERY_MS { break; }
         }
@@ -437,6 +463,15 @@ mod tests {
         eventually(&si, |p| !p.contains(&"inside/deep".into())).await;
         fs::write(v.path().join("inside/deep/back.md"), "x").unwrap();
         eventually(&si, |p| p.contains(&"inside/deep".into()) && p.contains(&"inside/deep/back.md".into())).await;
+    }
+
+    #[test]
+    fn root_changed_detects_remount_or_loss() {
+        let err = || Err(std::io::Error::from(std::io::ErrorKind::NotFound));
+        assert!(!root_changed((1, 2), Ok((1, 2))));
+        assert!(root_changed((1, 2), Ok((1, 3))));
+        assert!(root_changed((1, 2), Ok((9, 2))));
+        assert!(root_changed((1, 2), err()));
     }
 
     #[test]

@@ -303,6 +303,12 @@ async fn main() {
         Err(e) => eprintln!("Prompt preset seeding skipped: {}", e),
     }
 
+    match prompts_store.seed_v2_if_needed(prompts_seed::SEED_PRESETS_V2) {
+        Ok(0) => {}
+        Ok(n) => eprintln!("Added {} study prompt presets (v2)", n),
+        Err(e) => eprintln!("Prompt preset v2 seeding skipped: {}", e),
+    }
+
     let event_store = Arc::new(
         events::EventStore::open(std::path::Path::new(&data_dir_str))
             .expect("Failed to initialize event store"),

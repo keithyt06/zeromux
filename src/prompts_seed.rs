@@ -1,7 +1,9 @@
 //! Version-controlled starter preset content, seeded into the library on first
 //! run. The human-readable source is
-//! `docs/superpowers/specs/2026-06-16-preset-content-library-design.md`; this is
-//! the machine source of truth. Edit the wording in BOTH places.
+//! `docs/superpowers/specs/2026-06-16-preset-content-library-design.md` (v1);
+//! SEED_PRESETS_V2 holds the study presets from
+//! `docs/superpowers/specs/2026-09-25-fuzzy-search-design.md §8.`
+//! These are the machine sources of truth. Edit the wording in both places.
 //!
 //! Each entry is `(title, body)`. Titles carry an emoji prefix so the chips stay
 //! distinguishable when truncated on a phone. Bodies are verbatim from the design
@@ -92,5 +94,52 @@ Approach: If not on a feature branch, create one first. Run verification (tests/
 Done when: a descriptive commit (message explains WHY, not just what) is pushed, and either the PR is open (report the link) or you've reported the branch + PR draft. Include verification evidence (test output).
 
 用中文与我交流（代码保持英文；commit message 与 PR 描述用英文，正文说明可中文）。"#,
+    ),
+];
+
+/// v2 study presets (2026-09-25 fuzzy-search spec §8), appended once to libraries
+/// already seeded with v1. Designed for the "⚡ 问 agent" flow: `{{input}}` wraps
+/// the prefilled "当前笔记：<path>" line, and the session's work_dir is the note's
+/// folder, so relative paths resolve.
+pub const SEED_PRESETS_V2: &[(&str, &str)] = &[
+    (
+        "❓ 基于笔记出题",
+        r#"Task: Quiz me on this note. {{input}}
+
+Approach: Read that note in full first (the path above is absolute). Write 5 questions that cover its key points — mix recall, application, and one question that connects ideas across sections. Match the note's subject style (exam-style multiple choice for 考研英语 reading notes, worked problems for 管综数学).
+
+Done when: you show the 5 questions only, then STOP and wait for my answers. After I answer, grade each one, explain every mistake with a pointer to the exact part of the note, and give the correct answer.
+
+用中文与我交流（英文原文、公式、术语保持原样）。"#,
+    ),
+    (
+        "💯 批改我的答案",
+        r#"Task: Grade my answers for this note. {{input}}
+
+Approach: My answers may be in my message, or in answer-sheet*/IMG_* images in this folder — look there before asking me. Read the note for the passage and reasoning. If the note marks its own answers as unverified (e.g. "尚未核对官方答案"), tell me which ones you're grading against unverified answers. If a `kaoyan-reading-review` skill is available and this is a 考研英语 reading passage, follow that skill's workflow. For each question: my answer, the correct answer, right/wrong, and the technique that gets it right.
+
+Done when: every question is graded and the error pattern is summarized in 2–3 bullets. Only if I confirm, append the diagnosis to the note under a dated heading. If you found no answers anywhere, ask me for them and stop.
+
+用中文与我交流（英文原文保持原样）。"#,
+    ),
+    (
+        "🃏 生成背诵卡",
+        r#"Task: Turn this note into a memorization card. {{input}}
+
+Approach: Read the note. If other `*-背诵卡.md` files exist in this vault (search this folder and its parents), copy their conventions exactly — file naming (short topic name + `-背诵卡.md`), frontmatter (tags include `背诵卡`), the backlink to the full note, and their table-first layout. Otherwise use `<topic>-背诵卡.md` with a `[[原笔记|完整笔记]]` backlink. Extract only what must be memorized: definitions, formulas, key vocabulary, typical traps. No prose paragraphs.
+
+Done when: the card is written next to the note (never overwrite an existing file — if one exists, show me the diff and ask), and you report its path and how many items it contains.
+
+用中文与我交流（英文单词、公式保持原样）。"#,
+    ),
+    (
+        "🔁 抽背单词",
+        r#"Task: Drill me on vocabulary. {{input}}
+
+Approach: Find the nearest directory named `单词` — in this folder, its subfolders, or any parent folder up to the vault root (its notes are date-named, entries look like `## N. word /phonetic/`). If none exists, ask me where my word lists are. Collect words from the most recent 7 notes, pick 20 at random (no duplicates), and quiz me ONE word at a time: show the word, wait for my meaning, then judge it and show the note's definition and example.
+
+Done when: all 20 are done; then list the ones I missed with their note filenames so I can review them.
+
+用中文与我交流（英文单词与例句保持原样）。"#,
     ),
 ];

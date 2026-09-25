@@ -227,6 +227,45 @@ impl PromptPresetStore {
         tx.commit().map_err(|e| format!("Seed commit error: {}", e))?;
         Ok(inserted)
     }
+
+    /// One-shot v2 migration: append the study presets to a library already seeded
+    /// with v1 (`user_version == 1`), then mark `user_version = 2` — in one tx, same
+    /// atomicity argument as `seed_if_unseeded`. Titles the user already has are
+    /// skipped (no duplicates). `user_version >= 2` → never touched again, so a
+    /// deleted study preset is never resurrected. `user_version == 0` is left alone:
+    /// callers run `seed_if_unseeded` first, which moves a fresh DB to 1.
+    pub fn seed_v2_if_needed(&self, presets: &[(&str, &str)]) -> Result<usize, String> {
+        let mut conn = self.conn.lock().unwrap();
+        let version: i64 = conn
+            .query_row("PRAGMA user_version", [], |row| row.get(0))
+            .map_err(|e| format!("Pragma read error: {}", e))?;
+        if version != 1 {
+            return Ok(0);
+        }
+        let max_order: i64 = conn
+            .query_row("SELECT COALESCE(MAX(sort_order), 0) FROM prompt_presets", [], |row| row.get(0))
+            .map_err(|e| format!("Max order error: {}", e))?;
+        let now = now_iso();
+        let tx = conn.transaction().map_err(|e| format!("Tx error: {}", e))?;
+        let mut inserted = 0usize;
+        for (title, body) in presets {
+            let exists: i64 = tx
+                .query_row("SELECT COUNT(*) FROM prompt_presets WHERE title = ?1", params![title.trim()], |r| r.get(0))
+                .map_err(|e| format!("Exists check error: {}", e))?;
+            if exists > 0 { continue; }
+            inserted += 1;
+            tx.execute(
+                "INSERT INTO prompt_presets (id, title, body, created_at, updated_at, sort_order)
+                 VALUES (?1, ?2, ?3, ?4, ?4, ?5)",
+                params![short_uuid(), title.trim(), body.trim(), now, max_order + inserted as i64],
+            )
+            .map_err(|e| format!("Seed v2 insert error: {}", e))?;
+        }
+        tx.execute_batch("PRAGMA user_version = 2")
+            .map_err(|e| format!("Pragma write error: {}", e))?;
+        tx.commit().map_err(|e| format!("Seed v2 commit error: {}", e))?;
+        Ok(inserted)
+    }
 }
 
 // Local helpers (two tiny fns, not worth a shared util).
@@ -408,6 +447,73 @@ mod tests {
             assert!(!b.is_empty(), "seed body empty: {}", t);
             assert!(t.chars().count() <= TITLE_MAX, "seed title too long: {}", t);
             assert!(b.chars().count() <= BODY_MAX, "seed body too long: {}", t);
+        }
+    }
+
+    // ── seed_v2_if_needed ──
+    use crate::prompts_seed::SEED_PRESETS_V2;
+
+    fn titles(s: &PromptPresetStore) -> Vec<String> {
+        s.list().unwrap().into_iter().map(|p| p.title).collect()
+    }
+
+    #[test]
+    fn seed_v2_appends_four_after_v1_with_continuing_sort_order() {
+        let (s, _d) = tmp_store();
+        s.seed_if_unseeded(SEED_PRESETS).unwrap();
+        assert_eq!(s.seed_v2_if_needed(SEED_PRESETS_V2).unwrap(), 4);
+        let list = s.list().unwrap();
+        assert_eq!(list.len(), 12);
+        let last4: Vec<&str> = list[8..].iter().map(|p| p.title.as_str()).collect();
+        assert_eq!(last4, SEED_PRESETS_V2.iter().map(|(t, _)| *t).collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn seed_v2_is_idempotent_and_never_resurrects() {
+        let (s, _d) = tmp_store();
+        s.seed_if_unseeded(SEED_PRESETS).unwrap();
+        s.seed_v2_if_needed(SEED_PRESETS_V2).unwrap();
+        assert_eq!(s.seed_v2_if_needed(SEED_PRESETS_V2).unwrap(), 0);
+        for p in s.list().unwrap() { s.delete(&p.id).unwrap(); }
+        assert_eq!(s.seed_v2_if_needed(SEED_PRESETS_V2).unwrap(), 0);
+        assert!(s.list().unwrap().is_empty());
+    }
+
+    #[test]
+    fn seed_v2_skips_titles_the_user_already_has() {
+        let (s, _d) = tmp_store();
+        s.seed_if_unseeded(SEED_PRESETS).unwrap();
+        s.create(SEED_PRESETS_V2[0].0, "my own").unwrap();
+        assert_eq!(s.seed_v2_if_needed(SEED_PRESETS_V2).unwrap(), 3);
+        assert_eq!(titles(&s).iter().filter(|t| *t == SEED_PRESETS_V2[0].0).count(), 1);
+    }
+
+    #[test]
+    fn fresh_db_gets_twelve_via_both_seeds() {
+        let (s, _d) = tmp_store();
+        s.seed_if_unseeded(SEED_PRESETS).unwrap();
+        s.seed_v2_if_needed(SEED_PRESETS_V2).unwrap();
+        assert_eq!(s.list().unwrap().len(), 12);
+    }
+
+    #[test]
+    fn seed_v2_titles_do_not_reuse_v1_emoji() {
+        let lead = |t: &str| t.chars().next().unwrap();
+        for (t2, _) in SEED_PRESETS_V2 {
+            for (t1, _) in SEED_PRESETS {
+                assert_ne!(lead(t2), lead(t1), "{t2} collides with {t1} — chips are told apart by emoji");
+            }
+        }
+    }
+
+    #[test]
+    fn seed_v2_content_within_caps() {
+        for (title, body) in SEED_PRESETS_V2 {
+            let (t, b) = (title.trim(), body.trim());
+            assert!(!t.is_empty() && !b.is_empty());
+            assert!(t.chars().count() <= TITLE_MAX);
+            assert!(b.chars().count() <= BODY_MAX);
+            assert!(b.contains("{{input}}"), "study presets wrap the prefilled note context: {t}");
         }
     }
 }

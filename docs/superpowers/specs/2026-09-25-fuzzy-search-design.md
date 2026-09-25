@@ -368,6 +368,7 @@ deprecated）。不用 `notify` crate：watch 集合需与索引跳过规则逐�
 - `scope`：逗号分隔，取值 `dirs` / `notes`，缺省 = 两者；未知值 400。`sections` 按 `scope` 中的顺序返回
   （前端按段内最高分重排显示）。以后新增实体 = 新增一个 `kind`，旧客户端忽略未知 kind。
 - 每个 section 带自己的 `indexing` / `refreshing` / `truncated`。
+- 每个 item 带 `score`（排序分，含 basename 与 frecency 加分），供前端按段内最高分排段序、Enter 取全局第一。
 - notes 项的 `abs_dir`：笔记取其父目录绝对路径，文件夹取自身绝对路径——供「⚡ 问 agent」/「在此开 agent」
   作为 work_dir。仅 admin 可见 notes，故不构成新泄漏（vault 路径对 admin 本就可知）。
 - `display/hint` 复用 `dir_display_hint` / `note_display_hint`。

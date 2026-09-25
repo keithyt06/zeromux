@@ -19,6 +19,7 @@ mod scheduled_tasks;
 mod session_manager;
 mod session_store;
 mod web;
+mod vault_watch;
 mod ws_handler;
 
 use clap::Parser;
@@ -443,10 +444,13 @@ async fn main() {
     // Both indexes build in the background: the listener no longer waits ~46s for
     // the vault walk on JuiceFS. Until the first snapshot lands, vault search
     // reports `indexing` and wikilink resolution answers 503.
-    let search = fuzzy_index::SearchIndexes::start(
+    let search = fuzzy_index::SearchIndexes::start_watched(
         std::path::PathBuf::from(std::env::var("HOME").unwrap_or_else(|_| "/home/ubuntu".into())),
         vault_dir.as_ref().map(std::path::PathBuf::from),
     );
+    // Batch 1b: the watcher becomes the vault's refresh source (1a triggers turn
+    // into no-ops while it runs, and resume as the fallback if it stops).
+    vault_watch::spawn(search.clone());
 
     // Resolve the Kiro Crew data home and refuse a placement that would expose
     // its IPC secret. Fail FAST (exit 1) rather than degrade: a silently-readable

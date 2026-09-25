@@ -182,6 +182,9 @@ impl VaultModel {
     /// - NEW child dirs (not in the model before) are scanned fully (`on_dir` first);
     /// - KNOWN child dirs are re-reconciled only `known_depth` more levels.
     pub fn reconcile_dir_with(&mut self, root: &Path, rel_dir: &str, known_depth: usize, on_dir: &mut dyn FnMut(&str)) {
+        // A dirty path may come from a stale watch mapping of a dir since renamed to
+        // a dot/noise name — never read such a path into the model.
+        if rel_dir.split('/').any(skip_name) && !rel_dir.is_empty() { self.remove_subtree(rel_dir); return; }
         let fresh = match Self::read_node(root, rel_dir) {
             Ok(n) => n,
             Err(_) => { self.remove_subtree(rel_dir); return; }
@@ -363,11 +366,11 @@ pub const WARM_MIN_AGE_MS: i64 = 30_000;
 pub const RECONCILE_DEPTH: usize = 3;
 
 /// Owned variant of RebuildGuard so a claimed rebuild can move into spawn_blocking.
-struct OwnedGuard<T> { slot: Arc<IndexSlot<T>> }
+pub(crate) struct OwnedGuard<T> { slot: Arc<IndexSlot<T>> }
 impl<T> Drop for OwnedGuard<T> {
     fn drop(&mut self) { self.slot.rebuilding.store(false, Ordering::Release); }
 }
-fn claim<T>(slot: &Arc<IndexSlot<T>>) -> Option<OwnedGuard<T>> {
+pub(crate) fn claim<T>(slot: &Arc<IndexSlot<T>>) -> Option<OwnedGuard<T>> {
     slot.rebuilding
         .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
         .ok()
@@ -383,6 +386,9 @@ pub struct SearchIndexes {
     /// rebuilds replace it and reconciles mutate it — both under this lock, inside
     /// spawn_blocking, so they serialize and never publish out of order.
     vault_model: Option<Arc<Mutex<VaultModel>>>,
+    /// Set while the vault watcher (batch 1b) owns vault refreshes; the 1a poll
+    /// triggers become no-ops and resume as the fallback when it clears.
+    watcher_active: AtomicBool,
 }
 
 impl SearchIndexes {
@@ -390,16 +396,36 @@ impl SearchIndexes {
     /// report `indexing`) and then run in spawn_blocking. Must be called inside a
     /// tokio runtime.
     pub fn start(home: PathBuf, vault_root: Option<PathBuf>) -> Arc<Self> {
-        let si = Arc::new(Self {
+        let si = Self::new_unstarted(home, vault_root);
+        si.refresh_dirs_if_older(i64::MIN);
+        si.refresh_vault_if_older(i64::MIN);
+        si
+    }
+
+    /// Like `start`, but leaves the vault's initial build to the watcher (which must
+    /// attach watches during the walk). Until the watcher publishes, `current()` is
+    /// None → searches report `indexing`, resolve answers 503 — same as 1a startup.
+    pub fn start_watched(home: PathBuf, vault_root: Option<PathBuf>) -> Arc<Self> {
+        let si = Self::new_unstarted(home, vault_root);
+        si.refresh_dirs_if_older(i64::MIN);
+        si
+    }
+
+    fn new_unstarted(home: PathBuf, vault_root: Option<PathBuf>) -> Arc<Self> {
+        Arc::new(Self {
             dirs: Arc::new(IndexSlot::new()),
             vault: vault_root.as_ref().map(|_| Arc::new(IndexSlot::new())),
             vault_model: vault_root.as_ref().map(|_| Arc::new(Mutex::new(VaultModel::default()))),
             home,
             vault_root,
-        });
-        si.refresh_dirs_if_older(i64::MIN);
-        si.refresh_vault_if_older(i64::MIN);
-        si
+            watcher_active: AtomicBool::new(false),
+        })
+    }
+
+    pub fn watcher_is_active(&self) -> bool { self.watcher_active.load(Ordering::Acquire) }
+    pub(crate) fn set_watcher_active(&self, on: bool) { self.watcher_active.store(on, Ordering::Release) }
+    pub(crate) fn vault_parts(&self) -> Option<(Arc<IndexSlot<VaultSnapshot>>, Arc<Mutex<VaultModel>>, PathBuf)> {
+        Some((self.vault.clone()?, self.vault_model.clone()?, self.vault_root.clone()?))
     }
 
     fn age_ok<T>(slot: &IndexSlot<T>, built_at: impl Fn(&T) -> i64, max_age_ms: i64) -> bool {
@@ -421,6 +447,7 @@ impl SearchIndexes {
     }
 
     pub fn refresh_vault_if_older(self: &Arc<Self>, max_age_ms: i64) {
+        if self.watcher_is_active() { return; }
         let (Some(slot), Some(model), Some(root)) = (&self.vault, &self.vault_model, &self.vault_root) else { return };
         if !Self::age_ok(slot, |s| s.built_at_ms, max_age_ms) { return; }
         let Some(guard) = claim(slot) else { return };
@@ -431,7 +458,7 @@ impl SearchIndexes {
             // reconcile that landed mid-scan with the older scan result (review r1
             // P0-2). Readers never take this lock — they read the published Arc — and
             // a waiting reconcile runs right after, on top of the fresh model.
-            let mut m = model.lock().unwrap();
+            let mut m = model.lock().unwrap_or_else(|e| e.into_inner());
             match VaultModel::full_scan(&root) {
                 Ok(fresh) => {
                     *m = fresh;
@@ -461,11 +488,12 @@ impl SearchIndexes {
     /// published), the reconcile is skipped — publishing a one-dir model would look
     /// like an almost-empty vault.
     pub fn reconcile_vault_dir(self: &Arc<Self>, abs_dir: &Path) {
+        if self.watcher_is_active() { return; }
         let Some(rel) = self.vault_rel(abs_dir) else { return };
         let (Some(slot), Some(model), Some(root)) = (&self.vault, &self.vault_model, &self.vault_root) else { return };
         let (slot, model, root) = (slot.clone(), model.clone(), root.clone());
         tokio::task::spawn_blocking(move || {
-            let mut m = model.lock().unwrap();
+            let mut m = model.lock().unwrap_or_else(|e| e.into_inner());
             if slot.current().is_none() { return; }
             m.reconcile_dir(&root, &rel, RECONCILE_DEPTH);
             slot.publish(m.snapshot(now_ms()));

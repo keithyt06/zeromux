@@ -172,4 +172,20 @@ describe('Sidebar New Session search', () => {
     expect(await screen.findByText('Claude Code', LABEL)).toBeInTheDocument()
     expect(screen.queryByText('Terminal')).toBeNull()
   })
+
+  it('notes indexing re-query even after dirs finishes', async () => {
+    vi.spyOn(api, 'warmSearchIndex').mockResolvedValue()
+    const spy = vi.spyOn(api, 'searchPaths')
+      .mockResolvedValueOnce(R(sec('dirs', [{ path: '/h/repo', display: 'repo', hint: '~', agent: null, score: 1 }]), { ...sec('notes', []), indexing: true }))
+      .mockResolvedValue(R(sec('dirs', [{ path: '/h/repo', display: 'repo', hint: '~', agent: null, score: 1 }]), sec('notes', [{ path: 'ready2.md', kind: 'note', display: 'ready2', hint: '', abs_dir: '/v', score: 1 }])))
+    setup()
+    await openAndType('rea')
+    await act(async () => { vi.advanceTimersByTime(200) })
+    await screen.findByText('正在建立笔记索引…')
+    expect(screen.getByText('repo')).toBeInTheDocument()
+    // Notes still indexing after dirs finishes. Advance 4s, then notes should appear.
+    await act(async () => { vi.advanceTimersByTime(4100) })
+    await screen.findByText('ready2')
+    expect(spy.mock.calls.length).toBeGreaterThanOrEqual(2)
+  })
 })

@@ -273,6 +273,61 @@ impl VaultModel {
     }
 }
 
+use nucleo_matcher::pattern::{CaseMatching, Normalization, Pattern};
+use nucleo_matcher::{Config, Matcher, Utf32Str};
+
+/// Added to the basename-only score so `…/zeromux` outranks `…/zeromux/docs`
+/// (nucleo scores both full paths identically for `zmx`/`zeromux` — measured).
+pub const BASENAME_BONUS: u32 = 20;
+
+pub struct Hit<'a> { pub entry: &'a IndexEntry, pub score: u32 }
+
+/// Frecency bonus from the summed decayed score: floor(12·s/(s+1)) ∈ [0, 11].
+/// Capped below nucleo's per-char SCORE_MATCH (16) so history breaks ties but
+/// never beats a strictly better text match.
+pub fn frecency_bonus(sum_decayed: f64) -> u32 {
+    if !(sum_decayed > 0.0) { return 0; }
+    (12.0 * sum_decayed / (sum_decayed + 1.0)).floor() as u32
+}
+
+/// True iff `q` parses to at least one non-negated atom (i.e. it can match anything).
+pub fn has_positive_atom(q: &str) -> bool {
+    Pattern::parse(q, CaseMatching::Smart, Normalization::Smart).atoms.iter().any(|a| !a.negative)
+}
+
+pub fn search<'a>(ix: &'a PathIndex, q: &str, limit: usize, bonus_for: &dyn Fn(&str) -> u32) -> Vec<Hit<'a>> {
+    let pattern = Pattern::parse(q, CaseMatching::Smart, Normalization::Smart);
+    // A pattern with no positive atom (empty, whitespace, bare `'`/`^`/`$`, or only
+    // negations like `!docs`) scores EVERY haystack Some(0) — refuse it outright.
+    if !has_positive_atom(q) {
+        return Vec::new();
+    }
+    let mut matcher = Matcher::new(Config::DEFAULT.match_paths());
+    let mut buf = Vec::new();
+    let mut hits: Vec<Hit<'a>> = Vec::new();
+    for e in &ix.entries {
+        let full = match pattern.score(Utf32Str::new(&e.haystack, &mut buf), &mut matcher) {
+            Some(s) if s > 0 => s,
+            _ => continue,
+        };
+        let base = pattern
+            .score(Utf32Str::new(&e.haystack[e.basename_off..], &mut buf), &mut matcher)
+            .map(|s| s + BASENAME_BONUS)
+            .unwrap_or(0);
+        let bonus = match e.kind { EntryKind::VaultDir => 0, _ => bonus_for(&e.path) };
+        hits.push(Hit { entry: e, score: full.max(base) + bonus });
+    }
+    hits.sort_by(|a, b| {
+        b.score.cmp(&a.score)
+            .then(a.entry.is_empty_dir.cmp(&b.entry.is_empty_dir))
+            .then(b.entry.mtime_ms.cmp(&a.entry.mtime_ms))
+            .then(a.entry.haystack.len().cmp(&b.entry.haystack.len()))
+            .then(a.entry.path.cmp(&b.entry.path))
+    });
+    hits.truncate(limit);
+    hits
+}
+
 /// Stale-while-revalidate cell. `rebuilding` is claimed by CAS and released by the
 /// guard's Drop — so a panicking builder can't wedge the slot "rebuilding" forever.
 pub struct IndexSlot<T> { cur: RwLock<Option<Arc<T>>>, rebuilding: AtomicBool }
@@ -510,5 +565,98 @@ mod tests {
         assert!(!slot.is_rebuilding(), "Drop guard must reset rebuilding even on panic");
         slot.publish(7);
         assert_eq!(*slot.current().unwrap(), 7);
+    }
+
+    fn ix_of(items: &[(&str, EntryKind, i64, bool)]) -> PathIndex {
+        PathIndex {
+            truncated: false,
+            entries: items.iter().map(|(h, k, m, empty)| IndexEntry {
+                path: h.to_string(), kind: *k, haystack: h.to_string(),
+                basename_off: basename_off(h), mtime_ms: *m, is_empty_dir: *empty,
+            }).collect(),
+        }
+    }
+    fn top(ix: &PathIndex, q: &str) -> Vec<String> {
+        search(ix, q, 10, &|_| 0).into_iter().map(|h| h.entry.path.clone()).collect()
+    }
+
+    #[test]
+    fn search_subsequence_and_basename_weighting() {
+        let ix = ix_of(&[
+            ("~/s3/ai/zeromux/docs", EntryKind::Dir, 0, false),
+            ("~/s3/ai/zeromux", EntryKind::Dir, 0, false),
+            ("~/s3/keith-space/github-search/ai", EntryKind::Dir, 0, false),
+        ]);
+        assert_eq!(top(&ix, "zmx")[0], "~/s3/ai/zeromux", "repo itself beats its subdir");
+        assert_eq!(top(&ix, "gsai")[0], "~/s3/keith-space/github-search/ai");
+    }
+
+    #[test]
+    fn basename_bonus_beats_shorter_haystack() {
+        // Pins BASENAME_BONUS itself: without it both score 184 and the length
+        // tie-break would put the SHORTER `~/zeromux/a` first (verified by setting
+        // the bonus to 0 → this test goes red).
+        let ix = ix_of(&[
+            ("~/zeromux/a", EntryKind::Dir, 0, false),
+            ("~/s3/zeromux", EntryKind::Dir, 0, false),
+        ]);
+        assert_eq!(top(&ix, "zeromux")[0], "~/s3/zeromux");
+    }
+
+    #[test]
+    fn search_chinese_substring() {
+        let ix = ix_of(&[("projects/long-term/考研英语/_index", EntryKind::VaultNote, 1, false)]);
+        assert_eq!(top(&ix, "考研").len(), 1);
+    }
+
+    #[test]
+    fn search_negative_only_or_meta_only_query_returns_nothing() {
+        let ix = ix_of(&[("~/a", EntryKind::Dir, 0, false), ("~/b", EntryKind::Dir, 0, false)]);
+        for q in ["!docs", "'", "^", "$", "   ", ""] {
+            assert!(top(&ix, q).is_empty(), "query {q:?} must not return arbitrary rows");
+        }
+        // a positive atom plus a negation still works
+        assert_eq!(top(&ix, "a !b"), vec!["~/a"]);
+    }
+
+    #[test]
+    fn search_ties_prefer_nonempty_then_newest_mtime() {
+        // Equal mtime on both folders so ONLY the is_empty_dir rule can order them
+        // (with 500 vs 0 the mtime rule alone would pass — review r1 finding).
+        let ix = ix_of(&[
+            ("考研英语/2007/英语二/阅读理解", EntryKind::VaultDir, 0, true),
+            ("考研英语/2019/英语二/阅读理解", EntryKind::VaultDir, 0, false),
+            ("考研英语/单词/2026-09-24-上午", EntryKind::VaultNote, 100, false),
+            ("考研英语/单词/2026-09-25-上午", EntryKind::VaultNote, 200, false),
+        ]);
+        let r = top(&ix, "阅读理解");
+        assert_eq!(r[0], "考研英语/2019/英语二/阅读理解", "empty skeleton sorts after non-empty: {r:?}");
+        let r2 = top(&ix, "单词");
+        assert_eq!(r2[0], "考研英语/单词/2026-09-25-上午", "newest note first among ties: {r2:?}");
+    }
+
+    #[test]
+    fn frecency_bonus_is_capped_below_one_char_gap() {
+        assert_eq!(frecency_bonus(0.0), 0);
+        assert!(frecency_bonus(1.0) <= 12);
+        assert_eq!(frecency_bonus(1e9), 11, "floor(12·s/(s+1)) never reaches 12");
+        // bonus breaks a tie …
+        let ix = ix_of(&[("~/p/alpha", EntryKind::Dir, 0, false), ("~/q/alpha", EntryKind::Dir, 0, false)]);
+        let r: Vec<String> = search(&ix, "alpha", 10, &|p| if p == "~/q/alpha" { 5 } else { 0 })
+            .into_iter().map(|h| h.entry.path.clone()).collect();
+        assert_eq!(r[0], "~/q/alpha");
+        // … but never beats a strictly better text match (exact basename vs. scattered)
+        let ix2 = ix_of(&[("~/x/zeromux", EntryKind::Dir, 0, false), ("~/y/zexromxux", EntryKind::Dir, 0, false)]);
+        let r2: Vec<String> = search(&ix2, "zeromux", 10, &|p| if p == "~/y/zexromxux" { 11 } else { 0 })
+            .into_iter().map(|h| h.entry.path.clone()).collect();
+        assert_eq!(r2[0], "~/x/zeromux");
+    }
+
+    #[test]
+    fn search_respects_limit() {
+        let items: Vec<(String, EntryKind, i64, bool)> =
+            (0..30).map(|i| (format!("~/d{i}/note"), EntryKind::Dir, 0, false)).collect();
+        let refs: Vec<(&str, EntryKind, i64, bool)> = items.iter().map(|(a, b, c, d)| (a.as_str(), *b, *c, *d)).collect();
+        assert_eq!(search(&ix_of(&refs), "note", 6, &|_| 0).len(), 6);
     }
 }

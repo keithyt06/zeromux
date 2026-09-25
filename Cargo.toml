@@ -40,6 +40,8 @@ url = "2"
 # TlsFeatureNotEnabled).
 tokio-tungstenite = { version = "0.29", default-features = false, features = ["connect"] }
 p256 = { version = "0.13", features = ["pem", "ecdsa"] }
+# Fuzzy path matching for /api/search (fzf-style, Helix's matcher). Pure Rust.
+nucleo-matcher = "0.3"
 
 [profile.release]
 opt-level = "z"

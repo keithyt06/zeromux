@@ -22,6 +22,8 @@ const DEBOUNCE_MAX_MS: u64 = 1000;
 const FULL_EVERY_MS: i64 = 6 * 3600 * 1000;
 const MIN_REBUILD_GAP_MS: i64 = 60_000;
 const DRAIN_EVERY_DIRS: usize = 64;
+/// A watcher lifetime longer than this resets the restart backoff to 1s.
+const HEALTHY_LIFETIME: Duration = Duration::from_secs(600);
 
 fn mask() -> WatchMask {
     WatchMask::CREATE | WatchMask::DELETE | WatchMask::MOVED_FROM | WatchMask::MOVED_TO
@@ -33,13 +35,17 @@ pub(crate) struct Watcher {
     wd_to_dir: HashMap<i32, String>,
     root_wd: i32,
     buf: Vec<u8>,
+    /// add_watch failures since the last `log_add_failures` (ENOSPC on a big vault
+    /// would otherwise print one line per dir).
+    add_failed: usize,
+    last_add_err: Option<String>,
 }
 
 enum Drained { Ok, Overflow, RootGone }
 
 impl Watcher {
     fn new() -> std::io::Result<Self> {
-        Ok(Self { ino: Inotify::init()?, wd_to_dir: HashMap::new(), root_wd: -1, buf: vec![0u8; 64 * 1024] })
+        Ok(Self { ino: Inotify::init()?, wd_to_dir: HashMap::new(), root_wd: -1, buf: vec![0u8; 64 * 1024], add_failed: 0, last_add_err: None })
     }
 
     /// Watch `rel`. Re-adding an already-watched inode returns its existing wd
@@ -52,9 +58,40 @@ impl Watcher {
                 if rel.is_empty() { self.root_wd = id; }
                 self.wd_to_dir.insert(id, rel.to_string());
             }
+            // Gone already (renamed away / removed): the parent's reconcile drops it.
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
             // ENOSPC etc.: this dir falls back to the 6h full rebuild; no retry storm.
-            Err(e) => eprintln!("[vault_watch] add_watch {rel:?} failed: {e}"),
+            Err(e) => {
+                self.add_failed += 1;
+                self.last_add_err = Some(format!("{rel:?}: {e}"));
+            }
         }
+    }
+
+    /// One log line per full build / reconcile batch instead of one per dir.
+    fn log_add_failures(&mut self, ctx: &str) {
+        if self.add_failed > 0 {
+            eprintln!("[vault_watch] {ctx}: {} add_watch failures (last {})", self.add_failed,
+                self.last_add_err.take().unwrap_or_default());
+            self.add_failed = 0;
+        }
+    }
+
+    /// Reconcile the dirty dirs shallow-first. Each dir is (re-)watched first: a
+    /// KNOWN path whose inode changed (rename over an existing dir, rmdir+mkdir of
+    /// the same name) is not "new" to the model, so reconcile won't call `on_dir`
+    /// for it — without this its later events would be lost until the 6h rebuild.
+    /// Re-adding a still-watched inode returns the existing wd and just remaps it.
+    /// No ancestor de-dup — a dirty child must still be re-read (rename-over-
+    /// existing), and each read is ~27ms.
+    fn reconcile(&mut self, m: &mut VaultModel, root: &Path, dirty: &mut BTreeSet<String>) {
+        let mut ds: Vec<String> = std::mem::take(dirty).into_iter().collect();
+        ds.sort_by_key(|d| (d.matches('/').count() + usize::from(!d.is_empty()), d.clone()));
+        for d in &ds {
+            if !d.split('/').any(crate::fuzzy_index::skip_name) { self.add(root, d); }
+            m.reconcile_dir_with(root, d, 0, &mut |rel| self.add(root, rel));
+        }
+        self.log_add_failures("reconcile");
     }
 
     /// Non-blocking drain of all queued events into `dirty` (parent dirs).
@@ -103,23 +140,26 @@ impl Watcher {
     }
 
     /// Full BFS: watch-then-read every dir, draining the new queue every 64 dirs
-    /// so a burst during the ~52s walk can't overflow it.
-    fn full(root: &Path, dirty: &mut BTreeSet<String>) -> std::io::Result<(Watcher, VaultModel)> {
+    /// so a burst during the ~52s walk can't overflow it. The bool is `restart`:
+    /// the queue overflowed or the root went away mid-walk, so events in already-
+    /// walked dirs may be lost and the caller must run another full build.
+    fn full(root: &Path, dirty: &mut BTreeSet<String>) -> std::io::Result<(Watcher, VaultModel, bool)> {
         let mut w = Watcher::new()?;
         let mut n = 0usize;
-        let mut overflow = false;
+        let mut restart = false;
         let model = {
             let wref = &mut w;
             VaultModel::full_scan_with(root, &mut |rel| {
                 wref.add(root, rel);
                 n += 1;
-                if n % DRAIN_EVERY_DIRS == 0 {
-                    if let Drained::Overflow = wref.drain(dirty) { overflow = true; }
+                if n % DRAIN_EVERY_DIRS == 0 && !restart {
+                    if !matches!(wref.drain(dirty), Drained::Ok) { restart = true; }
                 }
             })?
         };
-        if overflow { dirty.insert(String::new()); } // reconcile the whole tree once more
-        Ok((w, model))
+        if !restart && !matches!(w.drain(dirty), Drained::Ok) { restart = true; }
+        w.log_add_failures("full build");
+        Ok((w, model, restart))
     }
 
     fn wait(&self, timeout: Duration) {
@@ -137,10 +177,13 @@ pub fn spawn(si: Arc<SearchIndexes>) {
         .spawn(move || {
             let mut backoff = Duration::from_secs(1);
             loop {
+                let t0 = Instant::now();
                 let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| run(&si)));
                 si.set_watcher_active(false);
+                // A lifetime that ran for a while was healthy: start backing off afresh.
+                if t0.elapsed() > HEALTHY_LIFETIME { backoff = Duration::from_secs(1); }
                 match r {
-                    Ok(Ok(())) => backoff = Duration::from_secs(1),
+                    Ok(Ok(never)) => match never {},
                     Ok(Err(e)) => eprintln!("[vault_watch] stopped: {e}; retrying in {backoff:?}"),
                     Err(_) => eprintln!("[vault_watch] panicked; retrying in {backoff:?}"),
                 }
@@ -151,9 +194,10 @@ pub fn spawn(si: Arc<SearchIndexes>) {
         .expect("spawn vault-watch thread");
 }
 
-/// One watcher lifetime: full build, then the event loop until a rebuild is
-/// needed (returns Ok to rebuild immediately) or an error (Err → backoff).
-fn run(si: &SearchIndexes) -> Result<(), String> {
+/// Watcher lifetimes back to back: full build, then the event loop until a
+/// rebuild is needed (overflow / root loss / 6h → loop). Returns only on error
+/// (→ backoff in `spawn`).
+fn run(si: &SearchIndexes) -> Result<std::convert::Infallible, String> {
     let (slot, model, root) = si.vault_parts().ok_or("no vault")?;
     let mut last_full = i64::MIN;
     loop {
@@ -165,20 +209,24 @@ fn run(si: &SearchIndexes) -> Result<(), String> {
         // extra walk). The guard only suppresses concurrent 1a rebuilds.
         let guard = claim(&slot);
         let mut dirty = BTreeSet::new();
-        let (mut w, fresh) = Watcher::full(&root, &mut dirty).map_err(|e| format!("full scan: {e}"))?;
+        let (mut w, fresh, restart) = Watcher::full(&root, &mut dirty).map_err(|e| format!("full scan: {e}"))?;
         last_full = now_ms();
         {
             let mut m = model.lock().unwrap_or_else(|e| e.into_inner());
             *m = fresh;
-            let mut ds: Vec<String> = std::mem::take(&mut dirty).into_iter().collect();
-            ds.sort_by_key(|d| (d.matches('/').count() + usize::from(!d.is_empty()), d.clone()));
-            for d in &ds {
-                m.reconcile_dir_with(&root, d, 0, &mut |rel| w.add(&root, rel));
-            }
+            w.reconcile(&mut m, &root, &mut dirty);
             slot.publish(m.snapshot(now_ms()));
         }
-        drop(guard);
+        if restart {
+            // Events were dropped during the walk: publish what we have, then walk
+            // again (MIN_REBUILD_GAP_MS spaces it out). 1a triggers stay the
+            // fallback meanwhile.
+            eprintln!("[vault_watch] queue overflow / root lost during full build; rebuilding");
+            continue;
+        }
+        // Active BEFORE releasing the claim, so no 1a rebuild can slip in between.
         si.set_watcher_active(true);
+        drop(guard);
 
         // Event loop.
         let mut first_dirty: Option<Instant> = None;
@@ -206,13 +254,8 @@ fn run(si: &SearchIndexes) -> Result<(), String> {
             if due {
                 let mut m = model.lock().unwrap_or_else(|e| e.into_inner());
                 // Shallow-first: a parent's reconcile drops removed children before any
-                // child entry is processed. No ancestor de-dup — a dirty child must still
-                // be re-read (rename-over-existing), and each read is ~27ms.
-                let mut ds: Vec<String> = std::mem::take(&mut dirty).into_iter().collect();
-                ds.sort_by_key(|d| (d.matches('/').count() + usize::from(!d.is_empty()), d.clone()));
-                for d in &ds {
-                    m.reconcile_dir_with(&root, d, 0, &mut |rel| w.add(&root, rel));
-                }
+                // child entry is processed.
+                w.reconcile(&mut m, &root, &mut dirty);
                 slot.publish(m.snapshot(now_ms()));
                 first_dirty = None;
             }
@@ -295,6 +338,34 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(1500)).await; // let the old B's IGNORED arrive
         let ps: Vec<String> = si.vault.as_ref().unwrap().current().unwrap().index.entries.iter().map(|e| e.path.clone()).collect();
         assert!(ps.contains(&"B/k.md".into()), "old B's IGNORED must not wipe the moved tree: {ps:?}");
+    }
+
+    #[tokio::test]
+    async fn rename_over_existing_dir_keeps_watching_the_moved_inode() {
+        let (_h, v, si) = started("overw").await;
+        fs::create_dir_all(v.path().join("A")).unwrap();
+        fs::write(v.path().join("A/k.md"), "x").unwrap();
+        fs::create_dir_all(v.path().join("B")).unwrap();
+        eventually(&si, |p| p.contains(&"A/k.md".into()) && p.contains(&"B".into())).await;
+        fs::rename(v.path().join("A"), v.path().join("B")).unwrap();
+        eventually(&si, |p| p.contains(&"B/k.md".into()) && !p.contains(&"A".into())).await;
+        tokio::time::sleep(Duration::from_millis(1500)).await;
+        fs::write(v.path().join("B/after.md"), "x").unwrap();
+        eventually(&si, |p| p.contains(&"B/after.md".into()) && p.contains(&"B/k.md".into())).await;
+    }
+
+    #[tokio::test]
+    async fn rmdir_then_mkdir_same_name_keeps_watching_the_new_inode() {
+        let (_h, v, si) = started("remk").await;
+        fs::create_dir_all(v.path().join("X")).unwrap();
+        fs::write(v.path().join("X/a.md"), "x").unwrap();
+        eventually(&si, |p| p.contains(&"X/a.md".into())).await;
+        fs::remove_dir_all(v.path().join("X")).unwrap();
+        fs::create_dir(v.path().join("X")).unwrap();
+        eventually(&si, |p| p.contains(&"X".into()) && !p.contains(&"X/a.md".into())).await;
+        tokio::time::sleep(Duration::from_millis(1500)).await;
+        fs::write(v.path().join("X/in.md"), "x").unwrap();
+        eventually(&si, |p| p.contains(&"X/in.md".into())).await;
     }
 
     #[tokio::test]

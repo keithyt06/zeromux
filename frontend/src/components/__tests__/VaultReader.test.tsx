@@ -68,4 +68,62 @@ describe('VaultReader', () => {
     expect(screen.queryByText('A-CONTENT')).toBeNull()
     expect(screen.getByText('B-CONTENT')).toBeInTheDocument()
   })
+
+  it('target (note) opens the note; a new nonce re-triggers', async () => {
+    const { rerender } = render(<VaultReader target={{ path: 'note.md', kind: 'note', nonce: 1 }} />)
+    await waitFor(() => expect(api.getVaultFile).toHaveBeenCalledWith('note.md'))
+    vi.mocked(api.getVaultFile).mockClear()
+    rerender(<VaultReader target={{ path: 'note.md', kind: 'note', nonce: 1 }} />)
+    expect(api.getVaultFile).not.toHaveBeenCalled()
+    rerender(<VaultReader target={{ path: 'note.md', kind: 'note', nonce: 2 }} />)
+    await waitFor(() => expect(api.getVaultFile).toHaveBeenCalledWith('note.md'))
+  })
+
+  it('target (folder) lists that folder', async () => {
+    render(<VaultReader target={{ path: 'projects/x', kind: 'folder', nonce: 1 }} />)
+    await waitFor(() => expect(api.listVault).toHaveBeenCalledWith('projects/x'))
+  })
+
+  it('search results include folders; tapping a folder navigates AND clears the query', async () => {
+    vi.mocked(api.searchPaths).mockResolvedValue({ dirs: null, notes: { kind: 'notes', indexing: false, refreshing: false, truncated: false, items: [
+      { path: 'projects/x', kind: 'folder', display: 'x', hint: 'projects', abs_dir: '/v/projects/x', score: 9 },
+    ] } })
+    render(<VaultReader />)
+    const input = screen.getByPlaceholderText('搜索笔记名…') as HTMLInputElement
+    fireEvent.change(input, { target: { value: 'x' } })
+    fireEvent.click(await screen.findByText('x'))
+    await waitFor(() => expect(api.listVault).toHaveBeenCalledWith('projects/x'))
+    expect(input.value).toBe('')
+  })
+
+  it('⚡ on a search result calls onAskAgent with the note context', async () => {
+    vi.mocked(api.searchPaths).mockResolvedValue({ dirs: null, notes: { kind: 'notes', indexing: false, refreshing: false, truncated: false, items: [
+      { path: 'a/n.md', kind: 'note', display: 'n', hint: 'a', abs_dir: '/v/a', score: 9 },
+    ] } })
+    const onAskAgent = vi.fn()
+    render(<VaultReader onAskAgent={onAskAgent} />)
+    fireEvent.change(screen.getByPlaceholderText('搜索笔记名…'), { target: { value: 'n' } })
+    fireEvent.click(await screen.findByTestId('sr-ask'))
+    expect(onAskAgent).toHaveBeenCalledWith({ absDir: '/v/a', relPath: 'a/n.md', kind: 'note' })
+  })
+
+  it('search failure shows retry instead of an endless 搜索中…', async () => {
+    vi.mocked(api.searchPaths).mockRejectedValueOnce(new Error('offline'))
+    render(<VaultReader />)
+    fireEvent.change(screen.getByPlaceholderText('搜索笔记名…'), { target: { value: 'q' } })
+    expect(await screen.findByText('重试')).toBeInTheDocument()
+  })
+
+  it('target (folder) also clears a pending query', async () => {
+    const { rerender } = render(<VaultReader />)
+    const input = screen.getByPlaceholderText('搜索笔记名…') as HTMLInputElement
+    fireEvent.change(input, { target: { value: 'zzz' } })
+    rerender(<VaultReader target={{ path: 'projects/x', kind: 'folder', nonce: 7 }} />)
+    await waitFor(() => expect(input.value).toBe(''))
+  })
+
+  it('warms the notes index on mount', async () => {
+    render(<VaultReader />)
+    await waitFor(() => expect(api.warmSearchIndex).toHaveBeenCalledWith('notes'))
+  })
 })

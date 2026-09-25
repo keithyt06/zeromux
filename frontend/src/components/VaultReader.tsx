@@ -1,20 +1,28 @@
 import { useState, useEffect, useCallback, useRef } from 'react'
 import { X, ChevronLeft, Search, FileText, Folder } from 'lucide-react'
-import { listVault, getVaultFile, searchPaths, resolveWikiLink } from '../lib/api'
+import { listVault, getVaultFile, searchPaths, warmSearchIndex, resolveWikiLink } from '../lib/api'
 import { filterVaultEntries, resolveVaultImageSrc } from '../lib/vault'
 import QuickTargets from './QuickTargets'
 import { notifyQuickTargetsChanged } from '../lib/quickTargetsBus'
 import MarkdownContent from './markdown/MarkdownContent'
-import type { DirListEntry } from '../lib/api'
+import SearchResults from './SearchResults'
+import type { DirListEntry, SearchResult, NoteHit } from '../lib/api'
 import { docTitleFromPath } from '../lib/docTabs'
+import type { AskAgentTarget } from '../lib/askAgent'
 
-export default function VaultReader({ onClose, onTitleChange }: { onClose?: () => void; onTitleChange?: (title: string | null) => void }) {
+export default function VaultReader({ onClose, onTitleChange, target, onAskAgent }: {
+  onClose?: () => void
+  onTitleChange?: (title: string | null) => void
+  target?: { path: string; kind: 'note' | 'folder'; nonce: number } | null
+  onAskAgent?: (t: AskAgentTarget) => void
+}) {
   const [mode, setMode] = useState<'list' | 'read'>('list')
   const [cwd, setCwd] = useState('')
   const [entries, setEntries] = useState<DirListEntry[]>([])
   const [query, setQuery] = useState('')
-  const [results, setResults] = useState<{ path: string; name: string }[]>([])
-  const [searchTruncated, setSearchTruncated] = useState(false)
+  const [search, setSearch] = useState<SearchResult | null>(null)
+  const [searchFailed, setSearchFailed] = useState(false)
+  const [retryTick, setRetryTick] = useState(0)
   const [openPath, setOpenPath] = useState('')
   const [content, setContent] = useState('')
   const [truncated, setTruncated] = useState(false)
@@ -36,18 +44,24 @@ export default function VaultReader({ onClose, onTitleChange }: { onClose?: () =
   }, [cwd])
 
   useEffect(() => {
-    const t = setTimeout(() => {
-      if (!query.trim()) { setResults([]); setSearchTruncated(false); return }
+    let again: ReturnType<typeof setTimeout> | undefined
+    const run = () => {
       const req = ++searchReqRef.current
+      if (!query.trim()) { setSearch(null); setSearchFailed(false); return }
       searchPaths(query, 'notes', 50)
-        .then(r => { if (searchReqRef.current === req) {
-          setResults((r.notes?.items ?? []).map(i => ({ path: i.path, name: i.display })))
-          setSearchTruncated(!!r.notes?.truncated)
-        } })
-        .catch(() => { if (searchReqRef.current === req) { setResults([]); setSearchTruncated(false) } })
-    }, 200)
-    return () => clearTimeout(t)
-  }, [query])
+        .then(r => {
+          if (searchReqRef.current !== req) return
+          setSearch(r); setSearchFailed(false)
+          const n = r.notes
+          if (n && (n.indexing || (n.refreshing && n.items.length === 0))) again = setTimeout(run, 4000)
+        })
+        .catch(() => { if (searchReqRef.current === req) { setSearch(null); setSearchFailed(true) } })
+    }
+    const t = setTimeout(run, 200)
+    return () => { clearTimeout(t); if (again) clearTimeout(again) }
+  }, [query, retryTick])
+
+  useEffect(() => { warmSearchIndex('notes') }, [])
 
   const openNote = useCallback((path: string) => {
     const req = ++openReqRef.current
@@ -72,6 +86,25 @@ export default function VaultReader({ onClose, onTitleChange }: { onClose?: () =
       else alert('未找到对应笔记:' + name)
     })
   }, [openNote])
+
+  // One-shot external navigation request (opened from search elsewhere, e.g.
+  // Sidebar), consumed once per nonce so re-tapping the same result re-navigates.
+  const lastTargetNonce = useRef(0)
+  useEffect(() => {
+    if (!target || target.nonce === lastTargetNonce.current) return
+    lastTargetNonce.current = target.nonce
+    if (target.kind === 'note') { openNote(target.path); return }
+    // Consuming an external one-shot navigation request is exactly an effect's job.
+    // eslint-disable-next-line react-hooks/set-state-in-effect
+    setMode('list'); setQuery(''); setCwd(target.path); onTitleChange?.(null)
+  }, [target, openNote, onTitleChange])
+
+  const pickHit = (h: NoteHit) => {
+    if (h.kind === 'note') { openNote(h.path); return }
+    // Clear the query too: while it's non-empty the result list keeps rendering,
+    // so navigating alone would look like the tap did nothing.
+    setQuery(''); setCwd(h.path)
+  }
 
   // READ MODE
   if (mode === 'read') {
@@ -112,14 +145,28 @@ export default function VaultReader({ onClose, onTitleChange }: { onClose?: () =
         <div className="flex items-center gap-2 px-2 py-1 rounded bg-[var(--bg-tertiary)]">
           <Search size={14} className="text-[var(--text-secondary)]" />
           <input value={query} onChange={e => setQuery(e.target.value)} placeholder="搜索笔记名…"
-            className="flex-1 bg-transparent text-sm outline-none text-[var(--text-primary)]" />
+            className="flex-1 bg-transparent text-base outline-none text-[var(--text-primary)]" />
         </div>
       </div>
       <div className="flex-1 overflow-auto">
         {query.trim() ? (
-          <ul>{results.map(r => (
-            <li key={r.path}><button onClick={() => openNote(r.path)} className="flex items-center gap-2 w-full px-3 py-2 text-sm text-left hover:bg-[var(--bg-tertiary)]"><FileText size={14} />{r.name}<span className="text-xs text-[var(--text-secondary)] truncate">{r.path}</span></button></li>
-          ))}{results.length === 0 && <li className="px-3 py-2 text-xs text-[var(--text-secondary)]">无匹配</li>}{searchTruncated && <li className="px-3 py-2 text-xs text-[var(--accent-yellow)]">仅显示前 100 条结果,请细化搜索</li>}</ul>
+          search?.notes ? (
+            <>
+              <SearchResults
+                result={search}
+                showNotes
+                onPickDir={() => {}}
+                onPickNote={pickHit}
+                onAskAgent={(h) => onAskAgent?.({ absDir: h.abs_dir, relPath: h.path, kind: h.kind })}
+              />
+              {search.notes.truncated && <div className="px-3 py-2 text-xs text-[var(--accent-yellow)]">仅显示前 50 条，请细化搜索</div>}
+            </>
+          ) : searchFailed ? (
+            <div className="px-3 py-2 flex items-center justify-between gap-2 text-xs text-[var(--text-secondary)]">
+              <span>搜索暂时不可用</span>
+              <button type="button" onClick={() => setRetryTick(t => t + 1)} className="px-2 py-1 min-h-[44px] rounded bg-[var(--bg-tertiary)]">重试</button>
+            </div>
+          ) : <div className="px-3 py-2 text-xs text-[var(--text-secondary)]">搜索中…</div>
         ) : (
           <>
             {/* `hidden` rather than conditional rendering: VaultReader stays mounted in

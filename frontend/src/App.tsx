@@ -17,6 +17,8 @@ import AgentDashboard from './components/AgentDashboard'
 import VaultReader from './components/VaultReader'
 import MemoryPanel from './components/MemoryPanel'
 import { type DocTab, newDocTab, isDocTabId, loadDocTabs, saveDocTabs, resolveActivePane, DEFAULT_DOC_TITLE } from './lib/docTabs'
+import { pickDocTabForTarget } from './lib/docTarget'
+import type { AskAgentTarget } from './lib/askAgent'
 
 type AuthState = 'loading' | 'unauthenticated' | 'pending' | 'active'
 type OverlayView = 'none' | 'files' | 'git' | 'events' | 'memory'
@@ -30,6 +32,10 @@ export default function App() {
   // initial active pane against the live doc-tab list.
   const docTabsRef = useRef(docTabs)
   useEffect(() => { docTabsRef.current = docTabs; saveDocTabs(docTabs) }, [docTabs])
+  // In-memory only (never persisted): refresh reopens doc tabs in list mode.
+  const [docTargets, setDocTargets] = useState<Record<string, { path: string; kind: 'note' | 'folder'; nonce: number }>>({})
+  const [askAgentRequest, setAskAgentRequest] = useState<(AskAgentTarget & { nonce: number }) | null>(null)
+  const nonceRef = useRef(0)
   const [activeId, setActiveId] = useState<string | null>(null)
   const [overlay, setOverlay] = useState<Record<string, OverlayView>>({})
   // session id → turns_completed already seen (red-dot read baseline)
@@ -251,6 +257,22 @@ export default function App() {
     setActiveId(s.id)
   }, [])
 
+  const handleOpenVault = useCallback((target: { path: string; kind: 'note' | 'folder' }) => {
+    const nonce = ++nonceRef.current
+    const existing = pickDocTabForTarget(docTabsRef.current)
+    const id = existing ?? (() => {
+      const tab = newDocTab(DEFAULT_DOC_TITLE)
+      setDocTabs(prev => [...prev, tab])
+      return tab.id
+    })()
+    setDocTargets(prev => ({ ...prev, [id]: { ...target, nonce } }))
+    setActiveId(id)
+  }, [])
+
+  const handleAskAgent = useCallback((t: AskAgentTarget) => {
+    setAskAgentRequest({ ...t, nonce: ++nonceRef.current })
+  }, [])
+
   const handleLogout = useCallback(() => {
     clearAuth()
     setAuthState('unauthenticated')
@@ -267,6 +289,7 @@ export default function App() {
         : cur)
       return next
     })
+    setDocTargets(prev => { const { [id]: _, ...rest } = prev; return rest })
   }, [sessions])
 
   const updateDocTabTitle = useCallback((id: string, title: string | null) => {
@@ -334,6 +357,8 @@ export default function App() {
         onToggle={() => setSidebarOpen(v => !v)}
         mobile={isMobile}
         confirmCount={confirmCount}
+        onOpenVault={handleOpenVault}
+        askAgentRequest={askAgentRequest}
       />
       <main className="flex-1 min-w-0 flex flex-col">
         {/* Info bar for active session */}
@@ -405,7 +430,7 @@ export default function App() {
             const isActive = t.id === activeId
             return (
               <div key={t.id} className={`absolute inset-0 ${isActive ? '' : 'hidden'}`}>
-                <VaultReader onTitleChange={(title) => updateDocTabTitle(t.id, title)} />
+                <VaultReader onTitleChange={(title) => updateDocTabTitle(t.id, title)} target={docTargets[t.id] ?? null} onAskAgent={handleAskAgent} />
               </div>
             )
           })}

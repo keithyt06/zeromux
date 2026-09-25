@@ -31,7 +31,7 @@ export default function SearchResults({ result, showNotes, onPickDir, onDirMenu,
         <span className="text-[10px] text-[var(--text-muted)]">搜索暂时不可用</span>
         {onRetry && (
           <button type="button" onClick={onRetry}
-            className="shrink-0 px-2 py-1 min-h-[32px] text-[10px] font-semibold bg-[var(--bg-hover)] rounded">重试</button>
+            className="shrink-0 px-2 py-1 min-h-[44px] text-[10px] font-semibold bg-[var(--bg-hover)] rounded">重试</button>
         )}
       </div>
     )

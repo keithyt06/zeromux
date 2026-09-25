@@ -449,16 +449,45 @@ export async function getVaultFile(path: string): Promise<{ content: string; tru
   const d = await res.json()
   return { content: d.content, truncated: d.truncated }
 }
-export async function getVaultSearch(q: string): Promise<{ results: { path: string; name: string }[]; truncated?: boolean }> {
-  const res = await api(`/api/vault/search?q=${encodeURIComponent(q)}`)
-  if (!res.ok) throw new Error(await res.text())
-  return res.json()
-}
-export async function resolveWikiLink(name: string): Promise<string | null> {
+export type WikiResolve = { path: string } | { indexing: true } | null
+/** 503 = the vault index is still building after a restart (~50s) — distinct from
+ *  a genuinely missing note so the UI can say "try again shortly". */
+export async function resolveWikiLink(name: string): Promise<WikiResolve> {
   const res = await api(`/api/vault/resolve?name=${encodeURIComponent(name)}`)
+  if (res.status === 503) return { indexing: true }
   if (!res.ok) return null
   const d = await res.json()
-  return d.path ?? null
+  return d.path ? { path: d.path } : null
+}
+
+export interface DirHit { path: string; display: string; hint: string; agent: SessionType | null; score: number }
+export interface NoteHit { path: string; kind: 'note' | 'folder'; display: string; hint: string; abs_dir: string; score: number }
+export interface SearchSection<T> { kind: 'dirs' | 'notes'; indexing: boolean; refreshing: boolean; truncated: boolean; items: T[] }
+export interface SearchResult { dirs: SearchSection<DirHit> | null; notes: SearchSection<NoteHit> | null }
+
+const SEARCH_AGENTS: readonly SessionType[] = ['tmux', 'claude', 'crew', 'codex']
+
+export async function searchPaths(q: string, scope: string, limit = 6): Promise<SearchResult> {
+  const params = new URLSearchParams({ q, scope, limit: String(limit) })
+  const res = await api(`/api/search?${params}`)
+  if (!res.ok) throw new ApiError(res.status, await res.text())
+  const d = await res.json() as { sections: Array<SearchSection<unknown> & { kind: string }> }
+  const out: SearchResult = { dirs: null, notes: null }
+  for (const s of d.sections ?? []) {
+    if (s.kind === 'dirs') {
+      out.dirs = { ...s, kind: 'dirs', items: (s.items as DirHit[]).map(it => ({
+        ...it, agent: SEARCH_AGENTS.includes(it.agent as SessionType) ? it.agent : null,
+      })) }
+    } else if (s.kind === 'notes') {
+      out.notes = { ...s, kind: 'notes', items: s.items as NoteHit[] }
+    } // unknown kinds: ignored (forward compatible)
+  }
+  return out
+}
+
+/** Fire-and-forget: ask the server to refresh stale indexes while the user types. */
+export async function warmSearchIndex(scope: string): Promise<void> {
+  try { await api(`/api/search/warm?scope=${encodeURIComponent(scope)}`) } catch { /* best effort */ }
 }
 export function vaultRawUrl(path: string): string {
   const token = getToken()

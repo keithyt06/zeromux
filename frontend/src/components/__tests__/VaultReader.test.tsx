@@ -6,7 +6,8 @@ import * as api from '../../lib/api'
 vi.mock('../../lib/api', () => ({
   listVault: vi.fn(async () => ({ entries: [{ name: 'note.md', type: 'file', size: 1, mtime: 0, writable: false }], truncated: false })),
   getVaultFile: vi.fn(async () => ({ content: '<table><tr><td>Cell</td></tr></table>', truncated: false })),
-  getVaultSearch: vi.fn(async () => ({ results: [] })),
+  searchPaths: vi.fn(async () => ({ dirs: null, notes: { kind: 'notes', indexing: false, refreshing: false, truncated: false, items: [] } })),
+  warmSearchIndex: vi.fn(async () => {}),
   resolveWikiLink: vi.fn(async () => null),
   vaultRawUrl: (p: string) => `/api/vault/file/raw?path=${p}`,
 }))

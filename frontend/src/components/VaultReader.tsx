@@ -1,6 +1,6 @@
 import { useState, useEffect, useCallback, useRef } from 'react'
 import { X, ChevronLeft, Search, FileText, Folder } from 'lucide-react'
-import { listVault, getVaultFile, getVaultSearch, resolveWikiLink } from '../lib/api'
+import { listVault, getVaultFile, searchPaths, resolveWikiLink } from '../lib/api'
 import { filterVaultEntries, resolveVaultImageSrc } from '../lib/vault'
 import QuickTargets from './QuickTargets'
 import { notifyQuickTargetsChanged } from '../lib/quickTargetsBus'
@@ -39,8 +39,11 @@ export default function VaultReader({ onClose, onTitleChange }: { onClose?: () =
     const t = setTimeout(() => {
       if (!query.trim()) { setResults([]); setSearchTruncated(false); return }
       const req = ++searchReqRef.current
-      getVaultSearch(query)
-        .then(r => { if (searchReqRef.current === req) { setResults(r.results); setSearchTruncated(!!r.truncated) } })
+      searchPaths(query, 'notes', 50)
+        .then(r => { if (searchReqRef.current === req) {
+          setResults((r.notes?.items ?? []).map(i => ({ path: i.path, name: i.display })))
+          setSearchTruncated(!!r.notes?.truncated)
+        } })
         .catch(() => { if (searchReqRef.current === req) { setResults([]); setSearchTruncated(false) } })
     }, 200)
     return () => clearTimeout(t)
@@ -63,7 +66,11 @@ export default function VaultReader({ onClose, onTitleChange }: { onClose?: () =
   }, [onTitleChange])
 
   const onWikiLink = useCallback((name: string) => {
-    resolveWikiLink(name).then(p => { if (p) openNote(p); else alert('未找到对应笔记:' + name) })
+    resolveWikiLink(name).then(r => {
+      if (r && 'path' in r) openNote(r.path)
+      else if (r && 'indexing' in r) alert('笔记索引建立中，请稍候再试')
+      else alert('未找到对应笔记:' + name)
+    })
   }, [openNote])
 
   // READ MODE

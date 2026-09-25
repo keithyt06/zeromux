@@ -514,9 +514,6 @@ export default function Sidebar({ sessions, docTabs, activeId, onSelect, onCreat
                       presetStore.reload()
                       setStep(agent ? 'pick-prompt' : 'pick-type')
                     }}
-                    // 列表为空（全新库）时直接跳到类型选择器，而不是给出一个只有标题
-                    // 加一行「其他目录…」的空壳首屏——那比改动前更差。
-                    onEmpty={() => setStep('pick-type')}
                   />
                   <button
                     type="button"

@@ -1,4 +1,4 @@
-import { render, screen, waitFor, act } from '@testing-library/react'
+import { render, screen, act } from '@testing-library/react'
 import { describe, it, expect, vi, beforeEach } from 'vitest'
 import QuickTargets from '../QuickTargets'
 import * as api from '../../lib/api'
@@ -130,10 +130,4 @@ describe('QuickTargets 手机可用性', () => {
     expect(menu.className).not.toMatch(/group-hover/)
   })
 
-  it('列表为空时通知父级（父级据此渲染 pick-type，而不是给出空壳首屏）', async () => {
-    vi.spyOn(api, 'listQuickTargets').mockResolvedValue(list([]))
-    const onEmpty = vi.fn()
-    render(<QuickTargets kind="dir" onPick={() => {}} onEmpty={onEmpty} />)
-    await waitFor(() => expect(onEmpty).toHaveBeenCalled())
-  })
 })

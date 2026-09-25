@@ -1,5 +1,5 @@
 import { useState, useEffect, useCallback, useRef } from 'react'
-import { MoreVertical, X, FileText, Terminal, Repeat, MessageSquarePlus } from 'lucide-react'
+import { MoreVertical, X, FileText, Folder, Terminal, Repeat, MessageSquarePlus } from 'lucide-react'
 import type { SessionType, QuickTarget } from '../lib/api'
 import { listQuickTargets, forgetQuickTarget } from '../lib/api'
 import { coerceAgent } from '../lib/quickTargets'
@@ -8,7 +8,8 @@ import { ClaudeCodeIcon, CrewIcon, CodexIcon } from './BrandIcons'
 
 /** 行首图标 = 这一行会开出什么。比行尾一个小写标签的信息量更高，且省下约 44px 宽度
  *  给目录名和 hint（224px 弹层里这是决定性的）。 */
-function RowIcon({ kind, agent, size = 15 }: { kind: 'dir' | 'note'; agent: string; size?: number }) {
+export function RowIcon({ kind, agent, size = 15 }: { kind: 'dir' | 'note' | 'folder'; agent: string; size?: number }) {
+  if (kind === 'folder') return <Folder size={size} className="text-[var(--accent-blue)] shrink-0" />
   if (kind === 'note') return <FileText size={size} className="text-[var(--accent-blue)] shrink-0" />
   switch (coerceAgent(agent)) {
     case 'claude': return <ClaudeCodeIcon size={size} className="shrink-0" />
@@ -21,17 +22,14 @@ function RowIcon({ kind, agent, size = 15 }: { kind: 'dir' | 'note'; agent: stri
 
 /** 常用目录/笔记快速入口。一份实现服务三处：New Session 首屏、DirectoryPicker 顶部、
  *  VaultReader 的「最近打开」。kind 决定数据源与图标，其余行为一致。 */
-export default function QuickTargets({ kind, onPick, onChangeAgent, onPickWithPrompt, onEmpty }: {
+export default function QuickTargets({ kind, onPick, onChangeAgent, onPickWithPrompt }: {
   kind: 'dir' | 'note'
   onPick: (path: string, agent: SessionType | null) => void
   onChangeAgent?: (path: string) => void
   onPickWithPrompt?: (path: string, agent: SessionType | null) => void
-  onEmpty?: () => void
 }) {
   const [items, setItems] = useState<QuickTarget[]>([])
   const [loaded, setLoaded] = useState(false)
-  // 区分「加载失败」与「真的没有数据」——只有后者才该触发 onEmpty 的自动跳转。
-  const [failed, setFailed] = useState(false)
   const [openMenu, setOpenMenu] = useState<string | null>(null)   // path|agent 的 key
 
   // 单调请求令牌。本组件同时具备「慢 GET」（JueceFS/S3 上的 per-row 守卫）与
@@ -42,20 +40,14 @@ export default function QuickTargets({ kind, onPick, onChangeAgent, onPickWithPr
 
   const load = useCallback(async () => {
     const req = ++reqRef.current
-    setFailed(false)
     try {
       const data = await listQuickTargets(kind)
       if (reqRef.current !== req) return
       setItems(data?.top ?? [])
     } catch {
       if (reqRef.current !== req) return
-      // 快速入口是加速器，不是主路径：加载失败就安静地什么都不显示，让用户回落到
-      // 目录浏览，而不是弹错误挡住新建会话。
-      //
-      // 但 failed 必须与「真的没有数据」区分开：onEmpty 会让父级自动跳到类型选择器，
-      // 而那个跳转只有在「确实没有历史」时才是对的。请求失败时跳转会把一次网络抖动
-      // 变成「对话框闪一下就跳走」，用户无法分辨。
-      setFailed(true)
+      // 快速入口是加速器：失败就安静地不显示，让用户回落到目录浏览，而不是弹错误
+      // 挡住新建会话。
       setItems([])
     }
     if (reqRef.current === req) setLoaded(true)
@@ -65,12 +57,6 @@ export default function QuickTargets({ kind, onPick, onChangeAgent, onPickWithPr
   // 事件驱动刷新：没有它，列表就是挂载时的静态快照（VaultReader 常驻挂载，会一直
   // 显示几小时前的顺序）。发射点精确镜像后端两处 bump。
   useEffect(() => subscribeQuickTargets(load), [load])
-
-  // 空列表时通知父级，让它改渲染原来的类型选择器 —— 否则全新库点 ＋ 只看到一个标题
-  // 加一行「其他目录…」，比改动前更差。
-  useEffect(() => {
-    if (loaded && !failed && items.length === 0) onEmpty?.()
-  }, [loaded, failed, items.length, onEmpty])
 
   const forget = useCallback(async (it: QuickTarget) => {
     reqRef.current++      // 使任何在途 GET 失效，否则旧快照会让这条复活成 ghost

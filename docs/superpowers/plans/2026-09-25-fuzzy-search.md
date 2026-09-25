@@ -10,11 +10,17 @@
 
 **Spec:** `docs/superpowers/specs/2026-09-25-fuzzy-search-design.md`（v4）
 
+**本计划为 r2**：经 CTO（在隔离 worktree 中逐 Step 实跑 Task 1–8、12）+ PM（spec 覆盖矩阵 + 用户旅程走查）交叉评审后修订。r1→r2 的实质改动：冒烟命令隔离数据目录（r1 原样执行会写线上 `prompts.db`——已实际发生一次，见 Task 11 注）；两条非法的 `cargo test a b` 验红命令；全量重建与 turn 结束对账的覆盖竞态（改为全程持锁）；basename 加权 / 空目录规则补上真正能验红的测试；搜索框 16px 防 iOS 缩放；预填改为绝对路径；桌面弹层加宽 + hint 去公共前缀；indexing 自动重查 + VaultReader 失败态；桌面折叠态 ⚡ 无反应；预设 emoji 撞车与真实笔记对齐；lint 预期改为「不新增」；补 handler 级测试。
+
 ## Global Constraints
 
 - **语言**：用户可见字符串中文；代码与注释英文（本 repo 双语惯例）。
 - **构建顺序**：前端先 build 才能 `cargo build`（`rust-embed` 编译期读 `frontend/dist/`）。迭代用 `cargo test` / `cargo check`，不用 `--release`。
-- **测试命令**：后端 `cargo test <filter>`（repo 根）；前端 `cd frontend && npx vitest run <file>`。基线：`cargo test` 395 passed；`npx vitest run` 290 passed / 48 files。
+- **测试命令**：后端 `cargo test <filter>`（repo 根）；**多个 filter 必须写成 `cargo test -- a b`**（`cargo test a b` 是参数错误，不是「验红」）。前端 `cd frontend && npx vitest run <file>`。基线：`cargo test` 395 passed；`npx vitest run` 290 passed / 48 files。
+- **已知 flaky**：`git_show_signature_gpg_program_cannot_exfil_credential`（base 上 10 次失败 3 次，`git commit -S` 环境相关，与本计划无关）。若 Step 4 计数少 1 且失败项是它，重跑一次即可；**不要**为它改代码。
+- **Lint**：仓库基线 `npx eslint .` 已有 30 errors / 5 warnings。预期统一为「**本任务改动的文件不新增 lint 错误**」：`npx eslint <改动文件…>`，与改动前对比。
+- **冒烟 / 本地实例必须隔离数据目录**：`--data-dir "$(mktemp -d)" --host 127.0.0.1`。默认 `~/.zeromux` 就是线上库（`zeromux.service` 未传 `--data-dir`），默认 host `0.0.0.0` 会对外暴露 smoke 密码。
+- **iOS 输入框字号 ≥ 16px**（`text-base`）：低于 16px 聚焦时 Safari 整页放大（`Composer.tsx:54` 既有注释）。
 - **目录索引**：根 `$HOME`，`DIR_MAX_DEPTH = 6`，`DIR_MAX_ENTRIES = 5000`，**BFS**；跳过 `.` 开头、`node_modules | target | __pycache__`；`file_type()` 不跟 symlink；**不排除 vault 子树**；守卫只做词法（`path_hits_sensitive_dir` + `read_hits_home_dotdir` 的词法等价，**不 canonicalize**）。
 - **vault 收录**：`VaultNote` = `.md`（大小写不敏感）；`VaultDir` = 「子树含 `.md`」或「空文件夹（无任何非 dot 子项）」；跳过 dot 名与 `node_modules | target | __pycache__`；不跟 symlink。
 - **目录 slot 刷新**：快照 > **120s** 或（零结果且 > **30s**）或 warm 且 > **30s**；CAS `false→true` 成功者发起。
@@ -27,15 +33,17 @@
 - **stale-response 防护**：所有新前端 fetch 用单调 `reqRef`（发请求前 bump、await 后比对）。
 - **禁止 hover-only 控件**（Tailwind v4 把 `group-hover` 编译进 `@media (hover:hover)`，手机上是隐形可点按钮）。触控目标 ≥ 44px。
 - **Drop-based teardown / fan-out 唯一 owner** 不变；turn 结束钩子只**读** `work_dir` 并异步投递，不触碰进程。
-- **学习预设**：`seed_v2_if_needed` 置 `user_version = 2`；同标题已存在跳过；删除后不复活。
+- **学习预设**：`seed_v2_if_needed` 置 `user_version = 2`；同标题已存在跳过；删除后不复活。标题 emoji 不得与 v1 撞车（v1 已用 🔍📋✅🐛👀♻️📖📝）。
+- **⚡ 预填用绝对路径**：agent 的 cwd 是笔记所在文件夹，vault 相对路径在那里解析不到。
 
 ## Review Focus
 
-1. **vault 在 `$HOME` 下、且 JuiceFS 冷缓存**：启动后前 ~52s notes 段必须返回 `indexing:true` 而非空结果被误读为「无匹配」，`vault_resolve` 返回 503 而非 404 → 前端提示「索引建立中」。Task 3 / Task 5 / Task 9 测试钉住。
+1. **vault 在 `$HOME` 下、且 JuiceFS 冷缓存**：启动后前 ~52s notes 段必须返回 `indexing:true` 而非空结果被误读为「无匹配」，且前端**自动重查**而不是卡在提示上；`vault_resolve` 返回 503 而非 404 → 前端提示「索引建立中」。Task 3（`vault_resolve_503_while_indexing`）/ Task 5（`notes_section_indexing`）/ Task 7（503 映射）/ Task 9（indexing 重查）钉住。
 2. **查询只有否定或 fzf 元字符**（`!docs`、`'`、`^`、`$`、全空格）：nucleo 对全部条目返回 `Some(0)`（已实测），必须返回空结果，而不是任意前 6 条。Task 2 测试钉住。
 3. **中文与 128 上限**：128 个汉字（384 字节）必须通过，129 个 400。Task 5 测试钉住。
-4. **目录名含 Unicode / 空格 / 与 vault 重叠**：`~/…/obsidian/projects/x` 同时出现在 dirs（开会话）与 notes（读）两段，这是有意的；dirs 段 `display/hint` 对 `/home/ubuntu-backup` 不能缩写成 `~-backup`（复用既有 `dir_display_hint`）。Task 1 / Task 5 测试钉住。
-5. **⚡ 从 tmux 以外的路径才可达**：带上下文开 agent 时 pick-type 必须隐藏 Terminal（tmux 会忽略 initial_prompt，静默丢上下文）。Task 12 测试钉住。
+4. **目录名含 Unicode / 空格 / 与 vault 重叠**：`~/…/obsidian/projects/x` 同时出现在 dirs（开会话）与 notes（读）两段，这是有意的；dirs 段 `display/hint` 对 `/home/ubuntu-backup` 不能缩写成 `~-backup`（复用既有 `dir_display_hint`，由既有 `web.rs` 测试钉住）。
+6. **重建进行中 agent 写了笔记**：全量重建（~52s）结束时不得用扫描开始时的旧模型覆盖掉 turn 结束对账刚加入的笔记。Task 3 `reconcile_during_rebuild_is_not_lost` 钉住。
+5. **⚡ 从 tmux 以外的路径才可达**：带上下文开 agent 时 pick-type 必须隐藏 Terminal（tmux 会忽略 initial_prompt，静默丢上下文）。Task 9 测试钉住。
 
 ---
 
@@ -379,7 +387,8 @@ pub struct IndexEntry {
 pub struct PathIndex { pub entries: Vec<IndexEntry>, pub truncated: bool }
 
 pub struct DirSnapshot { pub index: PathIndex, pub built_at_ms: i64 }
-pub struct VaultSnapshot { pub index: PathIndex, pub wiki: crate::web::VaultIndex, pub built_at_ms: i64 }
+// pub(crate): `VaultIndex` is pub(crate), so a `pub` wrapper would warn (private type in public API).
+pub(crate) struct VaultSnapshot { pub index: PathIndex, pub wiki: crate::web::VaultIndex, pub built_at_ms: i64 }
 
 pub fn now_ms() -> i64 {
     std::time::SystemTime::now()
@@ -388,7 +397,7 @@ pub fn now_ms() -> i64 {
         .unwrap_or(0)
 }
 
-fn skip_name(name: &str) -> bool {
+pub(crate) fn skip_name(name: &str) -> bool {
     name.starts_with('.') || NOISE.contains(&name)
 }
 
@@ -702,6 +711,18 @@ Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>"
     }
 
     #[test]
+    fn basename_bonus_beats_shorter_haystack() {
+        // Pins BASENAME_BONUS itself: without it both score 184 and the length
+        // tie-break would put the SHORTER `~/zeromux/a` first (verified by setting
+        // the bonus to 0 → this test goes red).
+        let ix = ix_of(&[
+            ("~/zeromux/a", EntryKind::Dir, 0, false),
+            ("~/s3/zeromux", EntryKind::Dir, 0, false),
+        ]);
+        assert_eq!(top(&ix, "zeromux")[0], "~/s3/zeromux");
+    }
+
+    #[test]
     fn search_chinese_substring() {
         let ix = ix_of(&[("projects/long-term/考研英语/_index", EntryKind::VaultNote, 1, false)]);
         assert_eq!(top(&ix, "考研").len(), 1);
@@ -719,9 +740,11 @@ Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>"
 
     #[test]
     fn search_ties_prefer_nonempty_then_newest_mtime() {
+        // Equal mtime on both folders so ONLY the is_empty_dir rule can order them
+        // (with 500 vs 0 the mtime rule alone would pass — review r1 finding).
         let ix = ix_of(&[
             ("考研英语/2007/英语二/阅读理解", EntryKind::VaultDir, 0, true),
-            ("考研英语/2019/英语二/阅读理解", EntryKind::VaultDir, 500, false),
+            ("考研英语/2019/英语二/阅读理解", EntryKind::VaultDir, 0, false),
             ("考研英语/单词/2026-09-24-上午", EntryKind::VaultNote, 100, false),
             ("考研英语/单词/2026-09-25-上午", EntryKind::VaultNote, 200, false),
         ]);
@@ -793,6 +816,11 @@ pub fn frecency_bonus(sum_decayed: f64) -> u32 {
     (12.0 * sum_decayed / (sum_decayed + 1.0)).floor() as u32
 }
 
+/// True iff `q` parses to at least one non-negated atom (i.e. it can match anything).
+pub fn has_positive_atom(q: &str) -> bool {
+    Pattern::parse(q, CaseMatching::Smart, Normalization::Smart).atoms.iter().any(|a| !a.negative)
+}
+
 pub fn search<'a>(ix: &'a PathIndex, q: &str, limit: usize, bonus_for: &dyn Fn(&str) -> u32) -> Vec<Hit<'a>> {
     let pattern = Pattern::parse(q, CaseMatching::Smart, Normalization::Smart);
     // A pattern with no positive atom (empty, whitespace, bare `'`/`^`/`$`, or only
@@ -830,7 +858,7 @@ pub fn search<'a>(ix: &'a PathIndex, q: &str, limit: usize, bonus_for: &dyn Fn(&
 - [ ] **Step 4: Run tests to verify they pass**
 
 Run: `cargo test fuzzy_index 2>&1 | tail -5`
-Expected: `test result: ok. 18 passed`
+Expected: `test result: ok. 19 passed`
 
 - [ ] **Step 5: Commit**
 
@@ -847,9 +875,9 @@ Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>"
 
 **Files:**
 - Modify: `src/fuzzy_index.rs`（新增 `SearchIndexes`）
-- Modify: `src/main.rs:204`（`AppState.vault_index` → `search: Arc<fuzzy_index::SearchIndexes>`）、`src/main.rs:434-436`（删同步 `build_vault_index`，改为 `SearchIndexes::start`）、`src/main.rs:496`
+- Modify: `src/main.rs`（`AppState.vault_index` → `search: Arc<fuzzy_index::SearchIndexes>`；删同步 `build_vault_index` 调用块，改为 `SearchIndexes::start`；`AppState` 构造处 `vault_index,` → `search,`。Task 1 插入 mod 行后原 204/434-436/496 行各下移 1 行，用 `grep -n "vault_index" src/main.rs` 定位）
 - Modify: `src/web.rs:3799-3811`（`vault_resolve` 改读 vault 快照，首建中 503）
-- Modify: `src/web.rs:3471-3519`（删除 `build_vault_index`；其 4 个测试 `build_vault_index_*` 与 `wikilink_idx()` 改用 `VaultModel::full_scan(..).unwrap().snapshot(0).wiki`）
+- Modify: `src/web.rs`（删除 `build_vault_index`，位置用 grep 定位；其 4 个测试 `build_vault_index_*` 与 `wikilink_idx()` 改用 `VaultModel::full_scan(..).unwrap().snapshot(0).wiki`）
 - Test: `src/fuzzy_index.rs` tests
 
 **Interfaces:**
@@ -936,6 +964,28 @@ Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>"
     }
 
     #[tokio::test]
+    async fn reconcile_during_rebuild_is_not_lost() {
+        // review r1 P0-2: a turn-end reconcile landing while a full rebuild is in
+        // flight must survive the rebuild's publish.
+        let h = tmp("si_race_h");
+        let v = tmp("si_race_v");
+        fs::create_dir_all(v.path().join("d")).unwrap();
+        let si = SearchIndexes::start(h.path().into(), Some(v.path().into()));
+        let slot = si.vault.clone().unwrap();
+        wait_until(|| slot.current().is_some() && !slot.is_rebuilding()).await;
+        // Occupy the model lock to simulate a long full scan in progress.
+        let model = si.vault_model.clone().unwrap();
+        let held = model.lock().unwrap();
+        fs::write(v.path().join("d/new-card.md"), "x").unwrap();
+        si.reconcile_vault_dir(&v.path().join("d")); // queues behind the "scan"
+        drop(held);
+        wait_until(|| slot.current().unwrap().index.entries.iter().any(|e| e.path == "d/new-card.md")).await;
+        si.refresh_vault_if_older(0); // real full rebuild after the reconcile
+        wait_until(|| !slot.is_rebuilding()).await;
+        assert!(slot.current().unwrap().index.entries.iter().any(|e| e.path == "d/new-card.md"));
+    }
+
+    #[tokio::test]
     async fn vault_rebuild_failure_keeps_old_snapshot() {
         let h = tmp("si_fh");
         let v = tmp("si_fv");
@@ -951,6 +1001,20 @@ Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>"
             "a failed rebuild must not publish an empty index");
     }
 ```
+
+`web.rs` 的 `mod path_safety_tests` 追加（钉住 Review Focus #1 的后端一半）：
+
+```rust
+    #[test]
+    fn vault_resolve_503_while_indexing() {
+        // The handler maps "no snapshot yet" to 503; exercise that mapping directly.
+        let slot: crate::fuzzy_index::IndexSlot<crate::fuzzy_index::VaultSnapshot> = crate::fuzzy_index::IndexSlot::new();
+        let r = vault_resolve_in(slot.current().as_deref(), "x");
+        assert_eq!(r.unwrap_err().0, StatusCode::SERVICE_UNAVAILABLE);
+    }
+```
+
+（为此把 `vault_resolve` 的查找逻辑抽成纯函数 `fn vault_resolve_in(snap: Option<&crate::fuzzy_index::VaultSnapshot>, name: &str) -> Result<String, (StatusCode, String)>`，handler 只做 authz + `state.search.vault…current()` + 调它。）
 
 同时把 `web.rs` 里 4 个 `build_vault_index_*` 测试与 `wikilink_idx()` 的 `let idx = build_vault_index(&dir);` 全部替换为：
 
@@ -1044,14 +1108,20 @@ impl SearchIndexes {
         let Some(guard) = claim(slot) else { return };
         let (model, root) = (model.clone(), root.clone());
         tokio::task::spawn_blocking(move || {
+            // Hold the model lock for the WHOLE scan (~52s on JuiceFS). Scanning
+            // outside the lock and swapping afterwards would overwrite any turn-end
+            // reconcile that landed mid-scan with the older scan result (review r1
+            // P0-2). Readers never take this lock — they read the published Arc — and
+            // a waiting reconcile runs right after, on top of the fresh model.
+            let mut m = model.lock().unwrap();
             match VaultModel::full_scan(&root) {
                 Ok(fresh) => {
-                    let mut m = model.lock().unwrap();
                     *m = fresh;
                     guard.slot.publish(m.snapshot(now_ms()));
                 }
                 Err(e) => eprintln!("[search] vault rebuild failed, keeping old snapshot: {e}"),
             }
+            drop(m);
             drop(guard);
         });
     }
@@ -1067,15 +1137,18 @@ impl SearchIndexes {
         Some(s)
     }
 
-    /// Rescan one vault directory (used by the agent turn-end hook). Skipped while
-    /// no snapshot exists yet — the in-flight initial build will include the change.
+    /// Rescan one vault directory (used by the agent turn-end hook). Waits on the
+    /// model lock, so if a full build is running it applies on top of that build's
+    /// result. If no snapshot exists yet (the very first build failed or hasn't
+    /// published), the reconcile is skipped — publishing a one-dir model would look
+    /// like an almost-empty vault.
     pub fn reconcile_vault_dir(self: &Arc<Self>, abs_dir: &Path) {
         let Some(rel) = self.vault_rel(abs_dir) else { return };
         let (Some(slot), Some(model), Some(root)) = (&self.vault, &self.vault_model, &self.vault_root) else { return };
-        if slot.current().is_none() { return; }
         let (slot, model, root) = (slot.clone(), model.clone(), root.clone());
         tokio::task::spawn_blocking(move || {
             let mut m = model.lock().unwrap();
+            if slot.current().is_none() { return; }
             m.reconcile_dir(&root, &rel, RECONCILE_DEPTH);
             slot.publish(m.snapshot(now_ms()));
         });
@@ -1083,7 +1156,7 @@ impl SearchIndexes {
 }
 ```
 
-> 注：`reconcile_vault_dir` 与全量重建共用 `vault_model` 锁 → 两者串行；全量重建在锁内整体替换模型后发布，reconcile 之后发布的快照基于最新模型，不会回退。
+> 注：全量重建**在锁内扫描**，turn 结束的 reconcile 在锁上排队 → 两者严格串行，且 reconcile 总是基于最新模型。首建期间到来的 reconcile 会等首建结束（`slot.current()` 在锁内检查，此时已发布）再执行，不丢。
 
 `src/main.rs`：
 - `AppState` 中把 `pub vault_index: Option<std::sync::Arc<web::VaultIndex>>,` 替换为：
@@ -1111,23 +1184,27 @@ impl SearchIndexes {
 - 构造 `AppState` 处把 `vault_index,` 改为 `search,`。
 
 `src/web.rs`：
-- 删除 `pub(crate) fn build_vault_index`（`web.rs:3461-3519` 的 doc 注释 + 函数体）。
+- 删除 `pub(crate) fn build_vault_index` 及其 doc 注释（`grep -n "Walk the vault recursively" src/web.rs` 定位注释起点，到函数结束的 `}`）。
 - `vault_resolve` 改为：
   ```rust
+  /// Wikilink lookup against the current vault snapshot. None = the index is still
+  /// building after a restart → 503 (distinct from a genuinely missing note → 404).
+  fn vault_resolve_in(
+      snap: Option<&crate::fuzzy_index::VaultSnapshot>,
+      name: &str,
+  ) -> Result<String, (StatusCode, String)> {
+      let snap = snap.ok_or((StatusCode::SERVICE_UNAVAILABLE, "vault indexing".into()))?;
+      resolve_wikilink(&snap.wiki, name).ok_or((StatusCode::NOT_FOUND, "Wikilink target not found".into()))
+  }
+
   async fn vault_resolve(
       State(state): State<Arc<AppState>>,
       user: axum::Extension<CurrentUser>,
       Query(q): Query<VaultResolveQuery>,
   ) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
       let _base = vault_base(&state, &user)?;
-      let snap = state
-          .search
-          .vault
-          .as_ref()
-          .and_then(|s| s.current())
-          .ok_or((StatusCode::SERVICE_UNAVAILABLE, "vault indexing".into()))?;
-      let path = resolve_wikilink(&snap.wiki, &q.name)
-          .ok_or((StatusCode::NOT_FOUND, "Wikilink target not found".into()))?;
+      let snap = state.search.vault.as_ref().and_then(|s| s.current());
+      let path = vault_resolve_in(snap.as_deref(), &q.name)?;
       Ok(Json(serde_json::json!({ "path": path })))
   }
   ```
@@ -1136,7 +1213,7 @@ impl SearchIndexes {
 - [ ] **Step 4: Run tests to verify they pass**
 
 Run: `cargo test 2>&1 | grep "test result"`
-Expected: `test result: ok. 417 passed`（395 基线 + 本模块 22；`build_vault_index_*` 4 个与 `resolve_wikilink_*` 6 个改用新构建方式后仍绿）。
+Expected: `test result: ok. 420 passed`（395 基线 + fuzzy_index 24 + `vault_resolve_503_while_indexing` 1；`build_vault_index_*` 4 个与 `resolve_wikilink_*` 6 个改用新构建方式后仍绿）。
 
 - [ ] **Step 5: Commit**
 
@@ -1207,7 +1284,7 @@ Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>"
 
 - [ ] **Step 2: Run tests to verify they fail**
 
-Run: `cargo test maybe_mark_vault_dirty every_fanout_marks 2>&1 | tail -10`
+Run: `cargo test -- maybe_mark_vault_dirty every_fanout_marks 2>&1 | tail -10`
 Expected: 编译失败（`maybe_mark_vault_dirty` / `set_search` 未定义）。
 
 - [ ] **Step 3: Implement**
@@ -1260,7 +1337,7 @@ acp（`session_manager.rs` ~2495，`if … active_run_id.is_none() { … }` 结�
 
 > 不能直接放进 `active_run_id.is_none()` 的块里——那会把定时任务写的笔记排除。
 
-crew（~3302）与 codex（~3597），在 `maybe_push_turn_done(&mgr, &sid, &owner_id, dur, turn_starts.front_intent());` 下一行：
+crew 与 codex：**不要**按 `maybe_push_turn_done(...)` 那行文字定位（三个 fanout 中这行文字完全相同，含 acp，机械插入会插出 4 处、parity 测试失败——r1 执行时实际踩到）。用各自**唯一**的注释定位：crew 在注释 `// Crew runs no scheduled tasks yet` 所在块、codex 在注释 `// Codex runs no scheduled tasks, so every settling` 所在块，各自块末的 `maybe_push_turn_done(&mgr, &sid, &owner_id, dur, turn_starts.front_intent());` 下一行加：
 
 ```rust
                                     maybe_mark_vault_dirty(&mgr, &work_dir);
@@ -1277,7 +1354,7 @@ crew（~3302）与 codex（~3597），在 `maybe_push_turn_done(&mgr, &sid, &own
 - [ ] **Step 4: Run tests to verify they pass**
 
 Run: `cargo test 2>&1 | grep "test result"`
-Expected: `test result: ok. 419 passed`
+Expected: `test result: ok. 422 passed`
 
 - [ ] **Step 5: Commit**
 
@@ -1394,6 +1471,34 @@ Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>"
             let v = dir_section(Some(&snap), false, q, 6, &Default::default(), &Default::default(), "/home/u");
             assert_eq!(v["items"].as_array().unwrap().len(), 0, "{q:?}");
         }
+    }
+
+    #[test]
+    fn notes_section_indexing_and_refreshing() {
+        let none = notes_section(None, true, "x", 6, &Default::default(), "/v");
+        assert_eq!(none["indexing"], true);
+        assert_eq!(none["items"].as_array().unwrap().len(), 0);
+        let d = tempfile::tempdir().unwrap();
+        std::fs::write(d.path().join("a.md"), "x").unwrap();
+        let snap = crate::fuzzy_index::VaultModel::full_scan(d.path()).unwrap().snapshot(1);
+        let v = notes_section(Some(&snap), true, "a", 6, &Default::default(), "/v");
+        assert_eq!(v["indexing"], false);
+        assert_eq!(v["refreshing"], true);
+    }
+
+    #[test]
+    fn frecency_maps_aggregates_by_path_and_picks_best_valid_agent() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = crate::quick_targets::QuickTargetStore::open(dir.path()).unwrap();
+        let now = crate::fuzzy_index::now_ms();
+        store.bump("u1", "dir", "/h/p", "claude", now).unwrap();
+        store.bump("u1", "dir", "/h/p", "codex", now).unwrap();
+        store.bump("u1", "dir", "/h/p", "codex", now).unwrap();
+        store.bump("u1", "dir", "/h/p", "kiro", now).unwrap();   // legacy agent: not a valid pick
+        store.bump("u2", "dir", "/h/p", "crew", now).unwrap();   // other user: invisible
+        let (sum, best) = frecency_maps_from(&store, "u1", "dir");
+        assert!(sum["/h/p"] > 0.0);
+        assert_eq!(best.get("/h/p").map(|s| s.as_str()), Some("codex"));
     }
 
     #[test]
@@ -1526,10 +1631,18 @@ fn frecency_maps(
     user_id: &str,
     kind: &str,
 ) -> (std::collections::HashMap<String, f64>, std::collections::HashMap<String, String>) {
+    frecency_maps_from(&state.quick_targets, user_id, kind)
+}
+
+fn frecency_maps_from(
+    store: &crate::quick_targets::QuickTargetStore,
+    user_id: &str,
+    kind: &str,
+) -> (std::collections::HashMap<String, f64>, std::collections::HashMap<String, String>) {
     let now = crate::fuzzy_index::now_ms();
     let mut sum = std::collections::HashMap::<String, f64>::new();
     let mut best = std::collections::HashMap::<String, (f64, String)>::new();
-    for r in state.quick_targets.candidates(user_id, kind).unwrap_or_default() {
+    for r in store.candidates(user_id, kind).unwrap_or_default() {
         let d = crate::quick_targets::decayed_score(r.score_raw, r.last_ms, now);
         *sum.entry(r.path.clone()).or_default() += d;
         if matches!(r.agent.as_str(), "claude" | "crew" | "codex" | "tmux") {
@@ -1558,7 +1671,10 @@ async fn search(
                 let (bonus, agents) = frecency_maps(&state, &user.id, "dir");
                 let snap = si.dirs.current();
                 let sec = dir_section(snap.as_deref(), si.dirs.is_rebuilding(), &q.q, limit, &bonus, &agents, &home);
-                let zero = sec["items"].as_array().is_some_and(|a| a.is_empty());
+                // Only a REAL query's zero result is a staleness signal — a negation-only
+                // or metacharacter-only query is always empty and must not trigger rebuilds.
+                let zero = crate::fuzzy_index::has_positive_atom(&q.q)
+                    && sec["items"].as_array().is_some_and(|a| a.is_empty());
                 if zero { si.refresh_dirs_if_older(crate::fuzzy_index::ZERO_HIT_MIN_AGE_MS); }
                 else { si.refresh_dirs_if_older(crate::fuzzy_index::DIR_TTL_MS); }
                 sections.push(sec);
@@ -1571,7 +1687,7 @@ async fn search(
                 let (bonus, _) = frecency_maps(&state, &user.id, "note");
                 let snap = slot.current();
                 let sec = notes_section(snap.as_deref(), slot.is_rebuilding(), &q.q, limit, &bonus, &root.to_string_lossy());
-                if sec["items"].as_array().is_some_and(|a| a.is_empty()) {
+                if crate::fuzzy_index::has_positive_atom(&q.q) && sec["items"].as_array().is_some_and(|a| a.is_empty()) {
                     si.refresh_vault_if_older(crate::fuzzy_index::ZERO_HIT_MIN_AGE_MS);
                 }
                 sections.push(sec);
@@ -1607,7 +1723,9 @@ async fn search_warm(
 - [ ] **Step 4: Run tests to verify they pass**
 
 Run: `cargo test 2>&1 | grep "test result"`
-Expected: `test result: ok. 424 passed`（419 + 6 新 − 1 删除）
+Expected: `test result: ok. 429 passed`（422 + 8 新 − 1 删除）。
+
+> `QuickTargetStore::open(&Path)` / `bump(user, kind, path, agent, now_ms)` 签名见 `quick_targets.rs:65/96`；若 `bump` 参数顺序不同，以源码为准调整测试。
 
 - [ ] **Step 5: Commit**
 
@@ -1682,6 +1800,16 @@ Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>"
     }
 
     #[test]
+    fn seed_v2_titles_do_not_reuse_v1_emoji() {
+        let lead = |t: &str| t.chars().next().unwrap();
+        for (t2, _) in SEED_PRESETS_V2 {
+            for (t1, _) in SEED_PRESETS {
+                assert_ne!(lead(t2), lead(t1), "{t2} collides with {t1} — chips are told apart by emoji");
+            }
+        }
+    }
+
+    #[test]
     fn seed_v2_content_within_caps() {
         for (title, body) in SEED_PRESETS_V2 {
             let (t, b) = (title.trim(), body.trim());
@@ -1697,7 +1825,7 @@ Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>"
 
 - [ ] **Step 2: Run tests to verify they fail**
 
-Run: `cargo test seed_v2 fresh_db_gets_twelve 2>&1 | tail -10`
+Run: `cargo test -- seed_v2 fresh_db_gets_twelve 2>&1 | tail -10`
 Expected: 编译失败（`SEED_PRESETS_V2` / `seed_v2_if_needed` 未定义）。
 
 - [ ] **Step 3: Implement**
@@ -1711,40 +1839,40 @@ Expected: 编译失败（`SEED_PRESETS_V2` / `seed_v2_if_needed` 未定义）。
 /// folder, so relative paths resolve.
 pub const SEED_PRESETS_V2: &[(&str, &str)] = &[
     (
-        "📝 基于笔记出题",
-        r#"Task: Quiz me on the note referenced here: {{input}}
+        "❓ 基于笔记出题",
+        r#"Task: Quiz me on this note. {{input}}
 
-Approach: Read that note in full first. Write 5 questions that cover its key points — mix recall, application, and one question that connects ideas across sections. Match the note's subject style (e.g. exam-style multiple choice for 考研英语 reading notes, worked problems for 管综数学).
+Approach: Read that note in full first (the path above is absolute). Write 5 questions that cover its key points — mix recall, application, and one question that connects ideas across sections. Match the note's subject style (exam-style multiple choice for 考研英语 reading notes, worked problems for 管综数学).
 
 Done when: you show the 5 questions only, then STOP and wait for my answers. After I answer, grade each one, explain every mistake with a pointer to the exact part of the note, and give the correct answer.
 
 用中文与我交流（英文原文、公式、术语保持原样）。"#,
     ),
     (
-        "✅ 批改我的答案",
-        r#"Task: Grade my answers against this note: {{input}} — my answers are in my message below or in attached images. If I haven't given any answers yet, ask me for them and stop.
+        "💯 批改我的答案",
+        r#"Task: Grade my answers for this note. {{input}}
 
-Approach: Read the note (answer key / explanations) first. If a `kaoyan-reading-review` skill is available and this is a 考研英语 reading passage, follow that skill's workflow. For each question: my answer, the correct answer, right/wrong, and the reasoning technique that gets it right.
+Approach: My answers may be in my message, or in answer-sheet*/IMG_* images in this folder — look there before asking me. Read the note for the passage and reasoning. If the note marks its own answers as unverified (e.g. "尚未核对官方答案"), tell me which ones you're grading against unverified answers. If a `kaoyan-reading-review` skill is available and this is a 考研英语 reading passage, follow that skill's workflow. For each question: my answer, the correct answer, right/wrong, and the technique that gets it right.
 
-Done when: every question is graded, the error pattern is summarized in 2–3 bullets, and — only if I confirm — the diagnosis is appended to the note under a dated heading.
+Done when: every question is graded and the error pattern is summarized in 2–3 bullets. Only if I confirm, append the diagnosis to the note under a dated heading. If you found no answers anywhere, ask me for them and stop.
 
 用中文与我交流（英文原文保持原样）。"#,
     ),
     (
         "🃏 生成背诵卡",
-        r#"Task: Turn this note into a memorization card: {{input}}
+        r#"Task: Turn this note into a memorization card. {{input}}
 
-Approach: Read the note. Extract only what must be memorized — definitions, formulas, key vocabulary, typical traps — as short Q→A pairs or cloze lines, grouped by section. No prose paragraphs.
+Approach: Read the note. If other `*-背诵卡.md` files exist in this vault (search this folder and its parents), copy their conventions exactly — file naming (short topic name + `-背诵卡.md`), frontmatter (tags include `背诵卡`), the backlink to the full note, and their table-first layout. Otherwise use `<topic>-背诵卡.md` with a `[[原笔记|完整笔记]]` backlink. Extract only what must be memorized: definitions, formulas, key vocabulary, typical traps. No prose paragraphs.
 
-Done when: a new file `<original-name>-背诵卡.md` is written next to the original note (never overwrite an existing file — if one exists, show me the diff and ask), and you report its path and how many cards it contains.
+Done when: the card is written next to the note (never overwrite an existing file — if one exists, show me the diff and ask), and you report its path and how many items it contains.
 
 用中文与我交流（英文单词、公式保持原样）。"#,
     ),
     (
         "🔁 抽背单词",
-        r#"Task: Drill me on vocabulary. Context: {{input}}
+        r#"Task: Drill me on vocabulary. {{input}}
 
-Approach: Find the `单词/` notes in or under this directory (if none, ask me where they are). Collect the words from the most recent 7 notes, pick 20 at random (no duplicates), and quiz me ONE word at a time: show the word, wait for my meaning, then judge it and show the note's definition + example.
+Approach: Find the nearest directory named `单词` — in this folder, its subfolders, or any parent folder up to the vault root (its notes are date-named, entries look like `## N. word /phonetic/`). If none exists, ask me where my word lists are. Collect words from the most recent 7 notes, pick 20 at random (no duplicates), and quiz me ONE word at a time: show the word, wait for my meaning, then judge it and show the note's definition and example.
 
 Done when: all 20 are done; then list the ones I missed with their note filenames so I can review them.
 
@@ -1752,6 +1880,9 @@ Done when: all 20 are done; then list the ones I missed with their note filename
     ),
 ];
 ```
+
+> 标题 emoji 刻意避开 v1 已用的 ✅/📝（线上库 v1 有「✅ TDD 实现」「📝 提交并开 PR」）。
+> `{{input}}` 一律放在 Task 行末：`applyPreset` 按原样替换，放在句中会把后半句甩到预填的空行之后。
 
 `src/prompts.rs`，`seed_if_unseeded` 之后加：
 
@@ -1811,7 +1942,7 @@ Done when: all 20 are done; then list the ones I missed with their note filename
 - [ ] **Step 4: Run tests to verify they pass**
 
 Run: `cargo test 2>&1 | grep "test result"`
-Expected: `test result: ok. 429 passed`
+Expected: `test result: ok. 435 passed`（429 + 6）
 
 - [ ] **Step 5: Commit**
 
@@ -1982,6 +2113,7 @@ Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>"
 - Create: `frontend/src/components/SearchResults.tsx`
 - Modify: `frontend/src/components/QuickTargets.tsx`（`RowIcon` 导出；删 `onEmpty` prop 与 `failed` state）
 - Modify: `frontend/src/components/__tests__/QuickTargets.test.tsx:133-138`（删 `onEmpty` 测试）
+- Create: `frontend/src/lib/searchOrder.ts`
 - Create: `frontend/src/components/__tests__/SearchResults.test.tsx`
 
 **Interfaces:**
@@ -2000,7 +2132,9 @@ Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>"
     onRetry?: () => void
     failed?: boolean
   }): JSX.Element
+  // lib/searchOrder.ts（不放在组件文件里：react-refresh/only-export-components 要求组件文件只导出组件）
   export function orderSections(r: SearchResult, showNotes: boolean): Array<'dirs' | 'notes'>
+  export function compactHint(hint: string): string
   ```
 
 - [ ] **Step 1: Write the failing tests**
@@ -2010,7 +2144,8 @@ Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>"
 ```tsx
 import { render, screen, fireEvent } from '@testing-library/react'
 import { describe, it, expect, vi } from 'vitest'
-import SearchResults, { orderSections } from '../SearchResults'
+import SearchResults from '../SearchResults'
+import { orderSections, compactHint } from '../../lib/searchOrder'
 import type { SearchResult, DirHit, NoteHit } from '../../lib/api'
 
 const dir = (o: Partial<DirHit> = {}): DirHit => ({ path: '/h/zeromux', display: 'zeromux', hint: '~/s3', agent: 'claude', score: 80, ...o })
@@ -2027,6 +2162,12 @@ describe('SearchResults', () => {
     expect(orderSections(res([dir({ score: 50 })], [note({ score: 90 })]), true)).toEqual(['notes', 'dirs'])
     expect(orderSections(res([dir({ score: 90 })], [note({ score: 50 })]), true)).toEqual(['dirs', 'notes'])
     expect(orderSections(res([dir()], [note()]), false)).toEqual(['dirs'])
+  })
+
+  it('compactHint drops the shared vault prefix so the distinguishing tail survives truncation', () => {
+    expect(compactHint('projects/long-term/考研英语/2019/英语二')).toBe('考研英语/2019/英语二')
+    expect(compactHint('projects/short-term/web3')).toBe('web3')
+    expect(compactHint('knowledge/aws')).toBe('knowledge/aws')
   })
 
   it('renders both sections with display + hint', () => {
@@ -2094,10 +2235,32 @@ Expected: FAIL（模块不存在）。
 
 - [ ] **Step 3: Implement**
 
+新建 `frontend/src/lib/searchOrder.ts`：
+
+```ts
+import type { SearchResult } from './api'
+
+/** Section order follows each section's best hit — a fixed "dirs first" would bury
+ *  a clearly better note match below six directory rows. */
+export function orderSections(r: SearchResult, showNotes: boolean): Array<'dirs' | 'notes'> {
+  const best = (xs: { score: number }[] | undefined) => (xs && xs.length ? Math.max(...xs.map(x => x.score)) : -1)
+  const kinds: Array<'dirs' | 'notes'> = ['dirs']
+  if (showNotes) kinds.push('notes')
+  return kinds.sort((a, b) => best(r[b]?.items) - best(r[a]?.items))
+}
+
+/** Vault hints all start with `projects/long-term/…` (PARA layout); on a 224px
+ *  popover that prefix alone eats the width and the year/section that tells 20
+ *  identical `阅读理解` rows apart gets truncated. Drop it. */
+export function compactHint(hint: string): string {
+  return hint.replace(/^projects\/(long-term|short-term)\/?/, '')
+}
+```
+
 `QuickTargets.tsx`：
 - 把 `function RowIcon(...)` 改为 `export function RowIcon({ kind, agent, size = 15 }: { kind: 'dir' | 'note' | 'folder'; agent: string; size?: number })`，并在函数体首行加 `if (kind === 'folder') return <Folder size={size} className="text-[var(--accent-blue)] shrink-0" />`（`import` 加 `Folder`）。
 - 删除 prop `onEmpty`、state `failed`/`setFailed`、以及 `useEffect(() => { if (loaded && !failed && items.length === 0) onEmpty?.() }, …)`；catch 分支只保留 `setItems([])`（注释改为「快速入口是加速器：失败就安静地不显示」）。
-- `QuickTargets.test.tsx` 删除 `'列表为空时通知父级…'` 这一个 `it`。
+- `QuickTargets.test.tsx` 删除 `'列表为空时通知父级…'` 这一个 `it`，并把首行 import 改为 `import { render, screen, act } from '@testing-library/react'`（`waitFor` 只被删掉的那条用，留着 `tsc -b` 报 TS6133）。
 - `Sidebar.tsx:519` 删除 `onEmpty={() => setStep('pick-type')}` 及其上方两行注释（Task 9 会整体改写这一段，此处先删以保证 tsc 通过）。
 
 新建 `frontend/src/components/SearchResults.tsx`：
@@ -2107,17 +2270,7 @@ import { useState } from 'react'
 import { MoreVertical, Zap, Repeat, MessageSquarePlus, FolderInput } from 'lucide-react'
 import type { SearchResult, DirHit, NoteHit } from '../lib/api'
 import { RowIcon } from './QuickTargets'
-
-type SectionKind = 'dirs' | 'notes'
-
-/** Section order follows each section's best hit — a fixed "dirs first" would bury
- *  a clearly better note match below six directory rows. */
-export function orderSections(r: SearchResult, showNotes: boolean): SectionKind[] {
-  const best = (xs: { score: number }[] | undefined) => (xs && xs.length ? Math.max(...xs.map(x => x.score)) : -1)
-  const kinds: SectionKind[] = ['dirs']
-  if (showNotes) kinds.push('notes')
-  return kinds.sort((a, b) => best(r[b]?.items) - best(r[a]?.items))
-}
+import { orderSections, compactHint } from '../lib/searchOrder'
 
 function Hint({ text }: { text: string }) {
   return text ? <span className="truncate text-[10px] text-[var(--text-muted)]">{text}</span> : null
@@ -2221,7 +2374,7 @@ export default function SearchResults({ result, showNotes, onPickDir, onDirMenu,
                         <span className="mt-0.5"><RowIcon kind={h.kind} agent="" /></span>
                         <span className="flex flex-col min-w-0 flex-1">
                           <span className="truncate text-xs text-[var(--text-primary)]">{h.display}</span>
-                          <Hint text={h.hint} />
+                          <Hint text={compactHint(h.hint)} />
                         </span>
                       </button>
                       {/* ⚡ = ask an agent about this note, in the note's own folder. A separate
@@ -2255,13 +2408,13 @@ export default function SearchResults({ result, showNotes, onPickDir, onDirMenu,
 
 - [ ] **Step 4: Run to verify it passes**
 
-Run: `cd frontend && npx vitest run src/components/__tests__/SearchResults.test.tsx src/components/__tests__/QuickTargets.test.tsx src/components/__tests__/crewSessionType.test.tsx && npx tsc -b`
-Expected: PASS；tsc 无输出。
+Run: `cd frontend && npx vitest run src/components/__tests__/SearchResults.test.tsx src/components/__tests__/QuickTargets.test.tsx src/components/__tests__/crewSessionType.test.tsx && npx tsc -b && npx eslint src/components/SearchResults.tsx src/lib/searchOrder.ts`
+Expected: PASS；tsc 无输出；eslint 对这两个新文件无错误。
 
 - [ ] **Step 5: Commit**
 
 ```bash
-git add frontend/src/components/SearchResults.tsx frontend/src/components/QuickTargets.tsx frontend/src/components/Sidebar.tsx frontend/src/components/__tests__/SearchResults.test.tsx frontend/src/components/__tests__/QuickTargets.test.tsx
+git add frontend/src/components/SearchResults.tsx frontend/src/lib/searchOrder.ts frontend/src/components/QuickTargets.tsx frontend/src/components/Sidebar.tsx frontend/src/components/__tests__/SearchResults.test.tsx frontend/src/components/__tests__/QuickTargets.test.tsx
 git commit -m "feat(frontend): 共享搜索结果组件(两段/⚡/⋮/边界态);QuickTargets 去 onEmpty
 
 Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>"
@@ -2283,7 +2436,7 @@ Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>"
   ```ts
   // lib/askAgent.ts
   export interface AskAgentTarget { absDir: string; relPath: string; kind: 'note' | 'folder' }
-  export function askAgentPrompt(t: AskAgentTarget): string   // "当前笔记：<rel>\n\n" | "当前目录：<rel>/\n\n"
+  export function askAgentPrompt(t: AskAgentTarget): string   // "当前笔记：<absDir>/<basename>\n\n" | "当前目录：<absDir>/\n\n"
   // Sidebar Props additions
   onOpenVault?: (target: { path: string; kind: 'note' | 'folder' }) => void
   askAgentRequest?: (AskAgentTarget & { nonce: number }) | null
@@ -2298,11 +2451,11 @@ import { describe, it, expect } from 'vitest'
 import { askAgentPrompt } from '../askAgent'
 
 describe('askAgentPrompt', () => {
-  it('prefixes the note path', () => {
-    expect(askAgentPrompt({ absDir: '/v/a', relPath: 'a/Text3.md', kind: 'note' })).toBe('当前笔记：a/Text3.md\n\n')
+  it('prefixes the ABSOLUTE note path (the agent cwd is the note folder, so a vault-relative path would not resolve)', () => {
+    expect(askAgentPrompt({ absDir: '/v/p/a', relPath: 'p/a/Text3.md', kind: 'note' })).toBe('当前笔记：/v/p/a/Text3.md\n\n')
   })
-  it('prefixes the folder path with a trailing slash', () => {
-    expect(askAgentPrompt({ absDir: '/v/a', relPath: 'a', kind: 'folder' })).toBe('当前目录：a/\n\n')
+  it('prefixes the absolute folder path with a trailing slash', () => {
+    expect(askAgentPrompt({ absDir: '/v/p/a', relPath: 'p/a', kind: 'folder' })).toBe('当前目录：/v/p/a/\n\n')
   })
 })
 ```
@@ -2324,7 +2477,7 @@ function setup(over: Partial<React.ComponentProps<typeof Sidebar>> = {}) {
   const props = {
     sessions: [], docTabs: [], activeId: null, onSelect: vi.fn(), onCreate, onOpenVault,
     onDelete: vi.fn(), onRename: vi.fn(), hasUnread: () => false, onLogout: vi.fn(),
-    theme: 'dark' as const, onToggleTheme: vi.fn(), user: { id: 'u', login: 'u', role: 'admin', status: 'active' } as api.UserInfo,
+    theme: 'dark' as const, onToggleTheme: vi.fn(), user: { id: 'u', login: 'u', avatar: null, role: 'admin', status: 'active' } as api.UserInfo,
     open: true, onToggle, mobile: false, ...over,
   }
   render(<Sidebar {...props} />)
@@ -2390,7 +2543,7 @@ describe('Sidebar New Session search', () => {
     expect(screen.queryByText('Terminal')).toBeNull()   // tmux would drop the context
     fireEvent.click(screen.getByText('Claude Code'))
     const ta = await screen.findByPlaceholderText('给 agent 的第一条指令，留空则只创建会话') as HTMLTextAreaElement
-    expect(ta.value.startsWith(`当前笔记：${hit.path}`)).toBe(true)
+    expect(ta.value.startsWith(`当前笔记：${hit.abs_dir}/Text3.md`)).toBe(true)
     fireEvent.click(screen.getByText('Create & send'))
     expect(onCreate).toHaveBeenCalledWith('claude', hit.abs_dir, undefined, ta.value)
   })
@@ -2422,6 +2575,58 @@ describe('Sidebar New Session search', () => {
     expect((screen.getByPlaceholderText('搜索目录或笔记…') as HTMLInputElement).value).toBe('xr')
   })
 
+  it('indexing sections are re-queried automatically (no retyping needed after a restart)', async () => {
+    vi.spyOn(api, 'warmSearchIndex').mockResolvedValue()
+    const spy = vi.spyOn(api, 'searchPaths')
+      .mockResolvedValueOnce(R({ ...sec('dirs', []), indexing: true }, { ...sec('notes', []), indexing: true }))
+      .mockResolvedValue(R(sec('dirs', []), sec('notes', [{ path: 'n.md', kind: 'note', display: 'ready', hint: '', abs_dir: '/v', score: 1 }])))
+    setup()
+    await openAndType('rea')
+    await act(async () => { vi.advanceTimersByTime(200) })
+    await screen.findByText('正在建立笔记索引…')
+    await act(async () => { vi.advanceTimersByTime(4100) })
+    await screen.findByText('ready')
+    expect(spy.mock.calls.length).toBeGreaterThanOrEqual(2)
+  })
+
+  it('folder ⋮ 在此开 agent → pick type → creates directly in that folder', async () => {
+    vi.spyOn(api, 'warmSearchIndex').mockResolvedValue()
+    const f = { path: 'p/x', kind: 'folder' as const, display: 'x', hint: 'p', abs_dir: '/v/p/x', score: 5 }
+    vi.spyOn(api, 'searchPaths').mockResolvedValue(R(sec('dirs', []), sec('notes', [f])))
+    const { onCreate } = setup()
+    await openAndType('x')
+    fireEvent.click(await screen.findByTestId('sr-menu'))
+    fireEvent.click(screen.getByText('在此开 agent'))
+    fireEvent.click(await screen.findByText('Codex'))
+    expect(onCreate).toHaveBeenCalledWith('codex', '/v/p/x')
+  })
+
+  it('without vault only dirs are requested', async () => {
+    vi.spyOn(api, 'getVaultMeta').mockResolvedValue({ enabled: false, name: '' })
+    vi.spyOn(api, 'warmSearchIndex').mockResolvedValue()
+    const spy = vi.spyOn(api, 'searchPaths').mockResolvedValue(R(sec('dirs', []), null))
+    setup()
+    await openAndType('abc')
+    await act(async () => { vi.advanceTimersByTime(200) })
+    await waitFor(() => expect(spy).toHaveBeenCalled())
+    expect(spy.mock.calls[0][1]).toBe('dirs')
+    expect(screen.getByPlaceholderText('搜索目录…')).toBeInTheDocument()
+  })
+
+  it('search input is ≥16px so iOS Safari does not zoom on focus', async () => {
+    vi.spyOn(api, 'warmSearchIndex').mockResolvedValue()
+    setup()
+    const input = await openAndType('')
+    expect(input.className).toContain('text-base')
+    expect(input.className).not.toMatch(/\btext-xs\b/)
+  })
+
+  it('askAgentRequest opens the popover even when the desktop sidebar is collapsed', async () => {
+    vi.spyOn(api, 'warmSearchIndex').mockResolvedValue()
+    const { onToggle } = setup({ open: false, mobile: false, askAgentRequest: { absDir: '/v/a', relPath: 'a/n.md', kind: 'note', nonce: 1 } })
+    expect(onToggle).toHaveBeenCalled()
+  })
+
   it('askAgentRequest from VaultReader opens the flow once per nonce', async () => {
     vi.spyOn(api, 'warmSearchIndex').mockResolvedValue()
     setup({ askAgentRequest: { absDir: '/v/a', relPath: 'a/n.md', kind: 'note', nonce: 1 } })
@@ -2431,7 +2636,7 @@ describe('Sidebar New Session search', () => {
 })
 ```
 
-> 上面 `user` 对象的字段以 `api.ts` 的 `UserInfo` 为准（`grep -n "export interface UserInfo" -A8 frontend/src/lib/api.ts`），缺字段按其定义补齐；`getSchedulerHealth` 返回类型同理。
+> `user` 字段已按 `api.ts` 的 `UserInfo`（含 `avatar: string | null`）补齐；其他 mock（`getSchedulerHealth` → `{heartbeat_ms, healthy}`、`getVaultMeta`、`listQuickTargets` → `{top}`、`listPrompts`）已由 r1 评审对照真实定义核实。
 
 - [ ] **Step 2: Run to verify it fails**
 
@@ -2446,10 +2651,13 @@ Expected: FAIL（`askAgent` 模块不存在；搜索框不存在）。
 export interface AskAgentTarget { absDir: string; relPath: string; kind: 'note' | 'folder' }
 
 /** The context line prefilled into the new agent's first prompt. Only the PATH is
- *  passed — notes can be ~300KB; the agent reads the file itself. Presets wrap it
- *  via `{{input}}`. */
+ *  passed — notes can be ~300KB; the agent reads the file itself. ABSOLUTE, because
+ *  the session's cwd is the note's folder and a vault-relative path would not
+ *  resolve there. Presets wrap it via `{{input}}`. */
 export function askAgentPrompt(t: AskAgentTarget): string {
-  return t.kind === 'note' ? `当前笔记：${t.relPath}\n\n` : `当前目录：${t.relPath}/\n\n`
+  if (t.kind === 'folder') return `当前目录：${t.absDir}/\n\n`
+  const base = t.relPath.split('/').pop() || t.relPath
+  return `当前笔记：${t.absDir}/${base}\n\n`
 }
 ```
 
@@ -2471,6 +2679,7 @@ export function askAgentPrompt(t: AskAgentTarget): string {
      // going pick-type → back keeps it; openTypePicker clears it.
      const [query, setQuery] = useState('')
      const [searchResult, setSearchResult] = useState<SearchResult | null>(null)
+     const [searchResultQuery, setSearchResultQuery] = useState('')   // query the shown result answers
      const [searchFailed, setSearchFailed] = useState(false)
      const searchReqRef = useRef(0)
      // Set when a search hit fixed the dir: after picking a type, create directly
@@ -2489,9 +2698,12 @@ export function askAgentPrompt(t: AskAgentTarget): string {
        searchPaths(q, vaultEnabled ? 'dirs,notes' : 'dirs')
          .then(r => {
            if (searchReqRef.current !== req) return
-           setSearchResult(r); setSearchFailed(false)
-           const refreshing = (r.dirs?.refreshing && r.dirs.items.length === 0) || (r.notes?.refreshing && r.notes.items.length === 0)
-           if (refreshing) setTimeout(() => { if (searchReqRef.current === req) runSearch(q) }, 4000)
+           setSearchResult(r); setSearchResultQuery(q); setSearchFailed(false)
+           // Still building (indexing) or rebuilding with no hits → re-query in 4s so
+           // the user never has to retype after a restart. Superseded by any newer query.
+           const pending = (s: { indexing: boolean; refreshing: boolean; items: unknown[] } | null) =>
+             !!s && (s.indexing || (s.refreshing && s.items.length === 0))
+           if (pending(r.dirs) || pending(r.notes)) setTimeout(() => { if (searchReqRef.current === req) runSearch(q) }, 4000)
          })
          .catch(() => { if (searchReqRef.current === req) { setSearchResult(null); setSearchFailed(true) } })
      }, [vaultEnabled])
@@ -2557,7 +2769,12 @@ export function askAgentPrompt(t: AskAgentTarget): string {
      useEffect(() => {
        if (!askAgentRequest || askAgentRequest.nonce === lastAskNonce.current) return
        lastAskNonce.current = askAgentRequest.nonce
-       if (mobile && !open) onToggle()
+       // Collapsed sidebar (desktop icon rail, or mobile hidden) doesn't render the
+       // popover at all — open it, or the ⚡ tap silently does nothing.
+       if (!open) onToggle()
+       // Consuming an external one-shot request is exactly an effect's job; the
+       // setState calls here are the point, not a derived-state smell.
+       // eslint-disable-next-line react-hooks/set-state-in-effect
        setPendingType(null)
        askAgent(askAgentRequest)
      // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -2630,7 +2847,9 @@ export function askAgentPrompt(t: AskAgentTarget): string {
                        value={query}
                        onChange={e => setQuery(e.target.value)}
                        onKeyDown={e => {
-                         if (e.key !== 'Enter' || !searchResult) return
+                         // Ignore Enter while an IME is composing (pinyin), and when the
+                         // shown results belong to an older query (debounce not yet fired).
+                         if (e.key !== 'Enter' || e.nativeEvent.isComposing || !searchResult || searchResultQuery !== query) return
                          e.preventDefault()
                          const first = [...(searchResult.dirs?.items ?? []).map(h => ({ t: 'd' as const, h, s: h.score })),
                            ...(vaultEnabled ? searchResult.notes?.items ?? [] : []).map(h => ({ t: 'n' as const, h, s: h.score }))]
@@ -2640,8 +2859,9 @@ export function askAgentPrompt(t: AskAgentTarget): string {
                        }}
                        maxLength={128}
                        autoFocus={!mobile}
-                       placeholder="搜索目录或笔记…"
-                       className="flex-1 min-w-0 bg-transparent text-xs outline-none text-[var(--text-primary)]"
+                       placeholder={vaultEnabled ? '搜索目录或笔记…' : '搜索目录…'}
+                       /* text-base = 16px: below 16px iOS Safari zooms the whole page on focus. */
+                       className="flex-1 min-w-0 bg-transparent text-base outline-none text-[var(--text-primary)]"
                      />
                    </div>
                  </>
@@ -2649,6 +2869,13 @@ export function askAgentPrompt(t: AskAgentTarget): string {
    ```
 
 10. pick-type 的返回按钮：`onClick={() => { setPendingDir(null); setPendingSkipPrompt(false); setPendingAgentContext(null); setStep('quick') }}`（查询词保留）。Terminal 按钮外包一层 `{!pendingAgentContext && ( … )}`；Obsidian 文档按钮同样包 `{vaultEnabled && !pendingAgentContext && ( … )}`。
+   pick-type 标题：`pendingAgentContext` 非空时把 `Select type` 换成 `问 agent：{basename(pendingAgentContext.relPath)}`（`truncate`），让用户知道在问哪篇。
+
+10b. pick-prompt 的返回按钮：现为 `setStep(currentPath ? 'pick-dir' : 'pick-type')`（`Sidebar.tsx:782`）。⚡ / 搜索命中进来时 `currentPath` 可能是更早一次目录浏览留下的，会跳进目录浏览器。改为 `setStep(currentPath && !pendingAgentContext && !pendingSkipPrompt ? 'pick-dir' : 'pick-type')`；并且 `openTypePicker` 中 `setCurrentPath('')`。
+
+10c. pick-prompt 的 textarea（`Sidebar.tsx:819`）`text-xs` → `text-base`（同 iOS 缩放理由；⚡ 流程必经此处）。
+
+10d. 桌面弹层宽度：`step === 'quick'` 时 `w-56`（224px）放不下 vault 结果行（⚡+⋮ 占 88px，标题只剩约 87px）。把弹层容器 className 中的 `${mobile ? 'w-[calc(100vw-1rem)]' : 'w-56'}` 改为 `${mobile ? 'w-[calc(100vw-1rem)]' : step === 'quick' ? 'w-80' : 'w-56'}`（仅首屏加宽到 320px，其余步骤不变）。
 
 11. 手机键盘补偿：在弹层容器（`absolute bottom-full left-2 …` 那个 div）上加 `ref={popRef}`，并加 effect（参照 `TerminalView.tsx:391-410`）：
     ```ts
@@ -2675,7 +2902,7 @@ export function askAgentPrompt(t: AskAgentTarget): string {
 - [ ] **Step 4: Run to verify it passes**
 
 Run: `cd frontend && npx vitest run src/lib/__tests__/askAgent.test.ts src/components/__tests__/Sidebar.search.test.tsx src/components/__tests__/crewSessionType.test.tsx && npx tsc -b`
-Expected: PASS。然后**验红**：临时把 `runSearch` 里 `.then` 的 `if (searchReqRef.current !== req) return` 注释掉，重跑 `Sidebar.search.test.tsx`，`stale search responses are dropped` 必须 FAIL；恢复后再 PASS。
+Expected: PASS。`npx eslint src/components/Sidebar.tsx src/lib/askAgent.ts` 的错误数不高于改动前（先 `git stash; npx eslint src/components/Sidebar.tsx | tail -1; git stash pop` 记下基线）。然后**验红**：临时把 `runSearch` 里 `.then` 的 `if (searchReqRef.current !== req) return` 注释掉，重跑 `Sidebar.search.test.tsx`，`stale search responses are dropped` 必须 FAIL；恢复后再 PASS。
 
 - [ ] **Step 5: Commit**
 
@@ -2773,6 +3000,21 @@ describe('pickDocTabForTarget', () => {
     expect(onAskAgent).toHaveBeenCalledWith({ absDir: '/v/a', relPath: 'a/n.md', kind: 'note' })
   })
 
+  it('search failure shows retry instead of an endless 搜索中…', async () => {
+    vi.mocked(api.searchPaths).mockRejectedValueOnce(new Error('offline'))
+    render(<VaultReader />)
+    fireEvent.change(screen.getByPlaceholderText('搜索笔记名…'), { target: { value: 'q' } })
+    expect(await screen.findByText('重试')).toBeInTheDocument()
+  })
+
+  it('target (folder) also clears a pending query', async () => {
+    const { rerender } = render(<VaultReader />)
+    const input = screen.getByPlaceholderText('搜索笔记名…') as HTMLInputElement
+    fireEvent.change(input, { target: { value: 'zzz' } })
+    rerender(<VaultReader target={{ path: 'projects/x', kind: 'folder', nonce: 7 }} />)
+    await waitFor(() => expect(input.value).toBe(''))
+  })
+
   it('warms the notes index on mount', async () => {
     render(<VaultReader />)
     await waitFor(() => expect(api.warmSearchIndex).toHaveBeenCalledWith('notes'))
@@ -2810,19 +3052,26 @@ export function pickDocTabForTarget(tabs: DocTab[]): string | null {
   }) {
   ```
 - import：`import { listVault, getVaultFile, searchPaths, warmSearchIndex, resolveWikiLink } from '../lib/api'`；`import type { DirListEntry, SearchResult, NoteHit } from '../lib/api'`；`import SearchResults from './SearchResults'`；`import type { AskAgentTarget } from '../lib/askAgent'`。
-- state `results`/`searchTruncated` 替换为 `const [search, setSearch] = useState<SearchResult | null>(null)`。
-- 搜索 effect 改为：
+- state `results`/`searchTruncated` 替换为 `const [search, setSearch] = useState<SearchResult | null>(null)` 与 `const [searchFailed, setSearchFailed] = useState(false)`，以及 `const [retryTick, setRetryTick] = useState(0)`。
+- 搜索 effect 改为（与 Sidebar 同款：indexing / 刷新中零结果 4s 自动重查；失败显示重试）：
   ```ts
   useEffect(() => {
-    const t = setTimeout(() => {
+    let again: ReturnType<typeof setTimeout> | undefined
+    const run = () => {
       const req = ++searchReqRef.current
-      if (!query.trim()) { setSearch(null); return }
+      if (!query.trim()) { setSearch(null); setSearchFailed(false); return }
       searchPaths(query, 'notes', 50)
-        .then(r => { if (searchReqRef.current === req) setSearch(r) })
-        .catch(() => { if (searchReqRef.current === req) setSearch(null) })
-    }, 200)
-    return () => clearTimeout(t)
-  }, [query])
+        .then(r => {
+          if (searchReqRef.current !== req) return
+          setSearch(r); setSearchFailed(false)
+          const n = r.notes
+          if (n && (n.indexing || (n.refreshing && n.items.length === 0))) again = setTimeout(run, 4000)
+        })
+        .catch(() => { if (searchReqRef.current === req) { setSearch(null); setSearchFailed(true) } })
+    }
+    const t = setTimeout(run, 200)
+    return () => { clearTimeout(t); if (again) clearTimeout(again) }
+  }, [query, retryTick])
 
   useEffect(() => { warmSearchIndex('notes') }, [])
   ```
@@ -2833,6 +3082,8 @@ export function pickDocTabForTarget(tabs: DocTab[]): string | null {
     if (!target || target.nonce === lastTargetNonce.current) return
     lastTargetNonce.current = target.nonce
     if (target.kind === 'note') { openNote(target.path); return }
+    // Consuming an external one-shot navigation request — setState is the point.
+    // eslint-disable-next-line react-hooks/set-state-in-effect
     setMode('list'); setQuery(''); setCwd(target.path); onTitleChange?.(null)
   }, [target, openNote, onTitleChange])
 
@@ -2857,6 +3108,11 @@ export function pickDocTabForTarget(tabs: DocTab[]): string | null {
               />
               {search.notes.truncated && <div className="px-3 py-2 text-xs text-[var(--accent-yellow)]">仅显示前 50 条，请细化搜索</div>}
             </>
+          ) : searchFailed ? (
+            <div className="px-3 py-2 flex items-center justify-between gap-2 text-xs text-[var(--text-secondary)]">
+              <span>搜索暂时不可用</span>
+              <button type="button" onClick={() => setRetryTick(t => t + 1)} className="px-2 py-1 min-h-[32px] rounded bg-[var(--bg-tertiary)]">重试</button>
+            </div>
           ) : <div className="px-3 py-2 text-xs text-[var(--text-secondary)]">搜索中…</div>
         ) : (
   ```
@@ -2895,8 +3151,9 @@ export function pickDocTabForTarget(tabs: DocTab[]): string | null {
 
 - [ ] **Step 4: Run to verify it passes**
 
-Run: `cd frontend && npx vitest run && npx tsc -b && npm run lint`
-Expected: 全部 PASS（约 290 − 1 + 新增 ≈ 315+）；tsc/lint 无错误。
+Run: `cd frontend && npx vitest run && npx tsc -b && npx eslint src/App.tsx src/components/VaultReader.tsx src/lib/docTarget.ts`
+Expected: vitest 全部 PASS（290 − 1 + 本计划新增）；tsc 无输出；eslint 对这三个文件不高于改动前的错误数。
+另：VaultReader 搜索框既有 `text-sm`（14px）→ 改为 `text-base`（iOS 缩放）。
 
 - [ ] **Step 5: Commit**
 
@@ -2920,26 +3177,33 @@ Expected: frontend build 成功；`test result: ok. 429 passed`。
 
 - [ ] **Step 2: 本地冒烟（非 live 端口）**
 
+> ⚠️ r1 评审照 r1 的命令执行时，因缺 `--data-dir`，冒烟实例把 v2 迁移写进了**线上** `~/.zeromux/prompts.db`（`user_version` 1→2，新增 4 条 r1 版预设）。r2 的预设标题/正文已改，执行本计划前须先按 Task 11 Step 0 处理线上库。
+
+- [ ] **Step 0: 线上预设库状态确认（仅本计划首次执行时）**
+
+若 `python3 -c "import sqlite3,os;print(sqlite3.connect('file:'+os.path.expanduser('~/.zeromux/prompts.db')+'?mode=ro',uri=True).execute('pragma user_version').fetchone())"` 输出 `(2,)` 且库中有 r1 版标题（`📝 基于笔记出题` / `✅ 批改我的答案`），按用户决定处理（回滚为 `user_version=1` 并删除这 4 行，或手工替换为 r2 正文）。**不经用户确认不得改线上库。**
+
 ```bash
 cargo build
-./target/debug/zeromux --port 8099 --password smoke --work-dir $HOME --vault-dir $HOME/s3-workspace/keith-space/obsidian > /tmp/zmx-smoke.log 2>&1 &
+SMOKE_DATA=$(mktemp -d)
+./target/debug/zeromux --host 127.0.0.1 --port 8099 --data-dir "$SMOKE_DATA" --password smoke --work-dir $HOME --vault-dir $HOME/s3-workspace/keith-space/obsidian > /tmp/zmx-smoke.log 2>&1 &
 sleep 3; grep -n "listening" /tmp/zmx-smoke.log      # 应在 ~3s 内出现（不再等 46s vault 遍历）
 TOKEN=$(curl -s -X POST localhost:8099/auth/login -H 'content-type: application/json' -d '{"password":"smoke"}' | python3 -c 'import sys,json;print(json.load(sys.stdin)["token"])')
-curl -s "localhost:8099/api/search?q=zmx&scope=dirs" -H "Authorization: Bearer $TOKEN" | python3 -m json.tool | head -20
+curl -s "localhost:8099/api/search?q=zeromux&scope=dirs" -H "Authorization: Bearer $TOKEN" | python3 -m json.tool | head -20
 curl -s -o /dev/null -w '%{http_code}\n' "localhost:8099/api/vault/resolve?name=_index" -H "Authorization: Bearer $TOKEN"   # 启动 50s 内应为 503
 sleep 60
 curl -s "localhost:8099/api/search?q=单词&scope=notes" -H "Authorization: Bearer $TOKEN" | python3 -m json.tool | head -30   # 今天的单词笔记排第一
-curl -s -o /dev/null -w '%{http_code}\n' "localhost:8099/api/vault/search?q=x" -H "Authorization: Bearer $TOKEN"   # 应非 200（SPA fallback 或 404）
-kill %1
+curl -s "localhost:8099/api/vault/search?q=x" -H "Authorization: Bearer $TOKEN" | grep -c '"results"'   # 0（被 SPA fallback 接走返回 text/html，不再是 JSON 接口）
+kill %1; rm -rf "$SMOKE_DATA"
 ```
 
-Expected：listening 秒级出现；dirs 段首条是 `zeromux`；resolve 先 503；notes 段 `单词` 首条为最新日期；旧接口不可用。
+Expected：listening 秒级出现；查 `zeromux` 时 dirs 段首条是 zeromux 仓库本身；resolve 先 503；notes 段 `单词` 首条为最新日期；旧接口返回里无 `"results"`。
 
 > 登录接口字段以 `web.rs:142 legacy_login` 实际返回为准（`grep -n "fn legacy_login" -A25 src/web.rs`）。
 
 - [ ] **Step 3: 真机验收（iOS Safari，用户手机）**
 
-部署后在手机上：打开 New Session → 点底部搜索框 → 键盘弹起时输入框与结果前 3 条可见；结果滚动不带动输入框；搜 `阅读理解` → 笔记段有内容文件夹排在空骨架之前；点 ⚡ → 类型中无 Terminal → 选 Claude → prompt 预填「当前笔记：…」→ 点「📝 基于笔记出题」chip → 发送 → 会话 work_dir 为该笔记文件夹。
+部署后在手机上：打开 New Session → 点底部搜索框 → **页面不缩放** → 键盘弹起时输入框与结果前 3 条可见；结果滚动不带动输入框；搜 `阅读理解` → 笔记段有内容文件夹排在空骨架之前；点 ⚡ → 类型页标题为「问 agent：<笔记名>」且无 Terminal → 选 Claude → prompt 预填「当前笔记：/home/ubuntu/…/xxx.md」→ 点「❓ 基于笔记出题」chip → 发送 → 会话 work_dir 为该笔记文件夹。
 
 - [ ] **Step 4: 部署**
 
@@ -2950,7 +3214,7 @@ git push
 ./deploy.sh --build
 ```
 
-Expected：deploy.sh 最终行 `OK: HTTP 200`；`journalctl -u zeromux -n 50` 中 `listening` 在 `serving read-only vault` 后数秒内出现，`Added 4 study prompt presets (v2)` 出现一次。
+Expected：deploy.sh 最终行 `OK: HTTP 200`；`journalctl -u zeromux -n 50` 中 `listening` 在 `serving read-only vault` 后数秒内出现；若 Step 0 已回滚为 `user_version=1`，则 `Added 4 study prompt presets (v2)` 出现一次。
 
 ---
 
@@ -3118,6 +3382,21 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(300)).await;
         assert!(!si.vault.as_ref().unwrap().is_rebuilding());
         assert_eq!(si.vault.as_ref().unwrap().current().unwrap().built_at_ms, t0);
+    }
+
+    #[tokio::test]
+    async fn moved_in_from_outside_and_last_note_removal() {
+        let (h, v, si) = started("in").await;
+        fs::create_dir_all(h.path().join("outside/deep")).unwrap();
+        fs::write(h.path().join("outside/deep/o.md"), "x").unwrap();
+        fs::rename(h.path().join("outside"), v.path().join("inside")).unwrap();
+        eventually(&si, |p| p.contains(&"inside/deep/o.md".into())).await;
+        // folder with only a picture drops out; writing a note brings it back
+        fs::remove_file(v.path().join("inside/deep/o.md")).unwrap();
+        fs::write(v.path().join("inside/deep/pic.png"), "x").unwrap();
+        eventually(&si, |p| !p.contains(&"inside/deep".into())).await;
+        fs::write(v.path().join("inside/deep/back.md"), "x").unwrap();
+        eventually(&si, |p| p.contains(&"inside/deep".into()) && p.contains(&"inside/deep/back.md".into())).await;
     }
 
     #[test]
@@ -3324,6 +3603,9 @@ fn run(si: &SearchIndexes) -> Result<(), String> {
         // Space rebuilds out so a burst still in progress can't loop us.
         let gap = now_ms().saturating_sub(last_full);
         if gap < MIN_REBUILD_GAP_MS { std::thread::sleep(Duration::from_millis((MIN_REBUILD_GAP_MS - gap) as u64)); }
+        // May be None if a 1a-path rebuild raced us at startup; the model lock below
+        // still serializes the publishes, so proceeding is safe (worst case: one
+        // extra walk). The guard only suppresses concurrent 1a rebuilds.
         let guard = claim(&slot);
         let mut dirty = BTreeSet::new();
         let (mut w, fresh) = Watcher::full(&root, &mut dirty).map_err(|e| format!("full scan: {e}"))?;
@@ -3414,7 +3696,9 @@ fn run(si: &SearchIndexes) -> Result<(), String> {
 - [ ] **Step 4: Run to verify it passes**
 
 Run: `cargo test 2>&1 | grep "test result"`
-Expected: `test result: ok. 439 passed`（429 + 10）
+Expected: `test result: ok. 446 passed`（435 + 11）。
+另在 JuiceFS 上跑一遍（r1 评审在 JuiceFS 上观察到过一次无法复现的 7/10 失败，根因未明）：
+`for i in 1 2 3 4 5; do TMPDIR=$HOME/s3-workspace/keith-space/drafts/.vw-tmp cargo test vault_watch 2>&1 | grep "test result"; done; rm -rf $HOME/s3-workspace/keith-space/drafts/.vw-tmp`（先 `mkdir -p` 该目录）。5 次均须全绿；若出现失败，保留日志并停下报告，不要合并。
 
 - [ ] **Step 5: Commit**
 
@@ -3445,15 +3729,18 @@ Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>"
 cd frontend && npx vitest run && npm run build && cd .. && cargo test 2>&1 | grep "test result"
 ```
 
-然后本地冒烟（同 Task 11 Step 2 起一个 8099 实例），在另一个终端：
+然后本地冒烟：按 Task 11 Step 2 的**隔离**命令（`--host 127.0.0.1 --data-dir "$(mktemp -d)"`）起一个 8099 实例并取 `$TOKEN`，在另一个终端：
 
 ```bash
-echo x > "$HOME/s3-workspace/keith-space/obsidian/projects/zzz-watch-probe.md"
-sleep 2
-curl -s "localhost:8099/api/search?q=zzz-watch&scope=notes" -H "Authorization: Bearer $TOKEN" | grep -c zzz-watch-probe   # 1
-rm "$HOME/s3-workspace/keith-space/obsidian/projects/zzz-watch-probe.md"
-sleep 2
-curl -s "localhost:8099/api/search?q=zzz-watch&scope=notes" -H "Authorization: Bearer $TOKEN" | grep -c zzz-watch-probe   # 0
+# Run the probe 5× on the real JuiceFS vault (r1 saw one unexplained JuiceFS failure).
+P="$HOME/s3-workspace/keith-space/obsidian/projects/zzz-watch-probe.md"
+for i in 1 2 3 4 5; do
+  echo x > "$P"; sleep 2
+  a=$(curl -s "localhost:8099/api/search?q=zzz-watch&scope=notes" -H "Authorization: Bearer $TOKEN" | grep -c zzz-watch-probe)
+  rm "$P"; sleep 2
+  b=$(curl -s "localhost:8099/api/search?q=zzz-watch&scope=notes" -H "Authorization: Bearer $TOKEN" | grep -c zzz-watch-probe)
+  echo "round $i: present=$a absent=$b"   # expect present=1 absent=0 every round
+done
 ```
 
 - [ ] **Step 5: Commit + 部署**

@@ -389,7 +389,7 @@ deprecated）。不用 `notify` crate：watch 集合需与索引跳过规则逐�
 
 ### 4. New Session 首屏（`Sidebar.tsx` `step === 'quick'`）
 
-布局（弹层 `absolute bottom-full`，向上生长，锚在底部 New session 按钮）：
+布局（弹层 `absolute bottom-full`，向上生长，锚在底部 New session 按钮；桌面首屏宽度 224px → **320px**，其余步骤不变；vault hint 去掉 `projects/long-term|short-term/` 公共前缀）：
 
 ```
 ┌ 新建会话 ───────────────┐
@@ -403,6 +403,8 @@ deprecated）。不用 `notify` crate：watch 集合需与索引跳过规则逐�
 - **键盘**：手机不 `autoFocus`（主路径仍是 QuickTargets 一击，自动弹键盘会盖住它）；桌面 `autoFocus`。
   手机键盘弹起时，弹层底部用 `visualViewport`（`height + offsetTop` 相对 `innerHeight` 的差）
   上抬，参照 `TerminalView.tsx:391-410` 的现有做法。
+- 输入框与 prompt textarea 字号 **16px**（`text-base`，低于 16px iOS Safari 聚焦整页放大）；IME 组字中忽略 Enter。
+- `indexing` 或「刷新中且零结果」→ 4s 自动重查（Sidebar 与 VaultReader 同款）。
 - 输入 `maxLength={128}`；防抖 150ms；monotonic `reqRef` 守卫（发请求前 bump，await 后比对）。
 - 查询词存 Sidebar 级 state：从结果进 `pick-type` 再返回 `quick` 时保留；`openTypePicker` 时清空。
 - Enter = 打开第一条结果。
@@ -462,8 +464,9 @@ QuickTargets 清理：删除 `onEmpty` prop 与 `failed` state（`Sidebar.tsx:51
 
 交互（New Session 弹层与 VaultReader 搜索结果共用）：
 1. 点笔记 / 文件夹行的「⚡」→ Sidebar 进入 `pick-type`，`pendingDir = abs_dir`，`promptDraft` 预填：
-   - 笔记：`当前笔记：<vault 相对路径>\n\n`
-   - 文件夹：`当前目录：<vault 相对路径>/\n\n`
+   - 笔记：`当前笔记：<绝对路径>\n\n`
+   - 文件夹：`当前目录：<绝对路径>/\n\n`
+   （绝对路径：session cwd 是笔记所在文件夹，vault 相对路径在那里解析不到——计划 r2 评审修正。）
 2. 选类型（tmux 不可选：Terminal 项在 `pendingAgentContext` 时隐藏——tmux 忽略 initial_prompt）→ 进
    **pick-prompt**（此处**不**跳过 prompt 页：带上下文开 agent 的意义就在 prompt；预设 chip 以 `{{input}}`
    包裹已预填的上下文行）。
@@ -483,10 +486,12 @@ vault 在 `$HOME` 下可通过。
 
 | 标题 | 用途 |
 |---|---|
-| `📝 基于笔记出题` | 读 `{{input}}` 指向的笔记，出 5 道题（覆盖要点，含答案折叠在末尾） |
-| `✅ 批改我的答案` | 对照 `{{input}}` 笔记 / 附图批改；若存在 `kaoyan-reading-review` skill 则按其流程 |
-| `🃏 生成背诵卡` | 把 `{{input}}` 笔记提炼为同目录下的 `<原名>-背诵卡.md` |
-| `🔁 抽背单词` | 从 `单词/` 最近 N 篇随机抽 20 词考我，逐个等我作答再判 |
+| `❓ 基于笔记出题` | 读笔记出 5 道题，**先只给题、等我作答再批改** |
+| `💯 批改我的答案` | 答案来自消息或本文件夹 `answer-sheet*/IMG_*` 图片；笔记答案若标注未核对需提示；有 `kaoyan-reading-review` skill 时按其流程 |
+| `🃏 生成背诵卡` | 若 vault 已有 `*-背诵卡.md`，照其命名 / frontmatter / 反链 / 表格格式；否则 `<主题>-背诵卡.md` |
+| `🔁 抽背单词` | 就近（本目录、子目录或任一祖先目录）找名为 `单词` 的目录，从最近 7 篇抽 20 词逐个考 |
+
+标题 emoji 不得与 v1 重复（v1 已用 🔍📋✅🐛👀♻️📖📝）。
 
 正文在实现计划中逐字给出；本 spec 的内容来源备案同 `2026-06-16-preset-content-library-design.md`。
 

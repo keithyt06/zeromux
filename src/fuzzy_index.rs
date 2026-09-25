@@ -352,6 +352,127 @@ impl<T> IndexSlot<T> {
     }
 }
 
+use std::path::PathBuf;
+use std::sync::Mutex;
+
+pub const DIR_TTL_MS: i64 = 120_000;
+pub const ZERO_HIT_MIN_AGE_MS: i64 = 30_000;
+pub const WARM_MIN_AGE_MS: i64 = 30_000;
+/// Depth below an agent's work_dir rescanned on turn end (study-note dirs are
+/// leaves or shallow; deeper writes are caught by the next warm-up).
+pub const RECONCILE_DEPTH: usize = 3;
+
+/// Owned variant of RebuildGuard so a claimed rebuild can move into spawn_blocking.
+struct OwnedGuard<T> { slot: Arc<IndexSlot<T>> }
+impl<T> Drop for OwnedGuard<T> {
+    fn drop(&mut self) { self.slot.rebuilding.store(false, Ordering::Release); }
+}
+fn claim<T>(slot: &Arc<IndexSlot<T>>) -> Option<OwnedGuard<T>> {
+    slot.rebuilding
+        .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+        .ok()
+        .map(|_| OwnedGuard { slot: slot.clone() })
+}
+
+pub struct SearchIndexes {
+    pub dirs: Arc<IndexSlot<DirSnapshot>>,
+    pub vault: Option<Arc<IndexSlot<VaultSnapshot>>>,
+    home: PathBuf,
+    vault_root: Option<PathBuf>,
+    /// The vault model is the single writable source for vault snapshots. Full
+    /// rebuilds replace it and reconciles mutate it — both under this lock, inside
+    /// spawn_blocking, so they serialize and never publish out of order.
+    vault_model: Option<Arc<Mutex<VaultModel>>>,
+}
+
+impl SearchIndexes {
+    /// Never blocks: both initial builds are claimed (rebuilding=true → searches
+    /// report `indexing`) and then run in spawn_blocking. Must be called inside a
+    /// tokio runtime.
+    pub fn start(home: PathBuf, vault_root: Option<PathBuf>) -> Arc<Self> {
+        let si = Arc::new(Self {
+            dirs: Arc::new(IndexSlot::new()),
+            vault: vault_root.as_ref().map(|_| Arc::new(IndexSlot::new())),
+            vault_model: vault_root.as_ref().map(|_| Arc::new(Mutex::new(VaultModel::default()))),
+            home,
+            vault_root,
+        });
+        si.refresh_dirs_if_older(i64::MIN);
+        si.refresh_vault_if_older(i64::MIN);
+        si
+    }
+
+    fn age_ok<T>(slot: &IndexSlot<T>, built_at: impl Fn(&T) -> i64, max_age_ms: i64) -> bool {
+        match slot.current() {
+            None => true,
+            Some(s) => now_ms() - built_at(&s) > max_age_ms,
+        }
+    }
+
+    pub fn refresh_dirs_if_older(self: &Arc<Self>, max_age_ms: i64) {
+        if !Self::age_ok(&self.dirs, |s| s.built_at_ms, max_age_ms) { return; }
+        let Some(guard) = claim(&self.dirs) else { return };
+        let home = self.home.clone();
+        tokio::task::spawn_blocking(move || {
+            let index = scan_dirs(&home, DIR_MAX_DEPTH, DIR_MAX_ENTRIES);
+            guard.slot.publish(DirSnapshot { index, built_at_ms: now_ms() });
+            drop(guard);
+        });
+    }
+
+    pub fn refresh_vault_if_older(self: &Arc<Self>, max_age_ms: i64) {
+        let (Some(slot), Some(model), Some(root)) = (&self.vault, &self.vault_model, &self.vault_root) else { return };
+        if !Self::age_ok(slot, |s| s.built_at_ms, max_age_ms) { return; }
+        let Some(guard) = claim(slot) else { return };
+        let (model, root) = (model.clone(), root.clone());
+        tokio::task::spawn_blocking(move || {
+            // Hold the model lock for the WHOLE scan (~52s on JuiceFS). Scanning
+            // outside the lock and swapping afterwards would overwrite any turn-end
+            // reconcile that landed mid-scan with the older scan result (review r1
+            // P0-2). Readers never take this lock — they read the published Arc — and
+            // a waiting reconcile runs right after, on top of the fresh model.
+            let mut m = model.lock().unwrap();
+            match VaultModel::full_scan(&root) {
+                Ok(fresh) => {
+                    *m = fresh;
+                    guard.slot.publish(m.snapshot(now_ms()));
+                }
+                Err(e) => eprintln!("[search] vault rebuild failed, keeping old snapshot: {e}"),
+            }
+            drop(m);
+            drop(guard);
+        });
+    }
+
+    pub fn vault_root(&self) -> Option<&Path> { self.vault_root.as_deref() }
+
+    /// Lexical vault-relative path of `abs` ("" = the root); None if outside the vault.
+    pub fn vault_rel(&self, abs: &Path) -> Option<String> {
+        let root = self.vault_root.as_ref()?;
+        let rel = abs.strip_prefix(root).ok()?;
+        let s = rel.to_string_lossy().to_string();
+        if s.split('/').any(|seg| seg.starts_with('.') && !seg.is_empty()) { return None; }
+        Some(s)
+    }
+
+    /// Rescan one vault directory (used by the agent turn-end hook). Waits on the
+    /// model lock, so if a full build is running it applies on top of that build's
+    /// result. If no snapshot exists yet (the very first build failed or hasn't
+    /// published), the reconcile is skipped — publishing a one-dir model would look
+    /// like an almost-empty vault.
+    pub fn reconcile_vault_dir(self: &Arc<Self>, abs_dir: &Path) {
+        let Some(rel) = self.vault_rel(abs_dir) else { return };
+        let (Some(slot), Some(model), Some(root)) = (&self.vault, &self.vault_model, &self.vault_root) else { return };
+        let (slot, model, root) = (slot.clone(), model.clone(), root.clone());
+        tokio::task::spawn_blocking(move || {
+            let mut m = model.lock().unwrap();
+            if slot.current().is_none() { return; }
+            m.reconcile_dir(&root, &rel, RECONCILE_DEPTH);
+            slot.publish(m.snapshot(now_ms()));
+        });
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -658,5 +779,97 @@ mod tests {
             (0..30).map(|i| (format!("~/d{i}/note"), EntryKind::Dir, 0, false)).collect();
         let refs: Vec<(&str, EntryKind, i64, bool)> = items.iter().map(|(a, b, c, d)| (a.as_str(), *b, *c, *d)).collect();
         assert_eq!(search(&ix_of(&refs), "note", 6, &|_| 0).len(), 6);
+    }
+
+    async fn wait_until(mut f: impl FnMut() -> bool) {
+        for _ in 0..200 {
+            if f() { return; }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        panic!("condition not reached");
+    }
+
+    #[tokio::test]
+    async fn search_indexes_start_is_async_and_publishes_both() {
+        let h = tmp("si_home");
+        let v = tmp("si_vault");
+        fs::create_dir_all(h.path().join("proj")).unwrap();
+        fs::write(v.path().join("n.md"), "x").unwrap();
+        let si = SearchIndexes::start(h.path().into(), Some(v.path().into()));
+        // initial state is "indexing": rebuilding claimed before the build runs
+        wait_until(|| si.dirs.current().is_some() && si.vault.as_ref().unwrap().current().is_some()).await;
+        assert!(!si.dirs.is_rebuilding());
+        let vs = si.vault.as_ref().unwrap().current().unwrap();
+        assert!(vs.index.entries.iter().any(|e| e.path == "n.md"));
+    }
+
+    #[tokio::test]
+    async fn refresh_if_older_only_rebuilds_stale_snapshots() {
+        let h = tmp("si_ref");
+        let si = SearchIndexes::start(h.path().into(), None);
+        wait_until(|| si.dirs.current().is_some() && !si.dirs.is_rebuilding()).await;
+        let t0 = si.dirs.current().unwrap().built_at_ms;
+        fs::create_dir_all(h.path().join("fresh-clone")).unwrap();
+        si.refresh_dirs_if_older(60_000); // snapshot is ~0s old → no rebuild
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        assert_eq!(si.dirs.current().unwrap().built_at_ms, t0);
+        si.refresh_dirs_if_older(0);      // any age qualifies → rebuild
+        wait_until(|| si.dirs.current().unwrap().index.entries.iter().any(|e| e.path.ends_with("/fresh-clone"))).await;
+    }
+
+    #[tokio::test]
+    async fn reconcile_vault_dir_updates_snapshot_and_ignores_outside_paths() {
+        let h = tmp("si_rh");
+        let v = tmp("si_rv");
+        fs::create_dir_all(v.path().join("单词")).unwrap();
+        let si = SearchIndexes::start(h.path().into(), Some(v.path().into()));
+        let slot = si.vault.clone().unwrap();
+        wait_until(|| slot.current().is_some() && !slot.is_rebuilding()).await;
+        fs::write(v.path().join("单词/new.md"), "x").unwrap();
+        si.reconcile_vault_dir(&v.path().join("单词"));
+        wait_until(|| slot.current().unwrap().index.entries.iter().any(|e| e.path == "单词/new.md")).await;
+        // outside the vault: no panic, no change
+        si.reconcile_vault_dir(h.path());
+        assert!(si.vault_rel(h.path()).is_none());
+        assert_eq!(si.vault_rel(&v.path().join("单词")).as_deref(), Some("单词"));
+        assert_eq!(si.vault_rel(v.path()).as_deref(), Some(""));
+    }
+
+    #[tokio::test]
+    async fn reconcile_during_rebuild_is_not_lost() {
+        // review r1 P0-2: a turn-end reconcile landing while a full rebuild is in
+        // flight must survive the rebuild's publish.
+        let h = tmp("si_race_h");
+        let v = tmp("si_race_v");
+        fs::create_dir_all(v.path().join("d")).unwrap();
+        let si = SearchIndexes::start(h.path().into(), Some(v.path().into()));
+        let slot = si.vault.clone().unwrap();
+        wait_until(|| slot.current().is_some() && !slot.is_rebuilding()).await;
+        // Occupy the model lock to simulate a long full scan in progress.
+        let model = si.vault_model.clone().unwrap();
+        let held = model.lock().unwrap();
+        fs::write(v.path().join("d/new-card.md"), "x").unwrap();
+        si.reconcile_vault_dir(&v.path().join("d")); // queues behind the "scan"
+        drop(held);
+        wait_until(|| slot.current().unwrap().index.entries.iter().any(|e| e.path == "d/new-card.md")).await;
+        si.refresh_vault_if_older(0); // real full rebuild after the reconcile
+        wait_until(|| !slot.is_rebuilding()).await;
+        assert!(slot.current().unwrap().index.entries.iter().any(|e| e.path == "d/new-card.md"));
+    }
+
+    #[tokio::test]
+    async fn vault_rebuild_failure_keeps_old_snapshot() {
+        let h = tmp("si_fh");
+        let v = tmp("si_fv");
+        fs::write(v.path().join("keep.md"), "x").unwrap();
+        let root = v.path().to_path_buf();
+        let si = SearchIndexes::start(h.path().into(), Some(root.clone()));
+        let slot = si.vault.clone().unwrap();
+        wait_until(|| slot.current().is_some() && !slot.is_rebuilding()).await;
+        drop(v); // vault root disappears (≈ JuiceFS unmounted)
+        si.refresh_vault_if_older(0);
+        wait_until(|| !slot.is_rebuilding()).await;
+        assert!(slot.current().unwrap().index.entries.iter().any(|e| e.path == "keep.md"),
+            "a failed rebuild must not publish an empty index");
     }
 }

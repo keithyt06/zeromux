@@ -3474,66 +3474,6 @@ pub(crate) fn vault_index_from_paths(paths: Vec<String>) -> VaultIndex {
     VaultIndex { by_basename, all_paths: paths, by_basename_lc }
 }
 
-/// Walk the vault recursively, building the wikilink basename index and the full
-/// .md path list. On basename collision the first seen wins for `by_basename`, but
-/// every path is kept in `all_paths`.
-///
-/// Symlinked directories are NOT followed: `entry.file_type()` reports the link
-/// itself (unlike `path.is_dir()`, which follows it), so a symlink cycle inside the
-/// vault can't make this walk loop forever, and a symlink to a large external tree
-/// (e.g. $HOME) can't make it index far past the vault. This matters because the
-/// walk runs synchronously in `main()` before the HTTP listener binds — an unbounded
-/// walk would hang the entire boot, not just the vault feature.
-pub(crate) fn build_vault_index(vault_dir: &std::path::Path) -> VaultIndex {
-    let mut by_basename = std::collections::HashMap::new();
-    let mut by_basename_lc = std::collections::HashMap::new();
-    let mut all_paths = Vec::new();
-    let mut stack = vec![vault_dir.to_path_buf()];
-    while let Some(dir) = stack.pop() {
-        let rd = match std::fs::read_dir(&dir) {
-            Ok(r) => r,
-            Err(_) => continue,
-        };
-        for entry in rd.flatten() {
-            let path = entry.path();
-            let name = entry.file_name().to_string_lossy().to_string();
-            if name.starts_with('.') {
-                continue;
-            } // skip .obsidian/.trash/.git
-            // file_type() does NOT follow symlinks — a symlinked dir reports is_symlink(),
-            // not is_dir(), so we never descend into it (cycle / external-tree guard).
-            let ft = match entry.file_type() {
-                Ok(t) => t,
-                Err(_) => continue,
-            };
-            if ft.is_symlink() {
-                continue;
-            }
-            if ft.is_dir() {
-                stack.push(path);
-            } else if name.to_ascii_lowercase().ends_with(".md") {
-                if let Ok(rel) = path.strip_prefix(vault_dir) {
-                    let rel_str = rel.to_string_lossy().to_string();
-                    // The ends_with(".md") guard above already proved the final 3 bytes
-                    // are an ASCII ".md" in SOME casing. `trim_end_matches(".md")` is a
-                    // literal match, so ".Md"/".mD" would slip through and leave the
-                    // extension on the basename key → `[[Note]]` 404s. Strip a fixed 3
-                    // bytes (safe: those bytes are ASCII, so the boundary is valid).
-                    let base = name[..name.len() - 3].to_string();
-                    by_basename_lc
-                        .entry(base.to_ascii_lowercase())
-                        .or_insert_with(|| rel_str.clone());
-                    by_basename
-                        .entry(base)
-                        .or_insert_with(|| rel_str.clone());
-                    all_paths.push(rel_str);
-                }
-            }
-        }
-    }
-    VaultIndex { by_basename, all_paths, by_basename_lc }
-}
-
 /// Case-insensitive substring match over relative paths (filename + path).
 /// Empty query → no results. Caps at 100.
 fn vault_search_filter(paths: &[String], q: &str) -> Vec<String> {
@@ -3786,9 +3726,11 @@ async fn vault_search(
     // by basename (first-wins), so per-folder README.md / index.md / 2026.md would be
     // unsearchable past the first one.
     let paths: Vec<String> = state
-        .vault_index
+        .search
+        .vault
         .as_ref()
-        .map(|idx| idx.all_paths.clone())
+        .and_then(|s| s.current())
+        .map(|s| s.wiki.all_paths.clone())
         .unwrap_or_default();
     let hits = vault_search_filter(&paths, &query.q);
     // Surface the 100-result cap so the UI can say "results truncated" instead of
@@ -3812,17 +3754,24 @@ struct VaultResolveQuery {
     name: String,
 }
 
+/// Wikilink lookup against the current vault snapshot. None = the index is still
+/// building after a restart → 503 (distinct from a genuinely missing note → 404).
+fn vault_resolve_in(
+    snap: Option<&crate::fuzzy_index::VaultSnapshot>,
+    name: &str,
+) -> Result<String, (StatusCode, String)> {
+    let snap = snap.ok_or((StatusCode::SERVICE_UNAVAILABLE, "vault indexing".into()))?;
+    resolve_wikilink(&snap.wiki, name).ok_or((StatusCode::NOT_FOUND, "Wikilink target not found".into()))
+}
+
 async fn vault_resolve(
     State(state): State<Arc<AppState>>,
     user: axum::Extension<CurrentUser>,
     Query(q): Query<VaultResolveQuery>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
     let _base = vault_base(&state, &user)?;
-    let path = state
-        .vault_index
-        .as_ref()
-        .and_then(|idx| resolve_wikilink(idx, &q.name))
-        .ok_or((StatusCode::NOT_FOUND, "Wikilink target not found".into()))?;
+    let snap = state.search.vault.as_ref().and_then(|s| s.current());
+    let path = vault_resolve_in(snap.as_deref(), &q.name)?;
     Ok(Json(serde_json::json!({ "path": path })))
 }
 
@@ -3894,7 +3843,7 @@ mod path_safety_tests {
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(dir.join("Weird.Md"), b"x").unwrap();
         std::fs::write(dir.join("Other.mD"), b"y").unwrap();
-        let idx = build_vault_index(&dir);
+        let idx = crate::fuzzy_index::VaultModel::full_scan(&dir).unwrap().snapshot(0).wiki;
         // case-insensitive resolve must find them by bare stem
         assert_eq!(resolve_wikilink(&idx, "weird"), Some("Weird.Md".to_string()));
         assert_eq!(resolve_wikilink(&idx, "other"), Some("Other.mD".to_string()));
@@ -3907,7 +3856,7 @@ mod path_safety_tests {
         std::fs::create_dir_all(dir.join("knowledge/aws")).unwrap();
         std::fs::write(dir.join("knowledge/aws/EKS 网络模型.md"), b"x").unwrap();
         std::fs::write(dir.join("待处理区.md"), b"y").unwrap();
-        let idx = build_vault_index(&dir);
+        let idx = crate::fuzzy_index::VaultModel::full_scan(&dir).unwrap().snapshot(0).wiki;
         assert_eq!(idx.by_basename.get("EKS 网络模型").map(|s| s.as_str()),
                    Some("knowledge/aws/EKS 网络模型.md"));
         assert_eq!(idx.by_basename.get("待处理区").map(|s| s.as_str()), Some("待处理区.md"));
@@ -3923,7 +3872,7 @@ mod path_safety_tests {
         std::fs::create_dir_all(dir.join("b")).unwrap();
         std::fs::write(dir.join("a/README.md"), b"x").unwrap();
         std::fs::write(dir.join("b/README.md"), b"y").unwrap();
-        let idx = build_vault_index(&dir);
+        let idx = crate::fuzzy_index::VaultModel::full_scan(&dir).unwrap().snapshot(0).wiki;
         assert_eq!(idx.by_basename.len(), 1, "by_basename dedupes by basename");
         let mut readmes: Vec<&String> =
             idx.all_paths.iter().filter(|p| p.ends_with("README.md")).collect();
@@ -3942,7 +3891,7 @@ mod path_safety_tests {
         std::fs::write(dir.join("real/note.md"), b"x").unwrap();
         // self-referential cycle: dir/loop -> dir
         let _ = symlink(&dir, dir.join("loop"));
-        let idx = build_vault_index(&dir); // must terminate
+        let idx = crate::fuzzy_index::VaultModel::full_scan(&dir).unwrap().snapshot(0).wiki; // must terminate
         assert_eq!(idx.by_basename.get("note").map(|s| s.as_str()), Some("real/note.md"));
         // The symlinked dir was not descended, so no duplicate "loop/real/note.md".
         assert!(idx.all_paths.iter().all(|p| !p.starts_with("loop/")),
@@ -6167,7 +6116,7 @@ diff --git a/src/main.rs b/src/main.rs\n\
         std::fs::write(dir.join("knowledge/aws/EKS 网络模型.md"), b"x").unwrap();
         std::fs::write(dir.join("a/README.md"), b"x").unwrap();
         std::fs::write(dir.join("b/README.md"), b"y").unwrap();
-        let idx = build_vault_index(&dir);
+        let idx = crate::fuzzy_index::VaultModel::full_scan(&dir).unwrap().snapshot(0).wiki;
         let _ = std::fs::remove_dir_all(&dir);
         idx
     }
@@ -6225,6 +6174,14 @@ diff --git a/src/main.rs b/src/main.rs\n\
         assert!(vault_path_has_dot_component(".git"));
         assert!(!vault_path_has_dot_component("note.md"));
         assert!(!vault_path_has_dot_component("a.b.md"));
+    }
+
+    #[test]
+    fn vault_resolve_503_while_indexing() {
+        // The handler maps "no snapshot yet" to 503; exercise that mapping directly.
+        let slot: crate::fuzzy_index::IndexSlot<crate::fuzzy_index::VaultSnapshot> = crate::fuzzy_index::IndexSlot::new();
+        let r = vault_resolve_in(slot.current().as_deref(), "x");
+        assert_eq!(r.unwrap_err().0, StatusCode::SERVICE_UNAVAILABLE);
     }
 }
 

@@ -202,7 +202,9 @@ pub struct AppState {
     pub external_url: String,
     pub push: Option<std::sync::Arc<crate::push::PushService>>,
     pub vault_dir: Option<String>,
-    pub vault_index: Option<std::sync::Arc<web::VaultIndex>>,
+    /// Fuzzy-search indexes ($HOME dirs + vault). Also the source of the vault
+    /// wikilink index (replaces the old synchronous startup walk).
+    pub search: Arc<fuzzy_index::SearchIndexes>,
     pub quick_targets: Arc<quick_targets::QuickTargetStore>,
 }
 
@@ -432,9 +434,13 @@ async fn main() {
     if let Some(ref v) = vault_dir {
         println!("[vault] serving read-only vault: {}", v);
     }
-    let vault_index = vault_dir.as_ref().map(|v| {
-        std::sync::Arc::new(web::build_vault_index(std::path::Path::new(v)))
-    });
+    // Both indexes build in the background: the listener no longer waits ~46s for
+    // the vault walk on JuiceFS. Until the first snapshot lands, vault search
+    // reports `indexing` and wikilink resolution answers 503.
+    let search = fuzzy_index::SearchIndexes::start(
+        std::path::PathBuf::from(std::env::var("HOME").unwrap_or_else(|_| "/home/ubuntu".into())),
+        vault_dir.as_ref().map(std::path::PathBuf::from),
+    );
 
     // Resolve the Kiro Crew data home and refuse a placement that would expose
     // its IPC secret. Fail FAST (exit 1) rather than degrade: a silently-readable
@@ -494,7 +500,7 @@ async fn main() {
         external_url,
         push: push_service.clone(),
         vault_dir,
-        vault_index,
+        search,
         quick_targets: quick_targets_store,
     });
 

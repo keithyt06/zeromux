@@ -1,9 +1,9 @@
 import { useState, useEffect, useCallback, useRef } from 'react'
-import type { SessionInfo, SessionType, DirEntry, UserInfo, TmuxSession } from '../lib/api'
-import { listDirectories, listTmuxSessions, getSchedulerHealth, getVaultMeta } from '../lib/api'
+import type { SessionInfo, SessionType, DirEntry, UserInfo, TmuxSession, SearchResult, DirHit, NoteHit } from '../lib/api'
+import { listDirectories, listTmuxSessions, getSchedulerHealth, getVaultMeta, searchPaths, warmSearchIndex } from '../lib/api'
 import { shouldShowVault } from '../lib/vault'
 import type { Theme } from '../lib/theme'
-import { Terminal, Plus, X, PanelLeftClose, PanelLeft, Sun, Moon, Folder, FolderGit2, ChevronLeft, Home, LogOut, Users, MonitorUp, Link, Clock, Bell, BookOpen, Settings, Pencil } from 'lucide-react'
+import { Terminal, Plus, X, PanelLeftClose, PanelLeft, Sun, Moon, Folder, FolderGit2, ChevronLeft, Home, LogOut, Users, MonitorUp, Link, Clock, Bell, BookOpen, Settings, Pencil, Search } from 'lucide-react'
 import { type DocTab } from '../lib/docTabs'
 import AdminPanel from './AdminPanel'
 import ScheduledTasksPanel from './ScheduledTasksPanel'
@@ -14,6 +14,8 @@ import { applyPreset } from '../lib/applyPreset'
 import { isStuck } from '../lib/stuck'
 import { ClaudeCodeIcon, CrewIcon, CodexIcon } from './BrandIcons'
 import QuickTargets from './QuickTargets'
+import SearchResults from './SearchResults'
+import { askAgentPrompt, type AskAgentTarget } from '../lib/askAgent'
 
 interface Props {
   sessions: SessionInfo[]
@@ -32,6 +34,9 @@ interface Props {
   onToggle: () => void
   mobile: boolean
   confirmCount?: number
+  /** Optional only so this task compiles before App wires it (Task 10); App always passes it. */
+  onOpenVault?: (target: { path: string; kind: 'note' | 'folder' }) => void
+  askAgentRequest?: (AskAgentTarget & { nonce: number }) | null
 }
 
 /** Relative "last activity" label. <60s 刚刚, <60m Xm, <24h Xh, else Xd. */
@@ -76,11 +81,24 @@ function SessionTypeIcon({ type, size = 14, className }: { type: SessionType; si
   }
 }
 
-export default function Sidebar({ sessions, docTabs, activeId, onSelect, onCreate, onDelete, onRename, hasUnread, onLogout, theme, onToggleTheme, user, open, onToggle, mobile, confirmCount = 0 }: Props) {
+export default function Sidebar({ sessions, docTabs, activeId, onSelect, onCreate, onDelete, onRename, hasUnread, onLogout, theme, onToggleTheme, user, open, onToggle, mobile, confirmCount = 0, onOpenVault, askAgentRequest }: Props) {
   const [step, setStep] = useState<NewSessionStep>('closed')
   const [pendingType, setPendingType] = useState<SessionType | null>(null)
   const [promptDraft, setPromptDraft] = useState('')
   const [pendingDir, setPendingDir] = useState<string | null>(null)
+  // Search on the New Session first screen. The query lives at Sidebar level so
+  // going pick-type → back keeps it; openTypePicker clears it.
+  const [query, setQuery] = useState('')
+  const [searchResult, setSearchResult] = useState<SearchResult | null>(null)
+  const [searchResultQuery, setSearchResultQuery] = useState('')   // query the shown result answers
+  const [searchFailed, setSearchFailed] = useState(false)
+  const searchReqRef = useRef(0)
+  // Set when a search hit fixed the dir: after picking a type, create directly
+  // instead of showing the prompt page (a middle page would undo "one tap").
+  const [pendingSkipPrompt, setPendingSkipPrompt] = useState(false)
+  // Set by ⚡: the session must carry context → hide Terminal (tmux ignores
+  // initial_prompt) and prefill the prompt page.
+  const [pendingAgentContext, setPendingAgentContext] = useState<AskAgentTarget | null>(null)
   const presetStore = usePromptPresets()
   const [showAdmin, setShowAdmin] = useState(false)
   const [showScheduled, setShowScheduled] = useState(false)
@@ -170,20 +188,56 @@ export default function Sidebar({ sessions, docTabs, activeId, onSelect, onCreat
     setTmuxLoading(false)
   }, [])
 
+  const runSearch = useCallback((query: string) => {
+    // Inner named function so the indexing re-query can recurse without the
+    // callback referencing itself (react-hooks/immutability).
+    const run = (q: string) => {
+      const req = ++searchReqRef.current
+      if (!q.trim()) { setSearchResult(null); setSearchFailed(false); return }
+      searchPaths(q, vaultEnabled ? 'dirs,notes' : 'dirs')
+        .then(r => {
+          if (searchReqRef.current !== req) return
+          setSearchResult(r); setSearchResultQuery(q); setSearchFailed(false)
+          // Still building (indexing) or rebuilding with no hits → re-query in 4s so
+          // the user never has to retype after a restart. Superseded by any newer query.
+          const pending = (s: { indexing: boolean; refreshing: boolean; items: unknown[] } | null) =>
+            !!s && (s.indexing || (s.refreshing && s.items.length === 0))
+          if (pending(r.dirs) || pending(r.notes)) setTimeout(() => { if (searchReqRef.current === req) run(q) }, 4000)
+        })
+        .catch(() => { if (searchReqRef.current === req) { setSearchResult(null); setSearchFailed(true) } })
+    }
+    run(query)
+  }, [vaultEnabled])
+
+  useEffect(() => {
+    if (step !== 'quick') return
+    const t = setTimeout(() => runSearch(query), 150)
+    return () => clearTimeout(t)
+  }, [query, step, runSearch])
+
   const openTypePicker = () => {
     setStep('quick')
     setPendingType(null)
     setPendingDir(null)   // start clean on every open so a leftover dir can't leak in
+    setPendingSkipPrompt(false)
+    setPendingAgentContext(null)
+    setQuery('')
+    setSearchResult(null)
+    setCurrentPath('')    // a stale browse path must not hijack pick-prompt's Back
+    warmSearchIndex('dirs,notes')
   }
 
   const selectType = (type: SessionType) => {
     setPendingType(type)
     if (type === 'tmux') {
       setStep('pick-terminal-mode')
+    } else if (pendingDir && pendingSkipPrompt) {
+      onCreate(type, pendingDir)
+      closeAfterCreate()
     } else if (pendingDir) {
-      // Arrived from a quick card's "换 agent 类型": the dir is already fixed and
-      // only the type changes, so skip the browser and go straight to the prompt page.
-      setPromptDraft('')
+      // Arrived from a quick card's "换 agent 类型" or from ⚡: the dir is fixed,
+      // only the type changes → straight to the prompt page (prefilled for ⚡).
+      setPromptDraft(pendingAgentContext ? askAgentPrompt(pendingAgentContext) : '')
       presetStore.reload()
       setStep('pick-prompt')
     } else {
@@ -223,11 +277,28 @@ export default function Sidebar({ sessions, docTabs, activeId, onSelect, onCreat
     }
   }
 
+  const pickDirHit = (h: DirHit) => {
+    if (h.agent) { onCreate(h.agent, h.path); closeAfterCreate(); return }
+    setPendingDir(h.path); setPendingSkipPrompt(true); setPendingAgentContext(null); setStep('pick-type')
+  }
+  const pickNoteHit = (h: NoteHit) => {
+    onOpenVault?.({ path: h.path, kind: h.kind })
+    closeAfterCreate()
+  }
+  const askAgent = (t: AskAgentTarget) => {
+    setPendingDir(t.absDir); setPendingSkipPrompt(false); setPendingAgentContext(t); setStep('pick-type')
+  }
+  const openHere = (h: NoteHit) => {
+    setPendingDir(h.abs_dir); setPendingSkipPrompt(true); setPendingAgentContext(null); setStep('pick-type')
+  }
+
   const close = () => {
     setStep('closed')
     setPendingType(null)
     setPromptDraft('')
     setPendingDir(null)
+    setPendingSkipPrompt(false)
+    setPendingAgentContext(null)
   }
 
   // Post-creation teardown: close the popover, and on mobile the full-screen
@@ -254,6 +325,42 @@ export default function Sidebar({ sessions, docTabs, activeId, onSelect, onCreat
     setPendingDir(null)
     closeAfterCreate()
   }
+
+  // One-shot external request (VaultReader's ⚡), consumed once per nonce.
+  const lastAskNonce = useRef(0)
+  useEffect(() => {
+    if (!askAgentRequest || askAgentRequest.nonce === lastAskNonce.current) return
+    lastAskNonce.current = askAgentRequest.nonce
+    // Collapsed sidebar (desktop icon rail, or mobile hidden) doesn't render the
+    // popover at all — open it, or the ⚡ tap silently does nothing.
+    if (!open) onToggle()
+    // Consuming an external one-shot request is exactly an effect's job.
+    setPendingType(null)
+    askAgent(askAgentRequest)
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [askAgentRequest])
+
+  // Mobile keyboard compensation: the popover is anchored to the bottom, so lift it
+  // by however much the on-screen keyboard overlaps the layout viewport.
+  const popRef = useRef<HTMLDivElement>(null)
+  useEffect(() => {
+    if (!mobile || step === 'closed') return
+    const vv = window.visualViewport
+    if (!vv) return
+    const el = popRef.current
+    const apply = () => {
+      const overlap = Math.max(0, window.innerHeight - vv.height - vv.offsetTop)
+      if (el) el.style.transform = overlap ? `translateY(-${overlap}px)` : ''
+    }
+    apply()
+    vv.addEventListener('resize', apply)
+    vv.addEventListener('scroll', apply)
+    return () => {
+      vv.removeEventListener('resize', apply)
+      vv.removeEventListener('scroll', apply)
+      if (el) el.style.transform = ''
+    }
+  }, [mobile, step])
 
   const handleSelect = (id: string) => {
     onSelect(id)
@@ -489,35 +596,58 @@ export default function Sidebar({ sessions, docTabs, activeId, onSelect, onCreat
         {step !== 'closed' && (
           <>
             <div className="fixed inset-0 z-10" onClick={close} />
-            <div className={`absolute bottom-full left-2 mb-1 bg-[var(--bg-tertiary)] border border-[var(--border)] rounded-lg py-1 ${mobile ? 'w-[calc(100vw-1rem)]' : 'w-56'} z-20 shadow-xl`}>
+            <div ref={popRef} className={`absolute bottom-full left-2 mb-1 bg-[var(--bg-tertiary)] border border-[var(--border)] rounded-lg py-1 ${mobile ? 'w-[calc(100vw-1rem)]' : step === 'quick' ? 'w-80' : 'w-56'} z-20 shadow-xl`}>
               {step === 'quick' && (
                 <>
                   <div className="px-3 py-1.5 text-[10px] font-semibold text-[var(--text-muted)] uppercase tracking-wider">
                     新建会话
                   </div>
-                  {/* 一击直达：点一行 = 用该行的 agent 直接创建，0 次列目录请求。
-                      刻意跳过 prompt 页——中间插一页就退化成「少点两下的老流程」，
-                      而且信息零丢失：会话建好后 AcpChatView 的 composer 里有一模一样的
-                      preset 选择器。要带 prompt 的场景走行级操作单。 */}
-                  <QuickTargets
-                    kind="dir"
-                    onPick={(path, agent) => {
-                      if (!agent) { setPendingDir(path); setStep('pick-type'); return }
-                      onCreate(agent, path)
-                      closeAfterCreate()
-                    }}
-                    onChangeAgent={(path) => { setPendingDir(path); setStep('pick-type') }}
-                    onPickWithPrompt={(path, agent) => {
-                      setPendingDir(path)
-                      setPendingType(agent ?? null)
-                      setPromptDraft('')
-                      presetStore.reload()
-                      setStep(agent ? 'pick-prompt' : 'pick-type')
-                    }}
-                  />
+                  {/* Results area is the only part that grows; capped so the popover (which
+                      grows UPWARD from the bottom anchor) never pushes the input off-screen. */}
+                  <div className="max-h-[40vh] overflow-y-auto border-b border-[var(--border)]">
+                    {query.trim() ? (
+                      searchResult || searchFailed ? (
+                        <SearchResults
+                          result={searchResult ?? { dirs: null, notes: null }}
+                          failed={searchFailed}
+                          onRetry={() => runSearch(query)}
+                          showNotes={vaultEnabled}
+                          onPickDir={pickDirHit}
+                          onDirMenu={{
+                            changeAgent: (h) => { setPendingDir(h.path); setPendingSkipPrompt(false); setStep('pick-type') },
+                            withPrompt: (h) => { setPendingDir(h.path); setPendingType(h.agent); setPromptDraft(''); presetStore.reload(); setStep(h.agent ? 'pick-prompt' : 'pick-type') },
+                          }}
+                          onPickNote={pickNoteHit}
+                          onAskAgent={(h) => askAgent({ absDir: h.abs_dir, relPath: h.path, kind: h.kind })}
+                          onOpenHere={openHere}
+                        />
+                      ) : <div className="px-3 py-2 text-[10px] text-[var(--text-muted)]">搜索中…</div>
+                    ) : (
+                      /* 一击直达：点一行 = 用该行的 agent 直接创建，0 次列目录请求。
+                         刻意跳过 prompt 页——中间插一页就退化成「少点两下的老流程」，
+                         而且信息零丢失：会话建好后 AcpChatView 的 composer 里有一模一样的
+                         preset 选择器。要带 prompt 的场景走行级操作单。 */
+                      <QuickTargets
+                        kind="dir"
+                        onPick={(path, agent) => {
+                          if (!agent) { setPendingDir(path); setStep('pick-type'); return }
+                          onCreate(agent, path)
+                          closeAfterCreate()
+                        }}
+                        onChangeAgent={(path) => { setPendingDir(path); setStep('pick-type') }}
+                        onPickWithPrompt={(path, agent) => {
+                          setPendingDir(path)
+                          setPendingType(agent ?? null)
+                          setPromptDraft('')
+                          presetStore.reload()
+                          setStep(agent ? 'pick-prompt' : 'pick-type')
+                        }}
+                      />
+                    )}
+                  </div>
                   <button
                     type="button"
-                    onClick={() => { setPendingDir(null); setStep('pick-type') }}
+                    onClick={() => { setPendingDir(null); setPendingSkipPrompt(false); setStep('pick-type') }}
                     className="flex items-center gap-2 w-full px-3 py-2.5 min-h-[44px] text-xs text-[var(--text-secondary)] hover:bg-[var(--bg-hover)] transition-colors"
                   >
                     <Folder size={13} className="shrink-0" />
@@ -536,6 +666,32 @@ export default function Sidebar({ sessions, docTabs, activeId, onSelect, onCreat
                       <span>Obsidian 笔记库</span>
                     </button>
                   )}
+                  {/* Input at the BOTTOM: next to the anchor and the thumb; results growing
+                      upward never move it. No autoFocus on phones (the QuickTargets one-tap is
+                      still the main path and a keyboard would cover it). */}
+                  <div className="flex items-center gap-2 mx-2 my-1.5 px-2 py-1.5 rounded bg-[var(--bg-secondary)] border border-[var(--border)]">
+                    <Search size={13} className="text-[var(--text-muted)] shrink-0" />
+                    <input
+                      value={query}
+                      onChange={e => setQuery(e.target.value)}
+                      onKeyDown={e => {
+                        // Ignore Enter while an IME is composing (pinyin), and when the
+                        // shown results belong to an older query (debounce not yet fired).
+                        if (e.key !== 'Enter' || e.nativeEvent.isComposing || !searchResult || searchResultQuery !== query) return
+                        e.preventDefault()
+                        const first = [...(searchResult.dirs?.items ?? []).map(h => ({ t: 'd' as const, h, s: h.score })),
+                          ...(vaultEnabled ? searchResult.notes?.items ?? [] : []).map(h => ({ t: 'n' as const, h, s: h.score }))]
+                          .sort((a, b) => b.s - a.s)[0]
+                        if (!first) return
+                        if (first.t === 'd') pickDirHit(first.h as DirHit); else pickNoteHit(first.h as NoteHit)
+                      }}
+                      maxLength={128}
+                      autoFocus={!mobile}
+                      placeholder={vaultEnabled ? '搜索目录或笔记…' : '搜索目录…'}
+                      /* text-base = 16px: below 16px iOS Safari zooms the whole page on focus. */
+                      className="flex-1 min-w-0 bg-transparent text-base outline-none text-[var(--text-primary)]"
+                    />
+                  </div>
                 </>
               )}
 
@@ -545,26 +701,31 @@ export default function Sidebar({ sessions, docTabs, activeId, onSelect, onCreat
                       needs a way back — matching pick-terminal-mode / pick-dir. */}
                   <div className="flex items-center gap-1 px-2 py-1.5 border-b border-[var(--border)]">
                     <button
-                      onClick={() => { setPendingDir(null); setStep('quick') }}
+                      onClick={() => { setPendingDir(null); setPendingSkipPrompt(false); setPendingAgentContext(null); setStep('quick') }}
                       className="p-0.5 text-[var(--text-secondary)] hover:text-[var(--text-primary)] rounded transition-colors"
                       title="返回"
                     >
                       <ChevronLeft size={14} />
                     </button>
                     <span className="text-[10px] font-semibold text-[var(--text-muted)] uppercase tracking-wider truncate flex-1">
-                      Select type
+                      {pendingAgentContext
+                        ? `问 agent：${pendingAgentContext.relPath.split('/').pop() || pendingAgentContext.relPath}`
+                        : 'Select type'}
                     </span>
                   </div>
-                  <button
-                    onClick={() => selectType('tmux')}
-                    className="flex items-center gap-2.5 w-full px-3 py-2 text-xs text-[var(--text-primary)] hover:bg-[var(--bg-hover)] transition-colors"
-                  >
-                    <Terminal size={14} className="text-[var(--accent-green-text)] shrink-0" />
-                    <div className="text-left">
-                      <div className="font-medium">Terminal</div>
-                      <div className="text-[10px] text-[var(--text-secondary)]">bash / tmux shell</div>
-                    </div>
-                  </button>
+                  {/* tmux ignores initial_prompt, so ⚡'s context would be silently dropped. */}
+                  {!pendingAgentContext && (
+                    <button
+                      onClick={() => selectType('tmux')}
+                      className="flex items-center gap-2.5 w-full px-3 py-2 text-xs text-[var(--text-primary)] hover:bg-[var(--bg-hover)] transition-colors"
+                    >
+                      <Terminal size={14} className="text-[var(--accent-green-text)] shrink-0" />
+                      <div className="text-left">
+                        <div className="font-medium">Terminal</div>
+                        <div className="text-[10px] text-[var(--text-secondary)]">bash / tmux shell</div>
+                      </div>
+                    </button>
+                  )}
                   <button
                     onClick={() => selectType('claude')}
                     className="flex items-center gap-2.5 w-full px-3 py-2 text-xs text-[var(--text-primary)] hover:bg-[var(--bg-hover)] transition-colors"
@@ -598,7 +759,7 @@ export default function Sidebar({ sessions, docTabs, activeId, onSelect, onCreat
                       <div className="text-[10px] text-[var(--text-secondary)]">AI coding agent (MCP)</div>
                     </div>
                   </button>
-                  {vaultEnabled && (
+                  {vaultEnabled && !pendingAgentContext && (
                     <button
                       onClick={() => { onCreate('vault'); setStep('closed') }}
                       className="flex items-center gap-2.5 w-full px-3 py-2 text-xs text-[var(--text-primary)] hover:bg-[var(--bg-hover)] transition-colors"
@@ -776,7 +937,7 @@ export default function Sidebar({ sessions, docTabs, activeId, onSelect, onCreat
                 <>
                   <div className="flex items-center gap-1 px-2 py-1.5 border-b border-[var(--border)]">
                     <button
-                      onClick={() => setStep(currentPath ? 'pick-dir' : 'pick-type')}
+                      onClick={() => setStep(currentPath && !pendingAgentContext && !pendingSkipPrompt ? 'pick-dir' : 'pick-type')}
                       className="p-0.5 text-[var(--text-secondary)] hover:text-[var(--text-primary)] rounded transition-colors"
                       title="Back"
                     >
@@ -813,7 +974,7 @@ export default function Sidebar({ sessions, docTabs, activeId, onSelect, onCreat
                         else if (e.key === 'Escape') { e.preventDefault(); close() }
                       }}
                       placeholder="给 agent 的第一条指令，留空则只创建会话"
-                      className="w-full h-24 resize-none rounded bg-[var(--bg-secondary)] border border-[var(--border)] p-2 text-xs text-[var(--text-primary)] focus:outline-none focus:border-[var(--accent-blue)]"
+                      className="w-full h-24 resize-none rounded bg-[var(--bg-secondary)] border border-[var(--border)] p-2 text-base text-[var(--text-primary)] focus:outline-none focus:border-[var(--accent-blue)]"
                     />
                     <div className="flex justify-end gap-2">
                       {promptDraft.trim() ? (

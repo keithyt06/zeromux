@@ -3458,6 +3458,22 @@ pub(crate) fn resolve_wikilink(idx: &VaultIndex, name: &str) -> Option<String> {
     idx.by_basename_lc.get(&bare.to_ascii_lowercase()).cloned()
 }
 
+/// Build the wikilink index from a list of vault-relative `.md` paths, in the given
+/// order (first-seen wins on basename collision — same rule as the walk below).
+/// Used by `fuzzy_index::VaultModel::snapshot`, which owns the vault walk now.
+pub(crate) fn vault_index_from_paths(paths: Vec<String>) -> VaultIndex {
+    let mut by_basename = std::collections::HashMap::new();
+    let mut by_basename_lc = std::collections::HashMap::new();
+    for rel in &paths {
+        let name = rel.rsplit('/').next().unwrap_or(rel);
+        // Caller guarantees a case-insensitive ".md" suffix (3 ASCII bytes).
+        let base = name[..name.len() - 3].to_string();
+        by_basename_lc.entry(base.to_ascii_lowercase()).or_insert_with(|| rel.clone());
+        by_basename.entry(base).or_insert_with(|| rel.clone());
+    }
+    VaultIndex { by_basename, all_paths: paths, by_basename_lc }
+}
+
 /// Walk the vault recursively, building the wikilink basename index and the full
 /// .md path list. On basename collision the first seen wins for `by_basename`, but
 /// every path is kept in `all_paths`.

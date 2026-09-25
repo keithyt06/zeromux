@@ -6,6 +6,7 @@ mod auto_update;
 mod crew_memory;
 mod db;
 mod events;
+mod fuzzy_index;
 mod logger;
 mod push;
 mod oauth;

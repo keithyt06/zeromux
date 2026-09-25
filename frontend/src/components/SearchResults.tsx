@@ -94,7 +94,7 @@ export default function SearchResults({ result, showNotes, onPickDir, onDirMenu,
       <div key="notes">
         <div className="px-3 pt-2 pb-1 text-[10px] font-semibold text-[var(--text-muted)] uppercase tracking-wider">笔记</div>
         {s.indexing ? <Status text="正在建立笔记索引…" />
-          : s.items.length === 0 ? <Status text={s.refreshing ? '笔记索引刷新中…' : '无匹配笔记'} />
+          : s.items.length === 0 ? <Status text="无匹配笔记" />
           : (
             <ul>
               {s.items.map(h => {

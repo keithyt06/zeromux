@@ -68,7 +68,7 @@ describe('SearchResults', () => {
     expect(screen.getByText('正在建立笔记索引…')).toBeInTheDocument()
     rerender(<SearchResults result={res([], [], { refreshing: true }, { refreshing: true })} showNotes {...base} />)
     expect(screen.getByText('索引刷新中…')).toBeInTheDocument()
-    expect(screen.getByText('笔记索引刷新中…')).toBeInTheDocument()
+    expect(screen.getAllByText('无匹配笔记').length).toBeGreaterThan(0)
     rerender(<SearchResults result={res([], [])} showNotes {...base} />)
     expect(screen.getByText(/未找到（仅索引 6 层内）/)).toBeInTheDocument()
     expect(screen.getByText('无匹配笔记')).toBeInTheDocument()

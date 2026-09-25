@@ -200,9 +200,11 @@ export default function Sidebar({ sessions, docTabs, activeId, onSelect, onCreat
           setSearchResult(r); setSearchResultQuery(q); setSearchFailed(false)
           // Still building (indexing) or rebuilding with no hits → re-query in 4s so
           // the user never has to retype after a restart. Superseded by any newer query.
+          // With the inotify watcher live, notes section no longer shows "refreshing" —
+          // zero results during a rebuild are real misses, so only re-query for dirs.
           const pending = (s: { indexing: boolean; refreshing: boolean; items: unknown[] } | null) =>
             !!s && (s.indexing || (s.refreshing && s.items.length === 0))
-          if (pending(r.dirs) || pending(r.notes)) setTimeout(() => { if (searchReqRef.current === req) run(q) }, 4000)
+          if (pending(r.dirs)) setTimeout(() => { if (searchReqRef.current === req) run(q) }, 4000)
         })
         .catch(() => { if (searchReqRef.current === req) { setSearchResult(null); setSearchFailed(true) } })
     }

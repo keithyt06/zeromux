@@ -52,8 +52,10 @@ export default function VaultReader({ onClose, onTitleChange, target, onAskAgent
         .then(r => {
           if (searchReqRef.current !== req) return
           setSearch(r); setSearchFailed(false)
+          // With the inotify watcher live, re-query only while indexing (building the index).
+          // Once built, zero results during a refresh are real misses.
           const n = r.notes
-          if (n && (n.indexing || (n.refreshing && n.items.length === 0))) again = setTimeout(run, 4000)
+          if (n?.indexing) again = setTimeout(run, 4000)
         })
         .catch(() => { if (searchReqRef.current === req) { setSearch(null); setSearchFailed(true) } })
     }

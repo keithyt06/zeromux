@@ -161,7 +161,7 @@ export default function VaultReader({ onClose, onTitleChange, target, onAskAgent
                 onPickNote={pickHit}
                 onAskAgent={(h) => onAskAgent?.({ absDir: h.abs_dir, relPath: h.path, kind: h.kind })}
               />
-              {search.notes.truncated && <div className="px-3 py-2 text-xs text-[var(--accent-yellow)]">仅显示前 50 条，请细化搜索</div>}
+              {search.notes.items.length >= 50 && <div className="px-3 py-2 text-xs text-[var(--accent-yellow)]">仅显示前 50 条，请细化搜索</div>}
             </>
           ) : searchFailed ? (
             <div className="px-3 py-2 flex items-center justify-between gap-2 text-xs text-[var(--text-secondary)]">

@@ -122,6 +122,23 @@ describe('VaultReader', () => {
     await waitFor(() => expect(input.value).toBe(''))
   })
 
+  it('shows the 50-item cap hint when a full page comes back (truncated is never set for notes)', async () => {
+    const items = (n: number) => Array.from({ length: n }, (_, i) => (
+      { path: `a/n${i}.md`, kind: 'note' as const, display: `note${i}`, hint: 'a', abs_dir: '/v/a', score: 9 }))
+    vi.mocked(api.searchPaths).mockResolvedValue({ dirs: null, notes: { kind: 'notes', indexing: false, refreshing: false, truncated: false, items: items(50) } })
+    const { unmount } = render(<VaultReader />)
+    fireEvent.change(screen.getByPlaceholderText('搜索笔记名…'), { target: { value: 'n' } })
+    await screen.findByText('note49')
+    expect(screen.getByText(/仅显示前 50 条/)).toBeInTheDocument()
+    unmount()
+
+    vi.mocked(api.searchPaths).mockResolvedValue({ dirs: null, notes: { kind: 'notes', indexing: false, refreshing: false, truncated: false, items: items(3) } })
+    render(<VaultReader />)
+    fireEvent.change(screen.getByPlaceholderText('搜索笔记名…'), { target: { value: 'n' } })
+    await screen.findByText('note2')
+    expect(screen.queryByText(/仅显示前 50 条/)).toBeNull()
+  })
+
   it('warms the notes index on mount', async () => {
     render(<VaultReader />)
     await waitFor(() => expect(api.warmSearchIndex).toHaveBeenCalledWith('notes'))

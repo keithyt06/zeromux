@@ -339,6 +339,8 @@ export default function Sidebar({ sessions, docTabs, activeId, onSelect, onCreat
     if (!open) onToggle()
     // Consuming an external one-shot request is exactly an effect's job.
     setPendingType(null)
+    setQuery('')            // never show the previous open's query/results
+    setSearchResult(null)
     askAgent(askAgentRequest)
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [askAgentRequest])
@@ -704,7 +706,7 @@ export default function Sidebar({ sessions, docTabs, activeId, onSelect, onCreat
                       needs a way back — matching pick-terminal-mode / pick-dir. */}
                   <div className="flex items-center gap-1 px-2 py-1.5 border-b border-[var(--border)]">
                     <button
-                      onClick={() => { setPendingDir(null); setPendingSkipPrompt(false); setPendingAgentContext(null); setStep('quick') }}
+                      onClick={() => { setPendingDir(null); setPendingSkipPrompt(false); setPendingAgentContext(null); setCurrentPath(''); setStep('quick') }}
                       className="p-0.5 text-[var(--text-secondary)] hover:text-[var(--text-primary)] rounded transition-colors"
                       title="返回"
                     >

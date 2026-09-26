@@ -164,6 +164,9 @@ export default function TerminalView({ sessionId, active, theme, tmuxName, tmuxO
   // tmux copy-mode state (server-authoritative via scroll_state); drives the pill.
   const [scrolling, setScrolling] = useState(false)
   const scrollingRef = useRef(false)
+  // "↓ N 行新输出": server diffs history_size every 1s while in copy-mode
+  // (scroll_watch), since a frozen copy-mode pane can't show new output.
+  const [newLines, setNewLines] = useState(0)
   const sendScroll = useCallback((m: ScrollMsg) => {
     const ws = wsRef.current
     if (ws?.readyState === WebSocket.OPEN) ws.send(JSON.stringify({ type: 'scroll', ...m }))
@@ -172,6 +175,13 @@ export default function TerminalView({ sessionId, active, theme, tmuxName, tmuxO
   // Ref twin so the once-only init effect's touch batcher always calls the latest sendScroll.
   const sendScrollRef = useRef(sendScroll)
   useEffect(() => { sendScrollRef.current = sendScroll }, [sendScroll])
+  // Arm/disarm the server-side history_size watch as copy-mode is entered/left.
+  useEffect(() => {
+    const ws = wsRef.current
+    if (!tmuxName || ws?.readyState !== WebSocket.OPEN) return
+    ws.send(JSON.stringify({ type: 'scroll_watch', on: scrolling }))
+    if (!scrolling) setNewLines(0)
+  }, [scrolling, tmuxName])
   // Set by the init effect: stops in-flight inertia + drops batched lines, so a
   // keystroke right after a flick can't be followed by a stale `up` that
   // re-enters copy-mode.
@@ -473,6 +483,7 @@ export default function TerminalView({ sessionId, active, theme, tmuxName, tmuxO
           if (msg.type === 'scroll_state') {
             scrollingRef.current = !!msg.in_mode
             setScrolling(!!msg.in_mode)
+            if (typeof msg.new_lines === 'number') setNewLines(msg.new_lines)
             return
           }
           if (msg.type === 'output') {
@@ -637,7 +648,7 @@ export default function TerminalView({ sessionId, active, theme, tmuxName, tmuxO
           <button aria-label="scroll-top" onPointerDown={e => { e.preventDefault(); sendScroll({ op: 'top', n: 1 }) }}
             className="px-2 py-1.5 rounded-full bg-[var(--bg-tertiary)] border border-[var(--border)] shadow">⤒顶</button>
           <button aria-label="scroll-bottom" onPointerDown={e => { e.preventDefault(); exitScroll() }}
-            className="px-3 py-1.5 rounded-full bg-[var(--accent-blue)] text-white shadow">⏸ 已暂停跟随 · ⤓</button>
+            className="px-3 py-1.5 rounded-full bg-[var(--accent-blue)] text-white shadow">{newLines > 0 ? `↓ ${newLines} 行新输出` : '⏸ 已暂停跟随 · ⤓'}</button>
         </div>
       )}
       {ended && <EndedOverlay name={tmuxName ?? ''} origin={tmuxOrigin} onRevive={handleRevive} onClose={() => onClose?.()} />}

@@ -31,6 +31,11 @@ enum ClientMsg {
     /// Desktop mouse/browser toggle for tmux terminals: session-level `mouse` option.
     #[serde(rename = "mouse")]
     Mouse { on: bool },
+    /// While reading tmux copy-mode, ask the server to diff `history_size` every
+    /// 1s and push `scroll_state.new_lines` — the frozen pane can't show new
+    /// output any other way.
+    #[serde(rename = "scroll_watch")]
+    ScrollWatch { on: bool },
 }
 
 pub async fn ws_terminal(
@@ -141,12 +146,30 @@ async fn handle_ws(socket: WebSocket, session_id: String, state: Arc<AppState>) 
     let mut keepalive = tokio::time::interval(std::time::Duration::from_secs(30));
     keepalive.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
+    // Polls `history_size` every 1s while the client is reading copy-mode, so
+    // the "↓ N new lines" indicator can tell the user output is piling up
+    // behind the frozen pane. Only armed while `watch_baseline` is Some.
+    let mut watch = tokio::time::interval(std::time::Duration::from_secs(1));
+    watch.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    let mut watch_baseline: Option<u64> = None;
+
     // Subscribe loop: receive broadcast events + forward client input
     loop {
         tokio::select! {
             _ = keepalive.tick() => {
                 if ws_sink.send(Message::Ping(Default::default())).await.is_err() {
                     break;
+                }
+            }
+            _ = watch.tick(), if watch_baseline.is_some() => {
+                if let (Some(base), Some((name, _))) = (watch_baseline, state.sessions.tmux_binding(&session_id)) {
+                    if let Ok(i) = state.tmux.info(&name).await {
+                        let m = serde_json::json!({"type": "scroll_state", "in_mode": i.in_mode,
+                            "history_size": i.history_size,
+                            "new_lines": crate::scroll_watch::new_lines(base, i.history_size)});
+                        if !i.in_mode { watch_baseline = None; }   // left copy-mode (maybe from VSCode)
+                        if ws_sink.send(Message::Text(m.to_string().into())).await.is_err() { break; }
+                    }
                 }
             }
             result = event_rx.recv() => {
@@ -212,6 +235,14 @@ async fn handle_ws(socket: WebSocket, session_id: String, state: Arc<AppState>) 
                                 ClientMsg::Mouse { on } => {
                                     if let Some((name, _)) = state.sessions.tmux_binding(&session_id) {
                                         let _ = state.tmux.set_mouse(&name, on).await;
+                                    }
+                                }
+                                ClientMsg::ScrollWatch { on } => {
+                                    watch_baseline = None;
+                                    if on {
+                                        if let Some((name, _)) = state.sessions.tmux_binding(&session_id) {
+                                            watch_baseline = state.tmux.info(&name).await.ok().map(|i| i.history_size);
+                                        }
                                     }
                                 }
                             }

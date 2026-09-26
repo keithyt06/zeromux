@@ -16,6 +16,7 @@ mod pty_bridge;
 mod quick_targets;
 mod run_metrics;
 mod scheduled_tasks;
+mod scroll_watch;
 mod session_manager;
 mod session_store;
 mod tmux;

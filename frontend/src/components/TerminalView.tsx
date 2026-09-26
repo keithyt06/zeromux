@@ -17,7 +17,7 @@ import HistoryView from './HistoryView'
 import { TmuxHealthBar, LostBanner, EndedOverlay, ReconnectHint } from './TerminalNotices'
 import { arrowSequence, rowHeight, linesFromDrag, bracketedPaste, submitSequence, controlSequence, launchSequence } from '../lib/terminalInput'
 import { shouldStickToBottom } from '../lib/scrollReplay'
-import { ScrollBatcher, inertiaLines, scheduleInertia, shouldCancelBeforeInput, type ScrollMsg } from '../lib/terminalScroll'
+import { ScrollBatcher, inertiaLines, pillFromScrollState, scheduleInertia, shouldCancelBeforeInput, type ScrollMsg } from '../lib/terminalScroll'
 import { shouldShowShiftHint, mousePref, MOUSE_PREF_KEY, mouseToggleApplies, shouldSendMouseOffOnConnect } from '../lib/desktopHints'
 import { historyPrompt } from '../lib/historyToAgent'
 
@@ -170,12 +170,18 @@ export default function TerminalView({ sessionId, active, theme, tmuxName, tmuxO
   // tmux copy-mode state (server-authoritative via scroll_state); drives the pill.
   const [scrolling, setScrolling] = useState(false)
   const scrollingRef = useRef(false)
+  // True while scrolling is routed as wheel events into a fullscreen app
+  // (server `app_scroll`, e.g. Claude Code) rather than tmux copy-mode.
+  const appScrollRef = useRef(false)
+  // Last op sent, so a late app_scroll reply can't reopen a pill we just closed.
+  const lastScrollOpRef = useRef<ScrollMsg['op']>('cancel')
   // "↓ N 行新输出": server diffs history_size every 1s while in copy-mode
   // (scroll_watch), since a frozen copy-mode pane can't show new output.
   const [newLines, setNewLines] = useState(0)
   const sendScroll = useCallback((m: ScrollMsg) => {
     const ws = wsRef.current
     if (ws?.readyState === WebSocket.OPEN) ws.send(JSON.stringify({ type: 'scroll', ...m }))
+    lastScrollOpRef.current = m.op
     if (m.op === 'up' || m.op === 'top') { scrollingRef.current = true; setScrolling(true) }
   }, [])
   // Ref twin so the once-only init effect's touch batcher always calls the latest sendScroll.
@@ -216,8 +222,23 @@ export default function TerminalView({ sessionId, active, theme, tmuxName, tmuxO
     if (!cancel) return
     scrollingRef.current = false
     setScrolling(false)
+    if (appScrollRef.current) {
+      // No copy-mode to leave; typing into the app jumps it to the bottom itself.
+      appScrollRef.current = false
+      lastScrollOpRef.current = 'cancel'
+      return
+    }
     sendScroll({ op: 'cancel', n: 1 })
   }, [sendScroll, isTouch])
+  // ⤓ pill button: copy-mode → cancel (exitScroll); fullscreen app → wheel to bottom.
+  const scrollToBottom = useCallback(() => {
+    if (!appScrollRef.current) { exitScroll(); return }
+    cancelInertiaRef.current()
+    appScrollRef.current = false
+    scrollingRef.current = false
+    setScrolling(false)
+    sendScroll({ op: 'bottom', n: 1 })
+  }, [exitScroll, sendScroll])
 
   // 桌面 Shift 拖选提示：tmux mouse=on 时普通拖动交给 tmux（复制模式/选窗格），
   // 只有 Shift+拖动才是浏览器原生选区。首次左键按下（非 Shift）提示一次。
@@ -490,8 +511,10 @@ export default function TerminalView({ sessionId, active, theme, tmuxName, tmuxO
             return
           }
           if (msg.type === 'scroll_state') {
-            scrollingRef.current = !!msg.in_mode
-            setScrolling(!!msg.in_mode)
+            const p = pillFromScrollState(msg, lastScrollOpRef.current)
+            appScrollRef.current = p.appScroll
+            scrollingRef.current = p.scrolling
+            setScrolling(p.scrolling)
             if (typeof msg.new_lines === 'number') setNewLines(msg.new_lines)
             return
           }
@@ -656,7 +679,7 @@ export default function TerminalView({ sessionId, active, theme, tmuxName, tmuxO
         <div className="absolute right-3 bottom-28 z-10 flex gap-1 text-xs">
           <button aria-label="scroll-top" onPointerDown={e => { e.preventDefault(); sendScroll({ op: 'top', n: 1 }) }}
             className="px-2 py-1.5 rounded-full bg-[var(--bg-tertiary)] border border-[var(--border)] shadow">⤒顶</button>
-          <button aria-label="scroll-bottom" onPointerDown={e => { e.preventDefault(); exitScroll() }}
+          <button aria-label="scroll-bottom" onPointerDown={e => { e.preventDefault(); scrollToBottom() }}
             className="px-3 py-1.5 rounded-full bg-[var(--accent-blue)] text-white shadow">{newLines > 0 ? `↓ ${newLines} 行新输出` : '⏸ 已暂停跟随 · ⤓'}</button>
         </div>
       )}

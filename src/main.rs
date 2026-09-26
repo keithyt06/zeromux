@@ -281,6 +281,17 @@ async fn main() {
     if let Err(e) = tmux::write_tmux_conf(std::path::Path::new(&data_dir_str)) {
         tracing::warn!("write tmux.conf failed: {}", e);
     }
+    // Deploys never restart the tmux server, so push conf v2's env var into the
+    // running one too (new terminals inherit it; existing shells don't). Best-effort.
+    {
+        let ctl = tmux::TmuxCtl::new(Some(args.tmux_socket.clone()));
+        tokio::spawn(async move {
+            match ctl.run(&["set-environment", "-g", "CLAUDE_CODE_DISABLE_ALTERNATE_SCREEN", "1"]).await {
+                Ok(_) | Err(tmux::TmuxError::ServerDown) => {}
+                Err(e) => tracing::warn!("tmux set-environment failed: {}", e),
+            }
+        });
+    }
 
     // Initialize database if OAuth is configured
     let database = if oauth_configured {

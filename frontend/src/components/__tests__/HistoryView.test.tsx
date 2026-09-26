@@ -33,6 +33,18 @@ describe('HistoryView', () => {
     fireEvent.click(screen.getByLabelText('关闭历史'))
     expect(onClose).toHaveBeenCalled()
   })
+  it('fullscreen (alternate) capture shows the current-screen-only hint', async () => {
+    vi.spyOn(api, 'getHistory').mockResolvedValue({ text: 'screen', truncated: false, alternate: true })
+    render(<HistoryView sessionId="s" title="t" onClose={() => {}} />)
+    await waitFor(() => expect(screen.getByText(/screen/)).toBeInTheDocument())
+    expect(screen.getByText(/当前程序处于全屏模式/)).toBeInTheDocument()
+  })
+  it('no fullscreen hint for a normal capture', async () => {
+    vi.spyOn(api, 'getHistory').mockResolvedValue({ text: 'plain', truncated: false })
+    render(<HistoryView sessionId="s" title="t" onClose={() => {}} />)
+    await waitFor(() => expect(screen.getByText(/plain/)).toBeInTheDocument())
+    expect(screen.queryByText(/当前程序处于全屏模式/)).toBeNull()
+  })
   it('shows error text when fetch fails', async () => {
     vi.spyOn(api, 'getHistory').mockRejectedValue(new Error('tmux 服务未运行'))
     render(<HistoryView sessionId="s" title="api" onClose={() => {}} />)

@@ -11,7 +11,7 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 const TIMEOUT: Duration = Duration::from_secs(3);
-pub const TMUX_CONF_VERSION: u32 = 1;
+pub const TMUX_CONF_VERSION: u32 = 2;
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum TmuxError { ServerDown, NotFound, Timeout, Other(String) }
@@ -121,25 +121,39 @@ impl TmuxCtl {
 
     pub async fn info(&self, name: &str) -> Result<PaneInfo, TmuxError> {
         let s = self.run(&["display-message", "-p", "-t", &format!("={name}:"),
-            "#{session_name}\t#{session_attached}\t#{pane_in_mode}\t#{history_size}\t#{pane_current_command}"]).await?;
+            "#{session_name}\t#{session_attached}\t#{pane_in_mode}\t#{history_size}\t#{alternate_on}\t#{mouse_any_flag}\t#{pane_current_command}"]).await?;
         let f: Vec<&str> = s.trim_end_matches('\n').split('\t').collect();
         // On a server with zero sessions tmux 3.4 exits 0 with every format
         // field empty instead of erroring — an empty session_name means "gone".
         if f.first().is_none_or(|n| n.is_empty()) { return Err(TmuxError::NotFound); }
-        if f.len() < 5 { return Err(TmuxError::Other(format!("bad info: {s}"))); }
+        if f.len() < 7 { return Err(TmuxError::Other(format!("bad info: {s}"))); }
         Ok(PaneInfo {
             attached: f[1].parse().unwrap_or(0),
             in_mode: f[2] == "1",
             history_size: f[3].parse().unwrap_or(0),
-            current_command: f[4].to_string(),
+            alternate_on: f[4] == "1",
+            mouse_any: f[5] == "1",
+            current_command: f[6].to_string(),
         })
     }
 
-    /// Drive copy-mode from the server side. Never types into the pane: every
-    /// op that would only make sense inside copy-mode is gated on `in_mode`.
-    pub async fn scroll(&self, name: &str, op: ScrollOp) -> Result<PaneInfo, TmuxError> {
+    /// Drive scrolling from the server side. Two routes (see `scroll_route`):
+    /// - CopyMode: tmux copy-mode; every op that would only make sense inside
+    ///   copy-mode is gated on `in_mode`, so nothing is typed into the pane.
+    /// - AppWheel: a fullscreen app (alt-screen + mouse reporting, e.g. Claude
+    ///   Code) keeps tmux history empty, so copy-mode is useless; send SGR wheel
+    ///   events as pane input instead — the only bytes this path ever sends.
+    pub async fn scroll(&self, name: &str, op: ScrollOp) -> Result<(PaneInfo, ScrollRoute), TmuxError> {
         let t = format!("={name}:");
-        let in_mode = self.info(name).await?.in_mode;
+        let pre = self.info(name).await?;
+        let in_mode = pre.in_mode;
+        let route = scroll_route(in_mode, pre.alternate_on, pre.mouse_any);
+        if route == ScrollRoute::AppWheel {
+            if let Some(seq) = wheel_seq(op) {
+                self.run(&["send-keys", "-t", &t, "-l", &seq]).await?;
+            }
+            return Ok((self.info(name).await?, route));
+        }
         match op {
             ScrollOp::Up(n) => {
                 let n = n.to_string();
@@ -157,7 +171,7 @@ impl TmuxCtl {
             }
             _ => {}
         }
-        self.info(name).await
+        Ok((self.info(name).await?, route))
     }
 
     /// Session-level `mouse` toggle: `on` sends drag/wheel to tmux (copy-mode,
@@ -186,13 +200,44 @@ pub fn tmux_name_for(id: &str) -> String {
 }
 
 #[derive(Debug, Clone, serde::Serialize)]
-pub struct Captured { pub text: String, pub truncated: bool }
+pub struct Captured {
+    pub text: String, pub truncated: bool,
+    /// Set by the history endpoint from `info()`; `capture` itself leaves it false.
+    pub alternate: bool,
+}
 
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct HostTmux { pub name: String, pub windows: u32, pub attached: u32, pub created: i64, pub path: String }
 
 #[derive(Debug, Clone, serde::Serialize)]
-pub struct PaneInfo { pub attached: u32, pub in_mode: bool, pub history_size: u64, pub current_command: String }
+pub struct PaneInfo {
+    pub attached: u32, pub in_mode: bool, pub history_size: u64,
+    /// `#{alternate_on}` / `#{mouse_any_flag}`: fullscreen app with mouse reporting.
+    pub alternate_on: bool, pub mouse_any: bool,
+    pub current_command: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ScrollRoute { CopyMode, AppWheel }
+
+/// A fullscreen app that asked for mouse events scrolls its own view, and
+/// never writes into tmux history — route to it unless we're already in copy-mode.
+pub fn scroll_route(in_mode: bool, alternate_on: bool, mouse_any: bool) -> ScrollRoute {
+    if !in_mode && alternate_on && mouse_any { ScrollRoute::AppWheel } else { ScrollRoute::CopyMode }
+}
+
+/// SGR wheel events for AppWheel: up = button 64, down = 65, at cell 1;1.
+/// Top/Bottom = 200 events (the ScrollOp clamp); Cancel = nothing.
+fn wheel_seq(op: ScrollOp) -> Option<String> {
+    let (btn, n) = match op {
+        ScrollOp::Up(n) => (64, n),
+        ScrollOp::Down(n) => (65, n),
+        ScrollOp::Top => (64, 200),
+        ScrollOp::Bottom => (65, 200),
+        ScrollOp::Cancel => return None,
+    };
+    Some(format!("\x1b[<{btn};1;1M").repeat(n as usize))
+}
 
 #[derive(Debug, Clone, Copy)]
 pub enum ScrollOp { Up(u32), Down(u32), Top, Bottom, Cancel }
@@ -213,11 +258,11 @@ impl ScrollOp {
 
 /// Keep the TAIL (most recent output) under `max_bytes`, cutting at a line boundary.
 fn truncate_head(text: String, max_bytes: usize) -> Captured {
-    if text.len() <= max_bytes { return Captured { text, truncated: false }; }
+    if text.len() <= max_bytes { return Captured { text, truncated: false, alternate: false }; }
     let mut start = text.len() - max_bytes;
     while !text.is_char_boundary(start) { start += 1; }
     let start = text[start..].find('\n').map(|i| start + i + 1).unwrap_or(text.len());
-    Captured { text: text[start..].to_string(), truncated: true }
+    Captured { text: text[start..].to_string(), truncated: true, alternate: false }
 }
 
 fn classify_stderr(err: &str) -> TmuxError {
@@ -251,6 +296,7 @@ set -g window-size latest
 set -g status-left ''
 set -g status-right ''
 set -g status-style 'bg=default'
+set-environment -g CLAUDE_CODE_DISABLE_ALTERNATE_SCREEN 1
 ")
 }
 
@@ -400,6 +446,65 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn scroll_route_matrix() {
+        for in_mode in [false, true] {
+            for alt in [false, true] {
+                for mouse in [false, true] {
+                    let want = if !in_mode && alt && mouse { ScrollRoute::AppWheel } else { ScrollRoute::CopyMode };
+                    assert_eq!(scroll_route(in_mode, alt, mouse), want, "in_mode={in_mode} alt={alt} mouse={mouse}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn wheel_seq_encodes_sgr() {
+        assert_eq!(wheel_seq(ScrollOp::Up(2)).unwrap(), "\x1b[<64;1;1M\x1b[<64;1;1M");
+        assert_eq!(wheel_seq(ScrollOp::Down(1)).unwrap(), "\x1b[<65;1;1M");
+        assert_eq!(wheel_seq(ScrollOp::Top).unwrap().matches("\x1b[<64;1;1M").count(), 200);
+        assert_eq!(wheel_seq(ScrollOp::Bottom).unwrap().matches("\x1b[<65;1;1M").count(), 200);
+        assert!(wheel_seq(ScrollOp::Cancel).is_none());
+    }
+
+    #[test]
+    fn conf_v2_disables_claude_alt_screen() {
+        assert!(TMUX_CONF_VERSION >= 2);
+        assert!(tmux_conf_text().contains("set-environment -g CLAUDE_CODE_DISABLE_ALTERNATE_SCREEN 1"));
+    }
+
+    #[tokio::test]
+    async fn scroll_in_fullscreen_mouse_app_sends_sgr_wheel() {
+        let Some(srv) = TestServer::start() else { return };
+        let dir = tempfile::tempdir().unwrap();   // removed on drop, even if an assert panics
+        let log = dir.path().join("wheel.log");
+        let cmd = format!("printf '\\033[?1049h\\033[?1000h\\033[?1006h'; exec cat -v > {}", log.display());
+        srv.ctl.run(&["new-session", "-d", "-s", "zmx-w1", "-c", "/tmp", "sh", "-c", &cmd]).await.unwrap();
+        let mut ready = false;
+        for _ in 0..50 {
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            let i = srv.ctl.info("zmx-w1").await.unwrap();
+            if i.alternate_on && i.mouse_any { ready = true; break; }
+        }
+        assert!(ready, "app never entered alt-screen + mouse mode");
+        let (i, route) = srv.ctl.scroll("zmx-w1", ScrollOp::Up(3)).await.unwrap();
+        assert_eq!(route, ScrollRoute::AppWheel);
+        assert!(!i.in_mode, "must not enter copy-mode over a mouse-aware fullscreen app");
+        // Cancel sends nothing in AppWheel mode.
+        let (_, route) = srv.ctl.scroll("zmx-w1", ScrollOp::Cancel).await.unwrap();
+        assert_eq!(route, ScrollRoute::AppWheel);
+        // `cat -v` (line-buffered by the tty) only flushes on newline.
+        srv.ctl.run(&["send-keys", "-t", "=zmx-w1:", "Enter"]).await.unwrap();
+        let mut got = String::new();
+        for _ in 0..30 {
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            got = std::fs::read_to_string(&log).unwrap_or_default();
+            if got.contains('\n') { break; }
+        }
+        assert_eq!(got.matches("^[[<64;1;1M").count(), 3, "log: {got:?}");
+        assert_eq!(got.trim_end(), "^[[<64;1;1M".repeat(3), "nothing else may reach the pane");
+    }
+
+    #[test]
     fn scroll_op_parse_clamps() {
         assert!(matches!(ScrollOp::parse("up", 0), Some(ScrollOp::Up(1))));
         assert!(matches!(ScrollOp::parse("down", 9999), Some(ScrollOp::Down(200))));
@@ -472,11 +577,11 @@ pub(crate) mod tests {
         mk(&srv, "zmx-s1").await;
         srv.ctl.run(&["send-keys", "-t", "=zmx-s1:", "seq 1 300", "Enter"]).await.unwrap();
         tokio::time::sleep(std::time::Duration::from_millis(500)).await;
-        let i = srv.ctl.scroll("zmx-s1", ScrollOp::Up(5)).await.unwrap();
+        let (i, _) = srv.ctl.scroll("zmx-s1", ScrollOp::Up(5)).await.unwrap();
         assert!(i.in_mode);
-        let i = srv.ctl.scroll("zmx-s1", ScrollOp::Top).await.unwrap();
+        let (i, _) = srv.ctl.scroll("zmx-s1", ScrollOp::Top).await.unwrap();
         assert!(i.in_mode);
-        let i = srv.ctl.scroll("zmx-s1", ScrollOp::Bottom).await.unwrap();
+        let (i, _) = srv.ctl.scroll("zmx-s1", ScrollOp::Bottom).await.unwrap();
         assert!(!i.in_mode);
     }
 
@@ -498,7 +603,7 @@ pub(crate) mod tests {
             before = snap;
         }
         for op in [ScrollOp::Cancel, ScrollOp::Bottom, ScrollOp::Down(3)] {
-            let i = srv.ctl.scroll("zmx-q1", op).await.unwrap();
+            let (i, _) = srv.ctl.scroll("zmx-q1", op).await.unwrap();
             assert!(!i.in_mode);
         }
         tokio::time::sleep(std::time::Duration::from_millis(200)).await;

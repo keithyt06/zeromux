@@ -1,5 +1,5 @@
 import { describe, it, expect, vi } from 'vitest'
-import { dragToScroll, inertiaLines, ScrollBatcher, scheduleInertia, shouldCancelBeforeInput } from '../terminalScroll'
+import { dragToScroll, inertiaLines, pillFromScrollState, ScrollBatcher, scheduleInertia, shouldCancelBeforeInput } from '../terminalScroll'
 
 describe('dragToScroll', () => {
   // linesFromDrag convention: finger moves UP → positive → newer content (scroll down).
@@ -91,5 +91,21 @@ describe('shouldCancelBeforeInput', () => {
   })
   it('non-tmux: never force-cancels from a wheel event', () => {
     expect(shouldCancelBeforeInput({ scrolling: false, isTouch: false, hasTmux: false, wheelSinceInput: true })).toBe(false)
+  })
+})
+
+describe('pillFromScrollState', () => {
+  it('copy-mode route follows in_mode (unchanged behavior)', () => {
+    expect(pillFromScrollState({ in_mode: true }, 'up')).toEqual({ scrolling: true, appScroll: false })
+    expect(pillFromScrollState({ in_mode: false }, 'up')).toEqual({ scrolling: false, appScroll: false })
+    expect(pillFromScrollState({ in_mode: false, app_scroll: false }, 'down')).toEqual({ scrolling: false, appScroll: false })
+  })
+  it('app-wheel route keeps the pill while reading, even though in_mode is false', () => {
+    expect(pillFromScrollState({ in_mode: false, app_scroll: true }, 'up')).toEqual({ scrolling: true, appScroll: true })
+    expect(pillFromScrollState({ in_mode: false, app_scroll: true }, 'down')).toEqual({ scrolling: true, appScroll: true })
+  })
+  it('app-wheel reply after the last sent op was bottom/cancel clears the pill (late replies cannot reopen it)', () => {
+    expect(pillFromScrollState({ in_mode: false, app_scroll: true }, 'bottom')).toEqual({ scrolling: false, appScroll: false })
+    expect(pillFromScrollState({ in_mode: false, app_scroll: true }, 'cancel')).toEqual({ scrolling: false, appScroll: false })
   })
 })

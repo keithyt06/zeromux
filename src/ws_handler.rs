@@ -164,9 +164,16 @@ async fn handle_ws(socket: WebSocket, session_id: String, state: Arc<AppState>) 
             _ = watch.tick(), if watch_baseline.is_some() => {
                 if let (Some(base), Some((name, _))) = (watch_baseline, state.sessions.tmux_binding(&session_id)) {
                     if let Ok(i) = state.tmux.info(&name).await {
+                        // Reading a fullscreen app via wheel events (AppWheel): there is no
+                        // copy-mode to report and history doesn't grow — stay silent so the
+                        // client's pill isn't cleared by `in_mode: false`.
+                        if crate::tmux::scroll_route(i.in_mode, i.alternate_on, i.mouse_any) == crate::tmux::ScrollRoute::AppWheel {
+                            continue;
+                        }
+                        // Alt-screen output never lands in history → new_lines is meaningless.
+                        let new_lines = if i.alternate_on { 0 } else { crate::scroll_watch::new_lines(base, i.history_size) };
                         let m = serde_json::json!({"type": "scroll_state", "in_mode": i.in_mode,
-                            "history_size": i.history_size,
-                            "new_lines": crate::scroll_watch::new_lines(base, i.history_size)});
+                            "history_size": i.history_size, "new_lines": new_lines});
                         if !i.in_mode { watch_baseline = None; }   // left copy-mode (maybe from VSCode)
                         if ws_sink.send(Message::Text(m.to_string().into())).await.is_err() { break; }
                     }
@@ -226,8 +233,9 @@ async fn handle_ws(socket: WebSocket, session_id: String, state: Arc<AppState>) 
                                     if let (Some((name, _)), Some(op)) =
                                         (state.sessions.tmux_binding(&session_id), crate::tmux::ScrollOp::parse(&op, n))
                                     {
-                                        if let Ok(info) = state.tmux.scroll(&name, op).await {
-                                            let m = serde_json::json!({"type": "scroll_state", "in_mode": info.in_mode, "history_size": info.history_size});
+                                        if let Ok((info, route)) = state.tmux.scroll(&name, op).await {
+                                            let m = serde_json::json!({"type": "scroll_state", "in_mode": info.in_mode, "history_size": info.history_size,
+                                                "app_scroll": route == crate::tmux::ScrollRoute::AppWheel});
                                             if ws_sink.send(Message::Text(m.to_string().into())).await.is_err() { break; }
                                         }
                                     }

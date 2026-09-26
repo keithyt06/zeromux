@@ -48,7 +48,7 @@ export async function getSessionStatus(id: string): Promise<SessionStatus> {
   return res.json()
 }
 
-export async function getHistory(id: string, ansi = false): Promise<{ text: string; truncated: boolean }> {
+export async function getHistory(id: string, ansi = false): Promise<{ text: string; truncated: boolean; alternate?: boolean }> {
   const res = await api(`/api/sessions/${id}/history?ansi=${ansi ? 1 : 0}`)
   if (!res.ok) throw new Error(await res.text())
   return res.json()

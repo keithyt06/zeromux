@@ -85,3 +85,17 @@ export function shouldCancelBeforeInput(o: { scrolling: boolean; isTouch: boolea
   if (o.isTouch || !o.hasTmux) return false
   return o.wheelSinceInput
 }
+
+// Pill state from a server `scroll_state`. CopyMode replies follow `in_mode`.
+// AppWheel replies (`app_scroll`: wheel events into a fullscreen app such as
+// Claude Code) never have `in_mode`, so the pill stays up while reading —
+// unless the client's last op already left reading (bottom/cancel), so a late
+// reply can't reopen it.
+export function pillFromScrollState(
+  m: { in_mode?: boolean; app_scroll?: boolean },
+  lastOp: ScrollMsg['op'],
+): { scrolling: boolean; appScroll: boolean } {
+  if (!m.app_scroll) return { scrolling: !!m.in_mode, appScroll: false }
+  const reading = lastOp !== 'bottom' && lastOp !== 'cancel'
+  return { scrolling: reading, appScroll: reading }
+}

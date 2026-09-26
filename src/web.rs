@@ -1124,12 +1124,14 @@ async fn session_history(
         .sessions
         .tmux_binding(&id)
         .ok_or((StatusCode::BAD_REQUEST, "not a tmux terminal".into()))?;
-    state
+    let mut cap = state
         .tmux
         .capture(&name, 50_000, 5 * 1024 * 1024, q.ansi == 1)
         .await
-        .map(Json)
-        .map_err(|e| (StatusCode::SERVICE_UNAVAILABLE, e.to_string()))
+        .map_err(|e| (StatusCode::SERVICE_UNAVAILABLE, e.to_string()))?;
+    // Fullscreen app (alt-screen): history holds only the current screen — the UI hints so.
+    cap.alternate = state.tmux.info(&name).await.map(|i| i.alternate_on).unwrap_or(false);
+    Ok(Json(cap))
 }
 
 #[derive(serde::Deserialize)]

@@ -15,7 +15,7 @@ interface Props {
 
 // Loaded payload remembers which mode it was fetched in, so a mode toggle never
 // renders raw escapes (or strips a plain capture) while the refetch is in flight.
-interface Loaded { text: string; truncated: boolean; ansi: boolean }
+interface Loaded { text: string; truncated: boolean; ansi: boolean; alternate: boolean }
 
 const parseChunks = (chunks: string[]): Span[][][] => chunks.map(c => c.split('\n').map(parseAnsiLine))
 
@@ -35,7 +35,7 @@ export default function HistoryView({ sessionId, title, onClose, split, onSendTo
     let cancelled = false
     ;(document.activeElement as HTMLElement | null)?.blur?.()   // drop the soft keyboard
     getHistory(sessionId, ansi)
-      .then(r => { if (!cancelled) { setLoaded({ text: r.text, truncated: r.truncated, ansi }); setError(null) } })
+      .then(r => { if (!cancelled) { setLoaded({ text: r.text, truncated: r.truncated, ansi, alternate: !!r.alternate }); setError(null) } })
       .catch(e => { if (!cancelled) setError(String(e?.message ?? e)) })
     return () => { cancelled = true }
   }, [sessionId, ansi])
@@ -113,6 +113,7 @@ export default function HistoryView({ sessionId, title, onClose, split, onSendTo
         <button aria-label="关闭历史" onClick={onClose} className="px-2 text-[var(--text-muted)] hover:text-[var(--text-primary)]">✕</button>
       </div>
       <div ref={scrollRef} className="flex-1 min-h-0 overflow-y-auto overscroll-contain select-text" style={{ touchAction: 'pan-y', WebkitUserSelect: 'text' }}>
+        {loaded?.alternate && <div className="px-3 py-1.5 text-[11px] text-[var(--accent-yellow)] border-b border-[var(--border)]">当前程序处于全屏模式（如 Claude Code/vim），历史只含当前屏；请在终端中直接滑动查看。新开的终端已默认关闭 Claude Code 全屏模式。</div>}
         {loaded?.truncated && <div className="px-3 py-1 text-[10px] text-[var(--text-muted)]">仅显示最近 5MB</div>}
         {error && <div className="px-3 py-2 text-xs text-[var(--accent-red)]">{error}</div>}
         {text === null && !error && <div className="px-3 py-2 text-xs text-[var(--text-muted)]">Loading...</div>}

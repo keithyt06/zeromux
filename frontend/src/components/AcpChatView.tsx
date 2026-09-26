@@ -613,7 +613,7 @@ export default function AcpChatView({ sessionId, agentType = 'claude', onRegiste
           setTurnStartedMs(prev => prev ?? t)
           // Silence baseline: seed from the backend's authoritative
           // last_activity_ms (same clock as Date.now()) so `stuck` — and thus the
-          // `stuck`-gated 中断 button — reflects the REAL accumulated agent
+          // stuck styling of the 中断 button (shown whenever busy) — reflects the REAL accumulated agent
           // silence, not a fresh clock restarted on every reconnect. A hung turn
           // is then interruptible immediately after reconnect. Missing value →
           // now (old-backend / unknown session); future stamp → clamped to now.

@@ -21,6 +21,7 @@ import Toast from './components/Toast'
 import { type DocTab, newDocTab, isDocTabId, loadDocTabs, saveDocTabs, resolveActivePane, DEFAULT_DOC_TITLE } from './lib/docTabs'
 import { pickDocTabForTarget } from './lib/docTarget'
 import type { AskAgentTarget } from './lib/askAgent'
+import { peerNamesKey, peerNamesFromKey } from './lib/peer'
 
 type AuthState = 'loading' | 'unauthenticated' | 'pending' | 'active'
 type OverlayView = 'none' | 'files' | 'git' | 'events' | 'memory'
@@ -29,10 +30,8 @@ export default function App() {
   const [authState, setAuthState] = useState<AuthState>('loading')
   const [user, setUser] = useState<UserInfo | null>(null)
   const [sessions, setSessions] = useState<SessionInfo[]>([])
-  const peerNames = useMemo(
-    () => Object.fromEntries(sessions.filter(s => s.peer_name).map(s => [s.peer_name as string, s.name])),
-    [sessions],
-  )
+  const peerKey = peerNamesKey(sessions)
+  const peerNames = useMemo(() => peerNamesFromKey(peerKey), [peerKey])
   const [hostTmux, setHostTmux] = useState<HostTmux[]>([])
   const [docTabs, setDocTabs] = useState<DocTab[]>(() => loadDocTabs())
   // Ref mirror so loadSessions (captures a stale docTabs closure) can resolve the

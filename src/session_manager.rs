@@ -2832,7 +2832,7 @@ fn spawn_acp_fanout(
                             }
                             let skip_boundary = step == ClaudeStep::SkipBoundary;
                             if skip_boundary {
-                                tracing::debug!(
+                                tracing::info!(
                                     "claude[{}]: origin-tagged boundary before our prompt was echoed; not settling",
                                     sid);
                             }

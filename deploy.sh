@@ -62,6 +62,33 @@ _ensure_running() {
   sudo systemctl start "$SERVICE" 2>/dev/null || true
 }
 
+# ── tmux server unit (terminals survive zeromux restarts) ────────────────────
+# Idempotent: install/refresh the unit file and make sure it is enabled+running.
+# NEVER restart it here — that would kill every terminal.
+ensure_tmux_unit() {
+  local src=deploy/zeromux-tmux.service dst=/etc/systemd/system/zeromux-tmux.service
+  if ! sudo cmp -s "$src" "$dst" 2>/dev/null; then
+    echo ">> Installing $dst"
+    sudo cp "$src" "$dst"
+    sudo systemctl daemon-reload
+  fi
+  sudo systemctl enable zeromux-tmux.service >/dev/null 2>&1 || true
+  if ! systemctl is-active --quiet zeromux-tmux.service; then
+    # tmux.conf must exist before the server starts; zeromux writes it at boot,
+    # but on first install zeromux may not have run the new binary yet.
+    [ -f "$HOME/.zeromux/tmux.conf" ] || "$BUILT" --print-tmux-conf > "$HOME/.zeromux/tmux.conf"
+    echo ">> Starting zeromux-tmux.service"
+    sudo systemctl start zeromux-tmux.service
+  fi
+
+  local dropin=/etc/systemd/system/zeromux.service.d/10-tmux.conf
+  if [ ! -f "$dropin" ]; then
+    sudo mkdir -p "$(dirname "$dropin")"
+    printf '[Unit]\nWants=zeromux-tmux.service\nAfter=zeromux-tmux.service\n' | sudo tee "$dropin" >/dev/null
+    sudo systemctl daemon-reload
+  fi
+}
+
 do_swap() {
   local built="$1"
   SWAP_BACKUP="${INSTALLED}.bak-$(date +%Y%m%d-%H%M%S)"
@@ -113,6 +140,7 @@ if [ "${1:-}" = "--build" ]; then
   cargo build --release
 fi
 
+ensure_tmux_unit
 [ -f "$BUILT" ] || { echo "!! $BUILT not found — run with --build first."; exit 1; }
 echo ">> Smoke-testing new binary..."
 "$BUILT" --help >/dev/null

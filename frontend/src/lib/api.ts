@@ -147,6 +147,13 @@ export async function listTmuxSessions(): Promise<TmuxSession[]> {
   return data.sessions || []
 }
 
+export interface TmuxHealth { server: boolean; in_unit: boolean }
+export async function getTmuxHealth(): Promise<TmuxHealth | null> {
+  const res = await api('/api/tmux/health')
+  if (!res.ok) return null
+  return res.json()
+}
+
 export interface DirEntry {
   name: string
   path: string

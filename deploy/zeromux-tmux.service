@@ -1,0 +1,19 @@
+[Unit]
+Description=ZeroMux tmux server (terminals survive zeromux restarts)
+After=network-online.target
+
+[Service]
+Type=simple
+User=ubuntu
+Group=ubuntu
+Environment=HOME=/home/ubuntu
+Environment=LANG=C.UTF-8
+WorkingDirectory=/home/ubuntu
+# -D: stay in foreground so systemd owns the server process (and its cgroup).
+ExecStart=/usr/bin/tmux -D -f /home/ubuntu/.zeromux/tmux.conf
+Restart=always
+RestartSec=2
+KillMode=control-group
+
+[Install]
+WantedBy=multi-user.target

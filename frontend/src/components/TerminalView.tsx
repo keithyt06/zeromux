@@ -2,13 +2,14 @@ import { useEffect, useRef, useCallback, useState } from 'react'
 import { Terminal } from '@xterm/xterm'
 import { FitAddon } from '@xterm/addon-fit'
 import { WebglAddon } from '@xterm/addon-webgl'
-import { wsUrl, getSessionStatus } from '../lib/api'
-import type { SessionStatus } from '../lib/api'
+import { wsUrl, getSessionStatus, getTmuxHealth } from '../lib/api'
+import type { SessionStatus, TmuxHealth } from '../lib/api'
 import type { Theme } from '../lib/theme'
 import { b64encode, b64decode } from '../lib/base64'
 import { GitBranch, Folder, Circle } from 'lucide-react'
 import MobileKeyBar, { type BarKey } from './MobileKeyBar'
 import Composer from './Composer'
+import { TmuxHealthBar } from './TerminalNotices'
 import { arrowSequence, rowHeight, linesFromDrag, bracketedPaste, submitSequence, controlSequence, launchSequence, type ArrowKey } from '../lib/terminalInput'
 import { shouldStickToBottom } from '../lib/scrollReplay'
 
@@ -81,6 +82,7 @@ export default function TerminalView({ sessionId, active, theme }: Props) {
   const userScrolledUpRef = useRef(false)
   const scrollDebounceRef = useRef<ReturnType<typeof setTimeout> | undefined>(undefined)
   const [status, setStatus] = useState<SessionStatus | null>(null)
+  const [health, setHealth] = useState<TmuxHealth | null>(null)
   // 触摸设备检测：any-pointer:coarse 或 maxTouchPoints>0，少漏触屏笔记本/iPad。
   // 触摸能力在页面生命周期内不变，用惰性初始化在挂载时算一次即可（避免 effect 内 setState）。
   const [isTouch] = useState(
@@ -100,6 +102,7 @@ export default function TerminalView({ sessionId, active, theme }: Props) {
       getSessionStatus(sessionId).then(s => {
         if (!cancelled) setStatus(s)
       }).catch(() => {})
+      getTmuxHealth().then(h => { if (!cancelled) setHealth(h) }).catch(() => {})
     }
     fetchStatus()
     const interval = setInterval(fetchStatus, 10000)
@@ -415,6 +418,7 @@ export default function TerminalView({ sessionId, active, theme }: Props) {
 
   return (
     <div className="flex flex-col h-full">
+      <TmuxHealthBar health={health} />
       <div ref={containerRef} className="xterm-container w-full flex-1 min-h-0" />
       {/* 触摸端：方向/启动键栏在上，常驻输入框贴底（最靠近软键盘）。 */}
       {isTouch && <MobileKeyBar onKey={handleBarKey} />}

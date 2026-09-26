@@ -73,6 +73,7 @@ pub fn build_router(state: Arc<AppState>) -> Router {
         .route("/api/push/unsubscribe", post(push_unsubscribe))
         .route("/api/push/test", post(push_test))
         .route("/api/tmux/sessions", get(list_tmux_sessions))
+        .route("/api/tmux/health", get(tmux_health))
         .route("/api/admin/users", get(crate::admin::list_users))
         .route(
             "/api/admin/users/{id}/approve",
@@ -727,6 +728,14 @@ async fn forget_quick_target(
 }
 
 // ── Tmux session listing ──
+
+async fn tmux_health(
+    State(state): State<Arc<AppState>>,
+    user: axum::Extension<CurrentUser>,
+) -> Result<Json<crate::tmux::TmuxHealth>, StatusCode> {
+    if !user.is_admin() { return Err(StatusCode::FORBIDDEN); }
+    Ok(Json(state.tmux.health().await))
+}
 
 async fn list_tmux_sessions(
     user: axum::Extension<CurrentUser>,

@@ -18,6 +18,7 @@ mod run_metrics;
 mod scheduled_tasks;
 mod session_manager;
 mod session_store;
+mod tmux;
 mod web;
 mod vault_watch;
 mod ws_handler;
@@ -107,6 +108,16 @@ struct Args {
     /// Data directory for SQLite database
     #[arg(long, default_value = "~/.zeromux")]
     data_dir: String,
+
+    /// tmux socket name (`tmux -L <name>`). Empty = default socket, which is what
+    /// lets you `tmux attach` from VSCode. Smoke tests MUST set this.
+    #[arg(long, default_value = "")]
+    tmux_socket: String,
+
+    /// Print the generated tmux.conf to stdout and exit (used by deploy.sh to
+    /// seed `~/.zeromux/tmux.conf` before zeromux-tmux.service first starts).
+    #[arg(long)]
+    print_tmux_conf: bool,
 
     /// Pre-approved GitHub usernames (comma-separated)
     #[arg(long, env = "ZEROMUX_ALLOWED_USERS")]
@@ -207,6 +218,7 @@ pub struct AppState {
     /// wikilink index (replaces the old synchronous startup walk).
     pub search: Arc<fuzzy_index::SearchIndexes>,
     pub quick_targets: Arc<quick_targets::QuickTargetStore>,
+    pub tmux: tmux::TmuxCtl,
 }
 
 fn gen_random_string(len: usize) -> String {
@@ -227,6 +239,11 @@ async fn main() {
     tracing_subscriber::fmt::init();
 
     let args = Args::parse();
+
+    if args.print_tmux_conf {
+        print!("{}", tmux::tmux_conf_text());
+        return;
+    }
 
     let oauth_configured =
         args.github_client_id.is_some() && args.github_client_secret.is_some();
@@ -257,6 +274,10 @@ async fn main() {
     } else {
         args.data_dir.clone()
     };
+
+    if let Err(e) = tmux::write_tmux_conf(std::path::Path::new(&data_dir_str)) {
+        tracing::warn!("write tmux.conf failed: {}", e);
+    }
 
     // Initialize database if OAuth is configured
     let database = if oauth_configured {
@@ -512,6 +533,7 @@ async fn main() {
         vault_dir,
         search,
         quick_targets: quick_targets_store,
+        tmux: tmux::TmuxCtl::new(Some(args.tmux_socket.clone())),
     });
 
     // Wire PushService into SessionManager and ScheduledStore if available.

@@ -1,6 +1,6 @@
 import { useState, useEffect, useCallback, useMemo, useRef } from 'react'
-import type { SessionInfo, SessionType, UserInfo } from './lib/api'
-import { listSessions, createSession, deleteSession, closeCheck, restoreSession, checkAuth, legacyLogin, clearAuth, renameSession, listConfirmations, getSessionStatus, isAuthError } from './lib/api'
+import type { SessionInfo, SessionType, UserInfo, HostTmux } from './lib/api'
+import { listSessions, listSessionsWithHost, createSession, deleteSession, closeCheck, restoreSession, checkAuth, legacyLogin, clearAuth, renameSession, listConfirmations, getSessionStatus, isAuthError } from './lib/api'
 import { deepLinkView } from './lib/deeplink'
 import { closeConfirmMessage } from './lib/closeSession'
 import { notifyQuickTargetsChanged } from './lib/quickTargetsBus'
@@ -29,6 +29,7 @@ export default function App() {
   const [authState, setAuthState] = useState<AuthState>('loading')
   const [user, setUser] = useState<UserInfo | null>(null)
   const [sessions, setSessions] = useState<SessionInfo[]>([])
+  const [hostTmux, setHostTmux] = useState<HostTmux[]>([])
   const [docTabs, setDocTabs] = useState<DocTab[]>(() => loadDocTabs())
   // Ref mirror so loadSessions (captures a stale docTabs closure) can resolve the
   // initial active pane against the live doc-tab list.
@@ -97,8 +98,10 @@ export default function App() {
 
   const loadSessions = useCallback(async () => {
     try {
-      const list = await listSessions()
+      const r = await listSessionsWithHost()
+      const list = r.sessions
       setSessions(list)
+      setHostTmux(r.host_tmux)
       // Keep the prior selection if it still resolves; otherwise pick a session,
       // then a doc tab. Doc tabs alone (0 sessions) must still get a live pane.
       setActiveId(prev => resolveActivePane(prev, list.map(s => s.id), docTabsRef.current.map(t => t.id)))
@@ -119,7 +122,9 @@ export default function App() {
     if (authState !== 'active') return
     const tick = setInterval(async () => {
       try {
-        setSessions(await listSessions())
+        const r = await listSessionsWithHost()
+        setSessions(r.sessions)
+        setHostTmux(r.host_tmux)
       } catch (err) {
         // A WS client can't observe the 401 on a failed upgrade, so its onclose just
         // reconnects forever. This REST poll is the reliable detector of credential
@@ -256,6 +261,8 @@ export default function App() {
     const s = await createSession(type, undefined, workDir, tmuxTarget, initialPrompt)
     notifyQuickTargetsChanged()   // the backend just bumped; re-rank any mounted quick lists
     setSessions(prev => [...prev, s])
+    // Attached host tmux is tracked now: drop it from the group before the next poll.
+    if (tmuxTarget) setHostTmux(prev => prev.filter(h => h.name !== tmuxTarget))
     setActiveId(s.id)
   }, [])
 
@@ -363,6 +370,7 @@ export default function App() {
   return (
     <div className="h-full flex bg-[var(--bg-primary)] text-[var(--text-primary)]">
       <Sidebar
+        hostTmux={hostTmux}
         sessions={sessions}
         docTabs={docTabs}
         activeId={activeId}

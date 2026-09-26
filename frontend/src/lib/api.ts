@@ -123,13 +123,19 @@ export async function legacyLogin(password: string, remember?: boolean): Promise
   return data.user
 }
 
-export async function listSessions(): Promise<SessionInfo[]> {
+export interface HostTmux { name: string; windows: number; attached: number; created: number; path: string }
+
+export async function listSessionsWithHost(): Promise<{ sessions: SessionInfo[]; host_tmux: HostTmux[] }> {
   const res = await api('/api/sessions')
   // Throw a status-carrying error so the background poll can tell a real 401/403
   // (→ logout) from a transient 5xx/network drop (→ keep retrying). (D-F1)
   if (!res.ok) throw new ApiError(res.status, 'listSessions failed')
   const data = await res.json()
-  return data.sessions || []
+  return { sessions: data.sessions || [], host_tmux: data.host_tmux || [] }
+}
+
+export async function listSessions(): Promise<SessionInfo[]> {
+  return (await listSessionsWithHost()).sessions
 }
 
 export async function createSession(type: SessionType, name?: string, workDir?: string, tmuxTarget?: string, initialPrompt?: string): Promise<SessionInfo> {

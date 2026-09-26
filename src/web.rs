@@ -936,7 +936,22 @@ async fn list_sessions(
         Some(user.id.as_str())
     };
     let sessions = state.sessions.list_sessions(filter);
-    Json(serde_json::json!({ "sessions": sessions }))
+    // Host tmux sessions are shared OS state → admin only (same gate as attach).
+    let host_tmux = if user.is_admin() { host_tmux_untracked(&state).await } else { vec![] };
+    Json(serde_json::json!({ "sessions": sessions, "host_tmux": host_tmux }))
+}
+
+/// `tmux ls` minus sessions zeromux already tracks. Cached 5s: the sidebar polls
+/// every 3s from every open tab.
+async fn host_tmux_untracked(state: &AppState) -> Vec<crate::tmux::HostTmux> {
+    let mut cache = state.host_tmux_cache.lock().await;
+    let fresh = matches!(&*cache, Some((t, _)) if t.elapsed() < std::time::Duration::from_secs(5));
+    if !fresh {
+        let list = state.tmux.list().await.unwrap_or_default();
+        *cache = Some((std::time::Instant::now(), list));
+    }
+    let tracked = state.sessions.tracked_tmux_names();
+    cache.as_ref().map(|(_, l)| l.iter().filter(|h| !tracked.contains(&h.name)).cloned().collect()).unwrap_or_default()
 }
 
 async fn revive_session(

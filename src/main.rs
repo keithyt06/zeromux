@@ -219,6 +219,8 @@ pub struct AppState {
     pub search: Arc<fuzzy_index::SearchIndexes>,
     pub quick_targets: Arc<quick_targets::QuickTargetStore>,
     pub tmux: tmux::TmuxCtl,
+    /// Short-TTL cache of `tmux ls` for the sidebar's "host tmux" group.
+    pub host_tmux_cache: tokio::sync::Mutex<Option<(std::time::Instant, Vec<tmux::HostTmux>)>>,
 }
 
 fn gen_random_string(len: usize) -> String {
@@ -535,6 +537,7 @@ async fn main() {
         search,
         quick_targets: quick_targets_store,
         tmux: tmux::TmuxCtl::new(Some(args.tmux_socket.clone())),
+        host_tmux_cache: tokio::sync::Mutex::new(None),
     });
 
     // Wire PushService into SessionManager and ScheduledStore if available.

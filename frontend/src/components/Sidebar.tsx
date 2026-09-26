@@ -1,9 +1,10 @@
 import { useState, useEffect, useCallback, useRef } from 'react'
-import type { SessionInfo, SessionType, DirEntry, UserInfo, TmuxSession, SearchResult, DirHit, NoteHit } from '../lib/api'
-import { listDirectories, listTmuxSessions, getSchedulerHealth, getVaultMeta, searchPaths, warmSearchIndex } from '../lib/api'
+import type { SessionInfo, SessionType, DirEntry, UserInfo, SearchResult, DirHit, NoteHit, HostTmux } from '../lib/api'
+import { isOrphan, matchHostTmux } from '../lib/hostTmux'
+import { listDirectories, getSchedulerHealth, getVaultMeta, searchPaths, warmSearchIndex } from '../lib/api'
 import { shouldShowVault } from '../lib/vault'
 import type { Theme } from '../lib/theme'
-import { Terminal, Plus, X, PanelLeftClose, PanelLeft, Sun, Moon, Folder, FolderGit2, ChevronLeft, Home, LogOut, Users, MonitorUp, Link, Clock, Bell, BookOpen, Settings, Pencil, Search } from 'lucide-react'
+import { Terminal, Plus, X, PanelLeftClose, PanelLeft, Sun, Moon, Folder, FolderGit2, ChevronLeft, Home, LogOut, Users, Clock, Bell, BookOpen, Settings, Pencil, Search } from 'lucide-react'
 import { type DocTab } from '../lib/docTabs'
 import AdminPanel from './AdminPanel'
 import ScheduledTasksPanel from './ScheduledTasksPanel'
@@ -37,6 +38,8 @@ interface Props {
   /** Optional only so this task compiles before App wires it (Task 10); App always passes it. */
   onOpenVault?: (target: { path: string; kind: 'note' | 'folder' }) => void
   askAgentRequest?: (AskAgentTarget & { nonce: number }) | null
+  /** Untracked host tmux sessions (admin only; empty otherwise). Click = attach. */
+  hostTmux?: HostTmux[]
 }
 
 /** Relative "last activity" label. <60s 刚刚, <60m Xm, <24h Xh, else Xd. */
@@ -66,7 +69,7 @@ function TurnDot({ s }: { s: SessionInfo }) {
   return <span className={`w-2 h-2 rounded-full shrink-0 ${cls}`} title={stuck ? '可能卡住' : undefined} />
 }
 
-type NewSessionStep = 'closed' | 'quick' | 'pick-type' | 'pick-terminal-mode' | 'pick-dir' | 'pick-tmux' | 'pick-prompt' | 'manage-prompts'
+type NewSessionStep = 'closed' | 'quick' | 'pick-type' | 'pick-dir' | 'pick-prompt' | 'manage-prompts'
 
 /** Per-agent-type icon used in session list rows. Kept in one place so the
  *  sidebar's two render sites (active row, condensed row) stay in sync as
@@ -81,7 +84,7 @@ function SessionTypeIcon({ type, size = 14, className }: { type: SessionType; si
   }
 }
 
-export default function Sidebar({ sessions, docTabs, activeId, onSelect, onCreate, onDelete, onRename, hasUnread, onLogout, theme, onToggleTheme, user, open, onToggle, mobile, confirmCount = 0, onOpenVault, askAgentRequest }: Props) {
+export default function Sidebar({ sessions, docTabs, activeId, onSelect, onCreate, onDelete, onRename, hasUnread, onLogout, theme, onToggleTheme, user, open, onToggle, mobile, confirmCount = 0, onOpenVault, askAgentRequest, hostTmux = [] }: Props) {
   const [step, setStep] = useState<NewSessionStep>('closed')
   const [pendingType, setPendingType] = useState<SessionType | null>(null)
   const [promptDraft, setPromptDraft] = useState('')
@@ -149,10 +152,6 @@ export default function Sidebar({ sessions, docTabs, activeId, onSelect, onCreat
   // in the wrong directory. Drop superseded writes. (lastDirPath only feeds retry.)
   const dirReqRef = useRef(0)
 
-  // Tmux session list state
-  const [tmuxSessions, setTmuxSessions] = useState<TmuxSession[]>([])
-  const [tmuxLoading, setTmuxLoading] = useState(false)
-
   const ThemeIcon = theme === 'dark' ? Sun : Moon
 
   const loadDirs = useCallback(async (path?: string) => {
@@ -177,15 +176,6 @@ export default function Sidebar({ sessions, docTabs, activeId, onSelect, onCreat
       setDirError(msg)
     }
     if (dirReqRef.current === req) setLoading(false)
-  }, [])
-
-  const loadTmuxSessions = useCallback(async () => {
-    setTmuxLoading(true)
-    try {
-      const sessions = await listTmuxSessions()
-      setTmuxSessions(sessions)
-    } catch { setTmuxSessions([]) }
-    setTmuxLoading(false)
   }, [])
 
   const runSearch = useCallback((query: string) => {
@@ -233,7 +223,11 @@ export default function Sidebar({ sessions, docTabs, activeId, onSelect, onCreat
   const selectType = (type: SessionType) => {
     setPendingType(type)
     if (type === 'tmux') {
-      setStep('pick-terminal-mode')
+      // Terminals are always tmux now: dir fixed by a quick card/search → create;
+      // otherwise pick a dir. (Attaching existing tmux lives in the session list.)
+      if (pendingDir) { onCreate('tmux', pendingDir); closeAfterCreate(); return }
+      setStep('pick-dir')
+      loadDirs()
     } else if (pendingDir && pendingSkipPrompt) {
       onCreate(type, pendingDir)
       closeAfterCreate()
@@ -247,24 +241,6 @@ export default function Sidebar({ sessions, docTabs, activeId, onSelect, onCreat
       setStep('pick-dir')
       loadDirs()
     }
-  }
-
-  const selectNewShell = () => {
-    // Honour a dir already fixed by a quick card — otherwise "open dir A in a
-    // terminal" throws the user back into a 5-level directory browse.
-    if (pendingDir) { onCreate('tmux', pendingDir); closeAfterCreate(); return }
-    setStep('pick-dir')
-    loadDirs()
-  }
-
-  const selectAttachTmux = () => {
-    setStep('pick-tmux')
-    loadTmuxSessions()
-  }
-
-  const attachTmuxSession = (name: string) => {
-    onCreate('tmux', undefined, name)
-    closeAfterCreate()
   }
 
   const selectDir = (path: string) => {
@@ -586,6 +562,24 @@ export default function Sidebar({ sessions, docTabs, activeId, onSelect, onCreat
             </button>
           </div>
         ))}
+        {hostTmux.length > 0 && (
+          <>
+            <div className="px-3 pt-3 pb-1 text-[10px] font-semibold text-[var(--text-muted)] uppercase tracking-wider">本机 tmux</div>
+            {hostTmux.map(h => (
+              <button
+                key={h.name}
+                onClick={() => onCreate('tmux', undefined, h.name)}
+                title={`${h.path}\n点击接入`}
+                className="flex items-center gap-2 w-[calc(100%-0.5rem)] px-3 py-1.5 mx-1 rounded text-xs text-[var(--text-secondary)] hover:bg-[var(--bg-tertiary)] hover:text-[var(--text-primary)]"
+              >
+                <span className="w-2 h-2 rounded-full border border-[var(--text-muted)] shrink-0" />
+                <span className="truncate">{h.name}</span>
+                {isOrphan(h) && <span className="text-[10px] text-[var(--accent-yellow)] shrink-0">zeromux 遗留</span>}
+                <span className="ml-auto text-[10px] text-[var(--text-muted)] shrink-0">{h.windows} win{h.attached > 0 ? ` · 🖥${h.attached}` : ''}</span>
+              </button>
+            ))}
+          </>
+        )}
       </div>
 
       {/* New session */}
@@ -610,8 +604,16 @@ export default function Sidebar({ sessions, docTabs, activeId, onSelect, onCreat
                   {/* Results area is the only part that grows; capped so the popover (which
                       grows UPWARD from the bottom anchor) never pushes the input off-screen. */}
                   <div className="max-h-[40vh] overflow-y-auto border-b border-[var(--border)]">
-                    {query.trim() ? (
-                      searchResult || searchFailed ? (
+                    {query.trim() ? (<>
+                      {matchHostTmux(hostTmux, query).map(h => (
+                        <button key={`tmux-${h.name}`} onClick={() => { onCreate('tmux', undefined, h.name); closeAfterCreate() }}
+                          className="flex items-center gap-2.5 w-full px-3 py-2 text-xs text-[var(--text-primary)] hover:bg-[var(--bg-hover)]">
+                          <Terminal size={13} className="text-[var(--accent-green-text)] shrink-0" />
+                          <span className="truncate">接入 tmux：{h.name}</span>
+                          <span className="ml-auto text-[10px] text-[var(--text-muted)] truncate">{h.path}</span>
+                        </button>
+                      ))}
+                      {searchResult || searchFailed ? (
                         <SearchResults
                           result={searchResult ?? { dirs: null, notes: null }}
                           failed={searchFailed}
@@ -626,8 +628,8 @@ export default function Sidebar({ sessions, docTabs, activeId, onSelect, onCreat
                           onAskAgent={(h) => askAgent({ absDir: h.abs_dir, relPath: h.path, kind: h.kind })}
                           onOpenHere={openHere}
                         />
-                      ) : <div className="px-3 py-2 text-[10px] text-[var(--text-muted)]">搜索中…</div>
-                    ) : (
+                      ) : <div className="px-3 py-2 text-[10px] text-[var(--text-muted)]">搜索中…</div>}
+                    </>) : (
                       /* 一击直达：点一行 = 用该行的 agent 直接创建，0 次列目录请求。
                          刻意跳过 prompt 页——中间插一页就退化成「少点两下的老流程」，
                          而且信息零丢失：会话建好后 AcpChatView 的 composer 里有一模一样的
@@ -703,7 +705,7 @@ export default function Sidebar({ sessions, docTabs, activeId, onSelect, onCreat
               {step === 'pick-type' && (
                 <>
                   {/* `quick` is the first screen now, so pick-type is a second screen and
-                      needs a way back — matching pick-terminal-mode / pick-dir. */}
+                      needs a way back — matching pick-dir. */}
                   <div className="flex items-center gap-1 px-2 py-1.5 border-b border-[var(--border)]">
                     <button
                       onClick={() => { setPendingDir(null); setPendingSkipPrompt(false); setPendingAgentContext(null); setCurrentPath(''); setStep('quick') }}
@@ -727,7 +729,7 @@ export default function Sidebar({ sessions, docTabs, activeId, onSelect, onCreat
                       <Terminal size={14} className="text-[var(--accent-green-text)] shrink-0" />
                       <div className="text-left">
                         <div className="font-medium">Terminal</div>
-                        <div className="text-[10px] text-[var(--text-secondary)]">bash / tmux shell</div>
+                        <div className="text-[10px] text-[var(--text-secondary)]">持久 tmux 会话，可在 VSCode 接续</div>
                       </div>
                     </button>
                   )}
@@ -776,79 +778,6 @@ export default function Sidebar({ sessions, docTabs, activeId, onSelect, onCreat
                       </div>
                     </button>
                   )}
-                </>
-              )}
-
-              {step === 'pick-terminal-mode' && (
-                <>
-                  <div className="flex items-center gap-1 px-2 py-1.5 border-b border-[var(--border)]">
-                    <button
-                      onClick={() => setStep('pick-type')}
-                      className="p-0.5 text-[var(--text-secondary)] hover:text-[var(--text-primary)] rounded transition-colors"
-                      title="Back"
-                    >
-                      <ChevronLeft size={14} />
-                    </button>
-                    <span className="text-[10px] font-semibold text-[var(--text-muted)] uppercase tracking-wider">Terminal mode</span>
-                  </div>
-                  <button
-                    onClick={selectNewShell}
-                    className="flex items-center gap-2.5 w-full px-3 py-2 text-xs text-[var(--text-primary)] hover:bg-[var(--bg-hover)] transition-colors"
-                  >
-                    <MonitorUp size={14} className="text-[var(--accent-green-text)] shrink-0" />
-                    <div className="text-left">
-                      <div className="font-medium">New Shell</div>
-                      <div className="text-[10px] text-[var(--text-secondary)]">Start a fresh terminal</div>
-                    </div>
-                  </button>
-                  <button
-                    onClick={selectAttachTmux}
-                    className="flex items-center gap-2.5 w-full px-3 py-2 text-xs text-[var(--text-primary)] hover:bg-[var(--bg-hover)] transition-colors"
-                  >
-                    <Link size={14} className="text-[var(--accent-blue)] shrink-0" />
-                    <div className="text-left">
-                      <div className="font-medium">Attach tmux</div>
-                      <div className="text-[10px] text-[var(--text-secondary)]">Connect to existing session</div>
-                    </div>
-                  </button>
-                </>
-              )}
-
-              {step === 'pick-tmux' && (
-                <>
-                  <div className="flex items-center gap-1 px-2 py-1.5 border-b border-[var(--border)]">
-                    <button
-                      onClick={() => setStep('pick-terminal-mode')}
-                      className="p-0.5 text-[var(--text-secondary)] hover:text-[var(--text-primary)] rounded transition-colors"
-                      title="Back"
-                    >
-                      <ChevronLeft size={14} />
-                    </button>
-                    <span className="text-[10px] font-semibold text-[var(--text-muted)] uppercase tracking-wider">tmux sessions</span>
-                  </div>
-                  <div className="max-h-48 overflow-y-auto">
-                    {tmuxLoading ? (
-                      <div className="px-3 py-2 text-[10px] text-[var(--text-muted)]">Loading...</div>
-                    ) : tmuxSessions.length === 0 ? (
-                      <div className="px-3 py-2 text-[10px] text-[var(--text-muted)]">No tmux sessions running</div>
-                    ) : (
-                      tmuxSessions.map(s => (
-                        <button
-                          key={s.name}
-                          onClick={() => attachTmuxSession(s.name)}
-                          className="flex items-center gap-2.5 w-full px-3 py-2 text-xs text-[var(--text-primary)] hover:bg-[var(--bg-hover)] transition-colors"
-                        >
-                          <Terminal size={13} className="text-[var(--accent-green-text)] shrink-0" />
-                          <div className="flex-1 min-w-0 text-left">
-                            <div className="font-medium truncate">{s.name}</div>
-                            <div className="text-[10px] text-[var(--text-secondary)]">
-                              {s.windows} window{s.windows !== 1 ? 's' : ''}{s.attached > 0 ? ' · attached' : ''}
-                            </div>
-                          </div>
-                        </button>
-                      ))
-                    )}
-                  </div>
                 </>
               )}
 

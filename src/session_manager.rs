@@ -1053,6 +1053,8 @@ impl SessionManager {
         let id = uuid::Uuid::new_v4().to_string();
 
         let (tmux_name, origin) = match tmux_target {
+            // Adopting a zeromux leftover: it's ours, recreate-on-loss semantics apply.
+            Some(t) if t.starts_with("zmx-") => (t.to_string(), TmuxOrigin::Own),
             Some(t) => (t.to_string(), TmuxOrigin::External),
             None => (crate::tmux::tmux_name_for(&id), TmuxOrigin::Own),
         };
@@ -2343,6 +2345,15 @@ impl SessionManager {
             other_clients: info.as_ref().map(|i| i.attached.saturating_sub(running as u32)).unwrap_or(0),
             busy_command: info.map(|i| i.current_command).filter(|c| !SHELLS.contains(&c.as_str())),
         })
+    }
+
+    /// Names of every tmux session bound to a zeromux session — including ones
+    /// pending kill, so a just-closed window doesn't reappear as "host tmux".
+    pub fn tracked_tmux_names(&self) -> std::collections::HashSet<String> {
+        self.sessions.lock().unwrap().values().filter_map(|s| match (&s.resume_token, s.tmux_origin) {
+            (Some(ResumeToken::Tmux(n)), Some(_)) => Some(n.clone()),
+            _ => None,
+        }).collect()
     }
 
     pub fn tmux_binding(&self, id: &str) -> Option<(String, TmuxOrigin)> {
@@ -6094,6 +6105,16 @@ mod tmux_session_tests {
         let (m, _d) = mgr_with(srv.ctl.clone());
         let id = m.create_pty_session("x".into(), "bash", "/tmp", 80, 24, "u", Some("vscode-dev")).await.unwrap();
         assert_eq!(m.tmux_binding(&id), Some(("vscode-dev".into(), TmuxOrigin::External)));
+    }
+
+    #[tokio::test]
+    async fn adopting_zmx_orphan_is_own_and_tracked() {
+        let Some(srv) = TestServer::start() else { return };
+        srv.ctl.run(&["new-session", "-d", "-s", "zmx-deadbeef"]).await.unwrap();
+        let (m, _d) = mgr_with(srv.ctl.clone());
+        let id = m.create_pty_session("o".into(), "bash", "/tmp", 80, 24, "u", Some("zmx-deadbeef")).await.unwrap();
+        assert_eq!(m.tmux_binding(&id).unwrap().1, TmuxOrigin::Own);
+        assert!(m.tracked_tmux_names().contains("zmx-deadbeef"));
     }
 
     #[tokio::test]

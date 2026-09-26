@@ -298,7 +298,8 @@ export default function App() {
     setDocTabs(prev => prev.map(t => t.id === id ? { ...t, title: title ?? DEFAULT_DOC_TITLE } : t))
   }, [])
 
-  const [undoToast, setUndoToast] = useState<{ id: string; name: string } | null>(null)
+  const [undoToast, setUndoToast] = useState<{ id: string; name: string; durationMs: number } | null>(null)
+  const [failToast, setFailToast] = useState(false)
 
   const handleDelete = useCallback(async (id: string) => {
     const s = sessions.find(x => x.id === id)
@@ -306,7 +307,13 @@ export default function App() {
       const msg = closeConfirmMessage(s.name, await closeCheck(id))
       if (msg && !window.confirm(msg)) return
     }
-    const r = await deleteSession(id)
+    let r: { pending_until?: number }
+    try {
+      r = await deleteSession(id)
+    } catch {
+      await loadSessions()
+      return
+    }
     setSessions(prev => {
       const next = prev.filter(x => x.id !== id)
       if (activeId === id) {
@@ -314,8 +321,13 @@ export default function App() {
       }
       return next
     })
-    if (r.pending_until && s) setUndoToast({ id, name: s.name })
-  }, [activeId, docTabs, sessions])
+    // End the toast a bit before the server's undo window so a late click can't
+    // silently hit 410.
+    if (r.pending_until && s) {
+      const durationMs = Math.max(1000, (r.pending_until ?? 0) - Date.now() - 500) || 4500
+      setUndoToast({ id, name: s.name, durationMs })
+    }
+  }, [activeId, docTabs, sessions, loadSessions])
 
   const handleApproved = useCallback(() => {
     setAuthState('active')
@@ -455,10 +467,16 @@ export default function App() {
             key={undoToast.id}
             message={`已关闭 ${undoToast.name}`}
             actionLabel="撤销"
-            durationMs={5000}
-            onAction={async () => { if (await restoreSession(undoToast.id)) { await loadSessions(); setActiveId(undoToast.id) } }}
+            durationMs={undoToast.durationMs}
+            onAction={async () => {
+              if (await restoreSession(undoToast.id)) { await loadSessions(); setActiveId(undoToast.id) }
+              else setFailToast(true)
+            }}
             onDone={() => setUndoToast(null)}
           />
+        )}
+        {failToast && (
+          <Toast message="撤销失败，会话已关闭" durationMs={3000} onDone={() => setFailToast(false)} />
         )}
       </main>
     </div>

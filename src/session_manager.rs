@@ -2277,11 +2277,11 @@ impl SessionManager {
     /// `tmux kill-session`. Deliberately not in Drop: detach / fan-out exit must
     /// never kill the user's tmux session.
     pub async fn finalize_pending_kill(&self, id: &str, now: i64) -> bool {
-        let name = {
+        let (name, ended) = {
             let map = self.sessions.lock().unwrap();
             match map.get(id) {
                 Some(s) if s.pending_kill_until.is_some_and(|t| t <= now) => match &s.resume_token {
-                    Some(ResumeToken::Tmux(n)) => n.clone(),
+                    Some(ResumeToken::Tmux(n)) => (n.clone(), matches!(s.status, SessionMeta::Ended)),
                     _ => return false,
                 },
                 _ => return false,
@@ -2290,8 +2290,12 @@ impl SessionManager {
         // Remove FIRST so the fan-out's exit check finds no binding and doesn't
         // report this deliberate close as "ended elsewhere" / push it.
         let removed = self.remove_session(id);
-        if let Err(e) = self.tmux.kill(&name).await {
-            tracing::warn!("kill tmux {} for {} failed: {}", name, id, e);
+        // Ended = our binding is already gone; a session now holding that name is
+        // someone else's (e.g. re-created in VSCode) and must not be killed.
+        if !ended {
+            if let Err(e) = self.tmux.kill(&name).await {
+                tracing::warn!("kill tmux {} for {} failed: {}", name, id, e);
+            }
         }
         removed
     }
@@ -2311,6 +2315,8 @@ impl SessionManager {
         let (name, origin, running) = {
             let map = self.sessions.lock().unwrap();
             let s = map.get(id)?;
+            // Dead binding: nothing to warn about (and the name may belong to someone else now).
+            if matches!(s.status, SessionMeta::Ended) { return None; }
             match (&s.resume_token, s.tmux_origin) {
                 (Some(ResumeToken::Tmux(n)), Some(o)) => (n.clone(), o, s.running.is_some()),
                 _ => return None,
@@ -6246,6 +6252,28 @@ mod tmux_session_tests {
         let s = map.get("r1").unwrap();
         assert!(s.running.is_some(), "a concurrent respawn must survive mark_ended");
         assert!(matches!(s.status, SessionMeta::Running), "status unchanged while running");
+        drop(map);
+        let mut sp = test_session_for_size();
+        sp.id = "sp".into();
+        sp.spawning = true;
+        m.sessions.lock().unwrap().insert("sp".into(), sp);
+        m.mark_ended("sp");
+        assert!(matches!(m.sessions.lock().unwrap().get("sp").unwrap().status, SessionMeta::Idle),
+            "a spawning session must not be marked Ended");
+    }
+
+    #[tokio::test]
+    async fn closing_ended_session_does_not_kill_recreated_name() {
+        let Some(srv) = TestServer::start() else { return };
+        let (m, _d) = mgr_with(srv.ctl.clone());
+        idle_tmux(&m, "e", "x", TmuxOrigin::External);
+        assert!(matches!(m.tmux_preflight("e").await, Preflight::Ended));
+        srv.ctl.run(&["new-session", "-d", "-s", "x"]).await.unwrap(); // re-created elsewhere
+        assert!(m.close_check("e").await.is_none(), "no confirm for a dead binding");
+        assert!(m.mark_pending_kill("e", 0));
+        assert!(m.finalize_pending_kill("e", PENDING_KILL_MS).await);
+        assert!(srv.ctl.has("x").await.unwrap(), "unrelated session with the same name survives");
+        assert!(m.tmux_binding("e").is_none(), "zeromux session removed");
     }
 
     fn test_session_for_size() -> Session {

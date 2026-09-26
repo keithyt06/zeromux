@@ -6,7 +6,7 @@ import { defaultGitTab, COMMIT_PROMPT, DISCARD_PROMPT } from '../lib/gitviewer'
 
 interface Props {
   sessionId: string
-  onForward?: (text: string) => void
+  onForward?: (text: string) => boolean
 }
 
 // Colors for graph lanes
@@ -264,16 +264,17 @@ function WorktreePanel({ wt, selected, onSelect, onRefresh, onForward }: {
   selected: string | null
   onSelect: (path: string) => void
   onRefresh: () => void
-  onForward?: (text: string) => void
+  onForward?: (text: string) => boolean
 }) {
   // After a forward, show a brief "已发送给 agent" line and disable both buttons so
   // a second tap can't queue a duplicate prompt (the chat where it lands is hidden
   // behind this overlay, so the panel itself must give the only feedback).
   const [sent, setSent] = useState(false)
+  const [failed, setFailed] = useState(false)
   const forward = useCallback((text: string, confirmMsg?: string) => {
     if (!onForward) return
     if (confirmMsg && !window.confirm(confirmMsg)) return
-    onForward(text)
+    if (!onForward(text)) { setFailed(true); setTimeout(() => setFailed(false), 4000); return }
     setSent(true)
     setTimeout(() => setSent(false), 4000)
   }, [onForward])
@@ -337,6 +338,7 @@ function WorktreePanel({ wt, selected, onSelect, onRefresh, onForward }: {
                 已发送给 agent,切到 Chat 查看执行
               </div>
             )}
+            {failed && <div className="px-2 pt-2"><span className="text-xs text-[var(--accent-red)]">未连接,未发送</span></div>}
             <div className="flex gap-2 p-2">
               <button onClick={() => forward(COMMIT_PROMPT)} disabled={sent}
                 className="px-2 py-1 text-xs rounded bg-[var(--bg-tertiary)] text-[var(--text-primary)] hover:bg-[var(--bg-hover)] disabled:opacity-40 disabled:cursor-not-allowed">让 agent 提交</button>

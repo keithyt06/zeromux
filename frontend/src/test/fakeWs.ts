@@ -12,6 +12,10 @@ export interface FakeSocket {
   onmessage: ((e: { data: string }) => void) | null
   /** 推一帧到组件（等价于服务端 broadcast）。 */
   emit(evt: unknown): void
+  /** 模拟握手完成:readyState→OPEN 并调用 onopen。 */
+  fireOpen(): void
+  /** 模拟断线:readyState→CLOSED 并调用 onclose。 */
+  fireClose(): void
 }
 
 /** 装上替身，返回「取最近一个实例」的句柄。调用方在 afterEach 里 restore。 */
@@ -32,6 +36,8 @@ export function installFakeWebSocket(): { latest: () => FakeSocket; all: FakeSoc
     send(data: string) { this.sent.push(data) }
     close() { this.readyState = 3 }
     emit(evt: unknown) { this.onmessage?.({ data: JSON.stringify(evt) }) }
+    fireOpen() { this.readyState = 1; this.onopen?.() }
+    fireClose() { this.readyState = 3; this.onclose?.() }
   }
   // WebSocket.OPEN 是组件里 readyState 比较的来源，必须一并提供。
   ;(globalThis as unknown as { WebSocket: unknown }).WebSocket = Fake

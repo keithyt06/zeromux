@@ -6,6 +6,8 @@ import { peerLabel } from '../lib/peer'
 import { ChevronDown, Wrench, Brain, AlertCircle, FileText, Terminal, Search, Bot, Paperclip, ListPlus, X, Ban, Check, type LucideIcon } from 'lucide-react'
 import MarkdownContent from './markdown/MarkdownContent'
 import Composer from './Composer'
+import ConnectionBar from './ConnectionBar'
+import type { WsStatus } from '../lib/wsStatus'
 import PromptManager from './PromptManager'
 import { usePromptPresets } from '../lib/usePromptPresets'
 import { applyPreset } from '../lib/applyPreset'
@@ -70,7 +72,7 @@ interface Props {
   agentType?: 'claude' | 'crew' | 'codex'
   // Lets the parent (App→SessionInfoBar) drive WS-only controls that live in
   // this component. Registered on mount, cleared on unmount. (G2b queue mode.)
-  onRegisterControls?: (sessionId: string, api: { setQueueMode: (mode: string) => void; sendPrompt: (text: string) => void } | null) => void
+  onRegisterControls?: (sessionId: string, api: { setQueueMode: (mode: string) => void; sendPrompt: (text: string) => boolean } | null) => void
   // Report the backend-authoritative queue mode UP to App so the sibling
   // SessionInfoBar dropdown reflects the real mode (review 2026-07-28). The
   // functional path uses queueModeRef; this only mirrors the same value into
@@ -143,6 +145,9 @@ export default function AcpChatView({ sessionId, agentType = 'claude', onRegiste
   // 上下文用量（Crew 白拿的新能力：zeromux 自己没有）。
   const [ctxUsage, setCtxUsage] = useState<{ used: number; total: number } | null>(null)
   const [busy, setBusy] = useState(false)
+  // WS connection state for the ConnectionBar (B8). Mirrors onopen/onclose only;
+  // backoff/attempt logic is untouched (I-4).
+  const [wsStatus, setWsStatus] = useState<{ status: WsStatus; since: number }>(() => ({ status: 'connecting', since: Date.now() }))
   const [pending, setPending] = useState<string[]>([])   // 已上传待发的实际路径
   const [uploading, setUploading] = useState(0)           // 上传中计数
   const fileInputRef = useRef<HTMLInputElement>(null)
@@ -337,6 +342,7 @@ export default function AcpChatView({ sessionId, agentType = 'claude', onRegiste
       wsRef.current = ws
 
       ws.onopen = () => {
+        setWsStatus({ status: 'open', since: Date.now() })
         // Reset backoff only after the connection proves STABLE (~3s), not on the
         // instant it opens. Otherwise an accept-then-immediately-close loop (app-level
         // close after upgrade, a deleted/unavailable session, or a proxy that 1006s
@@ -377,6 +383,7 @@ export default function AcpChatView({ sessionId, agentType = 'claude', onRegiste
 
       ws.onclose = () => {
         wsRef.current = null
+        if (!disposed) setWsStatus({ status: 'reconnecting', since: Date.now() })
         // A close before the stability timer fires means this open did NOT prove
         // stable — cancel the pending reset so `attempt` keeps escalating.
         clearTimeout(stableTimer)
@@ -683,8 +690,8 @@ export default function AcpChatView({ sessionId, agentType = 'claude', onRegiste
     setPending(p => p.filter(x => x !== path))
   }, [])
 
-  const sendPrompt = useCallback((text: string) => {
-    if (!wsRef.current || wsRef.current.readyState !== WebSocket.OPEN) return
+  const sendPrompt = useCallback((text: string): boolean => {
+    if (!wsRef.current || wsRef.current.readyState !== WebSocket.OPEN) return false
     const full = buildPromptWithAttachments(text, pending)
     // Optimistic bubble: insert immediately with MAX_SAFE_INTEGER turn_id so it
     // sorts last (newest) until the server echo arrives with the true turn_id,
@@ -695,7 +702,6 @@ export default function AcpChatView({ sessionId, agentType = 'claude', onRegiste
     // even if they had scrolled up to read history a moment before.
     appendEvent({ type: 'user_prompt', text: full, turn_id: Number.MAX_SAFE_INTEGER, client_id: cid }, true)
     wsRef.current.send(JSON.stringify({ type: 'prompt', text: full, client_id: cid }))
-    setInput('')
     setPending([])
     // If a turn is already in flight, a send in the default Collect queue mode is
     // merely enqueued server-side (no interrupt, no new turn) — re-seeding the clocks
@@ -720,6 +726,7 @@ export default function AcpChatView({ sessionId, agentType = 'claude', onRegiste
       // still measured (otherwise lastEventMs stays null → never stuck).
       setLastEventMs(sentAt)
     }
+    return true
   }, [appendEvent, pending])
 
   // Keep busyRef in sync so sendPrompt (whose deps omit busy) can tell whether a
@@ -858,6 +865,7 @@ export default function AcpChatView({ sessionId, agentType = 'claude', onRegiste
         {notices.map(n => <NoticeBubble key={n.id} notice={n} />)}
       </div>
 
+      <ConnectionBar status={wsStatus.status} sinceMs={wsStatus.since} />
       <div className="relative flex flex-col px-4 py-3 border-t border-[var(--border)] bg-[var(--bg-secondary)]">
         {queuedCount > 0 && (
           <div className="px-2 pb-1 text-xs text-[var(--text-muted)]">
@@ -1038,7 +1046,7 @@ export default function AcpChatView({ sessionId, agentType = 'claude', onRegiste
         <Composer
           value={input}
           onChange={setInput}
-          onSend={sendPrompt}
+          onSend={(t) => { const ok = sendPrompt(t); if (ok) setInput(''); return ok }}
           submitOnEnter={true}
           placeholder={`Send a message to ${agentType === 'crew' ? 'Crew' : agentType === 'codex' ? 'Codex' : 'Claude'}...`}
           rightSlot={

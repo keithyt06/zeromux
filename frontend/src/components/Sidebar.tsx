@@ -114,6 +114,11 @@ export default function Sidebar({ sessions, docTabs, activeId, onSelect, onCreat
   const [schedulerHealthy, setSchedulerHealthy] = useState(true)
   const [editingId, setEditingId] = useState<string | null>(null)
   const [createError, setCreateError] = useState<string | null>(null)
+  // Synchronous in-flight guard: two taps can land in the same tick before a
+  // re-render, so state alone can't stop a double create. `creating` mirrors it
+  // for the pending UI.
+  const creatingRef = useRef(false)
+  const [creating, setCreating] = useState(false)
 
   const commitRename = (id: string, name: string) => {
     setEditingId(null)
@@ -295,12 +300,18 @@ export default function Sidebar({ sessions, docTabs, activeId, onSelect, onCreat
   // Await creation; only tear the popover down on success. On failure keep the
   // user where they are with a visible reason (audit B3) — never close silently.
   const runCreate = async (create: () => Promise<void>, after: () => void = closeAfterCreate) => {
+    if (creatingRef.current) return
+    creatingRef.current = true
+    setCreating(true)
     setCreateError(null)
     try {
       await create()
       after()
     } catch (e) {
       setCreateError(`创建失败:${(e as Error).message || '未知错误'}`)
+    } finally {
+      creatingRef.current = false
+      setCreating(false)
     }
   }
 
@@ -579,6 +590,9 @@ export default function Sidebar({ sessions, docTabs, activeId, onSelect, onCreat
                 {createError}
               </div>
             )}
+            {creating && (
+              <div className="mx-2 my-1 px-2 py-1.5 text-xs text-[var(--text-muted)]">创建中…</div>
+            )}
             {hostTmux.map(h => (
               <button
                 key={h.name}
@@ -615,6 +629,9 @@ export default function Sidebar({ sessions, docTabs, activeId, onSelect, onCreat
                   {createError}
                 </div>
               )}
+              {creating && (
+                <div className="mx-2 my-1 px-2 py-1.5 text-xs text-[var(--text-muted)]">创建中…</div>
+              )}
               {step === 'quick' && (
                 <>
                   <div className="px-3 py-1.5 text-[10px] font-semibold text-[var(--text-muted)] uppercase tracking-wider">
@@ -625,7 +642,7 @@ export default function Sidebar({ sessions, docTabs, activeId, onSelect, onCreat
                   <div className="max-h-[40vh] overflow-y-auto border-b border-[var(--border)]">
                     {query.trim() ? (<>
                       {matchHostTmux(hostTmux, query).map(h => (
-                        <button key={`tmux-${h.name}`} onClick={() => runCreate(() => onCreate('tmux', undefined, h.name))}
+                        <button key={`tmux-${h.name}`} disabled={creating} onClick={() => runCreate(() => onCreate('tmux', undefined, h.name))}
                           className="flex items-center gap-2.5 w-full px-3 py-2 text-xs text-[var(--text-primary)] hover:bg-[var(--bg-hover)]">
                           <Terminal size={13} className="text-[var(--accent-green-text)] shrink-0" />
                           <span className="truncate">接入 tmux：{h.name}</span>
@@ -685,6 +702,7 @@ export default function Sidebar({ sessions, docTabs, activeId, onSelect, onCreat
                     <button
                       type="button"
                       onClick={() => runCreate(() => onCreate('vault'))}
+                      disabled={creating}
                       className="flex items-center gap-2 w-full px-3 py-2.5 min-h-[44px] text-xs text-[var(--text-secondary)] hover:bg-[var(--bg-hover)] transition-colors"
                     >
                       <BookOpen size={13} className="shrink-0" />
@@ -742,6 +760,7 @@ export default function Sidebar({ sessions, docTabs, activeId, onSelect, onCreat
                   {!pendingAgentContext && (
                     <button
                       onClick={() => selectType('tmux')}
+                      disabled={creating}
                       className="flex items-center gap-2.5 w-full px-3 py-2 text-xs text-[var(--text-primary)] hover:bg-[var(--bg-hover)] transition-colors"
                     >
                       <Terminal size={14} className="text-[var(--accent-green-text)] shrink-0" />
@@ -753,6 +772,7 @@ export default function Sidebar({ sessions, docTabs, activeId, onSelect, onCreat
                   )}
                   <button
                     onClick={() => selectType('claude')}
+                    disabled={creating}
                     className="flex items-center gap-2.5 w-full px-3 py-2 text-xs text-[var(--text-primary)] hover:bg-[var(--bg-hover)] transition-colors"
                   >
                     <ClaudeCodeIcon size={14} className="shrink-0" />
@@ -766,6 +786,7 @@ export default function Sidebar({ sessions, docTabs, activeId, onSelect, onCreat
                       副标题是唯一能解释「它和 Claude 有何不同」的位置。 */}
                   <button
                     onClick={() => selectType('crew')}
+                    disabled={creating}
                     className="flex items-center gap-2.5 w-full px-3 py-2 text-xs text-[var(--text-primary)] hover:bg-[var(--bg-hover)] transition-colors"
                   >
                     <CrewIcon size={14} className="shrink-0" />
@@ -776,6 +797,7 @@ export default function Sidebar({ sessions, docTabs, activeId, onSelect, onCreat
                   </button>
                   <button
                     onClick={() => selectType('codex')}
+                    disabled={creating}
                     className="flex items-center gap-2.5 w-full px-3 py-2 text-xs text-[var(--text-primary)] hover:bg-[var(--bg-hover)] transition-colors"
                   >
                     <CodexIcon size={14} className="text-[var(--text-primary)] shrink-0" />
@@ -787,6 +809,7 @@ export default function Sidebar({ sessions, docTabs, activeId, onSelect, onCreat
                   {vaultEnabled && !pendingAgentContext && (
                     <button
                       onClick={() => runCreate(() => onCreate('vault'))}
+                      disabled={creating}
                       className="flex items-center gap-2.5 w-full px-3 py-2 text-xs text-[var(--text-primary)] hover:bg-[var(--bg-hover)] transition-colors"
                     >
                       <BookOpen size={14} className="text-[var(--accent-blue)] shrink-0" />
@@ -831,7 +854,7 @@ export default function Sidebar({ sessions, docTabs, activeId, onSelect, onCreat
                     </div>
                     <button
                       onClick={() => selectDir(currentPath)}
-                      disabled={!currentPath}
+                      disabled={!currentPath || creating}
                       className="w-full py-1 text-[10px] font-semibold bg-[var(--accent-blue)] hover:bg-[var(--accent-blue-hover)] text-white rounded transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
                     >
                       Use this directory
@@ -933,12 +956,14 @@ export default function Sidebar({ sessions, docTabs, activeId, onSelect, onCreat
                         <>
                           <button
                             onClick={submitSkip}
+                            disabled={creating}
                             className="px-2 py-1 text-[10px] font-semibold text-[var(--text-secondary)] hover:text-[var(--text-primary)] transition-colors"
                           >
                             Skip &amp; create
                           </button>
                           <button
                             onClick={submitWithPrompt}
+                            disabled={creating}
                             className="px-3 py-1 text-[10px] font-semibold bg-[var(--accent-blue)] hover:bg-[var(--accent-blue-hover)] text-white rounded transition-colors"
                           >
                             Create &amp; send
@@ -947,6 +972,7 @@ export default function Sidebar({ sessions, docTabs, activeId, onSelect, onCreat
                       ) : (
                         <button
                           onClick={submitSkip}
+                          disabled={creating}
                           className="px-3 py-1 text-[10px] font-semibold bg-[var(--accent-blue)] hover:bg-[var(--accent-blue-hover)] text-white rounded transition-colors"
                         >
                           Create

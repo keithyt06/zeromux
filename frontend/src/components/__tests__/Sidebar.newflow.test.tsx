@@ -82,4 +82,17 @@ describe('Sidebar new terminal flow', () => {
     fireEvent.click(screen.getByText('New session'))
     expect(screen.queryByText(/创建失败/)).toBeNull()
   })
+  it('double tap on a quick target while create is in flight creates only one session', async () => {
+    vi.spyOn(api, 'listQuickTargets').mockResolvedValue({ top: [
+      { kind: 'dir', path: '/w/p', agent: 'claude', display: 'p', hint: '/w/p' },
+    ] })
+    const onCreate = vi.fn(() => new Promise<void>(() => {}))   // never resolves
+    setup({ onCreate })
+    fireEvent.click(screen.getByText('New session'))
+    const row = await screen.findByText('p')
+    fireEvent.click(row)
+    fireEvent.click(row)
+    expect(onCreate).toHaveBeenCalledTimes(1)
+    expect(await screen.findByText('创建中…')).toBeInTheDocument()
+  })
 })

@@ -957,6 +957,7 @@ impl SessionManager {
         let sid = id.to_string();
         let mgr_weak = self.weak();
         let sid_for_exit = id.to_string();
+        let is_tmux = tmux_name.is_some();
 
         // Spawn fan-out task: owns the PtyHandle, reads output, handles input
         tokio::spawn(async move {
@@ -978,8 +979,11 @@ impl SessionManager {
                                 // persisted) — the D2 anti-pattern the ACP handler forbids.
                                 // Bumping last_activity_ms is benign: PTY sessions never enter
                                 // TurnState::Running, so both turn watchdogs skip them.
+                                // tmux terminals keep NO byte scrollback: the tmux server holds
+                                // the real history and repaints via refresh-client on connect.
                                 if let Some(m) = mgr_weak.upgrade() {
-                                    m.record_and_broadcast(&sid, b64, true);
+                                    if is_tmux { m.broadcast_pty(&sid, b64); }
+                                    else { m.record_and_broadcast(&sid, b64, true); }
                                 } else {
                                     let _ = event_tx_clone.send(b64); // manager gone: best-effort
                                 }
@@ -1928,6 +1932,17 @@ impl SessionManager {
         let rx = s.running.as_ref()?.event_tx.subscribe();
         let history = s.scrollback.iter().cloned().collect();
         Some((history, rx))
+    }
+
+    /// tmux terminals: live broadcast only. The tmux server holds the real
+    /// history; on (re)connect we `refresh-client` instead of replaying bytes.
+    /// Still bumps `last_activity_ms` so the sidebar's "recent activity" stays live.
+    fn broadcast_pty(&self, id: &str, data: String) {
+        let mut map = self.sessions.lock().unwrap();
+        if let Some(s) = map.get_mut(id) {
+            s.last_activity_ms = now_millis();
+            if let Some(rp) = &s.running { let _ = rp.event_tx.send(data); }
+        }
     }
 
     /// Atomically push an event to scrollback AND broadcast it under a SINGLE
@@ -6059,6 +6074,17 @@ mod tmux_session_tests {
         assert!(srv.ctl.has(&name).await.unwrap());
         let info = m.list_sessions(None).into_iter().find(|s| s.id == id).unwrap();
         assert_eq!(info.tmux_name.as_deref(), Some(name.as_str()));
+    }
+
+    #[tokio::test]
+    async fn tmux_output_is_not_kept_in_scrollback() {
+        let Some(srv) = TestServer::start() else { return };
+        let (m, _d) = mgr_with(srv.ctl.clone());
+        let id = m.create_pty_session("t".into(), "bash", "/tmp", 80, 24, "u", None).await.unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(800)).await; // tmux paints the screen
+        let (hist, _rx) = m.subscribe_with_history(&id).unwrap();
+        assert!(hist.is_empty(), "tmux redraws on refresh-client; replaying 2MB of redraw bytes is noise");
+        assert!(m.pty_pid(&id).is_some());
     }
 
     #[tokio::test]

@@ -94,6 +94,17 @@ async fn handle_ws(socket: WebSocket, session_id: String, state: Arc<AppState>) 
             return;
         }
     };
+    // tmux terminals have no byte replay; ask tmux to repaint this client's
+    // screen now that we're subscribed.
+    if state.sessions.tmux_binding(&session_id).is_some() {
+        if let Some(pid) = state.sessions.pty_pid(&session_id) {
+            let tmux = state.tmux.clone();
+            tokio::spawn(async move {
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                let _ = tmux.refresh_client_for_pid(pid).await;
+            });
+        }
+    }
     let input_tx = match state.sessions.input_tx(&session_id) {
         Some(tx) => tx,
         None => return,

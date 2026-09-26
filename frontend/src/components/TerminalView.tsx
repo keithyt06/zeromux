@@ -93,6 +93,9 @@ export default function TerminalView({ sessionId, active, theme, tmuxName, tmuxO
   const endedRef = useRef(false)
   // Bumped after revive to re-run the Connect WebSocket effect.
   const [wsEpoch, setWsEpoch] = useState(0)
+  // Ref twin of `tmuxName` for long-lived closures (WS handlers, touch listeners).
+  const tmuxRef = useRef(tmuxName)
+  useEffect(() => { tmuxRef.current = tmuxName }, [tmuxName])
   // 触摸设备检测：any-pointer:coarse 或 maxTouchPoints>0，少漏触屏笔记本/iPad。
   // 触摸能力在页面生命周期内不变，用惰性初始化在挂载时算一次即可（避免 effect 内 setState）。
   const [isTouch] = useState(
@@ -168,6 +171,7 @@ export default function TerminalView({ sessionId, active, theme, tmuxName, tmuxO
       fontFamily: "'JetBrains Mono', 'Fira Code', 'Cascadia Code', Menlo, monospace",
       theme: THEMES[theme],
       allowProposedApi: true,
+      scrollback: 10000,
     })
 
     const fit = new FitAddon()
@@ -300,7 +304,8 @@ export default function TerminalView({ sessionId, active, theme, tmuxName, tmuxO
         // first so a reconnect doesn't double-paint the buffer.
         termRef.current?.reset()
         // Arm the replay window: the server is about to replay full scrollback.
-        replayingRef.current = true
+        // Only bare-shell PTYs replay scrollback; tmux repaints via refresh-client.
+        replayingRef.current = !tmuxRef.current
         userScrolledUpRef.current = false
         const fit = fitRef.current
         if (fit) {

@@ -457,7 +457,7 @@ export default function App() {
                   )}
                 </div>
                 {view === 'files' && <FileBrowser sessionId={s.id} />}
-                {view === 'git' && <GitViewer sessionId={s.id} onForward={(t) => sessionControls.current[s.id]?.sendPrompt(t) ?? false} />}
+                {view === 'git' && <GitViewer sessionId={s.id} onForward={s.type !== 'tmux' ? (t) => sessionControls.current[s.id]?.sendPrompt(t) ?? false : undefined} />}
                 {view === 'events' && <AgentDashboard sessionId={s.id} />}
                 {/* 记忆是 Crew 侧全局的（一份 Gateway 一份记忆），故不接 sessionId。 */}
                 {view === 'memory' && <MemoryPanel />}

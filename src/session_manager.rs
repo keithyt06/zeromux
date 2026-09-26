@@ -385,6 +385,7 @@ pub struct SessionInfo {
     pub source_task_id: Option<String>,
     pub tmux_name: Option<String>,
     pub tmux_origin: Option<TmuxOrigin>,
+    pub other_clients: u32,
 }
 
 // ── Git worktree helpers ──
@@ -637,6 +638,7 @@ fn session_info_of(s: &Session) -> SessionInfo {
             _ => None,
         },
         tmux_origin: s.tmux_origin,
+        other_clients: 0,
     }
 }
 

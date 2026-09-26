@@ -7,6 +7,7 @@ import type { SessionStatus, TmuxHealth } from '../lib/api'
 import type { Theme } from '../lib/theme'
 import { b64encode, b64decode } from '../lib/base64'
 import { GitBranch, Folder, Circle } from 'lucide-react'
+import { attachCommand, copyText } from '../lib/attachCommand'
 import MobileKeyBar, { type BarKey } from './MobileKeyBar'
 import Composer from './Composer'
 import HistoryView from './HistoryView'
@@ -71,9 +72,11 @@ interface Props {
   tmuxName?: string | null
   tmuxOrigin?: 'own' | 'external' | null
   onClose?: () => void
+  /** Bumped (nonce) by the sidebar's ⋯ 查看历史 to open the history drawer. */
+  historyRequest?: number
 }
 
-export default function TerminalView({ sessionId, active, theme, tmuxName, tmuxOrigin, onClose }: Props) {
+export default function TerminalView({ sessionId, active, theme, tmuxName, tmuxOrigin, onClose, historyRequest }: Props) {
   const containerRef = useRef<HTMLDivElement>(null)
   const termRef = useRef<Terminal | null>(null)
   const fitRef = useRef<FitAddon | null>(null)
@@ -96,12 +99,17 @@ export default function TerminalView({ sessionId, active, theme, tmuxName, tmuxO
   // Bumped after revive to re-run the Connect WebSocket effect.
   const [wsEpoch, setWsEpoch] = useState(0)
   const [historyOpen, setHistoryOpen] = useState(false)
+  const [chipCopied, setChipCopied] = useState(false)
   const [reconnected, setReconnected] = useState(false)
   // True once the WS has opened at least once; a later open is a reconnect (→ ReconnectHint).
   const openedOnceRef = useRef(false)
   // Ref twin of `tmuxName` for long-lived closures (WS handlers, touch listeners).
   const tmuxRef = useRef(tmuxName)
   useEffect(() => { tmuxRef.current = tmuxName }, [tmuxName])
+  // Sidebar ⋯ 查看历史: a nonce bump (even while already open) should (re)open the drawer.
+  // Consuming an external one-shot request is exactly an effect's job.
+  // eslint-disable-next-line react-hooks/set-state-in-effect
+  useEffect(() => { if (historyRequest) setHistoryOpen(true) }, [historyRequest])
   // 触摸设备检测：any-pointer:coarse 或 maxTouchPoints>0，少漏触屏笔记本/iPad。
   // 触摸能力在页面生命周期内不变，用惰性初始化在挂载时算一次即可（避免 effect 内 setState）。
   const [isTouch] = useState(
@@ -579,8 +587,17 @@ export default function TerminalView({ sessionId, active, theme, tmuxName, tmuxO
         ) : (
           <span className="text-xs text-[var(--text-muted)]">Loading...</span>
         )}
+        {tmuxName && (
+          <button
+            onClick={async () => { if (await copyText(attachCommand(tmuxName))) { setChipCopied(true); setTimeout(() => setChipCopied(false), 1500) } }}
+            title={attachCommand(tmuxName)}
+            className="ml-auto flex items-center gap-1 px-1.5 py-0.5 rounded border border-[var(--border)] text-[11px] font-mono text-[var(--text-secondary)] hover:text-[var(--text-primary)]"
+          >
+            {chipCopied ? '已复制' : `⧉ ${tmuxName}`}
+          </button>
+        )}
         {!isTouch && tmuxName && (
-          <button onClick={() => setHistoryOpen(true)} className="ml-auto text-xs text-[var(--text-secondary)] hover:text-[var(--text-primary)]">历史</button>
+          <button onClick={() => setHistoryOpen(true)} className="text-xs text-[var(--text-secondary)] hover:text-[var(--text-primary)]">历史</button>
         )}
       </div>
     </div>

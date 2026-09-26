@@ -16,6 +16,7 @@ import { isStuck } from '../lib/stuck'
 import { ClaudeCodeIcon, CrewIcon, CodexIcon } from './BrandIcons'
 import QuickTargets from './QuickTargets'
 import SearchResults from './SearchResults'
+import SessionRowMenu from './SessionRowMenu'
 import { askAgentPrompt, type AskAgentTarget } from '../lib/askAgent'
 
 interface Props {
@@ -40,6 +41,7 @@ interface Props {
   askAgentRequest?: (AskAgentTarget & { nonce: number }) | null
   /** Untracked host tmux sessions (admin only; empty otherwise). Click = attach. */
   hostTmux?: HostTmux[]
+  onOpenHistory?: (id: string) => void
 }
 
 /** Relative "last activity" label. <60s 刚刚, <60m Xm, <24h Xh, else Xd. */
@@ -84,7 +86,7 @@ function SessionTypeIcon({ type, size = 14, className }: { type: SessionType; si
   }
 }
 
-export default function Sidebar({ sessions, docTabs, activeId, onSelect, onCreate, onDelete, onRename, hasUnread, onLogout, theme, onToggleTheme, user, open, onToggle, mobile, confirmCount = 0, onOpenVault, askAgentRequest, hostTmux = [] }: Props) {
+export default function Sidebar({ sessions, docTabs, activeId, onSelect, onCreate, onDelete, onRename, hasUnread, onLogout, theme, onToggleTheme, user, open, onToggle, mobile, confirmCount = 0, onOpenVault, askAgentRequest, hostTmux = [], onOpenHistory }: Props) {
   const [step, setStep] = useState<NewSessionStep>('closed')
   const [pendingType, setPendingType] = useState<SessionType | null>(null)
   const [promptDraft, setPromptDraft] = useState('')
@@ -526,19 +528,19 @@ export default function Sidebar({ sessions, docTabs, activeId, onSelect, onCreat
                   </span>
                 )}
                 {hasUnread(s) && <span className="w-2 h-2 rounded-full bg-red-500 shrink-0" title="New activity" />}
+                {s.other_clients > 0 && <span className="text-[10px] text-[var(--accent-blue)] shrink-0" title="其他终端也在查看">🖥+{s.other_clients}</span>}
                 <span className="ml-auto text-[10px] text-[var(--text-muted)] shrink-0">{relativeTime(s.last_activity_ms)}</span>
               </div>
               {s.description && (
                 <div className="truncate text-[10px] text-[var(--text-muted)] -mt-0.5">{s.description}</div>
               )}
             </div>
-            <button
-              onClick={e => { e.stopPropagation(); onDelete(s.id) }}
-              className="p-0.5 opacity-0 group-hover:opacity-100 text-[var(--text-secondary)] hover:text-[var(--accent-red)] transition-all"
-              title="Delete session"
-            >
-              <X size={12} />
-            </button>
+            <SessionRowMenu
+              session={s}
+              onRename={() => setEditingId(s.id)}
+              onClose={() => onDelete(s.id)}
+              onHistory={onOpenHistory ? () => onOpenHistory(s.id) : undefined}
+            />
           </div>
         ))}
         {docTabs.map(t => (

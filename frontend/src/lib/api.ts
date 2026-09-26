@@ -19,6 +19,7 @@ export interface SessionInfo {
   source_task_id?: string | null
   tmux_name: string | null
   tmux_origin: 'own' | 'external' | null
+  other_clients: number
 }
 
 export interface SessionStatus {

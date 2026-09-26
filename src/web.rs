@@ -935,23 +935,37 @@ async fn list_sessions(
     } else {
         Some(user.id.as_str())
     };
-    let sessions = state.sessions.list_sessions(filter);
+    let mut sessions = state.sessions.list_sessions(filter);
+    // Fill other_clients from the host cache for every caller (not just admin) —
+    // this only exposes a count on sessions the caller can already see.
+    let all = host_tmux_all(&state).await;
+    for s in sessions.iter_mut() {
+        if let Some(name) = &s.tmux_name {
+            if let Some(h) = all.iter().find(|h| &h.name == name) {
+                s.other_clients = h.attached.saturating_sub(s.running as u32);
+            }
+        }
+    }
     // Host tmux sessions are shared OS state → admin only (same gate as attach).
-    let host_tmux = if user.is_admin() { host_tmux_untracked(&state).await } else { vec![] };
+    let host_tmux = if user.is_admin() { host_tmux_untracked(&all, &state) } else { vec![] };
     Json(serde_json::json!({ "sessions": sessions, "host_tmux": host_tmux }))
 }
 
-/// `tmux ls` minus sessions zeromux already tracks. Cached 5s: the sidebar polls
-/// every 3s from every open tab.
-async fn host_tmux_untracked(state: &AppState) -> Vec<crate::tmux::HostTmux> {
+/// `tmux ls`, cached 5s: the sidebar polls every 3s from every open tab.
+async fn host_tmux_all(state: &AppState) -> Vec<crate::tmux::HostTmux> {
     let mut cache = state.host_tmux_cache.lock().await;
     let fresh = matches!(&*cache, Some((t, _)) if t.elapsed() < std::time::Duration::from_secs(5));
     if !fresh {
         let list = state.tmux.list().await.unwrap_or_default();
         *cache = Some((std::time::Instant::now(), list));
     }
+    cache.as_ref().map(|(_, l)| l.clone()).unwrap_or_default()
+}
+
+/// `host_tmux_all`'s result minus sessions zeromux already tracks.
+fn host_tmux_untracked(all: &[crate::tmux::HostTmux], state: &AppState) -> Vec<crate::tmux::HostTmux> {
     let tracked = state.sessions.tracked_tmux_names();
-    cache.as_ref().map(|(_, l)| l.iter().filter(|h| !tracked.contains(&h.name)).cloned().collect()).unwrap_or_default()
+    all.iter().filter(|h| !tracked.contains(&h.name)).cloned().collect()
 }
 
 async fn revive_session(

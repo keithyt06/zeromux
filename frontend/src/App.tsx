@@ -69,6 +69,10 @@ export default function App() {
   const isMobile = useMemo(() => window.innerWidth < 768, [])
   const [sidebarOpen, setSidebarOpen] = useState(!isMobile)
   const [confirmCount, setConfirmCount] = useState(0)
+  // One-shot request from the sidebar's ⋯ menu (查看历史) → the active
+  // TerminalView opens its history drawer. nonce so re-requesting the same
+  // session (already open) still re-fires the effect.
+  const [historyReq, setHistoryReq] = useState<{ id: string; nonce: number } | null>(null)
 
   const initAuth = useCallback(async () => {
     try {
@@ -389,6 +393,7 @@ export default function App() {
         confirmCount={confirmCount}
         onOpenVault={handleOpenVault}
         askAgentRequest={askAgentRequest}
+        onOpenHistory={(id) => { setActiveId(id); setHistoryReq({ id, nonce: Date.now() }) }}
       />
       <main className="flex-1 min-w-0 flex flex-col">
         {/* Info bar for active session */}
@@ -443,7 +448,7 @@ export default function App() {
                 {/* Always keep terminal/chat mounted, hide with CSS when overlay is active */}
                 <div className={`h-full ${view !== 'none' ? 'hidden' : ''}`}>
                   {s.type === 'tmux' ? (
-                    <TerminalView sessionId={s.id} active={isActive && view === 'none'} theme={themeCtx.theme} tmuxName={s.tmux_name} tmuxOrigin={s.tmux_origin} onClose={() => handleDelete(s.id)} />
+                    <TerminalView sessionId={s.id} active={isActive && view === 'none'} theme={themeCtx.theme} tmuxName={s.tmux_name} tmuxOrigin={s.tmux_origin} onClose={() => handleDelete(s.id)} historyRequest={historyReq?.id === s.id ? historyReq.nonce : 0} />
                   ) : (
                     <AcpChatView sessionId={s.id} active={isActive && view === 'none'} agentType={s.type} onRegisterControls={registerControls} onQueueModeChange={handleQueueModeChange} showMetrics={!!metricsOpen[s.id]} onOpenMemory={s.type === 'crew' ? () => toggleOverlay(s.id, 'memory') : undefined} />
                   )}

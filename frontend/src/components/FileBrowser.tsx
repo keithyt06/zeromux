@@ -107,7 +107,9 @@ export function FileBrowser({ sessionId }: Props) {
   // Listing identity. When it changes, drop the old entries DURING render (React's
   // "reset state on prop change" pattern) so a slow listing never leaves the
   // previous directory's rows clickable against the new cwd. (B4)
-  const listKey = `${sessionId}\u0000${cwd}\u0000${effectiveBase ?? ''}\u0000${reloadKey}`
+  // reloadKey is deliberately NOT part of it: a re-list after mkdir/rename/delete/
+  // upload is the same directory, so keep the rows (and scroll) while it refetches.
+  const listKey = `${sessionId}\u0000${cwd}\u0000${effectiveBase ?? ''}`
   const [shownKey, setShownKey] = useState(listKey)
   if (shownKey !== listKey) {
     setShownKey(listKey)

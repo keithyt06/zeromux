@@ -185,6 +185,30 @@ describe('FileBrowser', () => {
     confirmSpy.mockRestore()
   })
 
+  it('re-list after a write op keeps the current rows (no blank-to-Loading)', async () => {
+    let calls = 0
+    vi.spyOn(api, 'listDir').mockImplementation(() => {
+      calls++
+      if (calls === 1) return Promise.resolve({
+        entries: [
+          { name: 'a.txt', type: 'file', size: 3, mtime: 0, writable: true },
+          { name: 'b.txt', type: 'file', size: 3, mtime: 0, writable: true },
+        ],
+        truncated: false,
+      })
+      return new Promise(() => {})                 // re-list stays in flight
+    })
+    vi.spyOn(api, 'deleteSessionFile').mockResolvedValue(undefined)
+    const confirmSpy = vi.spyOn(window, 'confirm').mockReturnValue(true)
+    render(<FileBrowser sessionId="s1" />)
+    await screen.findByText('b.txt')
+    screen.getAllByTitle('更多')[0].click()
+    ;(await screen.findByText('删除')).click()
+    await waitFor(() => expect(calls).toBe(2))
+    expect(screen.getByText('b.txt')).toBeInTheDocument()
+    confirmSpy.mockRestore()
+  })
+
   it('reset returns to work_dir root (default base, write controls back)', async () => {
     localStorage.setItem('zeromux:fb-root:s1', '/home/ubuntu/other')
     const spy = vi.spyOn(api, 'listDir').mockResolvedValue({ entries: [], truncated: false })

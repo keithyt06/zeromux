@@ -69,4 +69,17 @@ describe('Sidebar new terminal flow', () => {
     await waitFor(() => expect(screen.queryByText('其他目录…')).toBeNull())
     expect(screen.queryByText(/创建失败/)).toBeNull()
   })
+
+  it('reopening the popover via New session clears a stale create error', async () => {
+    vi.spyOn(api, 'listQuickTargets').mockResolvedValue({ top: [
+      { kind: 'dir', path: '/w/p', agent: 'claude', display: 'p', hint: '/w/p' },
+    ] })
+    const onCreate = vi.fn().mockRejectedValueOnce(new Error('work_dir not allowed'))
+    setup({ onCreate })
+    fireEvent.click(screen.getByText('New session'))
+    fireEvent.click(await screen.findByText('p'))
+    expect(await screen.findByText(/创建失败:work_dir not allowed/)).toBeInTheDocument()
+    fireEvent.click(screen.getByText('New session'))
+    expect(screen.queryByText(/创建失败/)).toBeNull()
+  })
 })

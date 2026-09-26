@@ -220,6 +220,7 @@ export default function Sidebar({ sessions, docTabs, activeId, onSelect, onCreat
     setQuery('')
     setSearchResult(null)
     setCurrentPath('')    // a stale browse path must not hijack pick-prompt's Back
+    setCreateError(null)  // a failed earlier attempt must not bleed into the next one
     warmSearchIndex('dirs,notes')
   }
 

@@ -133,7 +133,8 @@ export default function HistoryView({ sessionId, title, onClose, split, onSendTo
         {onSendToAgent && (
           <button className={btn} onClick={() => {
             const sel = window.getSelection()?.toString() ?? ''
-            const payload = sel.trim() ? sel : (text ?? '').split('\n').slice(-200).join('\n')
+            const raw = colored ? stripAnsi(text ?? '') : (text ?? '')
+            const payload = sel.trim() ? sel : raw.split('\n').slice(-200).join('\n')
             if (window.confirm('内容可能包含密钥或令牌，确认发给 agent？')) onSendToAgent(payload)
           }}>发给 agent</button>
         )}

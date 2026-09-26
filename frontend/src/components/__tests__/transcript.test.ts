@@ -223,3 +223,36 @@ describe('stabilizeGroups — object identity for React.memo (F-perf, 2026-08-03
     expect(stable.map(g => g.turnId)).toEqual([1, 2])
   })
 })
+
+describe('foldTranscript — cross-session peer message (spec 2026-09-26)', () => {
+  it('puts a peer_message into its turn group with fromName', () => {
+    const events: WireEvent[] = [
+      { type: 'peer_message', from_name: 'zeromux-98', text: 'ping', turn_id: 3 },
+      { type: 'content_block', block_type: 'text', text: 'pong', turn_id: 3 },
+      { type: 'result', text: 'pong', turn_id: 3 },
+    ]
+    const groups = foldTranscript(events)
+    expect(groups).toHaveLength(1)
+    expect(groups[0].turnId).toBe(3)
+    expect(groups[0].userPrompts).toEqual([{ text: 'ping', fromName: 'zeromux-98' }])
+    expect(groups[0].assistantText()).toBe('pong')
+    expect(groups[0].complete).toBe(true)
+  })
+
+  it('keeps a busy-time peer_message in the running turn alongside the user prompt', () => {
+    const events: WireEvent[] = [
+      { type: 'user_prompt', text: 'do x', turn_id: 5, client_id: 'c1' },
+      { type: 'content_block', block_type: 'tool_use', name: 'Bash', turn_id: 5 },
+      { type: 'peer_message', from_name: 'other', text: 'fyi', turn_id: 5 },
+    ]
+    const g = foldTranscript(events)[0]
+    expect(g.userPrompts.map(p => p.fromName)).toEqual([undefined, 'other'])
+  })
+
+  it('changes the group signature when only the sender differs', () => {
+    const a = foldTranscript([{ type: 'peer_message', from_name: 'a', text: 't', turn_id: 1 }])
+    const b = foldTranscript([{ type: 'peer_message', from_name: 'b', text: 't', turn_id: 1 }])
+    const out = stabilizeGroups(a, b)
+    expect(out[0]).toBe(b[0]) // not reused: signature differs
+  })
+})

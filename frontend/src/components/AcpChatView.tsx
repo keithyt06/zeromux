@@ -59,6 +59,8 @@ interface ServerEvent {
   tool_input?: string
   used?: number
   total?: number
+  from_name?: string
+  level?: string
 }
 
 interface Props {
@@ -463,6 +465,26 @@ export default function AcpChatView({ sessionId, agentType = 'claude', onRegiste
         const label = labelMap[evt.subtype || '']
         if (!label) break
         pushNotice({ id: newId(), kind: 'system', text: label })
+        break
+      }
+
+      case 'peer_message': {
+        // Another Claude session's message (spec 2026-09-26). The backend has
+        // already counted the turn; mirror content_block's observer-tab seeding
+        // so busy + the turn clock light up even without a local sendPrompt.
+        if (typeof evt.turn_id === 'number') activeTurnIdRef.current = evt.turn_id
+        appendEvent(evt as unknown as WireEvent)
+        setBusy(true)
+        const pmNow = Date.now()
+        setTurnStartedMs(prev => prev ?? pmNow)
+        setNowMs(pmNow)
+        setLastEventMs(pmNow)
+        break
+      }
+
+      case 'notice': {
+        // CLI informational line (e.g. our cross-session message was held/refused).
+        if (evt.text) pushNotice({ id: newId(), kind: 'system', text: evt.text })
         break
       }
 
@@ -1069,7 +1091,9 @@ function TurnGroupViewImpl({ group, agentName = 'Claude', density = 'concise', o
     <div className="space-y-4">
       {group.userPrompts.map((p, i) => (
         <div key={p.clientId ?? i}>
-          <p className="text-[11px] font-semibold text-[var(--accent-blue)] mb-0.5">You</p>
+          <p className={`text-[11px] font-semibold mb-0.5 ${p.fromName ? 'text-[var(--accent-purple)]' : 'text-[var(--accent-blue)]'}`}>
+            {p.fromName ? `来自 @${p.fromName}` : 'You'}
+          </p>
           <p className="text-sm text-[var(--text-primary)] whitespace-pre-wrap">{p.text}</p>
         </div>
       ))}

@@ -17,6 +17,8 @@ export interface WireEvent {
   cost_usd?: number
   /** 仅 block_type==='approval'：Crew 的 approval id，上行 resolve 时用。 */
   approval_id?: string
+  /** 仅 peer_message：发送方会话名（Claude Code 跨会话消息）。 */
+  from_name?: string
 }
 
 export interface Block {
@@ -37,7 +39,7 @@ export interface Block {
 
 export interface TurnGroup {
   turnId: number
-  userPrompts: { text: string; clientId?: string }[]
+  userPrompts: { text: string; clientId?: string; fromName?: string }[]
   blocks: Block[]
   complete: boolean
   cost?: number
@@ -87,6 +89,10 @@ export function foldTranscript(
       // seenClientIds set would skip the optimistic entry itself — hiding the
       // user's own prompt until reconnect.
       group(tid).userPrompts.push({ text: e.text ?? '', clientId: e.client_id })
+    } else if (e.type === 'peer_message') {
+      // A message from another Claude session (spec 2026-09-26). Rendered in the
+      // user-side slot of its turn, tagged with the sender.
+      group(tid).userPrompts.push({ text: e.text ?? '', fromName: e.from_name ?? 'unknown' })
     } else if (e.type === 'content_block') {
       const g = group(tid)
       const bt = (e.block_type ?? 'text') as Block['type']
@@ -141,7 +147,7 @@ function groupSignature(g: TurnGroup): string {
   const blocks = g.blocks
     .map(b => `${b.type}:${(b.text ?? '').length}:${b.summary ?? ''}:${b.name ?? ''}`)
     .join('|')
-  const prompts = g.userPrompts.map(p => p.text).join('')
+  const prompts = g.userPrompts.map(p => `${p.fromName ?? ''}:${p.text}`).join('')
   return `${g.complete ? 1 : 0}#${g.cost ?? ''}#${prompts}#${blocks}`
 }
 

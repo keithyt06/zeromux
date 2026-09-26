@@ -104,6 +104,18 @@ export function FileBrowser({ sessionId }: Props) {
   const [reloadKey, setReloadKey] = useState(0)
   const reload = useCallback(() => setReloadKey(k => k + 1), [])
 
+  // Listing identity. When it changes, drop the old entries DURING render (React's
+  // "reset state on prop change" pattern) so a slow listing never leaves the
+  // previous directory's rows clickable against the new cwd. (B4)
+  const listKey = `${sessionId}\u0000${cwd}\u0000${effectiveBase ?? ''}\u0000${reloadKey}`
+  const [shownKey, setShownKey] = useState(listKey)
+  if (shownKey !== listKey) {
+    setShownKey(listKey)
+    setLoading(true)
+    setEntries([])
+    setError(null)
+  }
+
   // Fetch the listing in the effect with an ignore-flag so a stale response
   // (cwd changed mid-flight, or unmount) never lands. setState only happens
   // inside the async closure, never synchronously in the effect body.

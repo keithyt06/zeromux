@@ -196,4 +196,21 @@ describe('FileBrowser', () => {
     await waitFor(() => expect(screen.getByTitle('新建文件夹')).toBeInTheDocument())
     expect(localStorage.getItem('zeromux:fb-root:s1')).toBeNull()
   })
+
+  it('navigating clears the old listing immediately (no stale clickable rows)', async () => {
+    let resolveSub: (v: { entries: api.DirListEntry[]; truncated: boolean }) => void = () => {}
+    vi.spyOn(api, 'listDir').mockImplementation((_s, cwd) => {
+      if (cwd === '') return Promise.resolve({ entries: [
+        { name: 'sub', type: 'dir', size: 0, mtime: 0, writable: true },
+        { name: 'old.txt', type: 'file', size: 1, mtime: 0, writable: true },
+      ], truncated: false })
+      return new Promise(r => { resolveSub = r })
+    })
+    render(<FileBrowser sessionId="s1" />)
+    ;(await screen.findByText('sub')).click()
+    await waitFor(() => expect(screen.queryByText('old.txt')).toBeNull())
+    expect(screen.getByText('Loading...')).toBeInTheDocument()
+    resolveSub({ entries: [{ name: 'inner.txt', type: 'file', size: 1, mtime: 0, writable: true }], truncated: false })
+    expect(await screen.findByText('inner.txt')).toBeInTheDocument()
+  })
 })

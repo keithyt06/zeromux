@@ -2766,6 +2766,9 @@ fn spawn_acp_fanout(
         // on the LIVE turn's entry via `set_live_intent` from the input branch, so
         // it overrides the terminal-event inference for exactly that turn.
         let mut turn_starts = TurnStarts::default();
+        // Spec 2026-09-26 §2d: set by a TurnOrigin marker, consumed by the very
+        // next boundary: that boundary ends a CLI-started turn.
+        let mut pending_origin = false;
         // ── cost 差分状态(仅 claude-code;见 cost-calibration spec)──
         // 冷启动:prev=Some(0.0)→首轮增量=total 本身;resume:prev=None→首轮记 0。
         let mut prev_cost: Option<f64> = if is_resumed { None } else { Some(0.0) };
@@ -2776,6 +2779,39 @@ fn spawn_acp_fanout(
                 event = process.event_rx.recv() => {
                     match event {
                         Some(evt) => {
+                            // TurnOrigin / StdinEcho are fan-out-internal markers:
+                            // update attribution state and drop them (never emitted,
+                            // persisted or logged — spec 2026-09-26 v2 §2d).
+                            if let AcpEvent::TurnOrigin { kind } = &evt {
+                                tracing::debug!("claude[{}]: next boundary ends a CLI-started turn ({})", sid, kind);
+                                pending_origin = true;
+                                continue;
+                            }
+                            if matches!(evt, AcpEvent::StdinEcho) {
+                                turn_starts.mark_echoed();
+                                continue;
+                            }
+                            let evt = cap_peer_message(evt);
+                            let step = classify_claude_event(
+                                local_running, &evt, pending_origin,
+                                turn_starts.front_is_external() || turn_starts.front_is_echoed());
+                            if step == ClaudeStep::StartExternal {
+                                // The CLI started a turn on its own (peer message or
+                                // background-task notification). Same four steps as a
+                                // stdin prompt so busy/metrics/push/queue all see a
+                                // real turn.
+                                tracing::info!("claude[{}]: CLI-started turn (external)", sid);
+                                turn_seq += 1;
+                                local_running = true;
+                                turn_starts.start_external(now_millis());
+                                if let Some(m) = mgr.upgrade() {
+                                    m.mark_turn(&sid, TurnState::Running, turn_seq);
+                                }
+                                // Flush-only-while-Idle invariant: a collect window armed
+                                // after the previous turn must not fire mid external turn.
+                                // Pending prompts are kept; this turn's boundary re-arms.
+                                queue.disarm();
+                            }
                             log_result_event(&events, agent_label, &sid, &work_dir, &owner_id, &evt);
                             // Backfill Claude resume token on first id-bearing event.
                             if !token_saved {
@@ -2790,6 +2826,16 @@ fn spawn_acp_fanout(
                                 evt,
                                 AcpEvent::Result { .. } | AcpEvent::Error { .. } | AcpEvent::Exit { .. }
                             );
+                            // The origin marker belongs to exactly this boundary.
+                            if is_boundary {
+                                pending_origin = false;
+                            }
+                            let skip_boundary = step == ClaudeStep::SkipBoundary;
+                            if skip_boundary {
+                                tracing::debug!(
+                                    "claude[{}]: origin-tagged boundary before our prompt was echoed; not settling",
+                                    sid);
+                            }
                             emit(&mgr, &sid, &event_tx, turn_seq, &evt);
                             // Tee to events.ndjson for the active scheduled run's turn.
                             // Scoped to active_run_id window: fires for every event from
@@ -2799,7 +2845,7 @@ fn spawn_acp_fanout(
                                     append_run_event(rid, &line);
                                 }
                             }
-                            if is_boundary {
+                            if is_boundary && !skip_boundary {
                                 // Each started turn emits AT LEAST one boundary
                                 // (Result/Error/Exit) in FIFO order, but NOT
                                 // always exactly one: a single turn can emit two
@@ -3483,7 +3529,7 @@ fn emit(
     // so the frontend can group by turn (T1). Other events are passed through.
     let stamped;
     let evt = match evt {
-        AcpEvent::ContentBlock { .. } | AcpEvent::Result { .. } => {
+        AcpEvent::ContentBlock { .. } | AcpEvent::Result { .. } | AcpEvent::PeerMessage { .. } => {
             stamped = with_turn_id(evt.clone(), turn_id);
             &stamped
         }
@@ -3571,10 +3617,24 @@ fn truncate_prompt_for_scrollback(text: &str) -> String {
     format!("{}\n[已截断 {} 字节]", &text[..cut], dropped)
 }
 
+/// Cap a peer message body before it enters scrollback — same budget as a
+/// UserPrompt (a peer can send ~1M chars; spec 2026-09-26 review focus 5).
+fn cap_peer_message(evt: AcpEvent) -> AcpEvent {
+    match evt {
+        AcpEvent::PeerMessage { from_name, text, turn_id } => AcpEvent::PeerMessage {
+            from_name,
+            text: truncate_prompt_for_scrollback(&text),
+            turn_id,
+        },
+        other => other,
+    }
+}
+
 fn with_turn_id(mut evt: AcpEvent, tid: u64) -> AcpEvent {
     match &mut evt {
         AcpEvent::ContentBlock { turn_id, .. } => *turn_id = tid,
         AcpEvent::Result { turn_id, .. } => *turn_id = tid,
+        AcpEvent::PeerMessage { turn_id, .. } => *turn_id = tid,
         _ => {}
     }
     evt
@@ -5830,6 +5890,29 @@ mod emit_tests {
             count: None,
         };
         assert!(!is_ephemeral_event(&init));
+    }
+
+    #[test]
+    fn with_turn_id_stamps_peer_message() {
+        let e = with_turn_id(AcpEvent::PeerMessage { from_name: "a".into(), text: "b".into(), turn_id: 0 }, 7);
+        match e {
+            AcpEvent::PeerMessage { turn_id, .. } => assert_eq!(turn_id, 7),
+            other => panic!("expected PeerMessage, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn peer_message_text_is_truncated_for_scrollback() {
+        // Review focus 5: a huge peer body must be capped like a UserPrompt.
+        let big = "y".repeat(USER_PROMPT_SCROLLBACK_CAP + 10);
+        let e = cap_peer_message(AcpEvent::PeerMessage { from_name: "a".into(), text: big, turn_id: 0 });
+        match e {
+            AcpEvent::PeerMessage { text, .. } => {
+                assert!(text.len() < USER_PROMPT_SCROLLBACK_CAP + 64);
+                assert!(text.contains("[已截断"));
+            }
+            other => panic!("expected PeerMessage, got {other:?}"),
+        }
     }
 
     #[test]

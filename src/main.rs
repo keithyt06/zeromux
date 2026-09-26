@@ -507,6 +507,7 @@ async fn main() {
             crew_home.clone(),
             args.shell.clone(),
             args.worktree_isolation,
+            tmux::TmuxCtl::new(Some(args.tmux_socket.clone())),
         ),
         password_hash,
         shell: args.shell,

@@ -17,6 +17,8 @@ export interface SessionInfo {
   last_activity_ms: number
   turns_completed: number
   source_task_id?: string | null
+  tmux_name: string | null
+  tmux_origin: 'own' | 'external' | null
 }
 
 export interface SessionStatus {

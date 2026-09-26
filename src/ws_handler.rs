@@ -163,6 +163,7 @@ async fn handle_ws(socket: WebSocket, session_id: String, state: Arc<AppState>) 
                                     }
                                 }
                                 ClientMsg::Resize { cols, rows } => {
+                                    state.sessions.set_size(&session_id, cols, rows);
                                     let _ = input_tx.send(SessionInput::PtyResize(cols, rows)).await;
                                 }
                             }

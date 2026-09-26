@@ -29,6 +29,9 @@ impl PtyHandle {
         cmd_builder.args(args);
         cmd_builder.env("TERM", "xterm-256color");
         cmd_builder.env("COLORTERM", "truecolor");
+        // A zeromux started from inside tmux would otherwise make every
+        // `tmux attach/new-session` refuse with "sessions should be nested".
+        cmd_builder.env_remove("TMUX");
         for (k, v) in env {
             cmd_builder.env(k, v);
         }

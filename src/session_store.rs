@@ -22,6 +22,9 @@ pub struct PersistedSession {
     pub created_ms: i64,
     pub source_task_id: Option<String>,
     pub name_is_auto: bool,   // true=占位名/可自动命名; false=用户已锁定
+    pub tmux_origin: Option<String>,
+    pub cols: u16,
+    pub rows: u16,
 }
 
 pub struct SessionStore {
@@ -55,6 +58,9 @@ impl SessionStore {
         let _ = conn.execute("ALTER TABLE sessions ADD COLUMN source_task_id TEXT", []);
         // name_is_auto: 1 = 占位名/可自动命名; 0 = 用户已锁定。旧行默认 1。
         let _ = conn.execute("ALTER TABLE sessions ADD COLUMN name_is_auto INTEGER NOT NULL DEFAULT 1", []);
+        let _ = conn.execute("ALTER TABLE sessions ADD COLUMN tmux_origin TEXT", []);
+        let _ = conn.execute("ALTER TABLE sessions ADD COLUMN cols INTEGER NOT NULL DEFAULT 80", []);
+        let _ = conn.execute("ALTER TABLE sessions ADD COLUMN rows INTEGER NOT NULL DEFAULT 24", []);
         Ok(Self { conn: Mutex::new(conn) })
     }
 
@@ -65,14 +71,15 @@ impl SessionStore {
         };
         let conn = self.conn.lock().unwrap();
         conn.execute(
-            "INSERT INTO sessions (id,name,type,work_dir,owner_id,description,resume_kind,resume_value,worktree_path,created_ms,source_task_id,name_is_auto)
-             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12)
+            "INSERT INTO sessions (id,name,type,work_dir,owner_id,description,resume_kind,resume_value,worktree_path,created_ms,source_task_id,name_is_auto,tmux_origin,cols,rows)
+             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15)
              ON CONFLICT(id) DO UPDATE SET
                name=?2, type=?3, work_dir=?4, owner_id=?5, description=?6,
-               resume_kind=?7, resume_value=?8, worktree_path=?9, name_is_auto=?12",
+               resume_kind=?7, resume_value=?8, worktree_path=?9, name_is_auto=?12,
+               tmux_origin=?13, cols=?14, rows=?15",
             params![s.id, s.name, s.session_type.to_string(), s.work_dir, s.owner_id,
                     s.description, rk, rv, s.worktree_path, s.created_ms, s.source_task_id,
-                    s.name_is_auto as i64],
+                    s.name_is_auto as i64, s.tmux_origin, s.cols as i64, s.rows as i64],
         )
         .map_err(|e| format!("upsert failed: {}", e))?;
         Ok(())
@@ -87,6 +94,14 @@ impl SessionStore {
         conn.execute("UPDATE sessions SET resume_kind=?2, resume_value=?3 WHERE id=?1",
                      params![id, rk, rv])
             .map_err(|e| format!("update_resume_token failed: {}", e))?;
+        Ok(())
+    }
+
+    pub fn update_size(&self, id: &str, cols: u16, rows: u16) -> Result<(), String> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute("UPDATE sessions SET cols=?2, rows=?3 WHERE id=?1",
+                     params![id, cols as i64, rows as i64])
+            .map_err(|e| format!("update_size failed: {}", e))?;
         Ok(())
     }
 
@@ -122,7 +137,7 @@ impl SessionStore {
     pub fn load_all(&self) -> Result<Vec<PersistedSession>, String> {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(
-            "SELECT id,name,type,work_dir,owner_id,description,resume_kind,resume_value,worktree_path,created_ms,source_task_id,name_is_auto FROM sessions")
+            "SELECT id,name,type,work_dir,owner_id,description,resume_kind,resume_value,worktree_path,created_ms,source_task_id,name_is_auto,tmux_origin,cols,rows FROM sessions")
             .map_err(|e| format!("prepare failed: {}", e))?;
         let rows = stmt.query_map([], |row| {
             let type_str: String = row.get(2)?;
@@ -144,6 +159,9 @@ impl SessionStore {
                 created_ms: row.get(9)?,
                 source_task_id: row.get(10)?,
                 name_is_auto: row.get::<_, i64>(11)? != 0,
+                tmux_origin: row.get(12)?,
+                cols: row.get::<_, i64>(13)? as u16,
+                rows: row.get::<_, i64>(14)? as u16,
             })
         }).map_err(|e| format!("query failed: {}", e))?;
         let mut out = Vec::new();
@@ -170,7 +188,22 @@ mod tests {
             resume_token: token, worktree_path: Some("/wt".into()), created_ms: 1000,
             source_task_id: None,
             name_is_auto: true,
+            tmux_origin: None, cols: 80, rows: 24,
         }
+    }
+
+    #[test]
+    fn persists_tmux_origin_and_size() {
+        let d = tempfile::tempdir().unwrap();
+        let st = SessionStore::open(d.path()).unwrap();
+        let mut p = sample("a", Some(ResumeToken::Tmux("zmx-a".into())));
+        p.tmux_origin = Some("external".into());
+        p.cols = 132; p.rows = 40;
+        st.upsert(&p).unwrap();
+        st.update_size("a", 100, 30).unwrap();
+        let r = st.load_all().unwrap().into_iter().find(|x| x.id == "a").unwrap();
+        assert_eq!(r.tmux_origin.as_deref(), Some("external"));
+        assert_eq!((r.cols, r.rows), (100, 30));
     }
 
     #[test]

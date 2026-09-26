@@ -13,6 +13,7 @@ const session: SessionInfo = {
   id: 's1', name: 'agent', type: 'claude', cols: 80, rows: 24, work_dir: '/w',
   description: '', status: 'running', running: true, turn_state: 'running',
   turn_started_ms: null, last_activity_ms: 0, turns_completed: 0,
+  tmux_name: null, tmux_origin: null,
 }
 
 // The queue dropdown lives inside the collapsed details panel — expand it first.

@@ -850,6 +850,7 @@ async fn create_session(
         crate::session_manager::SessionType::Tmux => {
             state.sessions
                 .create_pty_session(name.clone(), &state.shell, &work_dir, state.default_cols, state.default_rows, &owner_id, req.tmux_target.as_deref())
+                .await
                 .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?
         }
         crate::session_manager::SessionType::Claude => {

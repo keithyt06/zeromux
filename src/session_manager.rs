@@ -90,6 +90,15 @@ pub enum ResumeToken {
     Crew(String),
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, serde::Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum TmuxOrigin { Own, External }
+
+impl TmuxOrigin {
+    pub fn as_str(self) -> &'static str { match self { Self::Own => "own", Self::External => "external" } }
+    pub fn from_str_lenient(s: &str) -> Self { if s == "external" { Self::External } else { Self::Own } }
+}
+
 impl ResumeToken {
     /// 拆成持久化用的 (kind, value)。
     pub fn to_kind_value(&self) -> (&'static str, String) {
@@ -284,6 +293,11 @@ pub struct Session {
     pub name_is_auto: bool,
     pub status: SessionMeta,
     resume_token: Option<ResumeToken>,
+    /// Some for tmux-backed terminals (resume_token is Tmux(name)); None for
+    /// legacy bare-shell PTYs and agent sessions.
+    tmux_origin: Option<TmuxOrigin>,
+    /// Set by DELETE on tmux sessions: hidden from lists, killed when due (T5).
+    pending_kill_until: Option<i64>,
     /// Git worktree path for ACP sessions (cleaned up on delete)
     worktree_path: Option<PathBuf>,
     created_ms: i64,
@@ -346,6 +360,8 @@ pub struct SessionManager {
     /// session's in-memory VecDeque (under lock) and then `try_send`s here
     /// (outside the lock) so the async writer fsyncs off the conversation path.
     run_metrics_tx: tokio::sync::mpsc::Sender<crate::run_metrics::RunMetric>,
+    /// tmux control (socket + `-N`); every terminal is a tmux session on it.
+    tmux: crate::tmux::TmuxCtl,
 }
 
 #[derive(serde::Serialize)]
@@ -365,6 +381,8 @@ pub struct SessionInfo {
     pub last_activity_ms: i64,
     pub turns_completed: u32,
     pub source_task_id: Option<String>,
+    pub tmux_name: Option<String>,
+    pub tmux_origin: Option<TmuxOrigin>,
 }
 
 // ── Git worktree helpers ──
@@ -612,6 +630,11 @@ fn session_info_of(s: &Session) -> SessionInfo {
         last_activity_ms: s.last_activity_ms,
         turns_completed: s.turns_completed,
         source_task_id: s.source_task_id.clone(),
+        tmux_name: match (&s.resume_token, s.tmux_origin) {
+            (Some(ResumeToken::Tmux(n)), Some(_)) => Some(n.clone()),
+            _ => None,
+        },
+        tmux_origin: s.tmux_origin,
     }
 }
 
@@ -626,6 +649,7 @@ impl SessionManager {
         crew_home: String,
         shell: String,
         worktree_isolation: bool,
+        tmux: crate::tmux::TmuxCtl,
     ) -> Arc<Self> {
         let mgr = Arc::new(Self {
             sessions: Mutex::new(HashMap::new()),
@@ -643,9 +667,14 @@ impl SessionManager {
             push: Mutex::new(None),
             search: Mutex::new(None),
             run_metrics_tx: crate::run_metrics::spawn_writer(),
+            tmux,
         });
         *mgr.self_weak.lock().unwrap() = Arc::downgrade(&mgr);
         mgr
+    }
+
+    pub fn tmux(&self) -> &crate::tmux::TmuxCtl {
+        &self.tmux
     }
 
     fn weak(&self) -> Weak<SessionManager> {
@@ -898,6 +927,9 @@ impl SessionManager {
             created_ms: s.created_ms,
             source_task_id: s.source_task_id.clone(),
             name_is_auto: s.name_is_auto,
+            tmux_origin: s.tmux_origin.map(|o| o.as_str().to_string()),
+            cols: s.cols,
+            rows: s.rows,
         };
         if let Err(e) = self.store.upsert(&pj) {
             tracing::warn!("persist session {} failed: {}", s.id, e);
@@ -905,8 +937,8 @@ impl SessionManager {
     }
 
     /// Spawn a tmux/PTY process for `id` rooted at `work_dir`, start its fan-out
-    /// task, and return the live handle. `target` Some → `tmux attach -t <target>`
-    /// (restart-survival via existing tmux server), None → plain `self.shell`.
+    /// task, and return the live handle. `tmux_name` Some → `tmux new-session -A -s <name>`
+    /// (attach-or-create, via TmuxCtl); None → legacy bare shell.
     /// Shared by `create_pty_session` and `ensure_running`.
     fn spawn_tmux(
         &self,
@@ -914,15 +946,17 @@ impl SessionManager {
         work_dir: &str,
         cols: u16,
         rows: u16,
-        target: Option<&str>,
+        tmux_name: Option<&str>,
     ) -> Result<RunningProcess, String> {
         let cwd = if work_dir.is_empty() || work_dir == "." {
             None
         } else {
             Some(work_dir)
         };
-        let (cmd, args): (&str, Vec<&str>) = if let Some(target) = target {
-            ("tmux", vec!["attach", "-t", target])
+        let argv: Vec<String>;
+        let (cmd, args): (&str, Vec<&str>) = if let Some(name) = tmux_name {
+            argv = self.tmux.attach_argv(name, cwd);
+            ("tmux", argv.iter().map(String::as_str).collect())
         } else {
             (self.shell.as_str(), vec![])
         };
@@ -1000,7 +1034,7 @@ impl SessionManager {
         })
     }
 
-    pub fn create_pty_session(
+    pub async fn create_pty_session(
         &self,
         name: String,
         _shell: &str,
@@ -1018,7 +1052,17 @@ impl SessionManager {
 
         let id = uuid::Uuid::new_v4().to_string();
 
-        let running = self.spawn_tmux(&id, work_dir, cols, rows, tmux_target)?;
+        let (tmux_name, origin) = match tmux_target {
+            Some(t) => (t.to_string(), TmuxOrigin::External),
+            None => (crate::tmux::tmux_name_for(&id), TmuxOrigin::Own),
+        };
+        // Refuse rather than fall back to a bare shell: a bare shell silently
+        // loses the "survives deploy / attach from VSCode" promise.
+        self.tmux.run(&["list-sessions"]).await.or_else(|e| match e {
+            crate::tmux::TmuxError::NotFound => Ok(String::new()), // server up, 0 sessions
+            e => Err(e.to_string()),
+        })?;
+        let running = self.spawn_tmux(&id, work_dir, cols, rows, Some(&tmux_name))?;
 
         let session = Session {
             id: id.clone(),
@@ -1031,7 +1075,9 @@ impl SessionManager {
             description: String::new(),
             name_is_auto: true,
             status: SessionMeta::Running,
-            resume_token: tmux_target.map(|t| ResumeToken::Tmux(t.to_string())),
+            resume_token: Some(ResumeToken::Tmux(tmux_name.clone())),
+            tmux_origin: Some(origin),
+            pending_kill_until: None,
             worktree_path: None,
             created_ms: now_millis(),
             source_task_id: None,
@@ -1144,6 +1190,8 @@ impl SessionManager {
             name_is_auto: true,
             status: SessionMeta::Running,
             resume_token: None,
+            tmux_origin: None,
+            pending_kill_until: None,
             worktree_path,
             created_ms: now_millis(),
             source_task_id,
@@ -1487,6 +1535,8 @@ impl SessionManager {
             name_is_auto: true,
             status: SessionMeta::Running,
             resume_token: None,
+            tmux_origin: None,
+            pending_kill_until: None,
             worktree_path,
             created_ms: now_millis(),
             source_task_id: None,
@@ -1588,6 +1638,8 @@ impl SessionManager {
             name_is_auto: true,
             status: SessionMeta::Running,
             resume_token: None,
+            tmux_origin: None,
+            pending_kill_until: None,
             worktree_path,
             created_ms: now_millis(),
             source_task_id: None,
@@ -2102,13 +2154,20 @@ impl SessionManager {
                     id: p.id,
                     name: p.name,
                     session_type: p.session_type,
-                    cols: 80,
-                    rows: 24,
+                    cols: p.cols,
+                    rows: p.rows,
                     work_dir: p.work_dir,
                     owner_id: p.owner_id,
                     description: p.description,
                     name_is_auto: p.name_is_auto,
                     status: SessionMeta::Idle,
+                    tmux_origin: match (&p.resume_token, p.tmux_origin.as_deref()) {
+                        (Some(ResumeToken::Tmux(_)), Some(o)) => Some(TmuxOrigin::from_str_lenient(o)),
+                        // Pre-migration rows: zeromux-made names are ours, anything else was attached.
+                        (Some(ResumeToken::Tmux(n)), None) => Some(if n.starts_with("zmx-") { TmuxOrigin::Own } else { TmuxOrigin::External }),
+                        _ => None,
+                    },
+                    pending_kill_until: None,
                     resume_token: p.resume_token,
                     worktree_path: p.worktree_path.map(std::path::PathBuf::from),
                     created_ms: p.created_ms,
@@ -2125,6 +2184,23 @@ impl SessionManager {
                     scrollback_bytes: 0,
                 },
             );
+        }
+    }
+
+    pub fn set_size(&self, id: &str, cols: u16, rows: u16) {
+        let changed = match self.sessions.lock().unwrap().get_mut(id) {
+            Some(s) if (s.cols, s.rows) != (cols, rows) => { s.cols = cols; s.rows = rows; true }
+            _ => false,
+        };
+        if changed { let _ = self.store.update_size(id, cols, rows); }
+    }
+
+    pub fn tmux_binding(&self, id: &str) -> Option<(String, TmuxOrigin)> {
+        let map = self.sessions.lock().unwrap();
+        let s = map.get(id)?;
+        match (&s.resume_token, s.tmux_origin) {
+            (Some(ResumeToken::Tmux(n)), Some(o)) => Some((n.clone(), o)),
+            _ => None,
         }
     }
 
@@ -4018,6 +4094,8 @@ mod decide_spawn_tests {
             name_is_auto: true,
             status: SessionMeta::Idle,
             resume_token: None,
+            tmux_origin: None,
+            pending_kill_until: None,
             worktree_path: None,
             created_ms: 0,
             source_task_id: None,
@@ -4094,6 +4172,7 @@ mod decide_spawn_tests {
             "/tmp/crew".into(),
             "bash".into(),
             false,
+            crate::tmux::TmuxCtl::new(Some("zmx-test-unused".into())),
         );
         (mgr, dir)
     }
@@ -4207,7 +4286,7 @@ mod turn_state_tests {
             owner_id: "u".into(), description: String::new(),
             name_is_auto: true,
             status: SessionMeta::Running,
-            resume_token: None, worktree_path: None, created_ms: 0,
+            resume_token: None, tmux_origin: None, pending_kill_until: None, worktree_path: None, created_ms: 0,
             source_task_id: None,
             spawning: false,
             last_activity_ms: 0,
@@ -4254,6 +4333,7 @@ mod turn_state_tests {
                 events, store,
                 "claude".into(), "codex".into(), "off".into(),
                 5476, "/tmp/crew".into(), "bash".into(), false,
+            crate::tmux::TmuxCtl::new(Some("zmx-test-unused".into())),
             );
             (mgr, dir)
         };
@@ -4712,6 +4792,8 @@ mod running_summary_tests {
             name_is_auto: true,
             status: SessionMeta::Idle,
             resume_token: None,
+            tmux_origin: None,
+            pending_kill_until: None,
             worktree_path: None,
             created_ms: 0,
             source_task_id,
@@ -4744,6 +4826,7 @@ mod running_summary_tests {
             events, store,
             "claude".into(), "codex".into(), "off".into(),
             5476, "/tmp/crew".into(), "bash".into(), false,
+            crate::tmux::TmuxCtl::new(Some("zmx-test-unused".into())),
         );
         // Wire a scheduled store: `scheduled` in the summary is now sourced from
         // the DB in-flight run count, so tests that exercise the scheduled gate
@@ -5498,6 +5581,7 @@ mod lifetime_tests {
             events, store,
             "claude".into(), "codex".into(), "off".into(),
             5476, "/tmp/crew".into(), "bash".into(), false,
+            crate::tmux::TmuxCtl::new(Some("zmx-test-unused".into())),
         );
         (mgr, dir)
     }
@@ -5515,6 +5599,8 @@ mod lifetime_tests {
             name_is_auto: true,
             status: SessionMeta::Idle,
             resume_token: None,
+            tmux_origin: None,
+            pending_kill_until: None,
             worktree_path: None,
             created_ms: 0,
             source_task_id: None,
@@ -5766,5 +5852,84 @@ mod cost_diff_integration_guard_tests {
         let (d, p) = crate::run_metrics::diff_cost(Some(0.0), None, true, false);
         assert_eq!(d, None);
         assert_eq!(p, Some(0.0));
+    }
+}
+
+#[cfg(test)]
+mod tmux_session_tests {
+    use super::*;
+    use crate::tmux::tests::TestServer;
+
+    fn mgr_with(ctl: crate::tmux::TmuxCtl) -> (Arc<SessionManager>, tempfile::TempDir) {
+        let dir = tempfile::tempdir().unwrap();
+        let events = Arc::new(crate::events::EventStore::open(dir.path()).unwrap());
+        let store = Arc::new(crate::session_store::SessionStore::open(dir.path()).unwrap());
+        let m = SessionManager::new(events, store, "claude".into(), "codex".into(), "off".into(),
+            5476, "/tmp/crew".into(), "bash".into(), false, ctl);
+        (m, dir)
+    }
+
+    #[tokio::test]
+    async fn new_terminal_is_own_tmux_session() {
+        let Some(srv) = TestServer::start() else { return };
+        let (m, _d) = mgr_with(srv.ctl.clone());
+        let id = m.create_pty_session("t".into(), "bash", "/tmp", 80, 24, "u", None).await.unwrap();
+        let (name, origin) = m.tmux_binding(&id).unwrap();
+        assert_eq!(name, crate::tmux::tmux_name_for(&id));
+        assert_eq!(origin, TmuxOrigin::Own);
+        // PTY client attaches asynchronously; poll briefly.
+        for _ in 0..30 {
+            if srv.ctl.has(&name).await.unwrap() { break; }
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+        assert!(srv.ctl.has(&name).await.unwrap());
+        let info = m.list_sessions(None).into_iter().find(|s| s.id == id).unwrap();
+        assert_eq!(info.tmux_name.as_deref(), Some(name.as_str()));
+    }
+
+    #[tokio::test]
+    async fn attach_target_is_external() {
+        let Some(srv) = TestServer::start() else { return };
+        srv.ctl.run(&["new-session", "-d", "-s", "vscode-dev"]).await.unwrap();
+        let (m, _d) = mgr_with(srv.ctl.clone());
+        let id = m.create_pty_session("x".into(), "bash", "/tmp", 80, 24, "u", Some("vscode-dev")).await.unwrap();
+        assert_eq!(m.tmux_binding(&id), Some(("vscode-dev".into(), TmuxOrigin::External)));
+    }
+
+    #[tokio::test]
+    async fn server_down_errors_instead_of_bare_shell() {
+        let ctl = crate::tmux::TmuxCtl::new(Some(format!("zmx-test-down-{}", std::process::id())));
+        let (m, _d) = mgr_with(ctl);
+        let err = m.create_pty_session("t".into(), "bash", "/tmp", 80, 24, "u", None).await.unwrap_err();
+        assert!(err.contains("tmux 服务未运行"), "{err}");
+        assert!(m.list_sessions(None).is_empty());
+    }
+
+    #[test]
+    fn set_size_updates_memory_and_store() {
+        let (m, _d) = mgr_with(crate::tmux::TmuxCtl::new(Some("zmx-test-unused".into())));
+        let mut s = test_session_for_size();
+        s.id = "sz".into();
+        m.persist_meta(&s);
+        m.sessions.lock().unwrap().insert("sz".into(), s);
+        m.set_size("sz", 101, 33);
+        let s = m.sessions.lock().unwrap().get("sz").map(|s| (s.cols, s.rows));
+        assert_eq!(s, Some((101, 33)));
+        let row = m.store.load_all().unwrap().into_iter().find(|p| p.id == "sz").unwrap();
+        assert_eq!((row.cols, row.rows), (101, 33));
+    }
+
+    fn test_session_for_size() -> Session {
+        Session {
+            id: "sid".into(), name: "n".into(), session_type: SessionType::Tmux,
+            cols: 80, rows: 24, work_dir: "/tmp".into(), owner_id: "u".into(),
+            description: String::new(), name_is_auto: true, status: SessionMeta::Idle,
+            resume_token: Some(ResumeToken::Tmux("zmx-sid".into())), tmux_origin: Some(TmuxOrigin::Own),
+            pending_kill_until: None,
+            worktree_path: None, created_ms: 0, source_task_id: None, spawning: false,
+            last_activity_ms: 0, turns_completed: 0, run_metrics: VecDeque::new(),
+            lifetime_turns: 0, lifetime_duration_ms: 0, lifetime_cost_usd: 0.0,
+            running: None, scrollback: VecDeque::new(), scrollback_bytes: 0,
+        }
     }
 }

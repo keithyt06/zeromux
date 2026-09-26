@@ -4,8 +4,10 @@ import { Send } from 'lucide-react'
 interface ComposerProps {
   value: string
   onChange: (v: string) => void
-  /** Called with the trimmed text. Caller decides what bytes to send. */
-  onSend: (text: string) => void
+  /** Called with the trimmed text. Caller decides what bytes to send.
+   *  Return `false` when the text was NOT delivered (e.g. socket not open):
+   *  the caller must then leave `value` untouched so nothing typed is lost. */
+  onSend: (text: string) => boolean | void
   /** Chat: true (Enter submits). Terminal: false (Enter = newline, button submits). */
   submitOnEnter: boolean
   placeholder?: string
@@ -36,6 +38,10 @@ export default function Composer({
   }
 
   const handleKeyDown = (e: KeyboardEvent) => {
+    // IME guard: while a CJK candidate is being chosen, Enter confirms the
+    // candidate — it must never submit. Safari fires keydown with keyCode 229
+    // after compositionend, when isComposing is already false, so check both.
+    if (e.nativeEvent.isComposing || e.keyCode === 229) return
     if (submitOnEnter && e.key === 'Enter' && !e.shiftKey) {
       e.preventDefault()
       send()

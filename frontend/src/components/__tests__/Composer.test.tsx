@@ -45,4 +45,22 @@ describe('Composer', () => {
     fireEvent.keyDown(screen.getByPlaceholderText('type here'), { key: 'Enter' })
     expect(onSend).not.toHaveBeenCalled()
   })
+
+  it('IME composing: Enter while isComposing does NOT send', () => {
+    const { onSend } = setup({ value: '你好', submitOnEnter: true })
+    fireEvent.keyDown(screen.getByPlaceholderText('type here'), { key: 'Enter', isComposing: true })
+    expect(onSend).not.toHaveBeenCalled()
+  })
+
+  it('IME composing: Enter with keyCode 229 (Safari post-compositionend) does NOT send', () => {
+    const { onSend } = setup({ value: '你好', submitOnEnter: true })
+    fireEvent.keyDown(screen.getByPlaceholderText('type here'), { key: 'Enter', keyCode: 229 })
+    expect(onSend).not.toHaveBeenCalled()
+  })
+
+  it('plain Enter after composition ends still sends', () => {
+    const { onSend } = setup({ value: '你好', submitOnEnter: true })
+    fireEvent.keyDown(screen.getByPlaceholderText('type here'), { key: 'Enter', keyCode: 13 })
+    expect(onSend).toHaveBeenCalledWith('你好')
+  })
 })

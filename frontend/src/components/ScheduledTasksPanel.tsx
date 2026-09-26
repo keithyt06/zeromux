@@ -87,6 +87,9 @@ export default function ScheduledTasksPanel({ onClose }: Props) {
         retention_n: t.retention_n,
         side_effects: t.side_effects,
         max_runtime_min: t.max_runtime_min,
+        // PUT is a full upsert (scheduled_tasks.rs upsert SETs every column):
+        // omitting this would silently NULL the task's idle timeout. (B1)
+        idle_timeout_min: t.idle_timeout_min,
       })
       load()
     } catch { /* ignore */ }

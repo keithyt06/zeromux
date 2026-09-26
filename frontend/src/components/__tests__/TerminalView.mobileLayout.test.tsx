@@ -76,4 +76,18 @@ describe('TerminalView mobile bottom layout', () => {
     await act(async () => { await new Promise(r => setTimeout(r, 120)) })
     expect(fitSpy.calls).toBe(afterOpen)
   })
+  it('refits after a close -> open cycle (ConnectionBar height change after onopen measured)', async () => {
+    vi.spyOn(HTMLElement.prototype, 'clientWidth', 'get').mockReturnValue(390)
+    vi.spyOn(HTMLElement.prototype, 'clientHeight', 'get').mockReturnValue(600)
+    const ws = installFakeWebSocket()
+    render(<TerminalView sessionId="s1" active theme="dark" tmuxName="zmx-abc" tmuxOrigin="own" />)
+    act(() => { ws.latest().fireOpen() })
+    await act(async () => { await new Promise(r => setTimeout(r, 120)) })
+    act(() => { ws.latest().fireClose() })
+    await act(async () => { await new Promise(r => setTimeout(r, 1100)) })   // backoff 1s → reconnect
+    const before = fitSpy.calls
+    act(() => { ws.latest().fireOpen() })
+    await act(async () => { await new Promise(r => setTimeout(r, 120)) })
+    expect(fitSpy.calls).toBeGreaterThan(before)
+  })
 })

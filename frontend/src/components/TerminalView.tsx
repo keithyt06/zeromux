@@ -658,6 +658,15 @@ export default function TerminalView({ sessionId, active, theme, tmuxName, tmuxO
     return () => clearTimeout(t)
   }, [isTouch, keyboardOpen, handleResize])
 
+  // ConnectionBar is rendered while not open and removed on open, changing the
+  // terminal's height after onopen already measured (rows N-1). Refit once the
+  // bar is gone. handleResize skips hidden views and redundant sizes (I-12).
+  useEffect(() => {
+    if (wsStatus.status !== 'open') return
+    const t = setTimeout(handleResize, 50)
+    return () => clearTimeout(t)
+  }, [wsStatus.status, handleResize])
+
   // Split history halves the terminal width; refit so tmux reflows to the new cols.
   useEffect(() => {
     if (!split) return

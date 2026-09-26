@@ -42,7 +42,8 @@ export function busyAfterReplay(running: unknown): boolean {
 
 // 重连重放结束时,`stuck`(静默超阈)判定所用的「上次活动时间」基线。
 //
-// `中断`(interrupt)按钮只在 `stuck` 为真时渲染(见 AcpChatView 底栏),而
+// `中断`(interrupt)按钮在 `busy` 为真时即渲染(跨会话 CLI 发起的 turn 也需
+// 可中断),`stuck` 为真时变红强调(见 AcpChatView 底栏)。
 // `stuck = busy && now - lastEventMs > STUCK_SILENCE_MS`。若重连后把 lastEventMs
 // 直接置为 now,静默计时就被清零 —— 真正卡住的 turn 在重连后还要再等满一个
 // 180s 窗口按钮才出现;若静默 socket 被 idle-proxy 反复 <180s 掉线,每次重连都

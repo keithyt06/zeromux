@@ -90,8 +90,8 @@ export function RunMetricsPanel({ sessionId, turnStartedMs, running, refreshKey 
     // boundary (refreshKey bump) fires a slow JuiceFS/S3 getSessionRuns; if the
     // user clicks a verdict while it's in flight, that stale GET predates the
     // POST and would clobber the human mark back to unmarked until the next turn.
-    // Same reqRef discipline the sibling optimistic mutations use (AgentDashboard
-    // handleDelete, SessionInfoBar handleAddNote/handleDeleteNote).
+    // Same reqRef discipline the sibling optimistic mutation uses (AgentDashboard
+    // handleDelete).
     reqRef.current++
     // Optimistic: flip the row immediately, mark it human-sourced.
     setRuns(prev => prev.map(r =>

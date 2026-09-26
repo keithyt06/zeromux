@@ -313,7 +313,7 @@ export default function App() {
   }, [])
 
   const [undoToast, setUndoToast] = useState<{ id: string; name: string; durationMs: number } | null>(null)
-  const [failToast, setFailToast] = useState(false)
+  const [failToast, setFailToast] = useState<string | null>(null)
 
   const handleDelete = useCallback(async (id: string) => {
     const s = sessions.find(x => x.id === id)
@@ -451,7 +451,7 @@ export default function App() {
                 {/* Always keep terminal/chat mounted, hide with CSS when overlay is active */}
                 <div className={`h-full ${view !== 'none' ? 'hidden' : ''}`}>
                   {s.type === 'tmux' ? (
-                    <TerminalView sessionId={s.id} active={isActive && view === 'none'} theme={themeCtx.theme} tmuxName={s.tmux_name} tmuxOrigin={s.tmux_origin} onClose={() => handleDelete(s.id)} historyRequest={historyReq?.id === s.id ? historyReq.nonce : 0} onAskAgent={(prompt) => handleCreate('claude', s.work_dir, undefined, prompt)} />
+                    <TerminalView sessionId={s.id} active={isActive && view === 'none'} theme={themeCtx.theme} tmuxName={s.tmux_name} tmuxOrigin={s.tmux_origin} onClose={() => handleDelete(s.id)} historyRequest={historyReq?.id === s.id ? historyReq.nonce : 0} onAskAgent={(prompt) => { handleCreate('claude', s.work_dir, undefined, prompt).catch(() => setFailToast('创建会话失败')) }} />
                   ) : (
                     <AcpChatView sessionId={s.id} active={isActive && view === 'none'} agentType={s.type} onRegisterControls={registerControls} onQueueModeChange={handleQueueModeChange} showMetrics={!!metricsOpen[s.id]} onOpenMemory={s.type === 'crew' ? () => toggleOverlay(s.id, 'memory') : undefined} peerNames={peerNames} />
                   )}
@@ -486,13 +486,13 @@ export default function App() {
             durationMs={undoToast.durationMs}
             onAction={async () => {
               if (await restoreSession(undoToast.id)) { await loadSessions(); setActiveId(undoToast.id) }
-              else setFailToast(true)
+              else setFailToast('撤销失败，会话已关闭')
             }}
             onDone={() => setUndoToast(null)}
           />
         )}
         {failToast && (
-          <Toast message="撤销失败，会话已关闭" durationMs={3000} onDone={() => setFailToast(false)} />
+          <Toast message={failToast} durationMs={3000} onDone={() => setFailToast(null)} />
         )}
       </main>
     </div>

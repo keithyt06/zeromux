@@ -24,7 +24,7 @@ interface Props {
   docTabs: DocTab[]
   activeId: string | null
   onSelect: (id: string) => void
-  onCreate: (type: SessionType | 'vault', workDir?: string, tmuxTarget?: string, initialPrompt?: string) => void
+  onCreate: (type: SessionType | 'vault', workDir?: string, tmuxTarget?: string, initialPrompt?: string) => Promise<void>
   onDelete: (id: string) => void
   onRename: (id: string, name: string) => void
   hasUnread: (s: SessionInfo) => boolean
@@ -113,6 +113,7 @@ export default function Sidebar({ sessions, docTabs, activeId, onSelect, onCreat
   const [vaultEnabled, setVaultEnabled] = useState(false)
   const [schedulerHealthy, setSchedulerHealthy] = useState(true)
   const [editingId, setEditingId] = useState<string | null>(null)
+  const [createError, setCreateError] = useState<string | null>(null)
 
   const commitRename = (id: string, name: string) => {
     setEditingId(null)
@@ -227,12 +228,11 @@ export default function Sidebar({ sessions, docTabs, activeId, onSelect, onCreat
     if (type === 'tmux') {
       // Terminals are always tmux now: dir fixed by a quick card/search → create;
       // otherwise pick a dir. (Attaching existing tmux lives in the session list.)
-      if (pendingDir) { onCreate('tmux', pendingDir); closeAfterCreate(); return }
+      if (pendingDir) { runCreate(() => onCreate('tmux', pendingDir)); return }
       setStep('pick-dir')
       loadDirs()
     } else if (pendingDir && pendingSkipPrompt) {
-      onCreate(type, pendingDir)
-      closeAfterCreate()
+      runCreate(() => onCreate(type, pendingDir))
     } else if (pendingDir) {
       // Arrived from a quick card's "换 agent 类型" or from ⚡: the dir is fixed,
       // only the type changes → straight to the prompt page (prefilled for ⚡).
@@ -248,8 +248,7 @@ export default function Sidebar({ sessions, docTabs, activeId, onSelect, onCreat
   const selectDir = (path: string) => {
     if (!pendingType) { setStep('closed'); return }
     if (pendingType === 'tmux') {
-      onCreate('tmux', path)
-      closeAfterCreate()
+      runCreate(() => onCreate('tmux', path))
     } else {
       setPendingDir(path)
       setPromptDraft('')
@@ -259,7 +258,7 @@ export default function Sidebar({ sessions, docTabs, activeId, onSelect, onCreat
   }
 
   const pickDirHit = (h: DirHit) => {
-    if (h.agent) { onCreate(h.agent, h.path); closeAfterCreate(); return }
+    if (h.agent) { runCreate(() => onCreate(h.agent!, h.path)); return }
     setPendingDir(h.path); setPendingSkipPrompt(true); setPendingAgentContext(null); setStep('pick-type')
   }
   const pickNoteHit = (h: NoteHit) => {
@@ -280,6 +279,7 @@ export default function Sidebar({ sessions, docTabs, activeId, onSelect, onCreat
     setPendingDir(null)
     setPendingSkipPrompt(false)
     setPendingAgentContext(null)
+    setCreateError(null)
   }
 
   // Post-creation teardown: close the popover, and on mobile the full-screen
@@ -291,20 +291,26 @@ export default function Sidebar({ sessions, docTabs, activeId, onSelect, onCreat
     if (mobile) onToggle()
   }
 
+  // Await creation; only tear the popover down on success. On failure keep the
+  // user where they are with a visible reason (audit B3) — never close silently.
+  const runCreate = async (create: () => Promise<void>, after: () => void = closeAfterCreate) => {
+    setCreateError(null)
+    try {
+      await create()
+      after()
+    } catch (e) {
+      setCreateError(`创建失败:${(e as Error).message || '未知错误'}`)
+    }
+  }
+
   const submitWithPrompt = () => {
     if (!pendingType || !pendingDir) { setStep('closed'); return }
     const trimmed = promptDraft.trim()
-    onCreate(pendingType, pendingDir, undefined, trimmed ? promptDraft : undefined)
-    setPromptDraft('')
-    setPendingDir(null)
-    closeAfterCreate()
+    runCreate(() => onCreate(pendingType, pendingDir, undefined, trimmed ? promptDraft : undefined), () => { setPromptDraft(''); setPendingDir(null); closeAfterCreate() })
   }
   const submitSkip = () => {
     if (!pendingType || !pendingDir) { setStep('closed'); return }
-    onCreate(pendingType, pendingDir)
-    setPromptDraft('')
-    setPendingDir(null)
-    closeAfterCreate()
+    runCreate(() => onCreate(pendingType, pendingDir), () => { setPromptDraft(''); setPendingDir(null); closeAfterCreate() })
   }
 
   // One-shot external request (VaultReader's ⚡), consumed once per nonce.
@@ -567,10 +573,15 @@ export default function Sidebar({ sessions, docTabs, activeId, onSelect, onCreat
         {hostTmux.length > 0 && (
           <>
             <div className="px-3 pt-3 pb-1 text-[10px] font-semibold text-[var(--text-muted)] uppercase tracking-wider">本机 tmux</div>
+            {createError && (
+              <div role="alert" className="mx-2 my-1 px-2 py-1.5 rounded text-xs text-[var(--accent-red)] bg-[var(--bg-tertiary)] border border-[var(--accent-red)]/40">
+                {createError}
+              </div>
+            )}
             {hostTmux.map(h => (
               <button
                 key={h.name}
-                onClick={() => { onCreate('tmux', undefined, h.name); if (mobile) onToggle() }}
+                onClick={() => runCreate(() => onCreate('tmux', undefined, h.name), () => { if (mobile) onToggle() })}
                 title={`${h.path}\n点击接入`}
                 className="flex items-center gap-2 w-[calc(100%-0.5rem)] px-3 py-1.5 mx-1 rounded text-xs text-[var(--text-secondary)] hover:bg-[var(--bg-tertiary)] hover:text-[var(--text-primary)]"
               >
@@ -598,6 +609,11 @@ export default function Sidebar({ sessions, docTabs, activeId, onSelect, onCreat
           <>
             <div className="fixed inset-0 z-10" onClick={close} />
             <div ref={popRef} className={`absolute bottom-full left-2 mb-1 bg-[var(--bg-tertiary)] border border-[var(--border)] rounded-lg py-1 ${mobile ? 'w-[calc(100vw-1rem)]' : step === 'quick' ? 'w-80' : 'w-56'} z-20 shadow-xl`}>
+              {createError && (
+                <div role="alert" className="mx-2 my-1 px-2 py-1.5 rounded text-xs text-[var(--accent-red)] bg-[var(--bg-tertiary)] border border-[var(--accent-red)]/40">
+                  {createError}
+                </div>
+              )}
               {step === 'quick' && (
                 <>
                   <div className="px-3 py-1.5 text-[10px] font-semibold text-[var(--text-muted)] uppercase tracking-wider">
@@ -608,7 +624,7 @@ export default function Sidebar({ sessions, docTabs, activeId, onSelect, onCreat
                   <div className="max-h-[40vh] overflow-y-auto border-b border-[var(--border)]">
                     {query.trim() ? (<>
                       {matchHostTmux(hostTmux, query).map(h => (
-                        <button key={`tmux-${h.name}`} onClick={() => { onCreate('tmux', undefined, h.name); closeAfterCreate() }}
+                        <button key={`tmux-${h.name}`} onClick={() => runCreate(() => onCreate('tmux', undefined, h.name))}
                           className="flex items-center gap-2.5 w-full px-3 py-2 text-xs text-[var(--text-primary)] hover:bg-[var(--bg-hover)]">
                           <Terminal size={13} className="text-[var(--accent-green-text)] shrink-0" />
                           <span className="truncate">接入 tmux：{h.name}</span>
@@ -640,8 +656,7 @@ export default function Sidebar({ sessions, docTabs, activeId, onSelect, onCreat
                         kind="dir"
                         onPick={(path, agent) => {
                           if (!agent) { setPendingDir(path); setStep('pick-type'); return }
-                          onCreate(agent, path)
-                          closeAfterCreate()
+                          runCreate(() => onCreate(agent as SessionType, path))
                         }}
                         onChangeAgent={(path) => { setPendingDir(path); setStep('pick-type') }}
                         onPickWithPrompt={(path, agent) => {
@@ -668,7 +683,7 @@ export default function Sidebar({ sessions, docTabs, activeId, onSelect, onCreat
                   {vaultEnabled && (
                     <button
                       type="button"
-                      onClick={() => { onCreate('vault'); closeAfterCreate() }}
+                      onClick={() => runCreate(() => onCreate('vault'))}
                       className="flex items-center gap-2 w-full px-3 py-2.5 min-h-[44px] text-xs text-[var(--text-secondary)] hover:bg-[var(--bg-hover)] transition-colors"
                     >
                       <BookOpen size={13} className="shrink-0" />
@@ -770,7 +785,7 @@ export default function Sidebar({ sessions, docTabs, activeId, onSelect, onCreat
                   </button>
                   {vaultEnabled && !pendingAgentContext && (
                     <button
-                      onClick={() => { onCreate('vault'); setStep('closed') }}
+                      onClick={() => runCreate(() => onCreate('vault'))}
                       className="flex items-center gap-2.5 w-full px-3 py-2 text-xs text-[var(--text-primary)] hover:bg-[var(--bg-hover)] transition-colors"
                     >
                       <BookOpen size={14} className="text-[var(--accent-blue)] shrink-0" />

@@ -4,7 +4,7 @@ import Sidebar from '../Sidebar'
 import * as api from '../../lib/api'
 
 function setup(over: Partial<React.ComponentProps<typeof Sidebar>> = {}) {
-  const onCreate = vi.fn()
+  const onCreate = over.onCreate ?? vi.fn().mockResolvedValue(undefined)
   const props = {
     sessions: [], docTabs: [], activeId: null, onSelect: vi.fn(), onCreate, onOpenVault: vi.fn(),
     onDelete: vi.fn(), onRename: vi.fn(), hasUnread: () => false, onLogout: vi.fn(),
@@ -51,5 +51,22 @@ describe('Sidebar new terminal flow', () => {
   it('no host group when list is empty', () => {
     setup({ hostTmux: [] })
     expect(screen.queryByText('本机 tmux')).toBeNull()
+  })
+
+  it('create failure keeps the popover open and shows the error; retry success closes it', async () => {
+    vi.spyOn(api, 'listQuickTargets').mockResolvedValue({ top: [
+      { kind: 'dir', path: '/w/p', agent: 'claude', display: 'p', hint: '/w/p' },
+    ] })
+    const onCreate = vi.fn()
+      .mockRejectedValueOnce(new Error('work_dir not allowed'))
+      .mockResolvedValueOnce(undefined)
+    setup({ onCreate })
+    fireEvent.click(screen.getByText('New session'))
+    fireEvent.click(await screen.findByText('p'))
+    expect(await screen.findByText(/创建失败:work_dir not allowed/)).toBeInTheDocument()
+    expect(screen.getByText('其他目录…')).toBeInTheDocument()     // popover still open
+    fireEvent.click(screen.getByText('p'))
+    await waitFor(() => expect(screen.queryByText('其他目录…')).toBeNull())
+    expect(screen.queryByText(/创建失败/)).toBeNull()
   })
 })

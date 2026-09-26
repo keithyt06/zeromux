@@ -622,6 +622,9 @@ export default function TerminalView({ sessionId, active, theme, tmuxName, tmuxO
 
   useEffect(() => {
     if (active) {
+      // Re-shown view always reclaims the window size: another client may have
+      // resized it (window-size latest) while this view was hidden.
+      lastDims.current = { cols: 0, rows: 0 }
       const t = setTimeout(() => {
         handleResize()
         // 触摸端不自动聚焦：避免一进会话就弹软键盘（正是用户烦的）。

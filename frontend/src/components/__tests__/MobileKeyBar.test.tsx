@@ -10,7 +10,7 @@ describe('MobileKeyBar', () => {
     }
   })
 
-  it('不渲染已删键', () => {
+  it('第一页不显示 esc/left/right（已删/挪到第二页）', () => {
     render(<MobileKeyBar onKey={() => {}} />)
     for (const k of ['esc', 'left', 'right', 'y', 'n']) {
       expect(screen.queryByLabelText(k)).toBeNull()
@@ -35,5 +35,19 @@ describe('MobileKeyBar', () => {
     rerender(<MobileKeyBar onKey={() => {}} onHistory={onHistory} />)
     fireEvent.pointerDown(screen.getByLabelText('history'))
     expect(onHistory).toHaveBeenCalled()
+  })
+
+  it('more-keys flips to page 2 and back', () => {
+    const onKey = vi.fn()
+    render(<MobileKeyBar onKey={onKey} />)
+    fireEvent.pointerDown(screen.getByLabelText('more-keys'))
+    for (const k of ['esc', 'tab', 'left', 'right', 'ctrl-d', 'ctrl-z', 'pgup', 'pgdn']) {
+      expect(screen.getByLabelText(k)).toBeInTheDocument()
+    }
+    expect(screen.queryByLabelText('claude')).toBeNull()
+    fireEvent.pointerDown(screen.getByLabelText('esc'))
+    expect(onKey).toHaveBeenCalledWith('esc')
+    fireEvent.pointerDown(screen.getByLabelText('more-keys'))
+    expect(screen.getByLabelText('claude')).toBeInTheDocument()
   })
 })

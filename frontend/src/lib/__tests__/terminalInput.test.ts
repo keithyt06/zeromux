@@ -83,6 +83,17 @@ describe('controlSequence', () => {
   it('ctrl-c → ETX (0x03)', () => { expect(controlSequence('ctrl-c')).toBe('\x03') })
 })
 
+describe('controlSequence (page 2)', () => {
+  it('maps extra control keys', () => {
+    expect(controlSequence('esc')).toBe('\x1b')
+    expect(controlSequence('tab')).toBe('\t')
+    expect(controlSequence('ctrl-d')).toBe('\x04')
+    expect(controlSequence('ctrl-z')).toBe('\x1a')
+    expect(controlSequence('pgup')).toBe('\x1b[5~')
+    expect(controlSequence('pgdn')).toBe('\x1b[6~')
+  })
+})
+
 describe('launchSequence', () => {
   it('claude / codex 裸命令即进交互，发命令名 + 回车', () => {
     expect(launchSequence('claude')).toBe('claude\r')

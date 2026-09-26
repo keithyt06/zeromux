@@ -65,10 +65,16 @@ export function submitSequence(bracketedPasteMode: boolean): string {
 }
 
 // 单键 / 控制键 → 直发字节。与方向键分开：这些走 MobileKeyBar，不经 composer。
-export type ControlKey = 'ctrl-c'
+export type ControlKey = 'ctrl-c' | 'esc' | 'tab' | 'ctrl-d' | 'ctrl-z' | 'pgup' | 'pgdn'
 
 const CONTROL: Record<ControlKey, string> = {
   'ctrl-c': '\x03',
+  esc: '\x1b',
+  tab: '\t',
+  'ctrl-d': '\x04',
+  'ctrl-z': '\x1a',
+  pgup: '\x1b[5~',
+  pgdn: '\x1b[6~',
 }
 
 export function controlSequence(key: ControlKey): string {

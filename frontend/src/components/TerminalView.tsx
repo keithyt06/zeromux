@@ -14,7 +14,7 @@ import MobileKeyBar, { type BarKey } from './MobileKeyBar'
 import Composer from './Composer'
 import HistoryView from './HistoryView'
 import { TmuxHealthBar, LostBanner, EndedOverlay, ReconnectHint } from './TerminalNotices'
-import { arrowSequence, rowHeight, linesFromDrag, bracketedPaste, submitSequence, controlSequence, launchSequence, type ArrowKey } from '../lib/terminalInput'
+import { arrowSequence, rowHeight, linesFromDrag, bracketedPaste, submitSequence, controlSequence, launchSequence } from '../lib/terminalInput'
 import { shouldStickToBottom } from '../lib/scrollReplay'
 import { ScrollBatcher, inertiaLines, scheduleInertia, shouldCancelBeforeInput, type ScrollMsg } from '../lib/terminalScroll'
 import { shouldShowShiftHint, mousePref, MOUSE_PREF_KEY } from '../lib/desktopHints'
@@ -180,6 +180,7 @@ export default function TerminalView({ sessionId, active, theme, tmuxName, tmuxO
     const ws = wsRef.current
     if (!tmuxName || ws?.readyState !== WebSocket.OPEN) return
     ws.send(JSON.stringify({ type: 'scroll_watch', on: scrolling }))
+    // eslint-disable-next-line react-hooks/set-state-in-effect
     if (!scrolling) setNewLines(0)
   }, [scrolling, tmuxName])
   // Set by the init effect: stops in-flight inertia + drops batched lines, so a
@@ -237,12 +238,12 @@ export default function TerminalView({ sessionId, active, theme, tmuxName, tmuxO
     const term = termRef.current
     if (!term) return
     term.scrollToBottom()
-    if (key === 'ctrl-c') {
-      sendInput(controlSequence(key))
-    } else if (key === 'claude' || key === 'codex' || key === 'crew') {
+    if (key === 'claude' || key === 'codex' || key === 'crew') {
       sendInput(launchSequence(key))
+    } else if (key === 'up' || key === 'down' || key === 'left' || key === 'right' || key === 'enter') {
+      sendInput(arrowSequence(key, term.modes.applicationCursorKeysMode))
     } else {
-      sendInput(arrowSequence(key as ArrowKey, term.modes.applicationCursorKeysMode))
+      sendInput(controlSequence(key))
     }
   }, [sendInput])
 

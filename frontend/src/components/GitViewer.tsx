@@ -275,6 +275,7 @@ function WorktreePanel({ wt, selected, onSelect, onRefresh, onForward }: {
     if (!onForward) return
     if (confirmMsg && !window.confirm(confirmMsg)) return
     if (!onForward(text)) { setFailed(true); setTimeout(() => setFailed(false), 4000); return }
+    setFailed(false)
     setSent(true)
     setTimeout(() => setSent(false), 4000)
   }, [onForward])

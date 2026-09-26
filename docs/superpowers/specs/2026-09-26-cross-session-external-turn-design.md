@@ -1,11 +1,26 @@
 # Claude 跨会话消息 —— 外部 turn 正式支持 — 设计
 
 日期：2026-09-26
-状态：v2（CTO + PM 终审后修订；待用户审阅）
+状态：v3（tmux 默认终端合入 main 后复核；待用户审阅）
 
 ## 修订记录
 
-**v2（本版）** —— CTO + PM 并行终审。所有断言本人复核：CTO 的 `/tmp/zmx-cto-probe/{a,b,c}.log`
+**v3（本版）** —— 用户合入 tmux 默认终端（`e247aa7`…`ad42dda`，26 个提交）后复核。逐项核对：
+Claude 路径（`process.rs`、`spawn_acp_fanout`、`auto_titler.rs`、`acp/ws_handler.rs`、`AcpChatView.tsx`、`transcript.ts`、
+`SessionInfoBar.tsx`）**零改动**；`push.rs` 只新增 `term_ended`（`turn_done` 的 60 秒门槛与 routine 档位不变）；
+CLI 升到 2.1.283，一次性沙箱会话复测 `user.origin.kind/name/body`、`result.origin`、stdin 回显 `isReplay:true` 无 origin，**全部与 2.1.282 一致**。
+
+| # | 差异 | 改动 |
+|---|---|---|
+| 1 | **peer 名与 tmux 会话名撞前缀**：tmux 终端现在叫 `zmx-<id8>`（`session_manager.rs:1084` 用 `starts_with("zmx-")` 判 Own；`ListAgents` 对 tmux 里的 claude 会显示 `tmux zmx-…:@0.%0`）。v2 的 `zmx-<id6>` 在 UI 和 `ListAgents` 里会被当成 tmux 终端名，用户复制错地址 | peer 名改为 **`zmx-ai-<id6>`**：仍 ASCII、稳定、带 zmx 前缀便于识别，但与 `zmx-<8位 hex>` 形态不同，且 `starts_with("zmx-")` 判 tmux Own 的逻辑只作用于 tmux 的 resume token，不会误伤 |
+| 2 | 交互式 Claude Code **跑在 tmux 终端里**已经是主路径（tmux 默认 + `CLAUDE_CODE_DISABLE_ALTERNATE_SCREEN=1`），它们自带收件 socket、默认名 `<cwd>-<2位>`，本 spec 不管它们的计数（那是 CLI 自己的 TUI），但**它们是最常见的发送方/接收方**：用户在 tmux 里的 claude 让 ZeroMux agent 干活，正是用途 C 的 B 半边 | 目标补一句：tmux 终端里的交互 claude 是一等发送方，验收加一项；非目标补「不改 tmux 里交互 claude 的命名/inbound（CLI 自管）」 |
+| 3 | 新增的交互 tmux claude 是 **非 bypass**（普通权限模式），ZeroMux agent 是 bypass：默认规则下 bypass 接收方会 hold 非 bypass 发送方 —— v2 的 `accept` 决策因此更关键（否则这条最常见路径必然被 hold 后 5 分钟丢弃） | 用户决策表理由补这一条；验收第 7 项从「SSH 里交互 claude」扩为「SSH **或 ZeroMux tmux 终端**里的交互 claude」 |
+| 4 | `SessionManager::new` 多了 `tmux` 参数，调用点 5→**9**（main 1 + 测试 8） | 计划的 `set_oauth_mode` setter 方案不受影响（仍不改构造签名），仅更新行号与计数描述 |
+| 5 | `SessionInfo` 多了 `tmux_name/tmux_origin/other_clients`；`running_session` 测试 helper 多了 `tmux_origin/pending_kill_until` 字段 | 计划 Task 6 的锚点更新（加在 `other_clients` 之后）；测试 helper 直接复用，无需改 |
+| 6 | 大量行号漂移（fan-out 现 :2727-3581，`TurnStarts` :3250，`emit` :3391，`with_turn_id` :3491，`spawn_claude` :1147 / 调用点 :1214 :1760 :1801，`decide_spawn` :561，`session_info_of` :630，`load_persisted` 注释 :2190，main `set_search` :569，`oauth_configured` :251，App `<AcpChatView` :453） | 计划改为「以函数/符号为锚，行号仅供参考」并刷新行号 |
+| 7 | 冒烟隔离：新增 `--tmux-socket`（默认空=生产 default socket），启动时还会对 tmux 做 `set-environment` 与 `reconcile_pending_kills` | Task 4 Step 7 冒烟命令必须加 `--tmux-socket zmx-xs-smoke`，否则会触碰生产 tmux server |
+
+**v2** —— CTO + PM 并行终审。所有断言本人复核：CTO 的 `/tmp/zmx-cto-probe/{a,b,c}.log`
 原始日志逐行核对；`push.rs:301`（<60s 不推）、`push.ts:112`（routine 默认关）、`AcpChatView.tsx:840`
 （中断键仅 stuck 时出现）、`session_manager.rs:2082`（重启后 `running: None`）、`:1125`（定时 run 走同一
 `spawn_claude`）、systemd `ExecStart … --watch-build …/target/release/zeromux`、`run_metrics.rs:194` 硬编码 `$HOME/.zeromux`。
@@ -13,7 +28,7 @@
 | # | 改动 | 来源 | 理由 |
 |---|---|---|---|
 | 1 | **CLI 会把 ZeroMux 刚写入的 prompt 并进正在进行的外部 turn**，只出一个带 origin 的 result。新增 stdin 回显追踪（`StdinEcho` 标记 + `TurnEntry.echoed`），SkipBoundary 仅在队首**未回显**时成立 | CTO BLOCKER | v1 规则会把这个唯一 result 跳过 → turn N 永不结算 → 30 分钟后 TimeoutKill、排队 prompt 丢失。竞态窗口 = 外部 turn 首 token 时间（实测 3–5s），不是「几乎同时」 |
-| 2 | spawn 传 `--name zmx-<会话 id 前 6 位>`；SessionInfoBar 展开区显示 peer 名 + 复制；气泡把 `zmx-xxxxxx` 反查成会话标题 | PM HIGH | 默认名 `<cwd>-<2位后缀>` 同 repo 多会话无法区分，UI 也不知道它叫什么，用途 C 无法闭环 |
+| 2 | spawn 传 `--name zmx-<会话 id 前 6 位>`（v3 改为 `zmx-ai-<id6>`）；SessionInfoBar 展开区显示 peer 名 + 复制；气泡把 `zmx-xxxxxx` 反查成会话标题 | PM HIGH | 默认名 `<cwd>-<2位后缀>` 同 repo 多会话无法区分，UI 也不知道它叫什么，用途 C 无法闭环 |
 | 3 | inbound 按模式与会话类型选：legacy 交互会话 `accept`；**OAuth 模式与定时 run 会话 `refuse`** | CTO HIGH + PM MED | 所有会话同一 OS 用户：OAuth 多用户下 B 的 agent 能驱动 A 的 bypass agent（v1 前就存在的 bypass→bypass 通道，accept 只会扩大）；定时 run 无人值守，不应有外部输入 |
 | 4 | busy 时「中断」按钮**始终可见**（不再只在 stuck 时） | PM MED | 外部 turn 是非用户发起的自主执行（实测回复后又跑 4 分钟），手机上必须能随时停 |
 | 5 | 已知限制加 L4（休眠会话不可达）；SessionInfoBar 显示在线 / 休眠 | PM HIGH | 重启/部署后所有会话 `running: None`，没有进程就没有 inbox socket |
@@ -50,7 +65,8 @@ Claude 会话**不改代码就已在网络里**（实测 `ListAgents` 能列出 
   期间用户发的 prompt 按 queue mode 正常排队或打断；度量、`turn_done` 推送、vault 标脏走现有路径。
 - 竞态（外部 turn 开始到其首个输出之间 ZeroMux 写入 prompt；CLI 串行处理或把 prompt 并进外部 turn）下状态机不错乱。
 - 发送失败/被 hold/被拒的 CLI 通知（`system/informational`）在 UI 上显示为一行提示。
-- **可寻址**：每个 ZeroMux Claude 会话有稳定、可读的 peer 名（`zmx-<id6>`），UI 能看到并复制；收到的气泡显示发送方的 ZeroMux 会话标题。
+- **可寻址**：每个 ZeroMux Claude 会话有稳定、可读的 peer 名（`zmx-ai-<id6>`），UI 能看到并复制；收到的气泡显示发送方的 ZeroMux 会话标题。
+- **tmux 终端里的交互 claude 是一等发送方**（v3）：从 ZeroMux tmux 终端或 SSH 里运行的普通（非 bypass）`claude` 发来的消息直接送达，不被 hold。
 - **可停止**：外部 turn（及任何 busy turn）期间手机上随时可点「中断」。
 
 **非目标**
@@ -58,13 +74,14 @@ Claude 会话**不改代码就已在网络里**（实测 `ListAgents` 能列出 
 - 在 ZeroMux UI 里主动发起跨会话消息（仍由 agent 自己调 `SendMessage`）。
 - 外部 turn 的独立度量维度 / 按来源过滤推送。
 - 审批 UI（用户选择统一 `accept`，见下）。
+- tmux 终端里交互 `claude` 的命名、inbound 与 turn 计数（由 CLI 自己的 TUI 管理，ZeroMux 只提供 PTY）。
 
 ## 用户决策
 
 | 问题 | 决策 | 理由 |
 |---|---|---|
 | 用途 | C：ZeroMux 会话间协作 + 外部 `claude` 会话指挥 ZeroMux agent | — |
-| 外部（非 bypass）发送方 | legacy 模式交互会话 `crossSessionInbound: accept` | 个人项目；bypass 会话默认会 hold 非 bypass 发送方的消息，而 `-p` 无审批框，5 分钟后静默丢弃 |
+| 外部（非 bypass）发送方 | legacy 模式交互会话 `crossSessionInbound: accept` | 个人项目；bypass 会话默认会 hold 非 bypass 发送方的消息，而 `-p` 无审批框，5 分钟后静默丢弃。v3：tmux 默认终端上线后，最常见的发送方正是 tmux 里的普通权限 `claude`，不 accept 则这条主路径必然丢消息 |
 | OAuth 模式 / 定时 run 会话 | `refuse`（v2 新增，终审建议） | OAuth 多用户同 OS 用户无租户隔离；定时 run 无人值守 |
 | 实现路线 | 方案 1 改进版（下文） | 方案 2（全部 turn 改由 CLI 回显驱动）要重写 prompt/collect/interrupt 起点与 FIFO intent，回归风险过高；方案 3（只修 boundary）不满足 busy/度量目标 |
 
@@ -110,7 +127,8 @@ CLI 2.1.282：
 `--replay-user-messages`、`--name <peer_name>`、`--settings '{"crossSessionInbound":"<inbound>"}'`。
 `spawn` 新增两个入参 `peer_name: &str`、`inbound: Inbound`（`Accept | Refuse`）。由 `SessionManager::spawn_claude` 计算：
 
-- `peer_name = "zmx-" + 会话 id 前 6 个字符`。uuid 在会话创建时生成，resume 时 id 不变，所以名字稳定。
+- `peer_name = "zmx-ai-" + 会话 id 前 6 个字符`。uuid 在会话创建时生成，resume 时 id 不变，所以名字稳定。
+  （v3：不用 `zmx-<id>`，因为 tmux 终端已占用 `zmx-<id8>` 形态，`ListAgents` 与 UI 里会混淆。）
   只含 ASCII 小写十六进制与连字符，避开文档所说含空格/中文的名字需要加引号的问题。
   不用会话标题：标题在 auto-titler 之后才生成，`-p` 进程无法改名。
 - `inbound = Refuse` 当 **OAuth 模式**或会话 `source_task_id.is_some()`（定时 run）；否则 `Accept`。
@@ -214,10 +232,10 @@ Cancel / TimeoutKill 同理。
 **3b. `notice`**：`pushNotice({kind:'system', text})`，与 `resume_failed` 同一渲染路径。
 
 **3d. 可寻址性（SessionInfoBar + 气泡）**
-- 后端 `SessionInfo` 新增 `peer_name: string | null`（仅 Claude 会话非空，= `zmx-<id6>`，由 id 直接派生，无需存储）。
+- 后端 `SessionInfo` 新增 `peer_name: string | null`（仅 Claude 会话非空，= `zmx-ai-<id6>`，由 id 直接派生，无需存储）。
 - SessionInfoBar 展开区新增一行「Peer」：显示 `peer_name` + 复制按钮 + 在线/休眠标记（直接用现有 `running` 字段；
   休眠提示「打开会话后才能收到消息」）。
-- 气泡标签：`from_name` 以 `zmx-` 开头且在当前会话列表里能找到 `peer_name` 相同的会话 → 显示「来自 @{会话名}」，
+- 气泡标签：`from_name` 以 `zmx-ai-` 开头且在当前会话列表里能找到 `peer_name` 相同的会话 → 显示「来自 @{会话名}」，
   否则显示「来自 @{from_name}」。反查在 `AcpChatView` 渲染层完成（`foldTranscript` 仍只存原始 `from_name`），
   会话列表经新 prop `peerNames: Record<string, string>`（peer_name → 会话名）从 `App.tsx` 传入。
 
@@ -246,7 +264,7 @@ Cancel / TimeoutKill 同理。
 **Rust — `process.rs` 单元测试**（fixture 取本次实测 NDJSON，去除签名等无关字段）
 - 空闲 peer `user` → 一个 `PeerMessage`（`from_name`/`text` 取自 origin）。
 - stdin 回显 `user`（`isReplay:true`、无 origin）→ `StdinEcho`；`tool_result` `user`（无 `isReplay`）→ 空。
-- spawn 参数构造（抽成纯函数 `claude_args`）：含 `--replay-user-messages`、`--name zmx-…`、按 `Inbound` 生成的 `--settings`。
+- spawn 参数构造（抽成纯函数 `claude_args`）：含 `--replay-user-messages`、`--name zmx-ai-…`、按 `Inbound` 生成的 `--settings`。
 - `result` 带 `origin` → `[TurnOrigin, Result]`；`is_error` 且带 origin → `[TurnOrigin, Error]`；无 origin → `[Result]`。
 - `system/informational` → `Notice`。
 
@@ -281,7 +299,7 @@ collect / interrupt 的排队行为不改代码，由端到端验收覆盖。
 - 外部 turn 进行中点「中断」（非 stuck 状态也可见）：turn 停止，会话回到 Idle。
 - 刷新页面（replay）：气泡与分组一致、busy 状态正确。
 - ZeroMux 会话 A 经 UI 让它给会话 B（用 SessionInfoBar 复制的 peer 名）发消息，B 回信给 A：两边都出现「来自 @会话名」气泡，两边都不卡 Running。
-- 从 SSH 里交互式 `claude`（非 bypass）给 ZeroMux 会话发消息：直接送达，未被 hold。
+- 从 SSH 里、以及 **ZeroMux tmux 终端里**运行的交互式 `claude`（非 bypass）给 ZeroMux Claude 会话发消息：直接送达，未被 hold；`ListAgents` 里两者能区分（`zmx-ai-…` 是 agent 会话，tmux 里的 claude 带 `tmux zmx-…` 标注）。
 - ZeroMux 会话向一个 `refuse` 会话发消息：UI 出现灰色 notice。
 - deploy 后未打开的会话不在 `ListAgents` 中；打开后出现，且 peer 名与部署前相同。
 - 新会话首条 prompt 后标题正常生成（titler 未被干扰）。

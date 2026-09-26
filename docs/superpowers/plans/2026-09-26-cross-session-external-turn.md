@@ -4,9 +4,11 @@
 
 **Goal:** 让 ZeroMux 把 Claude CLI 因跨会话消息 / 后台任务通知而自开的 turn 当作一等 turn：可见、计数正确、busy 正确、可寻址、可中断。
 
-**Architecture:** 进程层（`src/acp/process.rs`）开启 `--replay-user-messages`、`--name zmx-<id6>`、按模式选 inbound，把 `user.origin.kind=="peer"` 翻成 `PeerMessage`、把 stdin 回显翻成内部标记 `StdinEcho`、把 `result.origin` 翻成内部标记 `TurnOrigin`、把 `system/informational` 翻成 `Notice`。Claude fan-out（`spawn_acp_fanout`，只有 Claude 用）用纯函数 `classify_claude_event` 决定每个事件是「开外部 turn / 跳过 boundary / 正常」，`TurnStarts` 条目记录 turn 来源与是否已回显。前端渲染 `peer_message` 气泡（反查会话名）、`notice` 提示、SessionInfoBar 的 peer 名、始终可见的中断键。
+**Architecture:** 进程层（`src/acp/process.rs`）开启 `--replay-user-messages`、`--name zmx-ai-<id6>`、按模式选 inbound，把 `user.origin.kind=="peer"` 翻成 `PeerMessage`、把 stdin 回显翻成内部标记 `StdinEcho`、把 `result.origin` 翻成内部标记 `TurnOrigin`、把 `system/informational` 翻成 `Notice`。Claude fan-out（`spawn_acp_fanout`，只有 Claude 用）用纯函数 `classify_claude_event` 决定每个事件是「开外部 turn / 跳过 boundary / 正常」，`TurnStarts` 条目记录 turn 来源与是否已回显。前端渲染 `peer_message` 气泡（反查会话名）、`notice` 提示、SessionInfoBar 的 peer 名、始终可见的中断键。
 
-**Revision:** v2 —— 按 spec v2（CTO + PM 终审）修订，并经 double check（在一次性 worktree 里按计划逐 Task 真实套用、编译、测试、验红）：新增 stdin 回显追踪修复 CTO BLOCKER（CLI 并入场景）；新增 Task 6（peer 名 / inbound 模式 / 中断键 / SessionInfoBar）；部署改为先 push 再 `./deploy.sh --build`。
+**Revision:** v3 —— 按 spec v3 刷新：peer 名 `zmx-ai-<id6>`（避开 tmux 的 `zmx-<id8>`）、冒烟加 `--tmux-socket`、行号按 tmux 合入后的 main（`ad42dda`）刷新；**所有位置以函数/符号为锚，行号仅供参考**。
+
+v2 —— 按 spec v2（CTO + PM 终审）修订，并经 double check（在一次性 worktree 里按计划逐 Task 真实套用、编译、测试、验红）：新增 stdin 回显追踪修复 CTO BLOCKER（CLI 并入场景）；新增 Task 6（peer 名 / inbound 模式 / 中断键 / SessionInfoBar）；部署改为先 push 再 `./deploy.sh --build`。
 
 **Tech Stack:** Rust（tokio、serde_json），React 19 + TypeScript，vitest。
 
@@ -15,7 +17,7 @@
 ## Global Constraints
 
 - 只改 Claude 路径：`AcpProcess::spawn` / `spawn_titler` / `translate_event` / `spawn_acp_fanout`。Codex（`spawn_codex_fanout`）与 Crew（`spawn_crew_fanout`）行为不得变化。
-- spawn 追加参数，原文：`--replay-user-messages`、`--name zmx-<会话 id 前 6 字符>`、`--settings '{"crossSessionInbound":"accept"}'`（legacy 交互会话）或 `--settings '{"crossSessionInbound":"refuse"}'`（OAuth 模式或定时 run 会话）；titler 追加 `--settings '{"crossSessionInbound":"refuse"}'`。
+- spawn 追加参数，原文：`--replay-user-messages`、`--name zmx-ai-<会话 id 前 6 字符>`、`--settings '{"crossSessionInbound":"accept"}'`（legacy 交互会话）或 `--settings '{"crossSessionInbound":"refuse"}'`（OAuth 模式或定时 run 会话）；titler 追加 `--settings '{"crossSessionInbound":"refuse"}'`。
 - `TurnOrigin` 与 `StdinEcho` 永不 emit、永不写 scrollback、永不进 `log_result_event`。
 - **不要单独跑 `cargo build --release`**：线上 systemd 带 `--watch-build …/target/release/zeromux`，release 产物一出现就可能被热更新到线上。release 构建只经 `./deploy.sh --build`，且先 `git push`。
 - `Notice` 不得用 `ContentBlock` 承载（空闲期到达会被误判为外部 turn 开始）。
@@ -68,7 +70,7 @@
   - `translate_event` 输出顺序：带 origin 的 `result` → `[TurnOrigin, Result|Error]`
   - `pub enum Inbound { Accept, Refuse }`
   - `fn claude_args(resume: Option<&str>, peer_name: &str, inbound: Inbound) -> Vec<String>`
-  - `AcpProcess::spawn(claude_path: &str, work_dir: &str, resume: Option<&str>, peer_name: &str, inbound: Inbound)`（新增后两个参数；唯一调用点 `session_manager.rs` `spawn_claude` 在本 Task 内同步更新为临时值 `&format!("zmx-{}", &id[..6.min(id.len())])`、`Inbound::Accept`，Task 6 替换为正式逻辑）
+  - `AcpProcess::spawn(claude_path: &str, work_dir: &str, resume: Option<&str>, peer_name: &str, inbound: Inbound)`（新增后两个参数；唯一调用点 `session_manager.rs` `spawn_claude` 在本 Task 内同步更新为临时值 `&format!("zmx-ai-{}", &id[..6.min(id.len())])`、`Inbound::Accept`，Task 6 替换为正式逻辑）
 
 - [ ] **Step 1: 写失败测试**（追加到 `src/acp/process.rs` 的 `mod tests`）
 
@@ -141,15 +143,15 @@ Fixture 取自 2026-09-26 实测 NDJSON（已删去无关字段）。
 
     #[test]
     fn claude_args_include_replay_name_and_inbound() {
-        let a = claude_args(None, "zmx-ab12cd", Inbound::Accept);
+        let a = claude_args(None, "zmx-ai-ab12cd", Inbound::Accept);
         assert!(a.iter().any(|x| x == "--replay-user-messages"));
         let i = a.iter().position(|x| x == "--name").unwrap();
-        assert_eq!(a[i + 1], "zmx-ab12cd");
+        assert_eq!(a[i + 1], "zmx-ai-ab12cd");
         let j = a.iter().position(|x| x == "--settings").unwrap();
         assert_eq!(a[j + 1], r#"{"crossSessionInbound":"accept"}"#);
         assert!(!a.iter().any(|x| x == "--resume"));
 
-        let r = claude_args(Some("sid-1"), "zmx-x", Inbound::Refuse);
+        let r = claude_args(Some("sid-1"), "zmx-ai-x", Inbound::Refuse);
         let j = r.iter().position(|x| x == "--settings").unwrap();
         assert_eq!(r[j + 1], r#"{"crossSessionInbound":"refuse"}"#);
         let k = r.iter().position(|x| x == "--resume").unwrap();
@@ -401,7 +403,7 @@ fn claude_args(resume: Option<&str>, peer_name: &str, inbound: Inbound) -> Vec<S
 更新唯一调用点 `src/session_manager.rs` 的 `spawn_claude`（约 :1065）为临时值（Task 6 替换）：
 
 ```rust
-        let peer_name = format!("zmx-{}", &id[..6.min(id.len())]);
+        let peer_name = format!("zmx-ai-{}", &id[..6.min(id.len())]);
         let process = AcpProcess::spawn(&self.claude_path, work_dir, resume,
                 &peer_name, crate::acp::process::Inbound::Accept)
 ```
@@ -440,7 +442,7 @@ Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>"
 ### Task 2: `TurnStarts` 记录 turn 来源与回显
 
 **Files:**
-- Modify: `src/session_manager.rs`（`struct TurnStarts` / `impl TurnStarts` 约 :2926-2964；其三处 `settle().and_then(|(_, o)| o)` 调用 :2612、:3346、:3642；测试模块 :4412 附近）
+- Modify: `src/session_manager.rs`（`struct TurnStarts` / `impl TurnStarts`（现约 :3250）；三处 `settle().and_then(|(_, o)| o)` 调用签名不变；测试放 `turn_starts_fifo_pairs_each_boundary_with_its_own_turn` 所在模块）
 
 **Interfaces:**
 - Consumes: 无
@@ -833,9 +835,9 @@ Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>"
 
 **Files:**
 - Modify: `src/session_manager.rs`
-  - `with_turn_id` :3167-3174
-  - `emit` 内 `ContentBlock | Result` 盖值分支约 :3078-3084
-  - `spawn_acp_fanout` 事件分支 `Some(evt) => {` :2452 起（`is_boundary` 计算 :2465-2468、`if is_boundary {` :2476）
+  - `with_turn_id`（现约 :3491）
+  - `emit`（现约 :3391）内 `ContentBlock | Result` 盖值分支
+  - `spawn_acp_fanout`（现约 :2727-3581，自 v2 起**未改动**）事件分支 `Some(evt) => {` 起、`is_boundary` 计算、`if is_boundary {`
 
 **Interfaces:**
 - Consumes: Task 1 `AcpEvent::{PeerMessage, TurnOrigin, Notice, StdinEcho}`；Task 2 `start_external`/`front_is_external`/`mark_echoed`/`front_is_echoed`；Task 3 `classify_claude_event`/`ClaudeStep`
@@ -989,19 +991,19 @@ Expected: 全 `ok`。
 cd frontend && npm run build && cd ..
 cargo build
 mkdir -p /tmp/zmx-xs-smoke
-./target/debug/zeromux --port 8097 --password smoke --data-dir /tmp/zmx-xs-smoke > /tmp/zmx-xs-smoke/log 2>&1 &
+./target/debug/zeromux --port 8097 --password smoke --data-dir /tmp/zmx-xs-smoke --tmux-socket zmx-xs-smoke > /tmp/zmx-xs-smoke/log 2>&1 &
 echo $! > /tmp/zmx-xs-smoke/pid
 ```
 
-`--data-dir` 已核实存在（`main.rs:108`）。注意：run-metrics 与 runs 目录硬编码为 `$HOME/.zeromux`（`run_metrics.rs:194`、`session_manager.rs:3141`），**冒烟会在生产 `~/.zeromux/run-metrics/` 留下 `<冒烟会话id>.ndjson`**，结束后删除；不能改 `HOME`（claude 会丢认证）。
+`--data-dir` 已核实存在（`main.rs:109`）。**必须**同时带 `--tmux-socket zmx-xs-smoke`（`main.rs:115`，默认空 = 生产 default socket）：启动时会对 tmux server 做 `set-environment` 与 `reconcile_pending_kills`，不隔离会触碰生产终端。注意：run-metrics 与 runs 目录硬编码为 `$HOME/.zeromux`（`run_metrics.rs` 与 `append_run_event` 的 `$HOME/.zeromux`），**冒烟会在生产 `~/.zeromux/run-metrics/` 留下 `<冒烟会话id>.ndjson`**，结束后删除；不能改 `HOME`（claude 会丢认证）。
 
-用浏览器或 `curl` 登录 `http://127.0.0.1:8097` 后建一个 Claude 会话（work_dir `/tmp/zmx-xs-smoke`），打开它（触发 `ensure_running`）。从开发会话 `ListAgents` 应看到 `zmx-<该会话 id 前 6 位>`（Task 6 前名字已由 Task 1 的临时逻辑生成）。依次验证：
+用浏览器或 `curl` 登录 `http://127.0.0.1:8097` 后建一个 Claude 会话（work_dir `/tmp/zmx-xs-smoke`），打开它（触发 `ensure_running`）。从开发会话 `ListAgents` 应看到 `zmx-ai-<该会话 id 前 6 位>`（Task 6 前名字已由 Task 1 的临时逻辑生成）。依次验证：
 
 1. **空闲 peer**：`SendMessage` 一条「只回复 pong，不用工具」→ 日志出现 `CLI-started turn (external)`，`GET /api/sessions` 中该会话 `turn_state` 回到 `idle`。
 2. **并入竞态**：`SendMessage` 一条「先用 Bash 执行 `sleep 8`，然后回复 done」，**消息发出后 2 秒内**在 UI 发一条 prompt「回复 USERPROMPT」→ 最终会话回到 `idle`（不能停在 `running`），UI 中两段输出都可见。
 3. **串行竞态**：`SendMessage` 一条「只回复 PEERREPLY，不用工具」，发出后 1 秒内在 UI 发 prompt → 最终 `idle`，日志出现一次 `not settling`。
 
-结束：`kill $(cat /tmp/zmx-xs-smoke/pid)`；`rm -f ~/.zeromux/run-metrics/<冒烟会话id>.ndjson`；`rm -rf /tmp/zmx-xs-smoke`。
+结束：`kill $(cat /tmp/zmx-xs-smoke/pid)`；`tmux -L zmx-xs-smoke kill-server 2>/dev/null`；`rm -f ~/.zeromux/run-metrics/<冒烟会话id>.ndjson`；`rm -rf /tmp/zmx-xs-smoke`。
 
 - [ ] **Step 8: 提交**
 
@@ -1176,18 +1178,18 @@ Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>"
 ### Task 6: 可寻址 + inbound 模式 + 中断键
 
 **Files:**
-- Modify: `src/session_manager.rs`（`SessionManager` 字段区 :325-345、`set_search` :666 之后、`SpawnPlan` :485-492、`decide_spawn` :527-543、`ensure_running` 解构 :1626、`spawn_claude` :1058-1067 及其三个调用点 :1125 / :1665 / :1706、`SessionInfo` :352-367、`session_info_of` :596-615；测试模块）
-- Modify: `src/main.rs`（`set_search` 调用 :529 之后）
-- Modify: `frontend/src/lib/api.ts`（`SessionInfo` :5-19）
+- Modify: `src/session_manager.rs`（行号为 `ad42dda` 参考值：`SessionManager` 字段区 `search` 字段之后、`set_search` :712 之后、`SpawnPlan` :519、`decide_spawn` :561、`ensure_running` 解构 :1721、`spawn_claude` :1147 及其三个调用点 :1214 / :1760 / :1801、`SessionInfo` :383（新字段加在 `other_clients` 之后）、`session_info_of` :630（加在 `other_clients: 0,` 之后）；测试模块）
+- Modify: `src/main.rs`（`set_search` 调用 :569 之后）
+- Modify: `frontend/src/lib/api.ts`（`SessionInfo` :5-23，加在 `other_clients` 之后）
 - Create: `frontend/src/lib/peer.ts`、`frontend/src/lib/__tests__/peer.test.ts`
 - Modify: `frontend/src/components/SessionInfoBar.tsx`（展开区 :174 之后）
 - Modify: `frontend/src/components/AcpChatView.tsx`（`Props` :64、气泡标签、中断键 :839-853）
-- Modify: `frontend/src/App.tsx`（`<AcpChatView` :418）
+- Modify: `frontend/src/App.tsx`（`sessions` state :31、`<AcpChatView` :453）
 
 **Interfaces:**
 - Consumes: Task 1 `Inbound`、`AcpProcess::spawn(.., peer_name, inbound)`；Task 5 `TurnGroup.userPrompts[].fromName`
 - Produces:
-  - `fn peer_name_for(id: &str) -> String`（`"zmx-" + id 前 6 字符`）
+  - `fn peer_name_for(id: &str) -> String`（`"zmx-ai-" + id 前 6 字符`）
   - `fn claude_inbound(oauth_mode: bool, source_task_id: Option<&str>) -> Inbound`
   - `SessionManager::set_oauth_mode(&self, on: bool)`
   - `SessionInfo.peer_name: Option<String>`（仅 Claude 会话 `Some`）
@@ -1199,8 +1201,10 @@ Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>"
 ```rust
     #[test]
     fn peer_name_is_stable_prefix_of_session_id() {
-        assert_eq!(peer_name_for("3186986d-b29f-40d5-9cd3-20d8b9124d98"), "zmx-318698");
-        assert_eq!(peer_name_for("abc"), "zmx-abc");
+        assert_eq!(peer_name_for("3186986d-b29f-40d5-9cd3-20d8b9124d98"), "zmx-ai-318698");
+        assert_eq!(peer_name_for("abc"), "zmx-ai-abc");
+        // must not look like a tmux terminal name `zmx-<id8>` (tmux Own check uses starts_with("zmx-"))
+        assert!(peer_name_for("3186986d").starts_with("zmx-ai-"));
     }
 
     #[test]
@@ -1214,7 +1218,7 @@ Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>"
     #[test]
     fn session_info_exposes_peer_name_for_claude_only() {
         let s = running_session("3186986d-b29f");
-        assert_eq!(session_info_of(&s).peer_name.as_deref(), Some("zmx-318698"));
+        assert_eq!(session_info_of(&s).peer_name.as_deref(), Some("zmx-ai-318698"));
     }
 ```
 
@@ -1241,10 +1245,11 @@ Expected: 编译错误 `cannot find function peer_name_for` 等。
 ```rust
 /// Claude Code cross-session address for a ZeroMux Claude session. Derived from
 /// the session id (stable across resume/respawn); ASCII-only so peers can type
-/// it without quoting (spec 2026-09-26 v2 §1a).
+/// it without quoting. `zmx-ai-` (not `zmx-`) so it can't be mistaken for a tmux
+/// terminal name `zmx-<id8>` (spec 2026-09-26 v3 §1a).
 fn peer_name_for(id: &str) -> String {
     let n = id.char_indices().nth(6).map(|(i, _)| i).unwrap_or(id.len());
-    format!("zmx-{}", &id[..n])
+    format!("zmx-ai-{}", &id[..n])
 }
 
 /// Accept peer messages only for interactive sessions in legacy (single-user)
@@ -1273,7 +1278,7 @@ fn claude_inbound(oauth_mode: bool, source_task_id: Option<&str>) -> crate::acp:
     oauth_mode: std::sync::atomic::AtomicBool,
 ```
 
-`SessionManager::new` 的结构体字面量里加 `oauth_mode: std::sync::atomic::AtomicBool::new(false),`（构造签名不变，5 个调用点不用改）。`set_search` 之后加：
+`SessionManager::new` 的结构体字面量里加 `oauth_mode: std::sync::atomic::AtomicBool::new(false),`（构造签名不变，现有 9 个调用点 —— main 1 + 测试 8 —— 都不用改）。`set_search` 之后加：
 
 ```rust
     /// Wire the auth mode (called once at startup).
@@ -1301,7 +1306,7 @@ fn claude_inbound(oauth_mode: bool, source_task_id: Option<&str>) -> crate::acp:
     state.sessions.set_oauth_mode(oauth_configured);
 ```
 
-（`oauth_configured` 在 `main` 顶部已定义，:231。）
+（`oauth_configured` 在 `main` 顶部已定义，:251。）
 
 - [ ] **Step 4: 跑 Rust 测试**
 
@@ -1317,12 +1322,13 @@ import { describe, it, expect } from 'vitest'
 import { peerLabel } from '../peer'
 
 describe('peerLabel (spec 2026-09-26 v2 §3d)', () => {
-  const names = { 'zmx-318698': '重构推送' }
+  const names = { 'zmx-ai-318698': '重构推送' }
   it('maps a known ZeroMux peer name to its session title', () => {
-    expect(peerLabel('zmx-318698', names)).toBe('重构推送')
+    expect(peerLabel('zmx-ai-318698', names)).toBe('重构推送')
   })
   it('falls back to the raw name for unknown or external senders', () => {
-    expect(peerLabel('zmx-ffffff', names)).toBe('zmx-ffffff')
+    expect(peerLabel('zmx-ai-ffffff', names)).toBe('zmx-ai-ffffff')
+    expect(peerLabel('zmx-6c3596b8', names)).toBe('zmx-6c3596b8') // claude inside a tmux terminal
     expect(peerLabel('keith-laptop', names)).toBe('keith-laptop')
   })
 })
@@ -1337,13 +1343,13 @@ Expected: FAIL（`Cannot find module '../peer'`）。
 
 ```ts
 // Claude Code cross-session peer names (spec 2026-09-26 v2 §3d). ZeroMux names
-// each Claude session `zmx-<id6>`; show the session title for those.
+// each Claude agent session `zmx-ai-<id6>`; show the session title for those.
 export function peerLabel(fromName: string, peerNames: Record<string, string>): string {
   return peerNames[fromName] ?? fromName
 }
 ```
 
-`frontend/src/lib/api.ts` 的 `SessionInfo` 加 `peer_name?: string | null`。
+`frontend/src/lib/api.ts` 的 `SessionInfo` 加 `peer_name?: string | null`（放在 `other_clients` 之后）。
 
 `App.tsx`：在组件内 `sessions` state 之后加
 
@@ -1425,7 +1431,7 @@ Expected: 全 PASS。验红：`peerLabel` 改为直接 `return fromName` → 第
 
 ```bash
 git add src/session_manager.rs src/main.rs frontend/src/lib/api.ts frontend/src/lib/peer.ts frontend/src/lib/__tests__/peer.test.ts frontend/src/components/SessionInfoBar.tsx frontend/src/components/AcpChatView.tsx frontend/src/App.tsx
-git commit -m "feat: stable zmx-<id> peer names, per-mode inbound policy, always-available interrupt
+git commit -m "feat: stable zmx-ai-<id6> peer names, per-mode inbound policy, always-available interrupt
 
 Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>"
 ```
@@ -1443,7 +1449,7 @@ cd frontend && npm ci && npm run lint && npm test && npm run build && cd ..
 cargo test 2>&1 | grep -E "^test result|FAILED"
 ```
 
-Expected: 全绿。基线（2026-09-26 double check：在一次性 worktree 里按本计划套用 Task 1–6 实测）：Rust **480 passed**（main 为 459）；前端 **54 files / 331 passed**；`tsc -b` 0 错；`npm run lint` 与 main 相同（main 已有 30 errors / 5 warnings，本特性不新增）；Rust 警告与 main 相同 3 条（`web.rs:2815` 等，非本特性）。**不要**在这里跑 `cargo build --release`（Global Constraints）。
+Expected: 全绿。基线（2026-09-26 double check：在一次性 worktree 里按本计划套用 Task 1–6 实测）：Rust **480 passed**（当时 main 为 459；tmux 合入后 main 基数已变，以实施时 `cargo test` 为准，本特性增量 +21）；前端 **54 files / 331 passed**（同上，本特性增量 +20）；`tsc -b` 0 错；`npm run lint` 与 main 相同（main 已有 30 errors / 5 warnings，本特性不新增）；Rust 警告与 main 相同 3 条（`web.rs:2815` 等，非本特性）。**不要**在这里跑 `cargo build --release`（Global Constraints）。
 
 - [ ] **Step 2: 先推送，再构建并部署**（本终端在 zeromux cgroup 内：deploy 时本终端掉线属预期）
 
@@ -1461,7 +1467,7 @@ git push origin main
   4. 外部 turn 进行中点「中断」（非 stuck 状态也可见）：turn 停止，会话回到 Idle。
   5. 刷新页面：气泡与分组一致，busy 与后端 `turn_state` 一致。
   6. ZeroMux 会话 A、B：从 B 的 SessionInfoBar 复制 peer 名，在 A 里让它给 B 发消息，并让 B 回信给 A。两边气泡显示「来自 @{对方会话名}」，两边都不卡 Running。
-  7. 从 SSH 里交互式 `claude`（非 bypass）给 ZeroMux 会话发消息：直接送达，未被 hold。
+  7. 从 SSH 里、以及从 **ZeroMux tmux 终端**里运行的交互式 `claude`（非 bypass）给 ZeroMux Claude 会话发消息：直接送达，未被 hold；`ListAgents` 里 `zmx-ai-…` 与 tmux 里的 claude（带 `tmux zmx-…` 标注）可区分。
   8. 让 ZeroMux 会话向一个 `crossSessionInbound: refuse` 的沙箱会话发消息：UI 出现灰色 notice。
   9. 部署后未打开的会话不在 `ListAgents` 中，SessionInfoBar 显示「休眠」；打开后出现，peer 名与部署前相同。
   10. 自动命名：新建会话首条 prompt 后标题正常生成（titler 未被 peer 干扰）。

@@ -3326,6 +3326,50 @@ impl TurnStarts {
     }
 }
 
+/// Per-event decision for the Claude fan-out's handling of CLI-started turns
+/// (spec 2026-09-26 §2b/§2d). Pure so it is unit-testable without a process.
+#[derive(Debug, PartialEq, Eq)]
+enum ClaudeStep {
+    /// Idle and the agent produced a peer message / output: the CLI started a
+    /// turn on its own. Run the same four turn-start steps as a stdin prompt.
+    StartExternal,
+    /// A boundary whose `result.origin` says it ends a CLI-started turn, but the
+    /// FIFO front is a ZeroMux turn whose prompt the CLI has not echoed yet (or
+    /// nothing): the CLI ran a peer turn ahead of our prompt. Emit it but do not
+    /// settle anything.
+    SkipBoundary,
+    /// Everything else: existing handling.
+    Normal,
+}
+
+fn classify_claude_event(
+    local_running: bool,
+    evt: &AcpEvent,
+    has_pending_origin: bool,
+    front_settles_on_origin: bool,
+) -> ClaudeStep {
+    // ZeroMux sets local_running BEFORE writing stdin, so output arriving while
+    // idle can only come from a turn the CLI started itself. System / Notice /
+    // Exit are lifecycle noise and never open a turn.
+    if !local_running
+        && matches!(evt, AcpEvent::PeerMessage { .. } | AcpEvent::ContentBlock { .. })
+    {
+        return ClaudeStep::StartExternal;
+    }
+    let is_boundary = matches!(
+        evt,
+        AcpEvent::Result { .. } | AcpEvent::Error { .. } | AcpEvent::Exit { .. }
+    );
+    // An origin-tagged boundary ends a CLI-started turn. It settles the FIFO
+    // front only if that front IS the CLI-started turn, or is our prompt that the
+    // CLI already took in (echoed) — i.e. merged into that turn. Otherwise the
+    // CLI ran the peer turn ahead of our not-yet-echoed prompt: skip it.
+    if is_boundary && has_pending_origin && !front_settles_on_origin {
+        return ClaudeStep::SkipBoundary;
+    }
+    ClaudeStep::Normal
+}
+
 /// Shared collect-queue state for all three fan-outs (was duplicated ~3×).
 /// Holds the pending appended prompts and the two debounce/hard-cap timers.
 /// Behavior is identical to the prior inline logic; this is an extraction only.
@@ -4863,6 +4907,120 @@ mod turn_state_tests {
         ts.mark_echoed();
         ts.settle();
         assert!(ts.front_is_echoed(), "the echo went to the internal entry");
+    }
+
+    // ── spec 2026-09-26 §2b/§2d: Claude external-turn classification ──
+    fn cb() -> AcpEvent {
+        AcpEvent::ContentBlock { block_type: "text".into(), turn_id: 0, text: Some("x".into()),
+            name: None, input: None, streaming: None, summary: None }
+    }
+    fn res() -> AcpEvent {
+        AcpEvent::Result { text: "r".into(), turn_id: 0, session_id: "s".into(),
+            cost_usd: None, tokens_in: None, tokens_out: None }
+    }
+    fn peer() -> AcpEvent {
+        AcpEvent::PeerMessage { from_name: "a".into(), text: "b".into(), turn_id: 0 }
+    }
+
+    #[test]
+    fn idle_peer_message_starts_external_turn() {
+        assert_eq!(classify_claude_event(false, &peer(), false, false), ClaudeStep::StartExternal);
+    }
+
+    #[test]
+    fn idle_content_block_starts_external_turn() {
+        // task-notification turns have no `user` event: first sign is output.
+        assert_eq!(classify_claude_event(false, &cb(), false, false), ClaudeStep::StartExternal);
+    }
+
+    #[test]
+    fn busy_peer_and_output_are_normal() {
+        assert_eq!(classify_claude_event(true, &peer(), false, false), ClaudeStep::Normal);
+        assert_eq!(classify_claude_event(true, &cb(), false, true), ClaudeStep::Normal);
+    }
+
+    #[test]
+    fn idle_system_and_notice_do_not_start_turn() {
+        // Review focus 1: lifecycle events arrive while idle (task_updated,
+        // background_tasks_changed, hold receipts) and must not open a turn.
+        let sys = AcpEvent::System { subtype: "task_updated".into(), session_id: None, count: None };
+        let notice = AcpEvent::Notice { text: "held".into(), level: "warning".into() };
+        let exit = AcpEvent::Exit { code: 0 };
+        assert_eq!(classify_claude_event(false, &sys, false, false), ClaudeStep::Normal);
+        assert_eq!(classify_claude_event(false, &notice, false, false), ClaudeStep::Normal);
+        assert_eq!(classify_claude_event(false, &exit, false, false), ClaudeStep::Normal);
+    }
+
+    #[test]
+    fn origin_boundary_settles_when_front_is_external() {
+        assert_eq!(classify_claude_event(true, &res(), true, true), ClaudeStep::Normal);
+        let err = AcpEvent::Error { message: "e".into() };
+        assert_eq!(classify_claude_event(true, &err, true, true), ClaudeStep::Normal);
+    }
+
+    #[test]
+    fn origin_boundary_skipped_when_front_is_unechoed_user_turn() {
+        // Serial race (spec v2 walkthrough A): the user's prompt counted turn N but
+        // the CLI hasn't echoed it yet — it ran the peer turn first; that result
+        // must not settle N.
+        assert_eq!(classify_claude_event(true, &res(), true, false), ClaudeStep::SkipBoundary);
+    }
+
+    #[test]
+    fn origin_boundary_with_empty_fifo_is_skipped() {
+        // Review focus 2: nothing pending (front_is_external=false on empty FIFO).
+        assert_eq!(classify_claude_event(false, &res(), true, false), ClaudeStep::SkipBoundary);
+    }
+
+    #[test]
+    fn plain_boundary_is_normal() {
+        assert_eq!(classify_claude_event(true, &res(), false, false), ClaudeStep::Normal);
+        assert_eq!(classify_claude_event(true, &AcpEvent::Exit { code: 1 }, false, true), ClaudeStep::Normal);
+    }
+
+    fn settles(ts: &TurnStarts) -> bool {
+        ts.front_is_external() || ts.front_is_echoed()
+    }
+
+    #[test]
+    fn serial_race_skips_peer_result_then_settles_user_turn() {
+        // Walkthrough A (CTO b.log): peer turn has no tool use, so the CLI runs it
+        // to completion, THEN takes our stdin prompt.
+        let mut ts = TurnStarts::default();
+        ts.start(1_000); // user prompt written to stdin (local_running = true)
+        assert_eq!(classify_claude_event(true, &peer(), false, settles(&ts)), ClaudeStep::Normal);
+        // peer turn's result (origin) arrives before our prompt's echo → skip
+        assert_eq!(classify_claude_event(true, &res(), true, settles(&ts)), ClaudeStep::SkipBoundary);
+        assert_eq!(ts.front(), Some(1_000), "FIFO untouched by the skipped boundary");
+        ts.mark_echoed(); // StdinEcho for our prompt
+        // our own result (no origin) → settles turn N
+        assert_eq!(classify_claude_event(true, &res(), false, settles(&ts)), ClaudeStep::Normal);
+        assert_eq!(ts.settle(), Some((1_000, None)));
+    }
+
+    #[test]
+    fn merged_race_settles_on_origin_result() {
+        // Walkthrough B (CTO a.log / c.log) — the v1 BLOCKER: peer turn uses a
+        // tool, the CLI injects our stdin prompt after the tool_result, and emits
+        // ONE result carrying origin:peer that answers our prompt. It must settle
+        // turn N, or the session stays Running until the 30-min watchdog.
+        let mut ts = TurnStarts::default();
+        ts.start(1_000);
+        assert_eq!(classify_claude_event(true, &peer(), false, settles(&ts)), ClaudeStep::Normal);
+        ts.mark_echoed(); // StdinEcho arrives BEFORE the only result
+        assert_eq!(classify_claude_event(true, &res(), true, settles(&ts)), ClaudeStep::Normal);
+        assert_eq!(ts.settle(), Some((1_000, None)));
+    }
+
+    #[test]
+    fn task_notification_merged_into_user_turn_settles() {
+        // Walkthrough C (CTO hypothesis): a background-task notification merged
+        // into a user turn yields a result with origin:task-notification. The user
+        // prompt that opened the turn was echoed first, so it settles.
+        let mut ts = TurnStarts::default();
+        ts.start(1_000);
+        ts.mark_echoed();
+        assert_eq!(classify_claude_event(true, &res(), true, settles(&ts)), ClaudeStep::Normal);
     }
 
     #[test]

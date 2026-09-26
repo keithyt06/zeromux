@@ -73,3 +73,15 @@ export class ScrollBatcher {
     this.cancel()
   }
 }
+
+// Desktop mouse-wheel over a tmux pane (mouse on) goes straight to tmux and
+// can enter copy-mode without ever calling sendScroll, so scrollingRef stays
+// stale (false) even though the pane really is in copy-mode. On desktop tmux
+// sessions, any wheel event since the last exitScroll must force a cancel on
+// the next keystroke regardless of scrollingRef — safe because the
+// server-side cancel is a no-op outside copy-mode (T2's in_mode guard).
+export function shouldCancelBeforeInput(o: { scrolling: boolean; isTouch: boolean; hasTmux: boolean; wheelSinceInput: boolean }): boolean {
+  if (o.scrolling) return true
+  if (o.isTouch || !o.hasTmux) return false
+  return o.wheelSinceInput
+}

@@ -16,7 +16,7 @@ import HistoryView from './HistoryView'
 import { TmuxHealthBar, LostBanner, EndedOverlay, ReconnectHint } from './TerminalNotices'
 import { arrowSequence, rowHeight, linesFromDrag, bracketedPaste, submitSequence, controlSequence, launchSequence, type ArrowKey } from '../lib/terminalInput'
 import { shouldStickToBottom } from '../lib/scrollReplay'
-import { ScrollBatcher, inertiaLines, scheduleInertia, type ScrollMsg } from '../lib/terminalScroll'
+import { ScrollBatcher, inertiaLines, scheduleInertia, shouldCancelBeforeInput, type ScrollMsg } from '../lib/terminalScroll'
 import { shouldShowShiftHint, mousePref, MOUSE_PREF_KEY } from '../lib/desktopHints'
 
 const FONT_SIZE = 14
@@ -176,9 +176,14 @@ export default function TerminalView({ sessionId, active, theme, tmuxName, tmuxO
   // Leave copy-mode before any keystroke so input isn't swallowed by tmux.
   const exitScroll = useCallback(() => {
     cancelInertiaRef.current()
-    const forceCancel = !isTouch && !!tmuxRef.current && wheelSinceInputRef.current
+    const cancel = shouldCancelBeforeInput({
+      scrolling: scrollingRef.current,
+      isTouch,
+      hasTmux: !!tmuxRef.current,
+      wheelSinceInput: wheelSinceInputRef.current,
+    })
     wheelSinceInputRef.current = false
-    if (!scrollingRef.current && !forceCancel) return
+    if (!cancel) return
     scrollingRef.current = false
     setScrolling(false)
     sendScroll({ op: 'cancel', n: 1 })
@@ -669,7 +674,8 @@ export default function TerminalView({ sessionId, active, theme, tmuxName, tmuxO
               const on = !mouseOn
               setMouseOn(on)
               localStorage.setItem(MOUSE_PREF_KEY, on ? '1' : '0')
-              wsRef.current?.send(JSON.stringify({ type: 'mouse', on }))
+              const ws = wsRef.current
+              if (ws?.readyState === WebSocket.OPEN) ws.send(JSON.stringify({ type: 'mouse', on }))
             }}
             title={mouseOn ? '鼠标交给 tmux（滚轮滚动、点选窗格）' : '鼠标交给浏览器（直接拖选文字）'}
             className="ml-auto text-[11px] text-[var(--text-secondary)] hover:text-[var(--text-primary)]">

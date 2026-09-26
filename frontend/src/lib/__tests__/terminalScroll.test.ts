@@ -1,5 +1,5 @@
 import { describe, it, expect, vi } from 'vitest'
-import { dragToScroll, inertiaLines, ScrollBatcher, scheduleInertia } from '../terminalScroll'
+import { dragToScroll, inertiaLines, ScrollBatcher, scheduleInertia, shouldCancelBeforeInput } from '../terminalScroll'
 
 describe('dragToScroll', () => {
   // linesFromDrag convention: finger moves UP → positive → newer content (scroll down).
@@ -75,5 +75,21 @@ describe('ScrollBatcher.cancel', () => {
     expect(send).toHaveBeenCalledWith({ op: 'down', n: 2 })
     b.dispose()
     vi.useRealTimers()
+  })
+})
+
+describe('shouldCancelBeforeInput', () => {
+  it('touch: cancels only when scrolling', () => {
+    expect(shouldCancelBeforeInput({ scrolling: true, isTouch: true, hasTmux: true, wheelSinceInput: false })).toBe(true)
+    expect(shouldCancelBeforeInput({ scrolling: false, isTouch: true, hasTmux: true, wheelSinceInput: true })).toBe(false)
+  })
+  it('desktop tmux after a wheel event: cancels even though not scrolling', () => {
+    expect(shouldCancelBeforeInput({ scrolling: false, isTouch: false, hasTmux: true, wheelSinceInput: true })).toBe(true)
+  })
+  it('desktop tmux, no wheel, not scrolling: no cancel', () => {
+    expect(shouldCancelBeforeInput({ scrolling: false, isTouch: false, hasTmux: true, wheelSinceInput: false })).toBe(false)
+  })
+  it('non-tmux: never force-cancels from a wheel event', () => {
+    expect(shouldCancelBeforeInput({ scrolling: false, isTouch: false, hasTmux: false, wheelSinceInput: true })).toBe(false)
   })
 })

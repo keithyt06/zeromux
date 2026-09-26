@@ -74,9 +74,20 @@ ensure_tmux_unit() {
   fi
   sudo systemctl enable zeromux-tmux.service >/dev/null 2>&1 || true
   if ! systemctl is-active --quiet zeromux-tmux.service; then
-    # tmux.conf must exist before the server starts; zeromux writes it at boot,
-    # but on first install zeromux may not have run the new binary yet.
-    [ -f "$HOME/.zeromux/tmux.conf" ] || "$BUILT" --print-tmux-conf > "$HOME/.zeromux/tmux.conf"
+    # tmux.conf must exist (and be non-empty) before the server starts; zeromux
+    # writes it at boot, but on first install zeromux may not have run the new
+    # binary yet. Seed atomically via a temp file + rename: writing straight to
+    # tmux.conf with `>` truncates it before $BUILT even runs, so if $BUILT is
+    # missing/stale (e.g. pre-feature, clap exits 2 on --print-tmux-conf) `set
+    # -e` aborts with an EMPTY tmux.conf already on disk — which then silently
+    # passes a bare `-f` check forever and starts the server with none of the
+    # pinned options (history-limit/mouse/exit-empty off). `-s` (non-empty)
+    # instead of `-f` so a previously-left-empty file also gets re-seeded.
+    if [ ! -s "$HOME/.zeromux/tmux.conf" ]; then
+      mkdir -p "$HOME/.zeromux"
+      tmp="$(mktemp "$HOME/.zeromux/tmux.conf.XXXX")"
+      "$BUILT" --print-tmux-conf > "$tmp" && mv "$tmp" "$HOME/.zeromux/tmux.conf"
+    fi
     echo ">> Starting zeromux-tmux.service"
     sudo systemctl start zeromux-tmux.service
   fi
@@ -140,10 +151,10 @@ if [ "${1:-}" = "--build" ]; then
   cargo build --release
 fi
 
-ensure_tmux_unit
 [ -f "$BUILT" ] || { echo "!! $BUILT not found — run with --build first."; exit 1; }
 echo ">> Smoke-testing new binary..."
 "$BUILT" --help >/dev/null
+ensure_tmux_unit
 
 # ── cgroup self-kill guard ───────────────────────────────────────────────────
 # If we're inside the zeromux.service cgroup (script launched from a zeromux PTY,

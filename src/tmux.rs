@@ -270,6 +270,14 @@ pub(crate) mod tests {
     impl Drop for TestServer {
         fn drop(&mut self) {
             let _ = std::process::Command::new("tmux").args(["-L", &self.socket, "kill-server"]).status();
+            // Best-effort: tmux doesn't remove the socket file itself on
+            // kill-server in every version, so clean up the one we created
+            // (same path convention tmux uses: $TMUX_TMPDIR or /tmp, then
+            // tmux-<uid>/<socket>). Never a hard requirement — just avoids
+            // littering /tmp with dead test sockets.
+            let base = std::env::var("TMUX_TMPDIR").unwrap_or_else(|_| "/tmp".to_string());
+            let uid = unsafe { libc::getuid() };
+            let _ = std::fs::remove_file(format!("{base}/tmux-{uid}/{}", self.socket));
         }
     }
 
@@ -316,7 +324,17 @@ pub(crate) mod tests {
         let Some(srv) = TestServer::start() else { return };
         let h = srv.ctl.health().await;
         assert!(h.server);
-        assert!(!h.in_unit);
+        // The test server itself is a plain tmux -L process, not the
+        // zeromux-tmux.service one — UNLESS this test happens to be running
+        // from inside a shell hosted by that unit (e.g. `cargo test` invoked
+        // from a zeromux terminal after the tmux-default rollout), in which
+        // case the test process (and everything it spawns) inherits that
+        // unit's cgroup too. So in_unit must track our own cgroup, not be
+        // unconditionally false.
+        let self_in_unit = std::fs::read_to_string("/proc/self/cgroup")
+            .unwrap_or_default()
+            .contains("zeromux-tmux.service");
+        assert_eq!(h.in_unit, self_in_unit);
     }
 
     async fn mk(srv: &TestServer, name: &str) {

@@ -108,7 +108,7 @@ Worktree isolation is **opt-in** via `--worktree-isolation` (default OFF). `git 
 
 ### Frontend (`frontend/src/`)
 
-React 19 + Vite + Tailwind v4. `App.tsx` owns auth state, the session list, and active-session/overlay routing. Views: `TerminalView` (xterm.js + WebGL addon), `AcpChatView` (agent chat), `GitViewer`, `MarkdownViewer`. Switching views uses CSS visibility toggling, not unmount, to preserve terminal/scroll state. Markdown rendering (`components/markdown/`) supports KaTeX math, mermaid diagrams, and syntax highlighting, with content hashing + caching to avoid re-render churn — agents are instructed (Codex via a developer-role preamble) to emit `$...$` math, ```` ```mermaid ```` blocks, and pipe tables to match these renderers.
+React 19 + Vite + Tailwind v4. `App.tsx` owns auth state, the session list, and active-session/overlay routing. Views: `TerminalView` (xterm.js + WebGL addon), `AcpChatView` (agent chat), `GitViewer`. Switching views uses CSS visibility toggling, not unmount, to preserve terminal/scroll state. Markdown rendering (`components/markdown/`) supports KaTeX math, mermaid diagrams, and syntax highlighting, with content hashing + caching to avoid re-render churn — agents are instructed (Codex via a developer-role preamble) to emit `$...$` math, ```` ```mermaid ```` blocks, and pipe tables to match these renderers.
 
 ## Conventions
 

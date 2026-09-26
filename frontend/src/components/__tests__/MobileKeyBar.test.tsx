@@ -27,4 +27,13 @@ describe('MobileKeyBar', () => {
     fireEvent.pointerDown(screen.getByLabelText('claude'))
     expect(onKey).toHaveBeenCalledWith('claude')
   })
+
+  it('history key only when onHistory given', () => {
+    const { rerender } = render(<MobileKeyBar onKey={() => {}} />)
+    expect(screen.queryByLabelText('history')).toBeNull()
+    const onHistory = vi.fn()
+    rerender(<MobileKeyBar onKey={() => {}} onHistory={onHistory} />)
+    fireEvent.pointerDown(screen.getByLabelText('history'))
+    expect(onHistory).toHaveBeenCalled()
+  })
 })

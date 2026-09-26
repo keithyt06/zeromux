@@ -26,6 +26,7 @@ pub fn build_router(state: Arc<AppState>) -> Router {
         .route("/api/sessions/{id}/restore", post(restore_session))
         .route("/api/sessions/{id}/close-check", get(close_check))
         .route("/api/sessions/{id}/status", get(session_status))
+        .route("/api/sessions/{id}/history", get(session_history))
         .route("/api/sessions/{id}/logs", get(session_logs))
         .route("/api/sessions/{id}/files", get(list_session_files))
         .route("/api/sessions/{id}/file", get(get_session_file))
@@ -1067,6 +1068,35 @@ async fn session_status(
         "git_dirty": git_dirty.unwrap_or(0),
         "is_git": git_branch.is_some(),
     })))
+}
+
+#[derive(serde::Deserialize)]
+struct HistoryQuery {
+    #[serde(default)]
+    #[allow(dead_code)] // ansi takes effect in T12; accepted now so the query param doesn't 400.
+    ansi: u8,
+}
+
+async fn session_history(
+    State(state): State<Arc<AppState>>,
+    user: axum::Extension<CurrentUser>,
+    axum::extract::Path(id): axum::extract::Path<String>,
+    Query(_q): Query<HistoryQuery>,
+) -> Result<Json<crate::tmux::Captured>, (StatusCode, String)> {
+    if !user.is_admin() && !state.sessions.is_owner(&id, &user.id) {
+        return Err((StatusCode::FORBIDDEN, "forbidden".into()));
+    }
+    // Target comes ONLY from the stored binding — never from the request.
+    let (name, _) = state
+        .sessions
+        .tmux_binding(&id)
+        .ok_or((StatusCode::BAD_REQUEST, "not a tmux terminal".into()))?;
+    state
+        .tmux
+        .capture(&name, 50_000, 5 * 1024 * 1024)
+        .await
+        .map(Json)
+        .map_err(|e| (StatusCode::SERVICE_UNAVAILABLE, e.to_string()))
 }
 
 #[derive(serde::Deserialize)]

@@ -9,7 +9,8 @@ import { b64encode, b64decode } from '../lib/base64'
 import { GitBranch, Folder, Circle } from 'lucide-react'
 import MobileKeyBar, { type BarKey } from './MobileKeyBar'
 import Composer from './Composer'
-import { TmuxHealthBar, LostBanner, EndedOverlay } from './TerminalNotices'
+import HistoryView from './HistoryView'
+import { TmuxHealthBar, LostBanner, EndedOverlay, ReconnectHint } from './TerminalNotices'
 import { arrowSequence, rowHeight, linesFromDrag, bracketedPaste, submitSequence, controlSequence, launchSequence, type ArrowKey } from '../lib/terminalInput'
 import { shouldStickToBottom } from '../lib/scrollReplay'
 import { ScrollBatcher, inertiaLines, scheduleInertia, type ScrollMsg } from '../lib/terminalScroll'
@@ -94,6 +95,10 @@ export default function TerminalView({ sessionId, active, theme, tmuxName, tmuxO
   const endedRef = useRef(false)
   // Bumped after revive to re-run the Connect WebSocket effect.
   const [wsEpoch, setWsEpoch] = useState(0)
+  const [historyOpen, setHistoryOpen] = useState(false)
+  const [reconnected, setReconnected] = useState(false)
+  // True once the WS has opened at least once; a later open is a reconnect (→ ReconnectHint).
+  const openedOnceRef = useRef(false)
   // Ref twin of `tmuxName` for long-lived closures (WS handlers, touch listeners).
   const tmuxRef = useRef(tmuxName)
   useEffect(() => { tmuxRef.current = tmuxName }, [tmuxName])
@@ -358,6 +363,10 @@ export default function TerminalView({ sessionId, active, theme, tmuxName, tmuxO
         // Only bare-shell PTYs replay scrollback; tmux repaints via refresh-client.
         replayingRef.current = !tmuxRef.current
         userScrolledUpRef.current = false
+        // Only a tmux terminal keeps history server-side across a reconnect —
+        // a bare-shell PTY reconnect just gets the same replay it always got.
+        if (openedOnceRef.current && tmuxRef.current) setReconnected(true)
+        openedOnceRef.current = true
         const fit = fitRef.current
         if (fit) {
           const dims = fit.proposeDimensions()
@@ -423,6 +432,10 @@ export default function TerminalView({ sessionId, active, theme, tmuxName, tmuxO
       wsRef.current?.close()
     }
   }, [sessionId, wsEpoch])
+
+  // Stable identity so ReconnectHint's 3s auto-dismiss timer isn't reset by every
+  // parent re-render (a new inline arrow each render would restart the setTimeout).
+  const hideReconnect = useCallback(() => setReconnected(false), [])
 
   const handleRevive = useCallback(async () => {
     try {
@@ -518,9 +531,16 @@ export default function TerminalView({ sessionId, active, theme, tmuxName, tmuxO
         </div>
       )}
       {ended && <EndedOverlay name={tmuxName ?? ''} origin={tmuxOrigin} onRevive={handleRevive} onClose={() => onClose?.()} />}
-      {/* 触摸端：方向/启动键栏在上，常驻输入框贴底（最靠近软键盘）。 */}
-      {isTouch && <MobileKeyBar onKey={handleBarKey} />}
-      {isTouch && (
+      {reconnected && (
+        <ReconnectHint
+          onOpenHistory={() => { setReconnected(false); setHistoryOpen(true) }}
+          onDone={hideReconnect}
+        />
+      )}
+      {historyOpen && <HistoryView sessionId={sessionId} title={tmuxName ?? ''} onClose={() => setHistoryOpen(false)} />}
+      {/* 触摸端：方向/启动键栏在上，常驻输入框贴底（最靠近软键盘）。历史抽屉打开时隐藏两者。 */}
+      {isTouch && !historyOpen && <MobileKeyBar onKey={handleBarKey} onHistory={tmuxName ? () => setHistoryOpen(true) : undefined} />}
+      {isTouch && !historyOpen && (
         <div className="px-2 py-1.5 border-t border-[var(--border)] bg-[var(--bg-secondary)]">
           <Composer
             value={composerText}
@@ -558,6 +578,9 @@ export default function TerminalView({ sessionId, active, theme, tmuxName, tmuxO
           </>
         ) : (
           <span className="text-xs text-[var(--text-muted)]">Loading...</span>
+        )}
+        {!isTouch && tmuxName && (
+          <button onClick={() => setHistoryOpen(true)} className="ml-auto text-xs text-[var(--text-secondary)] hover:text-[var(--text-primary)]">历史</button>
         )}
       </div>
     </div>

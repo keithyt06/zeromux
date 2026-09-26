@@ -1151,7 +1151,9 @@ impl SessionManager {
         owner_id: &str,
         resume: Option<&str>,
     ) -> Result<RunningProcess, String> {
-        let process = AcpProcess::spawn(&self.claude_path, work_dir, resume)
+        let peer_name = format!("zmx-ai-{}", &id[..6.min(id.len())]);
+        let process = AcpProcess::spawn(&self.claude_path, work_dir, resume,
+                &peer_name, crate::acp::process::Inbound::Accept)
             .await
             .map_err(|e| format!("Failed to spawn Claude: {}", e))?;
 

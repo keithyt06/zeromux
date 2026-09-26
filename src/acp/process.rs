@@ -124,6 +124,72 @@ pub enum AcpEvent {
         used: u64,
         total: u64,
     },
+    /// A message delivered by Claude Code cross-session messaging (another
+    /// local/remote Claude session's `SendMessage`). Emitted from the CLI's
+    /// `--replay-user-messages` echo when `origin.kind == "peer"`. `text` is the
+    /// peer's body only (not the CLI's wrapper prose). `turn_id` is stamped by the
+    /// fan-out, like ContentBlock. Frontend renders a 「来自 @from_name」 bubble.
+    PeerMessage {
+        from_name: String,
+        text: String,
+        turn_id: u64,
+    },
+    /// Fan-out-internal marker: the NEXT event (Result/Error) ends a turn the CLI
+    /// started on its own (`result.origin.kind`, e.g. "peer" / "task-notification").
+    /// Consumed by `spawn_acp_fanout`; never emitted, persisted, or logged.
+    TurnOrigin {
+        kind: StaticOrOwnedStr,
+    },
+    /// CLI `system/informational` notice (e.g. a cross-session message this
+    /// session sent was held / refused / expired). Rendered as a grey notice line.
+    /// Deliberately NOT a ContentBlock: arriving while idle it must not look like
+    /// agent output (which would start an external turn).
+    Notice {
+        text: String,
+        level: StaticOrOwnedStr,
+    },
+    /// Fan-out-internal marker: the CLI echoed a prompt ZeroMux wrote to stdin
+    /// (`user`, isReplay, no origin). Lets the fan-out know that prompt has been
+    /// taken into a turn — the CLI may merge it into a running CLI-started turn,
+    /// whose single result then carries `origin` (spec v2 §2d). Never emitted.
+    StdinEcho,
+}
+
+/// Whether this Claude session accepts Claude Code cross-session messages.
+/// Refuse for OAuth mode (all tenants share one OS user, so CLI socket isolation
+/// does not separate ZeroMux users) and for unattended scheduled runs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Inbound {
+    Accept,
+    Refuse,
+}
+
+/// Argument vector for an interactive/scheduled Claude session. Pure so the
+/// flag set is unit-testable.
+fn claude_args(resume: Option<&str>, peer_name: &str, inbound: Inbound) -> Vec<String> {
+    let mut args: Vec<String> = vec![
+        "-p".into(),
+        "--output-format".into(), "stream-json".into(),
+        "--input-format".into(), "stream-json".into(),
+        "--verbose".into(),
+        "--dangerously-skip-permissions".into(),
+        // Cross-session messaging (spec 2026-09-26): echo turn-driving inputs so
+        // the fan-out can see peer messages and attribute CLI-started turns.
+        "--replay-user-messages".into(),
+        // Stable, readable peer address (default would be <cwd>-<2 chars>).
+        "--name".into(), peer_name.to_string(),
+        "--settings".into(),
+        match inbound {
+            Inbound::Accept => r#"{"crossSessionInbound":"accept"}"#,
+            Inbound::Refuse => r#"{"crossSessionInbound":"refuse"}"#,
+        }
+        .into(),
+    ];
+    if let Some(sid) = resume {
+        args.push("--resume".into());
+        args.push(sid.to_string());
+    }
+    args
 }
 
 /// Events the CLI can produce are all top-level JSON objects with a `type` field.
@@ -144,18 +210,10 @@ impl AcpProcess {
         claude_path: &str,
         work_dir: &str,
         resume: Option<&str>,
+        peer_name: &str,
+        inbound: Inbound,
     ) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
-        let mut args: Vec<String> = vec![
-            "-p".into(),
-            "--output-format".into(), "stream-json".into(),
-            "--input-format".into(), "stream-json".into(),
-            "--verbose".into(),
-            "--dangerously-skip-permissions".into(),
-        ];
-        if let Some(sid) = resume {
-            args.push("--resume".into());
-            args.push(sid.to_string());
-        }
+        let args = claude_args(resume, peer_name, inbound);
         let mut child = tokio::process::Command::new(claude_path)
             .args(&args)
             .current_dir(work_dir)
@@ -193,6 +251,9 @@ impl AcpProcess {
             "--input-format".into(), "stream-json".into(),
             "--verbose".into(),
             "--allowedTools".into(), "".into(),
+            // The titler reads the FIRST Result as the title; a peer message
+            // starting a turn here would poison it. Refuse all inbound.
+            "--settings".into(), r#"{"crossSessionInbound":"refuse"}"#.into(),
         ];
         let mut child = tokio::process::Command::new(claude_path)
             .args(&args)
@@ -299,6 +360,15 @@ fn translate_event(val: &serde_json::Value) -> Vec<AcpEvent> {
             if IGNORED_SUBTYPES.contains(&subtype) {
                 return vec![];
             }
+            if subtype == "informational" {
+                let text = val.get("content").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                let level = match val.get("level").and_then(|v| v.as_str()).unwrap_or("info") {
+                    "warning" => StaticOrOwnedStr::Borrowed("warning"),
+                    "info" => StaticOrOwnedStr::Borrowed("info"),
+                    other => StaticOrOwnedStr::Owned(other.to_string()),
+                };
+                return vec![AcpEvent::Notice { text, level }];
+            }
             vec![AcpEvent::System {
                 subtype: StaticOrOwnedStr::Owned(subtype.to_string()),
                 session_id: val.get("session_id").and_then(|v| v.as_str()).map(String::from),
@@ -364,7 +434,48 @@ fn translate_event(val: &serde_json::Value) -> Vec<AcpEvent> {
                 .collect()
         }
 
+        // `--replay-user-messages` echoes every turn-driving input as a `user`
+        // event. Peer messages are surfaced; our own stdin prompts become an
+        // internal StdinEcho marker (ZeroMux already emitted its UserPrompt);
+        // tool_result echoes (no isReplay) are noise. `origin` is structured, so
+        // no parsing of the <cross-session-message> wrapper text is needed.
+        "user" => {
+            let Some(origin) = val.get("origin") else {
+                if val.get("isReplay").and_then(|v| v.as_bool()) == Some(true) {
+                    return vec![AcpEvent::StdinEcho];
+                }
+                return vec![];
+            };
+            if origin.get("kind").and_then(|v| v.as_str()) != Some("peer") {
+                return vec![];
+            }
+            vec![AcpEvent::PeerMessage {
+                from_name: origin.get("name").and_then(|v| v.as_str()).unwrap_or("unknown").to_string(),
+                text: origin.get("body").and_then(|v| v.as_str()).unwrap_or("").to_string(),
+                turn_id: 0,
+            }]
+        }
+
         "result" => {
+            // A result carrying `origin` ends a turn the CLI started by itself
+            // (peer message, background task notification). Precede the terminal
+            // event with a TurnOrigin marker so the fan-out can attribute the
+            // boundary (spec §2d).
+            let origin_kind = val
+                .get("origin")
+                .and_then(|o| o.get("kind"))
+                .and_then(|v| v.as_str())
+                .map(|k| match k {
+                    "peer" => StaticOrOwnedStr::Borrowed("peer"),
+                    "task-notification" => StaticOrOwnedStr::Borrowed("task-notification"),
+                    other => StaticOrOwnedStr::Owned(other.to_string()),
+                });
+            let wrap = |terminal: AcpEvent| -> Vec<AcpEvent> {
+                match origin_kind.clone() {
+                    Some(kind) => vec![AcpEvent::TurnOrigin { kind }, terminal],
+                    None => vec![terminal],
+                }
+            };
             // Claude sends `is_error:true` with subtype error_max_turns /
             // error_during_execution and (usually) NO `result` text. Emitting a
             // Result{text:""} here renders as a normal blank *successful* turn — the
@@ -380,17 +491,17 @@ fn translate_event(val: &serde_json::Value) -> Vec<AcpEvent> {
                     Some(d) => format!("Claude turn ended in error ({subtype}): {d}"),
                     None => format!("Claude turn ended in error ({subtype})"),
                 };
-                return vec![AcpEvent::Error { message }];
+                return wrap(AcpEvent::Error { message });
             }
             let usage = val.get("usage");
-            vec![AcpEvent::Result {
+            wrap(AcpEvent::Result {
                 text: val.get("result").and_then(|v| v.as_str()).unwrap_or("").to_string(),
                 turn_id: 0,
                 session_id: val.get("session_id").and_then(|v| v.as_str()).unwrap_or("").to_string(),
                 cost_usd: val.get("total_cost_usd").and_then(|v| v.as_f64()),
                 tokens_in: usage.and_then(|u| u.get("input_tokens")).and_then(|v| v.as_u64()),
                 tokens_out: usage.and_then(|u| u.get("output_tokens")).and_then(|v| v.as_u64()),
-            }]
+            })
         }
 
         other => {
@@ -474,5 +585,160 @@ mod tests {
             "result": "done", "session_id": "s1"
         });
         assert!(matches!(&translate_event(&raw)[0], AcpEvent::Result { .. }));
+    }
+
+    // ── cross-session external turn (spec 2026-09-26) ──
+    // Fixtures are trimmed copies of real CLI 2.1.282 stream-json lines.
+
+    #[test]
+    fn peer_user_event_becomes_peer_message() {
+        let v = serde_json::json!({
+            "type": "user",
+            "message": {"role": "user", "content": "Another Claude session sent a message:\n<cross-session-message from=\"uds:/tmp/cc-socks/39894.sock\" from-name=\"zeromux-98\" from-mode=\"bypass\">\nIDLE-PROBE\n</cross-session-message>"},
+            "isSynthetic": true, "isReplay": true,
+            "origin": {"kind": "peer", "from": "uds:/tmp/cc-socks/39894.sock", "name": "zeromux-98",
+                       "fromMode": "bypass", "msg_id": "m1", "body": "IDLE-PROBE"}
+        });
+        let evts = translate_event(&v);
+        assert_eq!(evts.len(), 1);
+        match &evts[0] {
+            AcpEvent::PeerMessage { from_name, text, turn_id } => {
+                assert_eq!(from_name, "zeromux-98");
+                assert_eq!(text, "IDLE-PROBE");
+                assert_eq!(*turn_id, 0);
+            }
+            other => panic!("expected PeerMessage, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn peer_user_event_without_name_uses_unknown() {
+        let v = serde_json::json!({
+            "type": "user", "message": {"role": "user", "content": "x"},
+            "origin": {"kind": "peer", "body": "hi"}
+        });
+        match &translate_event(&v)[0] {
+            AcpEvent::PeerMessage { from_name, text, .. } => {
+                assert_eq!(from_name, "unknown");
+                assert_eq!(text, "hi");
+            }
+            other => panic!("expected PeerMessage, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn stdin_replay_becomes_stdin_echo() {
+        // ZeroMux's own stdin prompt echoed back by --replay-user-messages: no
+        // origin, isReplay:true. The fan-out uses it to learn which turn absorbed
+        // the prompt (spec v2 §2d, CTO merged-race finding).
+        let replay = serde_json::json!({
+            "type": "user", "isReplay": true,
+            "message": {"role": "user", "content": [{"type": "text", "text": "reply only: ok"}]}
+        });
+        let evts = translate_event(&replay);
+        assert_eq!(evts.len(), 1);
+        assert!(matches!(evts[0], AcpEvent::StdinEcho));
+    }
+
+    #[test]
+    fn tool_result_user_event_is_dropped() {
+        // tool_result echoes carry no isReplay (CTO probe) — must not be mistaken
+        // for a stdin echo.
+        let tool_result = serde_json::json!({
+            "type": "user",
+            "message": {"role": "user", "content": [{"tool_use_id": "t1", "type": "tool_result", "content": "ok"}]}
+        });
+        assert!(translate_event(&tool_result).is_empty());
+    }
+
+    #[test]
+    fn claude_args_include_replay_name_and_inbound() {
+        let a = claude_args(None, "zmx-ai-ab12cd", Inbound::Accept);
+        assert!(a.iter().any(|x| x == "--replay-user-messages"));
+        let i = a.iter().position(|x| x == "--name").unwrap();
+        assert_eq!(a[i + 1], "zmx-ai-ab12cd");
+        let j = a.iter().position(|x| x == "--settings").unwrap();
+        assert_eq!(a[j + 1], r#"{"crossSessionInbound":"accept"}"#);
+        assert!(!a.iter().any(|x| x == "--resume"));
+
+        let r = claude_args(Some("sid-1"), "zmx-ai-x", Inbound::Refuse);
+        let j = r.iter().position(|x| x == "--settings").unwrap();
+        assert_eq!(r[j + 1], r#"{"crossSessionInbound":"refuse"}"#);
+        let k = r.iter().position(|x| x == "--resume").unwrap();
+        assert_eq!(r[k + 1], "sid-1");
+        // existing flags preserved
+        assert!(r.iter().any(|x| x == "--dangerously-skip-permissions"));
+    }
+
+    #[test]
+    fn result_with_origin_is_preceded_by_turn_origin() {
+        let v = serde_json::json!({
+            "type": "result", "subtype": "success", "is_error": false,
+            "result": "pong", "session_id": "s1",
+            "origin": {"kind": "peer", "name": "zeromux-98", "body": "x"}
+        });
+        let evts = translate_event(&v);
+        assert_eq!(evts.len(), 2);
+        match &evts[0] {
+            AcpEvent::TurnOrigin { kind } => assert_eq!(kind, "peer"),
+            other => panic!("expected TurnOrigin, got {other:?}"),
+        }
+        assert!(matches!(evts[1], AcpEvent::Result { .. }));
+    }
+
+    #[test]
+    fn error_result_with_origin_is_preceded_by_turn_origin() {
+        let v = serde_json::json!({
+            "type": "result", "subtype": "error_during_execution", "is_error": true,
+            "session_id": "s1", "origin": {"kind": "task-notification"}
+        });
+        let evts = translate_event(&v);
+        assert_eq!(evts.len(), 2);
+        match &evts[0] {
+            AcpEvent::TurnOrigin { kind } => assert_eq!(kind, "task-notification"),
+            other => panic!("expected TurnOrigin, got {other:?}"),
+        }
+        assert!(matches!(evts[1], AcpEvent::Error { .. }));
+    }
+
+    #[test]
+    fn result_without_origin_has_no_turn_origin() {
+        let v = serde_json::json!({
+            "type": "result", "subtype": "success", "is_error": false,
+            "result": "ok", "session_id": "s1"
+        });
+        let evts = translate_event(&v);
+        assert_eq!(evts.len(), 1);
+        assert!(matches!(evts[0], AcpEvent::Result { .. }));
+    }
+
+    #[test]
+    fn informational_system_becomes_notice() {
+        let v = serde_json::json!({
+            "type": "system", "subtype": "informational", "level": "warning",
+            "content": "Cross-session message held for approval (recipient: uds:/tmp/cc-socks/1.sock)."
+        });
+        let evts = translate_event(&v);
+        assert_eq!(evts.len(), 1);
+        match &evts[0] {
+            AcpEvent::Notice { text, level } => {
+                assert!(text.starts_with("Cross-session message held"));
+                assert_eq!(level, "warning");
+            }
+            other => panic!("expected Notice, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn new_events_serialize_with_expected_tags() {
+        let p = serde_json::to_string(&AcpEvent::PeerMessage {
+            from_name: "a".into(), text: "b".into(), turn_id: 3 }).unwrap();
+        assert!(p.contains("\"type\":\"peer_message\""));
+        assert!(p.contains("\"from_name\":\"a\""));
+        assert!(p.contains("\"turn_id\":3"));
+        let n = serde_json::to_string(&AcpEvent::Notice {
+            text: "t".into(), level: StaticOrOwnedStr::Borrowed("info") }).unwrap();
+        assert!(n.contains("\"type\":\"notice\""));
+        assert!(n.contains("\"level\":\"info\""));
     }
 }

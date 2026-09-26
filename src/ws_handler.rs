@@ -25,6 +25,9 @@ enum ClientMsg {
     Input { data: String },
     #[serde(rename = "resize")]
     Resize { cols: u16, rows: u16 },
+    /// Touch-drag scrolling for tmux terminals: drives server-side copy-mode.
+    #[serde(rename = "scroll")]
+    Scroll { op: String, #[serde(default)] n: u32 },
 }
 
 pub async fn ws_terminal(
@@ -191,6 +194,17 @@ async fn handle_ws(socket: WebSocket, session_id: String, state: Arc<AppState>) 
                                 ClientMsg::Resize { cols, rows } => {
                                     state.sessions.set_size(&session_id, cols, rows);
                                     let _ = input_tx.send(SessionInput::PtyResize(cols, rows)).await;
+                                }
+                                ClientMsg::Scroll { op, n } => {
+                                    // Awaited inline: bounded by TmuxCtl's 3s timeout.
+                                    if let (Some((name, _)), Some(op)) =
+                                        (state.sessions.tmux_binding(&session_id), crate::tmux::ScrollOp::parse(&op, n))
+                                    {
+                                        if let Ok(info) = state.tmux.scroll(&name, op).await {
+                                            let m = serde_json::json!({"type": "scroll_state", "in_mode": info.in_mode, "history_size": info.history_size});
+                                            if ws_sink.send(Message::Text(m.to_string().into())).await.is_err() { break; }
+                                        }
+                                    }
                                 }
                             }
                         }

@@ -12,6 +12,7 @@ import Composer from './Composer'
 import { TmuxHealthBar, LostBanner, EndedOverlay } from './TerminalNotices'
 import { arrowSequence, rowHeight, linesFromDrag, bracketedPaste, submitSequence, controlSequence, launchSequence, type ArrowKey } from '../lib/terminalInput'
 import { shouldStickToBottom } from '../lib/scrollReplay'
+import { ScrollBatcher, inertiaLines, type ScrollMsg } from '../lib/terminalScroll'
 
 const FONT_SIZE = 14
 
@@ -122,16 +123,36 @@ export default function TerminalView({ sessionId, active, theme, tmuxName, tmuxO
     return () => { cancelled = true; clearInterval(interval) }
   }, [sessionId, tmuxName])
 
+  // tmux copy-mode state (server-authoritative via scroll_state); drives the pill.
+  const [scrolling, setScrolling] = useState(false)
+  const scrollingRef = useRef(false)
+  const sendScroll = useCallback((m: ScrollMsg) => {
+    const ws = wsRef.current
+    if (ws?.readyState === WebSocket.OPEN) ws.send(JSON.stringify({ type: 'scroll', ...m }))
+    if (m.op === 'up' || m.op === 'top') { scrollingRef.current = true; setScrolling(true) }
+  }, [])
+  // Ref twin so the once-only init effect's touch batcher always calls the latest sendScroll.
+  const sendScrollRef = useRef(sendScroll)
+  useEffect(() => { sendScrollRef.current = sendScroll }, [sendScroll])
+  // Leave copy-mode before any keystroke so input isn't swallowed by tmux.
+  const exitScroll = useCallback(() => {
+    if (!scrollingRef.current) return
+    scrollingRef.current = false
+    setScrolling(false)
+    sendScroll({ op: 'cancel', n: 1 })
+  }, [sendScroll])
+
   // 所有 client→PTY 输入走这一条；term.onData 与 MobileKeyBar 共用。
   // 返回是否真正送出：重连窗口里 WS 未 OPEN 时为 false，调用方据此决定是否清空输入。
   const sendInput = useCallback((data: string) => {
+    exitScroll()
     const ws = wsRef.current
     if (ws?.readyState === WebSocket.OPEN) {
       ws.send(JSON.stringify({ type: 'input', data: b64encode(new TextEncoder().encode(data)) }))
       return true
     }
     return false
-  }, [])
+  }, [exitScroll])
 
   // 虚拟键：先回到底部（否则在 scrollback 里点键看不到反馈），再发对应字节。
   // 方向键/Enter 按 DECCKM 模式；控制键直发。
@@ -226,12 +247,16 @@ export default function TerminalView({ sessionId, active, theme, tmuxName, tmuxO
     const container = containerRef.current
     let startY = 0
     let touchId: number | null = null
+    // tmux terminals: drag → batched copy-mode scroll ops over the WS (+ inertia).
+    const batcher = new ScrollBatcher(m => sendScrollRef.current(m))
+    let lastY = 0, lastT = 0, vel = 0
 
     const onTouchStart = (e: TouchEvent) => {
       // 仅单指进入滚动逻辑；多指（pinch）忽略。
       if (e.touches.length !== 1) { touchId = null; return }
       startY = e.touches[0].clientY
       touchId = e.touches[0].identifier
+      lastY = e.touches[0].clientY; lastT = performance.now(); vel = 0
     }
     const onTouchMove = (e: TouchEvent) => {
       if (touchId === null) return
@@ -244,12 +269,24 @@ export default function TerminalView({ sessionId, active, theme, tmuxName, tmuxO
       const rh = rowHeight(term.element?.clientHeight ?? 0, term.rows, FONT_SIZE)
       const lines = linesFromDrag(startY, t.clientY, rh)
       if (lines !== 0) {
-        term.scrollLines(lines)
+        if (tmuxRef.current) batcher.add(lines)
+        else term.scrollLines(lines)
         startY = t.clientY
       }
+      const now = performance.now()
+      if (lastT) vel = (lastY - t.clientY) / Math.max(1, now - lastT)
+      lastY = t.clientY; lastT = now
     }
 
-    const onTouchEnd = () => { touchId = null }
+    const onTouchEnd = () => {
+      touchId = null
+      if (tmuxRef.current) {
+        batcher.flush()
+        const rh = rowHeight(term.element?.clientHeight ?? 0, term.rows, FONT_SIZE)
+        inertiaLines(vel, rh).forEach((l, i) => setTimeout(() => batcher.add(l), i * 16))
+      }
+      vel = 0; lastT = 0
+    }
 
     container?.addEventListener('touchstart', onTouchStart, { passive: true })
     container?.addEventListener('touchmove', onTouchMove, { passive: false })
@@ -261,6 +298,7 @@ export default function TerminalView({ sessionId, active, theme, tmuxName, tmuxO
       container?.removeEventListener('touchmove', onTouchMove)
       container?.removeEventListener('touchend', onTouchEnd)
       container?.removeEventListener('touchcancel', onTouchEnd)
+      batcher.dispose()
       if (scrollDebounceRef.current) clearTimeout(scrollDebounceRef.current)
       wsRef.current?.close()
       term.dispose()
@@ -324,6 +362,11 @@ export default function TerminalView({ sessionId, active, theme, tmuxName, tmuxO
             if (msg.kind === 'tmux_lost') setLost(true)
             if (msg.kind === 'tmux_ended') { endedRef.current = true; setEnded(true) }
             if (msg.kind === 'tmux_down') setHealth({ server: false, in_unit: false })
+            return
+          }
+          if (msg.type === 'scroll_state') {
+            scrollingRef.current = !!msg.in_mode
+            setScrolling(!!msg.in_mode)
             return
           }
           if (msg.type === 'output') {
@@ -453,6 +496,14 @@ export default function TerminalView({ sessionId, active, theme, tmuxName, tmuxO
       {tmuxName && <TmuxHealthBar health={health} />}
       {lost && <LostBanner onClose={() => setLost(false)} />}
       <div ref={containerRef} className="xterm-container w-full flex-1 min-h-0" />
+      {tmuxName && scrolling && (
+        <div className="absolute right-3 bottom-28 z-10 flex gap-1 text-xs">
+          <button aria-label="scroll-top" onPointerDown={e => { e.preventDefault(); sendScroll({ op: 'top', n: 1 }) }}
+            className="px-2 py-1.5 rounded-full bg-[var(--bg-tertiary)] border border-[var(--border)] shadow">⤒顶</button>
+          <button aria-label="scroll-bottom" onPointerDown={e => { e.preventDefault(); exitScroll() }}
+            className="px-3 py-1.5 rounded-full bg-[var(--accent-blue)] text-white shadow">⏸ 已暂停跟随 · ⤓</button>
+        </div>
+      )}
       {ended && <EndedOverlay name={tmuxName ?? ''} origin={tmuxOrigin} onRevive={handleRevive} onClose={() => onClose?.()} />}
       {/* 触摸端：方向/启动键栏在上，常驻输入框贴底（最靠近软键盘）。 */}
       {isTouch && <MobileKeyBar onKey={handleBarKey} />}

@@ -12,6 +12,19 @@ const SCROLLBACK_MAX_BYTES: usize = 2 * 1024 * 1024;
 /// Broadcast channel capacity — slow clients that fall behind will get Lagged error
 const BROADCAST_CAPACITY: usize = 512;
 
+/// Smallest terminal size a client may impose. A hidden (display:none) xterm's
+/// FitAddon falls back to ~10x5; with tmux `window-size latest` that tiny size
+/// would become the shared window size and truncate every TUI in it.
+pub const MIN_COLS: u16 = 20;
+pub const MIN_ROWS: u16 = 5;
+/// Size used when a persisted row carries a corrupted (below-minimum) size.
+const DEFAULT_COLS: u16 = 80;
+const DEFAULT_ROWS: u16 = 24;
+
+pub fn resize_is_sane(cols: u16, rows: u16) -> bool {
+    cols >= MIN_COLS && rows >= MIN_ROWS
+}
+
 use crate::acp::process::{AcpEvent, AcpProcess};
 use crate::pty_bridge::PtyHandle;
 
@@ -2191,14 +2204,21 @@ impl SessionManager {
                 continue;
             }
             let id = p.id.clone();
+            // Self-heal rows corrupted by hidden-view resizes (e.g. 10x5) so a
+            // respawn doesn't create a tiny PTY.
+            let (cols, rows) = if resize_is_sane(p.cols, p.rows) {
+                (p.cols, p.rows)
+            } else {
+                (DEFAULT_COLS, DEFAULT_ROWS)
+            };
             map.insert(
                 id,
                 Session {
                     id: p.id,
                     name: p.name,
                     session_type: p.session_type,
-                    cols: p.cols,
-                    rows: p.rows,
+                    cols,
+                    rows,
                     work_dir: p.work_dir,
                     owner_id: p.owner_id,
                     description: p.description,
@@ -6439,5 +6459,50 @@ mod tmux_session_tests {
             lifetime_turns: 0, lifetime_duration_ms: 0, lifetime_cost_usd: 0.0,
             running: None, scrollback: VecDeque::new(), scrollback_bytes: 0,
         }
+    }
+}
+
+#[cfg(test)]
+mod terminal_size_tests {
+    use super::*;
+
+    #[test]
+    fn resize_is_sane_rejects_hidden_view_fallback_dims() {
+        assert!(!resize_is_sane(12, 5), "hidden xterm fallback");
+        assert!(!resize_is_sane(10, 5));
+        assert!(!resize_is_sane(80, 4));
+        assert!(!resize_is_sane(0, 0));
+        assert!(resize_is_sane(MIN_COLS, MIN_ROWS));
+        assert!(resize_is_sane(53, 20));
+        assert!(resize_is_sane(80, 24));
+    }
+
+    fn persisted(id: &str, cols: u16, rows: u16) -> PersistedSession {
+        PersistedSession {
+            id: id.into(), name: id.into(), session_type: SessionType::Tmux,
+            work_dir: "/tmp".into(), owner_id: "u".into(), description: String::new(),
+            resume_token: Some(ResumeToken::Tmux(format!("zmx-{id}"))), worktree_path: None,
+            created_ms: 0, source_task_id: None, name_is_auto: true,
+            tmux_origin: Some("own".into()), cols, rows, pending_kill_until: None,
+        }
+    }
+
+    #[test]
+    fn load_persisted_clamps_corrupted_tiny_size_to_default() {
+        let dir = tempfile::tempdir().unwrap();
+        let events = Arc::new(crate::events::EventStore::open(dir.path()).unwrap());
+        let store = Arc::new(crate::session_store::SessionStore::open(dir.path()).unwrap());
+        store.upsert(&persisted("tiny", 10, 5)).unwrap();
+        store.upsert(&persisted("short", 120, 3)).unwrap();
+        store.upsert(&persisted("ok", 53, 20)).unwrap();
+        let m = SessionManager::new(events, store, "claude".into(), "codex".into(), "off".into(),
+            5476, "/tmp/crew".into(), "bash".into(), false,
+            crate::tmux::TmuxCtl::new(Some("zmx-test-unused".into())));
+        m.load_persisted();
+        let map = m.sessions.lock().unwrap();
+        let size = |id: &str| { let s = map.get(id).unwrap(); (s.cols, s.rows) };
+        assert_eq!(size("tiny"), (DEFAULT_COLS, DEFAULT_ROWS));
+        assert_eq!(size("short"), (DEFAULT_COLS, DEFAULT_ROWS));
+        assert_eq!(size("ok"), (53, 20), "sane sizes are kept");
     }
 }

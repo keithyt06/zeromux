@@ -20,6 +20,7 @@ import { shouldStickToBottom } from '../lib/scrollReplay'
 import { ScrollBatcher, inertiaLines, pillFromScrollState, scheduleInertia, shouldCancelBeforeInput, type ScrollMsg } from '../lib/terminalScroll'
 import { shouldShowShiftHint, mousePref, MOUSE_PREF_KEY, mouseToggleApplies, shouldSendMouseOffOnConnect } from '../lib/desktopHints'
 import { historyPrompt } from '../lib/historyToAgent'
+import { shouldSendResize } from '../lib/terminalSize'
 
 const FONT_SIZE = 14
 
@@ -116,6 +117,9 @@ export default function TerminalView({ sessionId, active, theme, tmuxName, tmuxO
   // Ref twin of `tmuxName` for long-lived closures (WS handlers, touch listeners).
   const tmuxRef = useRef(tmuxName)
   useEffect(() => { tmuxRef.current = tmuxName }, [tmuxName])
+  // Read by the WS onopen / window-resize callbacks, which outlive renders.
+  const activeRef = useRef(active)
+  useEffect(() => { activeRef.current = active }, [active])
   const tmuxOriginRef = useRef(tmuxOrigin)
   useEffect(() => { tmuxOriginRef.current = tmuxOrigin }, [tmuxOrigin])
   // Sidebar ⋯ 查看历史: a nonce bump (even while already open) should (re)open the drawer.
@@ -338,7 +342,9 @@ export default function TerminalView({ sessionId, active, theme, tmuxName, tmuxO
       return true
     })
 
-    fit.fit()
+    // A view mounted hidden (display:none) has no size; fitting it would
+    // collapse cols/rows to FitAddon's tiny fallback.
+    if (containerRef.current.clientWidth > 0 && containerRef.current.clientHeight > 0) fit.fit()
     termRef.current = term
     fitRef.current = fit
 
@@ -487,13 +493,26 @@ export default function TerminalView({ sessionId, active, theme, tmuxName, tmuxO
         // a bare-shell PTY reconnect just gets the same replay it always got.
         if (openedOnceRef.current && tmuxRef.current) setReconnected(true)
         openedOnceRef.current = true
+        // Only the active, visible view may size the PTY: a hidden view's
+        // proposeDimensions() is a ~10x5 fallback that would shrink the shared
+        // tmux window (window-size latest). When skipped, invalidate lastDims so
+        // the `active` effect sends the real size once this view is shown (the
+        // fresh attach may have come up at another client's size).
         const fit = fitRef.current
-        if (fit) {
-          const dims = fit.proposeDimensions()
-          if (dims) {
-            ws.send(JSON.stringify({ type: 'resize', cols: dims.cols, rows: dims.rows }))
-            lastDims.current = { cols: dims.cols, rows: dims.rows }
-          }
+        const el = containerRef.current
+        const dims = fit?.proposeDimensions()
+        if (dims && el && shouldSendResize({
+          active: activeRef.current,
+          containerWidth: el.clientWidth,
+          containerHeight: el.clientHeight,
+          cols: dims.cols,
+          rows: dims.rows,
+          last: { cols: 0, rows: 0 }, // first send on a new socket is never redundant
+        })) {
+          ws.send(JSON.stringify({ type: 'resize', cols: dims.cols, rows: dims.rows }))
+          lastDims.current = { cols: dims.cols, rows: dims.rows }
+        } else {
+          lastDims.current = { cols: 0, rows: 0 }
         }
         // tmux 会话默认 mouse=on（tmux.conf）；用户上次关过就在（重）连接时同步关掉，
         // 否则每次新建/重连的会话又会回到 tmux 接管鼠标。
@@ -579,13 +598,23 @@ export default function TerminalView({ sessionId, active, theme, tmuxName, tmuxO
     const fit = fitRef.current
     const term = termRef.current
     const ws = wsRef.current
-    if (!fit || !term) return
+    const el = containerRef.current
+    if (!fit || !term || !el) return
+    // Every mounted view gets window resize events; a hidden one has a 0x0
+    // container and fitting it would corrupt its cols/rows.
+    if (el.clientWidth === 0 || el.clientHeight === 0) return
     fit.fit()
-    // Skip redundant resize sends: Android fires window.resize on soft-keyboard
-    // open, which would otherwise spam PTY SIGWINCH and thrash the TUI even
-    // though cols/rows didn't change.
-    if (ws?.readyState === WebSocket.OPEN
-        && (term.cols !== lastDims.current.cols || term.rows !== lastDims.current.rows)) {
+    // Skip redundant resize sends (Android fires window.resize on soft-keyboard
+    // open → SIGWINCH spam) and anything from an inactive view or with
+    // below-minimum dims (see lib/terminalSize).
+    if (ws?.readyState === WebSocket.OPEN && shouldSendResize({
+      active: activeRef.current,
+      containerWidth: el.clientWidth,
+      containerHeight: el.clientHeight,
+      cols: term.cols,
+      rows: term.rows,
+      last: lastDims.current,
+    })) {
       lastDims.current = { cols: term.cols, rows: term.rows }
       ws.send(JSON.stringify({ type: 'resize', cols: term.cols, rows: term.rows }))
     }

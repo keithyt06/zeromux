@@ -225,8 +225,12 @@ async fn handle_ws(socket: WebSocket, session_id: String, state: Arc<AppState>) 
                                     }
                                 }
                                 ClientMsg::Resize { cols, rows } => {
-                                    state.sessions.set_size(&session_id, cols, rows);
-                                    let _ = input_tx.send(SessionInput::PtyResize(cols, rows)).await;
+                                    // Drop hidden-view fallback sizes (~10x5): with tmux
+                                    // `window-size latest` they'd shrink the shared window.
+                                    if crate::session_manager::resize_is_sane(cols, rows) {
+                                        state.sessions.set_size(&session_id, cols, rows);
+                                        let _ = input_tx.send(SessionInput::PtyResize(cols, rows)).await;
+                                    }
                                 }
                                 ClientMsg::Scroll { op, n } => {
                                     // Awaited inline: up to 3 tmux calls (info, op, info), each 3s-bounded → ≤9s.

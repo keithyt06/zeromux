@@ -23,6 +23,8 @@ pub fn build_router(state: Arc<AppState>) -> Router {
         .route("/api/sessions/{id}", delete(delete_session))
         .route("/api/sessions/{id}", patch(update_session))
         .route("/api/sessions/{id}/revive", post(revive_session))
+        .route("/api/sessions/{id}/restore", post(restore_session))
+        .route("/api/sessions/{id}/close-check", get(close_check))
         .route("/api/sessions/{id}/status", get(session_status))
         .route("/api/sessions/{id}/logs", get(session_logs))
         .route("/api/sessions/{id}/files", get(list_session_files))
@@ -951,20 +953,63 @@ async fn delete_session(
     State(state): State<Arc<AppState>>,
     user: axum::Extension<CurrentUser>,
     axum::extract::Path(id): axum::extract::Path<String>,
-) -> StatusCode {
+) -> Result<Json<serde_json::Value>, StatusCode> {
     // Check ownership (admin can delete any)
     if !user.is_admin() && !state.sessions.is_owner(&id, &user.id) {
-        return StatusCode::FORBIDDEN;
+        return Err(StatusCode::FORBIDDEN);
+    }
+
+    // tmux terminals: hide now, kill after the undo window (POST /restore cancels).
+    let now = crate::session_manager::now_millis();
+    if state.sessions.mark_pending_kill(&id, now) {
+        let st = state.clone();
+        let sid = id.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(
+                crate::session_manager::PENDING_KILL_MS as u64,
+            ))
+            .await;
+            if st.sessions.finalize_pending_kill(&sid, crate::session_manager::now_millis()).await {
+                if let Some(ref logger) = st.logger {
+                    logger.remove_session(&sid);
+                }
+            }
+        });
+        return Ok(Json(serde_json::json!({
+            "pending_until": now + crate::session_manager::PENDING_KILL_MS
+        })));
     }
 
     if state.sessions.remove_session(&id) {
         if let Some(ref logger) = state.logger {
             logger.remove_session(&id);
         }
-        StatusCode::OK
+        Ok(Json(serde_json::json!({})))
     } else {
-        StatusCode::NOT_FOUND
+        Err(StatusCode::NOT_FOUND)
     }
+}
+
+async fn restore_session(
+    State(state): State<Arc<AppState>>,
+    user: axum::Extension<CurrentUser>,
+    axum::extract::Path(id): axum::extract::Path<String>,
+) -> StatusCode {
+    if !user.is_admin() && !state.sessions.is_owner(&id, &user.id) {
+        return StatusCode::FORBIDDEN;
+    }
+    if state.sessions.restore(&id) { StatusCode::OK } else { StatusCode::GONE }
+}
+
+async fn close_check(
+    State(state): State<Arc<AppState>>,
+    user: axum::Extension<CurrentUser>,
+    axum::extract::Path(id): axum::extract::Path<String>,
+) -> Result<Json<Option<crate::session_manager::CloseCheck>>, StatusCode> {
+    if !user.is_admin() && !state.sessions.is_owner(&id, &user.id) {
+        return Err(StatusCode::FORBIDDEN);
+    }
+    Ok(Json(state.sessions.close_check(&id).await))
 }
 
 async fn session_status(
@@ -1062,6 +1107,13 @@ struct UpdateSessionReq {
     status: Option<crate::session_manager::SessionMeta>,
 }
 
+/// `Ended` is server-owned (set only when the tmux session is really gone);
+/// letting a client PATCH it would allow PATCH→Ended→revive to turn an External
+/// session into Own.
+fn patch_status_allowed(status: Option<crate::session_manager::SessionMeta>) -> bool {
+    !matches!(status, Some(crate::session_manager::SessionMeta::Ended))
+}
+
 /// Strip control characters (newlines, terminal escapes, etc.) and cap the
 /// length of a user-supplied metadata string (char-boundary-safe).
 fn sanitize_meta(s: &str, max_chars: usize) -> String {
@@ -1080,7 +1132,7 @@ async fn update_session(
     if !user.is_admin() && !state.sessions.is_owner(&id, &user.id) {
         return StatusCode::FORBIDDEN;
     }
-    if req.name.as_deref() == Some("") {
+    if req.name.as_deref() == Some("") || !patch_status_allowed(req.status) {
         return StatusCode::BAD_REQUEST;
     }
     // Sanitize free-form fields: strip control chars (incl. newlines, which break
@@ -3922,6 +3974,14 @@ async fn vault_resolve(
 mod path_safety_tests {
     use super::*;
     use std::os::unix::fs::symlink;
+
+    #[test]
+    fn patch_rejects_ended_status() {
+        use crate::session_manager::SessionMeta;
+        assert!(!patch_status_allowed(Some(SessionMeta::Ended)));
+        assert!(patch_status_allowed(Some(SessionMeta::Done)));
+        assert!(patch_status_allowed(None));
+    }
 
     #[test]
     fn vault_meta_name_hidden_when_not_enabled() {

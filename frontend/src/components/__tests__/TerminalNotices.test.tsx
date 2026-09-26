@@ -27,11 +27,16 @@ describe('LostBanner / EndedOverlay', () => {
   })
   it('ended overlay offers revive + close', () => {
     const onRevive = vi.fn(), onClose = vi.fn()
-    render(<EndedOverlay name="vscode-dev" onRevive={onRevive} onClose={onClose} />)
+    render(<EndedOverlay name="vscode-dev" origin="external" onRevive={onRevive} onClose={onClose} />)
     expect(screen.getByText(/vscode-dev 已在其他终端结束/)).toBeInTheDocument()
     fireEvent.click(screen.getByText('新建同名会话'))
     fireEvent.click(screen.getByText('关闭'))
     expect(onRevive).toHaveBeenCalled()
     expect(onClose).toHaveBeenCalled()
+  })
+  it('own session ended → generic copy, not "other terminal"', () => {
+    render(<EndedOverlay name="zmx-abcd1234" origin="own" onRevive={() => {}} onClose={() => {}} />)
+    expect(screen.getByText('tmux 会话已结束')).toBeInTheDocument()
+    expect(screen.queryByText(/其他终端/)).toBeNull()
   })
 })

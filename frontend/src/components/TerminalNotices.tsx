@@ -22,10 +22,10 @@ export function LostBanner({ onClose }: { onClose: () => void }) {
   )
 }
 
-export function EndedOverlay({ name, onRevive, onClose }: { name: string; onRevive: () => void; onClose: () => void }) {
+export function EndedOverlay({ name, origin, onRevive, onClose }: { name: string; origin?: 'own' | 'external' | null; onRevive: () => void; onClose: () => void }) {
   return (
     <div className="absolute inset-0 z-10 flex flex-col items-center justify-center gap-3 bg-[var(--bg-primary)]/90 text-sm text-[var(--text-primary)]">
-      <div>{name} 已在其他终端结束</div>
+      <div>{origin === 'external' ? `${name} 已在其他终端结束` : 'tmux 会话已结束'}</div>
       <div className="flex gap-2">
         <button onClick={onRevive} className="px-3 py-1.5 rounded bg-[var(--accent-blue)] text-white">新建同名会话</button>
         <button onClick={onClose} className="px-3 py-1.5 rounded border border-[var(--border)]">关闭</button>

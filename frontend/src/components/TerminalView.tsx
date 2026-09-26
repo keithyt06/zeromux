@@ -67,10 +67,11 @@ interface Props {
   active: boolean
   theme: Theme
   tmuxName?: string | null
+  tmuxOrigin?: 'own' | 'external' | null
   onClose?: () => void
 }
 
-export default function TerminalView({ sessionId, active, theme, tmuxName, onClose }: Props) {
+export default function TerminalView({ sessionId, active, theme, tmuxName, tmuxOrigin, onClose }: Props) {
   const containerRef = useRef<HTMLDivElement>(null)
   const termRef = useRef<Terminal | null>(null)
   const fitRef = useRef<FitAddon | null>(null)
@@ -447,7 +448,7 @@ export default function TerminalView({ sessionId, active, theme, tmuxName, onClo
       {tmuxName && <TmuxHealthBar health={health} />}
       {lost && <LostBanner onClose={() => setLost(false)} />}
       <div ref={containerRef} className="xterm-container w-full flex-1 min-h-0" />
-      {ended && <EndedOverlay name={tmuxName ?? ''} onRevive={handleRevive} onClose={() => onClose?.()} />}
+      {ended && <EndedOverlay name={tmuxName ?? ''} origin={tmuxOrigin} onRevive={handleRevive} onClose={() => onClose?.()} />}
       {/* 触摸端：方向/启动键栏在上，常驻输入框贴底（最靠近软键盘）。 */}
       {isTouch && <MobileKeyBar onKey={handleBarKey} />}
       {isTouch && (

@@ -273,7 +273,7 @@ struct RunningProcess {
     queue_mode: QueueMode,
 }
 
-fn now_millis() -> i64 {
+pub fn now_millis() -> i64 {
     use std::time::{SystemTime, UNIX_EPOCH};
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -1852,7 +1852,7 @@ impl SessionManager {
             .unwrap()
             .values()
             .filter(|s| {
-                owner_filter
+                s.pending_kill_until.is_none() && owner_filter
                     .map(|uid| s.owner_id == uid)
                     .unwrap_or(true)
             })
@@ -2176,7 +2176,7 @@ impl SessionManager {
                         (Some(ResumeToken::Tmux(n)), None) => Some(if n.starts_with("zmx-") { TmuxOrigin::Own } else { TmuxOrigin::External }),
                         _ => None,
                     },
-                    pending_kill_until: None,
+                    pending_kill_until: p.pending_kill_until,
                     resume_token: p.resume_token,
                     worktree_path: p.worktree_path.map(std::path::PathBuf::from),
                     created_ms: p.created_ms,
@@ -2227,10 +2227,13 @@ impl SessionManager {
         decision
     }
 
+    /// Never clears `running` and never touches a running/spawning session: a
+    /// concurrent respawn that won the race must not be dropped.
     fn mark_ended(&self, id: &str) {
         if let Some(s) = self.sessions.lock().unwrap().get_mut(id) {
-            s.status = SessionMeta::Ended;
-            s.running = None;
+            if s.running.is_none() && !s.spawning {
+                s.status = SessionMeta::Ended;
+            }
         }
     }
 
@@ -2246,6 +2249,79 @@ impl SessionManager {
         };
         if let Err(e) = self.store.upsert(&snapshot) { tracing::warn!("persist revive {} failed: {}", id, e); }
         true
+    }
+
+    pub fn mark_pending_kill(&self, id: &str, now: i64) -> bool {
+        let until = now + PENDING_KILL_MS;
+        {
+            let mut map = self.sessions.lock().unwrap();
+            let Some(s) = map.get_mut(id) else { return false };
+            if s.tmux_origin.is_none() { return false; }
+            s.pending_kill_until = Some(until);
+        }
+        let _ = self.store.set_pending_kill(id, Some(until));
+        true
+    }
+
+    pub fn restore(&self, id: &str) -> bool {
+        {
+            let mut map = self.sessions.lock().unwrap();
+            let Some(s) = map.get_mut(id) else { return false };
+            if s.pending_kill_until.take().is_none() { return false; }
+        }
+        let _ = self.store.set_pending_kill(id, None);
+        true
+    }
+
+    /// Explicit close path — the ONE place (with reconcile) that runs
+    /// `tmux kill-session`. Deliberately not in Drop: detach / fan-out exit must
+    /// never kill the user's tmux session.
+    pub async fn finalize_pending_kill(&self, id: &str, now: i64) -> bool {
+        let name = {
+            let map = self.sessions.lock().unwrap();
+            match map.get(id) {
+                Some(s) if s.pending_kill_until.is_some_and(|t| t <= now) => match &s.resume_token {
+                    Some(ResumeToken::Tmux(n)) => n.clone(),
+                    _ => return false,
+                },
+                _ => return false,
+            }
+        };
+        // Remove FIRST so the fan-out's exit check finds no binding and doesn't
+        // report this deliberate close as "ended elsewhere" / push it.
+        let removed = self.remove_session(id);
+        if let Err(e) = self.tmux.kill(&name).await {
+            tracing::warn!("kill tmux {} for {} failed: {}", name, id, e);
+        }
+        removed
+    }
+
+    /// Startup: every close still inside its undo window when the previous
+    /// process died is executed now (the undo UI died with it).
+    pub async fn reconcile_pending_kills(&self) {
+        let ids: Vec<String> = self.sessions.lock().unwrap().values()
+            .filter(|s| s.pending_kill_until.is_some()).map(|s| s.id.clone()).collect();
+        for id in ids {
+            if let Some(s) = self.sessions.lock().unwrap().get_mut(&id) { s.pending_kill_until = Some(0); }
+            self.finalize_pending_kill(&id, now_millis()).await;
+        }
+    }
+
+    pub async fn close_check(&self, id: &str) -> Option<CloseCheck> {
+        let (name, origin, running) = {
+            let map = self.sessions.lock().unwrap();
+            let s = map.get(id)?;
+            match (&s.resume_token, s.tmux_origin) {
+                (Some(ResumeToken::Tmux(n)), Some(o)) => (n.clone(), o, s.running.is_some()),
+                _ => return None,
+            }
+        };
+        let info = self.tmux.info(&name).await.ok();
+        Some(CloseCheck {
+            external: origin == TmuxOrigin::External,
+            other_clients: info.as_ref().map(|i| i.attached.saturating_sub(running as u32)).unwrap_or(0),
+            busy_command: info.map(|i| i.current_command).filter(|c| !SHELLS.contains(&c.as_str())),
+        })
     }
 
     pub fn tmux_binding(&self, id: &str) -> Option<(String, TmuxOrigin)> {
@@ -2411,8 +2487,16 @@ fn persisted_of(s: &Session) -> PersistedSession {
         tmux_origin: s.tmux_origin.map(|o| o.as_str().to_string()),
         cols: s.cols,
         rows: s.rows,
+        pending_kill_until: s.pending_kill_until,
     }
 }
+
+pub const PENDING_KILL_MS: i64 = 5_000;
+
+#[derive(Debug, serde::Serialize)]
+pub struct CloseCheck { pub external: bool, pub other_clients: u32, pub busy_command: Option<String> }
+
+const SHELLS: &[&str] = &["bash", "zsh", "sh", "fish", "dash"];
 
 pub enum Preflight { Ready, Lost, Ended, ServerDown }
 
@@ -6071,6 +6155,97 @@ mod tmux_session_tests {
         assert_eq!(s, Some((101, 33)));
         let row = m.store.load_all().unwrap().into_iter().find(|p| p.id == "sz").unwrap();
         assert_eq!((row.cols, row.rows), (101, 33));
+    }
+
+    #[tokio::test]
+    async fn delayed_kill_then_restore_and_finalize() {
+        let Some(srv) = TestServer::start() else { return };
+        let (m, _d) = mgr_with(srv.ctl.clone());
+        let id = m.create_pty_session("t".into(), "bash", "/tmp", 80, 24, "u", None).await.unwrap();
+        let (name, _) = m.tmux_binding(&id).unwrap();
+        for _ in 0..30 { if srv.ctl.has(&name).await.unwrap() { break; } tokio::time::sleep(std::time::Duration::from_millis(100)).await; }
+
+        assert!(m.mark_pending_kill(&id, 1_000));
+        assert!(m.list_sessions(None).iter().all(|s| s.id != id), "hidden while pending");
+        assert!(m.restore(&id));
+        assert!(m.list_sessions(None).iter().any(|s| s.id == id), "restored");
+        assert!(!m.finalize_pending_kill(&id, 1_000 + PENDING_KILL_MS).await, "restore cancels the kill");
+        assert!(srv.ctl.has(&name).await.unwrap());
+
+        assert!(m.mark_pending_kill(&id, 2_000));
+        assert!(!m.finalize_pending_kill(&id, 2_000 + PENDING_KILL_MS - 1).await, "not due yet");
+        assert!(m.finalize_pending_kill(&id, 2_000 + PENDING_KILL_MS).await);
+        assert!(!srv.ctl.has(&name).await.unwrap(), "tmux session killed");
+        assert!(m.tmux_binding(&id).is_none(), "zeromux session removed");
+    }
+
+    #[tokio::test]
+    async fn external_sessions_are_killed_too() {
+        let Some(srv) = TestServer::start() else { return };
+        srv.ctl.run(&["new-session", "-d", "-s", "ext1"]).await.unwrap();
+        let (m, _d) = mgr_with(srv.ctl.clone());
+        let id = m.create_pty_session("x".into(), "bash", "/tmp", 80, 24, "u", Some("ext1")).await.unwrap();
+        assert!(m.mark_pending_kill(&id, 0));
+        assert!(m.finalize_pending_kill(&id, PENDING_KILL_MS).await);
+        assert!(!srv.ctl.has("ext1").await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn startup_reconcile_kills_pending() {
+        let Some(srv) = TestServer::start() else { return };
+        let dir = tempfile::tempdir().unwrap();
+        let id = {
+            let events = Arc::new(crate::events::EventStore::open(dir.path()).unwrap());
+            let store = Arc::new(crate::session_store::SessionStore::open(dir.path()).unwrap());
+            let m = SessionManager::new(events, store, "claude".into(), "codex".into(), "off".into(),
+                5476, "/tmp/crew".into(), "bash".into(), false, srv.ctl.clone());
+            let id = m.create_pty_session("t".into(), "bash", "/tmp", 80, 24, "u", None).await.unwrap();
+            assert!(m.mark_pending_kill(&id, now_millis()));   // not yet due
+            id
+        }; // "process exits" before the timer fires
+        let name = crate::tmux::tmux_name_for(&id);
+        srv.ctl.run(&["new-session", "-d", "-s", &name]).await.ok(); // ensure it exists even if PTY died
+        let events = Arc::new(crate::events::EventStore::open(dir.path()).unwrap());
+        let store = Arc::new(crate::session_store::SessionStore::open(dir.path()).unwrap());
+        let m = SessionManager::new(events, store, "claude".into(), "codex".into(), "off".into(),
+            5476, "/tmp/crew".into(), "bash".into(), false, srv.ctl.clone());
+        m.load_persisted();
+        m.reconcile_pending_kills().await;
+        assert!(!srv.ctl.has(&name).await.unwrap());
+        assert!(m.list_sessions(None).is_empty());
+    }
+
+    #[tokio::test]
+    async fn close_check_reports_other_clients_and_origin() {
+        let Some(srv) = TestServer::start() else { return };
+        srv.ctl.run(&["new-session", "-d", "-s", "ext2"]).await.unwrap();
+        let (m, _d) = mgr_with(srv.ctl.clone());
+        let id = m.create_pty_session("x".into(), "bash", "/tmp", 80, 24, "u", Some("ext2")).await.unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        let c = m.close_check(&id).await.unwrap();
+        assert!(c.external);
+        assert_eq!(c.other_clients, 0, "zeromux's own client is not 'other'");
+        assert!(c.busy_command.is_none(), "idle shell is not busy");
+    }
+
+    #[test]
+    fn mark_ended_leaves_running_session_alone() {
+        let (m, _d) = mgr_with(crate::tmux::TmuxCtl::new(Some("zmx-test-unused".into())));
+        let mut s = test_session_for_size();
+        s.id = "r1".into();
+        let (event_tx, _) = broadcast::channel(BROADCAST_CAPACITY);
+        let (input_tx, _rx) = mpsc::channel(8);
+        s.running = Some(RunningProcess {
+            event_tx, input_tx, pty_pid: None, turn_state: TurnState::Idle,
+            turn_started_ms: None, turn_seq: 0, queue_mode: QueueMode::Collect,
+        });
+        s.status = SessionMeta::Running;
+        m.sessions.lock().unwrap().insert("r1".into(), s);
+        m.mark_ended("r1");
+        let map = m.sessions.lock().unwrap();
+        let s = map.get("r1").unwrap();
+        assert!(s.running.is_some(), "a concurrent respawn must survive mark_ended");
+        assert!(matches!(s.status, SessionMeta::Running), "status unchanged while running");
     }
 
     fn test_session_for_size() -> Session {

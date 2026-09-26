@@ -545,6 +545,8 @@ async fn main() {
 
     // Restore persisted session metadata (running=None until respawned).
     state.sessions.load_persisted();
+    // Closes still inside their undo window when the last process died: execute now.
+    state.sessions.reconcile_pending_kills().await;
 
     // Scheduled tasks: wire the store into the manager, reconcile orphans from a
     // prior process, then start the supervised scheduler loop.

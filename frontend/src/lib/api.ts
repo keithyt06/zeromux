@@ -209,8 +209,21 @@ export async function forgetQuickTarget(kind: 'dir' | 'note', path: string, agen
   if (!res.ok) throw new Error(await res.text())
 }
 
-export async function deleteSession(id: string): Promise<void> {
-  await api(`/api/sessions/${id}`, { method: 'DELETE' })
+export async function deleteSession(id: string): Promise<{ pending_until?: number }> {
+  const res = await api(`/api/sessions/${id}`, { method: 'DELETE' })
+  if (!res.ok) throw new ApiError(res.status, 'deleteSession failed')
+  return res.json().catch(() => ({}))
+}
+
+export interface CloseCheck { external: boolean; other_clients: number; busy_command: string | null }
+export async function closeCheck(id: string): Promise<CloseCheck | null> {
+  const res = await api(`/api/sessions/${id}/close-check`)
+  if (!res.ok) return null
+  return res.json()
+}
+export async function restoreSession(id: string): Promise<boolean> {
+  const res = await api(`/api/sessions/${id}/restore`, { method: 'POST' })
+  return res.ok
 }
 
 export async function reviveSession(id: string): Promise<void> {

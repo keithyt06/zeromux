@@ -53,6 +53,8 @@ The `--build` step runs as your normal user *before* the cgroup escape, so `npm`
 
 Recovery if found 502 / `inactive`: if the installed binary is already the intended one, `sudo systemctl start zeromux`; otherwise just run `./deploy.sh`. Do **not** switch the unit to `systemctl restart` (it keeps the OLD binary, since `cp` can't overwrite a running binary). And do **not** hand-run `systemctl stop` from a zeromux terminal — that is the trap above; you'll kill your own shell mid-command.
 
+`./deploy.sh` also installs/enables `zeromux-tmux.service` (idempotent, never restarts it). Restarting that unit kills every terminal — only do it when `/api/tmux/health` says the server is down or in the wrong cgroup.
+
 ## Architecture
 
 ### Session lifecycle & the broadcast fan-out model (core abstraction)
@@ -64,6 +66,7 @@ Recovery if found 502 / `inactive`: if the installed binary is already the inten
   - **output**: process events → `tokio::sync::broadcast::Sender<String>`. Any number of WebSocket clients `subscribe()` independently. Slow clients get `Lagged` (capacity `BROADCAST_CAPACITY = 512`) and skip messages rather than blocking others.
   - **input**: all clients send through one shared `mpsc::Sender<SessionInput>`. `SessionInput` is an enum (`PtyData`, `PtyResize`, `Prompt`, `Cancel`); PTY variants are meaningful only to tmux sessions and silently dropped by agent fan-outs.
 - **Cleanup is by Drop**: removing a session from the `HashMap` drops `event_tx`/`input_tx`, which ends the fan-out task, which drops the process. Don't add manual kill plumbing — follow the existing Drop-based teardown.
+- **Exception — tmux terminals:** since 2026-09 terminals are `zmx-<id8>` sessions on a tmux server owned by `zeromux-tmux.service` (default socket, so `tmux attach -t =zmx-…` works from VSCode). Dropping the PTY only *detaches*. `tmux kill-session` runs ONLY on the explicit close path (`DELETE` → 5s undo → `finalize_pending_kill`, plus `reconcile_pending_kills` at startup) — never put it in Drop. All tmux commands go through `src/tmux.rs` (`-N`, `=name`, 3s timeout); smoke tests must pass `--tmux-socket`.
 
 This is why disconnecting a browser never hangs a session, and why multiple tabs/devices can watch the same session. When adding a new session type, mirror `create_codex_session` + `spawn_codex_fanout` exactly.
 

@@ -1,7 +1,8 @@
 import { useState, useEffect, useCallback, useMemo, useRef } from 'react'
 import type { SessionInfo, SessionType, UserInfo } from './lib/api'
-import { listSessions, createSession, deleteSession, checkAuth, legacyLogin, clearAuth, renameSession, listConfirmations, getSessionStatus, isAuthError } from './lib/api'
+import { listSessions, createSession, deleteSession, closeCheck, restoreSession, checkAuth, legacyLogin, clearAuth, renameSession, listConfirmations, getSessionStatus, isAuthError } from './lib/api'
 import { deepLinkView } from './lib/deeplink'
+import { closeConfirmMessage } from './lib/closeSession'
 import { notifyQuickTargetsChanged } from './lib/quickTargetsBus'
 import { resyncPush, shouldResyncNow } from './lib/push'
 import { useTheme } from './lib/theme'
@@ -16,6 +17,7 @@ import GitViewer from './components/GitViewer'
 import AgentDashboard from './components/AgentDashboard'
 import VaultReader from './components/VaultReader'
 import MemoryPanel from './components/MemoryPanel'
+import Toast from './components/Toast'
 import { type DocTab, newDocTab, isDocTabId, loadDocTabs, saveDocTabs, resolveActivePane, DEFAULT_DOC_TITLE } from './lib/docTabs'
 import { pickDocTabForTarget } from './lib/docTarget'
 import type { AskAgentTarget } from './lib/askAgent'
@@ -296,16 +298,24 @@ export default function App() {
     setDocTabs(prev => prev.map(t => t.id === id ? { ...t, title: title ?? DEFAULT_DOC_TITLE } : t))
   }, [])
 
+  const [undoToast, setUndoToast] = useState<{ id: string; name: string } | null>(null)
+
   const handleDelete = useCallback(async (id: string) => {
-    await deleteSession(id)
+    const s = sessions.find(x => x.id === id)
+    if (s?.tmux_name) {
+      const msg = closeConfirmMessage(s.name, await closeCheck(id))
+      if (msg && !window.confirm(msg)) return
+    }
+    const r = await deleteSession(id)
     setSessions(prev => {
-      const next = prev.filter(s => s.id !== id)
+      const next = prev.filter(x => x.id !== id)
       if (activeId === id) {
         setActiveId(next[0]?.id ?? docTabs[0]?.id ?? null)
       }
       return next
     })
-  }, [activeId, docTabs])
+    if (r.pending_until && s) setUndoToast({ id, name: s.name })
+  }, [activeId, docTabs, sessions])
 
   const handleApproved = useCallback(() => {
     setAuthState('active')
@@ -413,7 +423,7 @@ export default function App() {
                 {/* Always keep terminal/chat mounted, hide with CSS when overlay is active */}
                 <div className={`h-full ${view !== 'none' ? 'hidden' : ''}`}>
                   {s.type === 'tmux' ? (
-                    <TerminalView sessionId={s.id} active={isActive && view === 'none'} theme={themeCtx.theme} tmuxName={s.tmux_name} onClose={() => handleDelete(s.id)} />
+                    <TerminalView sessionId={s.id} active={isActive && view === 'none'} theme={themeCtx.theme} tmuxName={s.tmux_name} tmuxOrigin={s.tmux_origin} onClose={() => handleDelete(s.id)} />
                   ) : (
                     <AcpChatView sessionId={s.id} active={isActive && view === 'none'} agentType={s.type} onRegisterControls={registerControls} onQueueModeChange={handleQueueModeChange} showMetrics={!!metricsOpen[s.id]} onOpenMemory={s.type === 'crew' ? () => toggleOverlay(s.id, 'memory') : undefined} />
                   )}
@@ -440,6 +450,16 @@ export default function App() {
             </div>
           )}
         </div>
+        {undoToast && (
+          <Toast
+            key={undoToast.id}
+            message={`已关闭 ${undoToast.name}`}
+            actionLabel="撤销"
+            durationMs={5000}
+            onAction={async () => { if (await restoreSession(undoToast.id)) { await loadSessions(); setActiveId(undoToast.id) } }}
+            onDone={() => setUndoToast(null)}
+          />
+        )}
       </main>
     </div>
   )

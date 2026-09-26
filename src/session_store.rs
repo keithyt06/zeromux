@@ -25,6 +25,8 @@ pub struct PersistedSession {
     pub tmux_origin: Option<String>,
     pub cols: u16,
     pub rows: u16,
+    /// Set while a tmux close is inside its undo window; reconciled at startup.
+    pub pending_kill_until: Option<i64>,
 }
 
 pub struct SessionStore {
@@ -61,6 +63,7 @@ impl SessionStore {
         let _ = conn.execute("ALTER TABLE sessions ADD COLUMN tmux_origin TEXT", []);
         let _ = conn.execute("ALTER TABLE sessions ADD COLUMN cols INTEGER NOT NULL DEFAULT 80", []);
         let _ = conn.execute("ALTER TABLE sessions ADD COLUMN rows INTEGER NOT NULL DEFAULT 24", []);
+        let _ = conn.execute("ALTER TABLE sessions ADD COLUMN pending_kill_until INTEGER", []);
         Ok(Self { conn: Mutex::new(conn) })
     }
 
@@ -71,15 +74,15 @@ impl SessionStore {
         };
         let conn = self.conn.lock().unwrap();
         conn.execute(
-            "INSERT INTO sessions (id,name,type,work_dir,owner_id,description,resume_kind,resume_value,worktree_path,created_ms,source_task_id,name_is_auto,tmux_origin,cols,rows)
-             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15)
+            "INSERT INTO sessions (id,name,type,work_dir,owner_id,description,resume_kind,resume_value,worktree_path,created_ms,source_task_id,name_is_auto,tmux_origin,cols,rows,pending_kill_until)
+             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16)
              ON CONFLICT(id) DO UPDATE SET
                name=?2, type=?3, work_dir=?4, owner_id=?5, description=?6,
                resume_kind=?7, resume_value=?8, worktree_path=?9, name_is_auto=?12,
-               tmux_origin=?13, cols=?14, rows=?15",
+               tmux_origin=?13, cols=?14, rows=?15, pending_kill_until=?16",
             params![s.id, s.name, s.session_type.to_string(), s.work_dir, s.owner_id,
                     s.description, rk, rv, s.worktree_path, s.created_ms, s.source_task_id,
-                    s.name_is_auto as i64, s.tmux_origin, s.cols as i64, s.rows as i64],
+                    s.name_is_auto as i64, s.tmux_origin, s.cols as i64, s.rows as i64, s.pending_kill_until],
         )
         .map_err(|e| format!("upsert failed: {}", e))?;
         Ok(())
@@ -102,6 +105,13 @@ impl SessionStore {
         conn.execute("UPDATE sessions SET cols=?2, rows=?3 WHERE id=?1",
                      params![id, cols as i64, rows as i64])
             .map_err(|e| format!("update_size failed: {}", e))?;
+        Ok(())
+    }
+
+    pub fn set_pending_kill(&self, id: &str, until: Option<i64>) -> Result<(), String> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute("UPDATE sessions SET pending_kill_until=?2 WHERE id=?1", params![id, until])
+            .map_err(|e| format!("set_pending_kill failed: {}", e))?;
         Ok(())
     }
 
@@ -137,7 +147,7 @@ impl SessionStore {
     pub fn load_all(&self) -> Result<Vec<PersistedSession>, String> {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(
-            "SELECT id,name,type,work_dir,owner_id,description,resume_kind,resume_value,worktree_path,created_ms,source_task_id,name_is_auto,tmux_origin,cols,rows FROM sessions")
+            "SELECT id,name,type,work_dir,owner_id,description,resume_kind,resume_value,worktree_path,created_ms,source_task_id,name_is_auto,tmux_origin,cols,rows,pending_kill_until FROM sessions")
             .map_err(|e| format!("prepare failed: {}", e))?;
         let rows = stmt.query_map([], |row| {
             let type_str: String = row.get(2)?;
@@ -162,6 +172,7 @@ impl SessionStore {
                 tmux_origin: row.get(12)?,
                 cols: row.get::<_, i64>(13)? as u16,
                 rows: row.get::<_, i64>(14)? as u16,
+                pending_kill_until: row.get(15)?,
             })
         }).map_err(|e| format!("query failed: {}", e))?;
         let mut out = Vec::new();
@@ -188,7 +199,7 @@ mod tests {
             resume_token: token, worktree_path: Some("/wt".into()), created_ms: 1000,
             source_task_id: None,
             name_is_auto: true,
-            tmux_origin: None, cols: 80, rows: 24,
+            tmux_origin: None, cols: 80, rows: 24, pending_kill_until: None,
         }
     }
 

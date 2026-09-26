@@ -147,6 +147,9 @@ export default function TerminalView({ sessionId, active, theme, tmuxName, tmuxO
   const split = isTouch && landscape
   const historySplit = historyOpen && split
   const [composerText, setComposerText] = useState('')
+  // 软键盘是否弹起：仅触摸端用 VisualViewport 判断（见下方 effect）。只作为重新 fit
+  // 的触发器——键盘弹起/收起时 paddingBottom 改变终端可用高度，而 iOS 不发 window.resize。
+  const [keyboardOpen, setKeyboardOpen] = useState(false)
   // Terminal WS status for ConnectionBar (display only; backoff logic untouched).
   const [wsStatus, setWsStatus] = useState<{ status: WsStatus; since: number }>(() => ({ status: 'connecting', since: Date.now() }))
   // 桌面 Ctrl/Cmd+F：非 tmux 会话本地搜索当前屏；tmux 会话改开历史抽屉
@@ -647,12 +650,13 @@ export default function TerminalView({ sessionId, active, theme, tmuxName, tmuxO
   }, [handleResize])
 
   // 键条 / composer 占用高度，改变终端可用区；渲染后重新 fit，
-  // 避免底部行被遮 / canvas 尺寸过期。
+  // 避免底部行被遮 / canvas 尺寸过期。软键盘弹起/收起时 VisualViewport effect 改了
+  // paddingBottom（iOS 不发 window.resize），这里是唯一的重算路径：每次切换 fit 一次。
   useEffect(() => {
     if (!isTouch) return
     const t = setTimeout(handleResize, 50)
     return () => clearTimeout(t)
-  }, [isTouch, handleResize])
+  }, [isTouch, keyboardOpen, handleResize])
 
   // Split history halves the terminal width; refit so tmux reflows to the new cols.
   useEffect(() => {
@@ -674,6 +678,8 @@ export default function TerminalView({ sessionId, active, theme, tmuxName, tmuxO
       const root = containerRef.current?.parentElement
       const overlap = Math.max(0, window.innerHeight - vv.height - vv.offsetTop)
       if (root) root.style.paddingBottom = `${overlap}px`
+      // overlap > 阈值 ≈ 软键盘弹起。阈值避开地址栏收合等小幅变化。
+      setKeyboardOpen(overlap > 120)
     }
     apply()
     vv.addEventListener('resize', apply)
@@ -683,6 +689,7 @@ export default function TerminalView({ sessionId, active, theme, tmuxName, tmuxO
       vv.removeEventListener('scroll', apply)
       const root = containerRef.current?.parentElement
       if (root) root.style.paddingBottom = ''
+      setKeyboardOpen(false)
     }
   }, [isTouch, active])
 
@@ -755,7 +762,6 @@ export default function TerminalView({ sessionId, active, theme, tmuxName, tmuxO
           </div>
         </div>
       )}
-      {isTouch && historyOpen && !split && scrollPill}
       {/* 状态栏：仅桌面。触屏上路径本就被截断，顶栏已显示会话名，把高度让给终端。 */}
       {!isTouch && (
       <div className="flex items-center gap-3 px-4 py-3 border-t border-[var(--border)] bg-[var(--bg-secondary)] min-h-[40px]">

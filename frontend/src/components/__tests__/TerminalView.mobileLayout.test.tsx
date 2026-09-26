@@ -1,5 +1,7 @@
 import { vi } from 'vitest'
 
+const fitSpy = vi.hoisted(() => ({ calls: 0 }))
+
 vi.mock('@xterm/xterm', () => ({ Terminal: class {
   cols = 80; rows = 24; options: Record<string, unknown> = {}; modes = { bracketedPasteMode: false }
   buffer = { active: { viewportY: 0, baseY: 0, length: 0 } }
@@ -8,12 +10,12 @@ vi.mock('@xterm/xterm', () => ({ Terminal: class {
   onScroll() { return { dispose() {} } } onSelectionChange() { return { dispose() {} } }
   attachCustomKeyEventHandler() {} hasSelection() { return false } getSelection() { return '' }
 } }))
-vi.mock('@xterm/addon-fit', () => ({ FitAddon: class { fit() {} proposeDimensions() { return { cols: 80, rows: 24 } } dispose() {} } }))
+vi.mock('@xterm/addon-fit', () => ({ FitAddon: class { fit() { fitSpy.calls++ } proposeDimensions() { return { cols: 80, rows: 24 } } dispose() {} } }))
 vi.mock('@xterm/addon-webgl', () => ({ WebglAddon: class { onContextLoss() { return { dispose() {} } } dispose() {} } }))
 vi.mock('@xterm/addon-search', () => ({ SearchAddon: class { findNext() {} findPrevious() {} dispose() {} } }))
 vi.mock('@xterm/addon-clipboard', () => ({ ClipboardAddon: class { dispose() {} } }))
 
-import { render, screen } from '@testing-library/react'
+import { render, screen, act } from '@testing-library/react'
 import { describe, it, expect, beforeEach, afterEach } from 'vitest'
 import TerminalView from '../TerminalView'
 import { installFakeWebSocket } from '../../test/fakeWs'
@@ -48,5 +50,30 @@ describe('TerminalView mobile bottom layout', () => {
     const bottom = screen.getByTestId('term-bottom')
     expect(bottom.contains(screen.getByLabelText('up'))).toBe(true)
     expect(bottom.contains(screen.getByPlaceholderText(/输入文字/))).toBe(true)
+  })
+
+  it('touch: soft keyboard crossing the 120px threshold triggers one refit (iOS sends no window.resize)', async () => {
+    // handleResize skips 0x0 containers; happy-dom reports 0 for layout sizes.
+    vi.spyOn(HTMLElement.prototype, 'clientWidth', 'get').mockReturnValue(390)
+    vi.spyOn(HTMLElement.prototype, 'clientHeight', 'get').mockReturnValue(600)
+    const listeners: Record<string, () => void> = {}
+    const vv = { height: 844, offsetTop: 0,
+      addEventListener: (t: string, f: () => void) => { listeners[t] = f },
+      removeEventListener: () => {} }
+    Object.defineProperty(window, 'visualViewport', { value: vv, configurable: true })
+    Object.defineProperty(window, 'innerHeight', { value: 844, configurable: true })
+    render(<TerminalView sessionId="s1" active theme="dark" tmuxName="zmx-abc" tmuxOrigin="own" />)
+    await act(async () => { await new Promise(r => setTimeout(r, 120)) })
+    
+    const before = fitSpy.calls
+    vv.height = 500 // keyboard up: overlap 344 > 120
+    act(() => { listeners.resize() })
+    await act(async () => { await new Promise(r => setTimeout(r, 120)) })
+    expect(fitSpy.calls).toBeGreaterThan(before)
+    const afterOpen = fitSpy.calls
+    vv.height = 480 // still open: no toggle, no extra refit
+    act(() => { listeners.resize() })
+    await act(async () => { await new Promise(r => setTimeout(r, 120)) })
+    expect(fitSpy.calls).toBe(afterOpen)
   })
 })

@@ -3250,13 +3250,50 @@ struct PendingPrompt {
 /// 2026-08-07 F3.)
 #[derive(Default)]
 struct TurnStarts {
-    inner: VecDeque<(i64, Option<crate::run_metrics::RunOutcome>)>,
+    inner: VecDeque<TurnEntry>,
+}
+
+/// One pending turn: start stamp, outcome intent, whether the CLI started it on
+/// its own (cross-session peer message / task notification), and whether the
+/// CLI has echoed the stdin prompt that started it (spec 2026-09-26 v2).
+struct TurnEntry {
+    ms: i64,
+    intent: Option<crate::run_metrics::RunOutcome>,
+    external: bool,
+    echoed: bool,
 }
 
 impl TurnStarts {
     /// A turn started at `ms`; enqueue its start-stamp with no intent yet.
     fn start(&mut self, ms: i64) {
-        self.inner.push_back((ms, None));
+        self.inner.push_back(TurnEntry { ms, intent: None, external: false, echoed: false });
+    }
+
+    /// A turn the CLI started by itself (no ZeroMux stdin write) began at `ms`.
+    /// There is no stdin prompt to wait for, so it counts as already echoed.
+    fn start_external(&mut self, ms: i64) {
+        self.inner.push_back(TurnEntry { ms, intent: None, external: true, echoed: true });
+    }
+
+    /// Whether the oldest pending turn (the one the next boundary settles) was
+    /// CLI-started. False on an empty FIFO.
+    fn front_is_external(&self) -> bool {
+        self.inner.front().is_some_and(|e| e.external)
+    }
+
+    /// The CLI echoed one of our stdin prompts. Every internal `start()` is
+    /// paired with exactly one `send_prompt`, echoed in write order, so the echo
+    /// belongs to the oldest entry still waiting for one. No-op if none.
+    fn mark_echoed(&mut self) {
+        if let Some(e) = self.inner.iter_mut().find(|e| !e.echoed) {
+            e.echoed = true;
+        }
+    }
+
+    /// Whether the oldest pending turn's prompt has been taken in by the CLI.
+    /// False on an empty FIFO.
+    fn front_is_echoed(&self) -> bool {
+        self.inner.front().is_some_and(|e| e.echoed)
     }
 
     /// Record the outcome INTENT for the currently-live turn (the FIFO back),
@@ -3265,27 +3302,27 @@ impl TurnStarts {
     /// must NOT persist an intent that a future unrelated turn would consume.
     fn set_live_intent(&mut self, outcome: crate::run_metrics::RunOutcome) {
         if let Some(back) = self.inner.back_mut() {
-            back.1 = Some(outcome);
+            back.intent = Some(outcome);
         }
     }
 
     /// Peek the oldest pending start-stamp without consuming it (used for the
     /// turn_done push duration, read before the metric block settles it).
     fn front(&self) -> Option<i64> {
-        self.inner.front().map(|(ms, _)| *ms)
+        self.inner.front().map(|e| e.ms)
     }
 
     /// Peek the oldest pending turn's outcome intent without consuming it (used
     /// for the turn_done push suppression on the settling boundary — the front
     /// IS the settling turn's entry, since boundaries drain the FIFO in order).
     fn front_intent(&self) -> Option<crate::run_metrics::RunOutcome> {
-        self.inner.front().and_then(|(_, o)| *o)
+        self.inner.front().and_then(|e| e.intent)
     }
 
     /// A boundary arrived; consume and return the oldest pending (start, intent),
     /// or None if this boundary has no matching turn-start (spurious extra).
     fn settle(&mut self) -> Option<(i64, Option<crate::run_metrics::RunOutcome>)> {
-        self.inner.pop_front()
+        self.inner.pop_front().map(|e| (e.ms, e.intent))
     }
 }
 
@@ -4762,6 +4799,70 @@ mod turn_state_tests {
         // no baseline corruption (will_record=false path stays load-bearing)
         assert_eq!(ts.front(), None);
         assert_eq!(ts.settle(), None);
+    }
+
+    #[test]
+    fn turn_starts_tracks_external_source_per_entry() {
+        // Spec 2026-09-26 §2a: each FIFO entry records whether the turn was
+        // started by the CLI itself (peer message / task notification) so the
+        // boundary-attribution rule can tell an external turn's result from a
+        // user turn's.
+        let mut ts = TurnStarts::default();
+        assert!(!ts.front_is_external(), "empty FIFO is not external");
+        ts.start_external(1_000);
+        ts.start(2_000);
+        assert!(ts.front_is_external());
+        assert_eq!(ts.settle(), Some((1_000, None)));
+        assert!(!ts.front_is_external(), "user turn is internal");
+        assert_eq!(ts.settle(), Some((2_000, None)));
+        assert!(!ts.front_is_external());
+    }
+
+    #[test]
+    fn set_live_intent_on_external_entry_keeps_source() {
+        use crate::run_metrics::RunOutcome;
+        // Review focus 3: Interrupt during an external turn stamps Cancelled on
+        // the external entry without losing its source flag.
+        let mut ts = TurnStarts::default();
+        ts.start_external(1_000);
+        ts.set_live_intent(RunOutcome::Cancelled);
+        assert!(ts.front_is_external());
+        assert_eq!(ts.front_intent(), Some(RunOutcome::Cancelled));
+        assert_eq!(ts.settle(), Some((1_000, Some(RunOutcome::Cancelled))));
+    }
+
+    #[test]
+    fn mark_echoed_marks_oldest_unechoed_internal_entry() {
+        // Spec v2 §2a: each stdin write is echoed once, in order. The echo tells
+        // us that prompt has been taken into a CLI turn (possibly merged into a
+        // running CLI-started turn — CTO merged-race finding).
+        let mut ts = TurnStarts::default();
+        assert!(!ts.front_is_echoed(), "empty FIFO is not echoed");
+        ts.start(1_000);
+        ts.start(2_000);
+        assert!(!ts.front_is_echoed());
+        ts.mark_echoed();
+        assert!(ts.front_is_echoed(), "first echo marks the oldest entry");
+        ts.settle();
+        assert!(!ts.front_is_echoed(), "second entry not echoed yet");
+        ts.mark_echoed();
+        assert!(ts.front_is_echoed());
+        ts.settle();
+        ts.mark_echoed(); // nothing pending: no-op, no panic
+        assert!(!ts.front_is_echoed());
+    }
+
+    #[test]
+    fn external_entries_count_as_echoed_and_are_skipped_by_mark_echoed() {
+        // An external turn has no stdin write, so it never waits for an echo;
+        // mark_echoed must pass over it to the next internal entry.
+        let mut ts = TurnStarts::default();
+        ts.start_external(1_000);
+        ts.start(2_000);
+        assert!(ts.front_is_echoed());
+        ts.mark_echoed();
+        ts.settle();
+        assert!(ts.front_is_echoed(), "the echo went to the internal entry");
     }
 
     #[test]

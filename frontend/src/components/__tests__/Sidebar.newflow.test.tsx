@@ -48,7 +48,7 @@ describe('Sidebar new terminal flow', () => {
     expect(onCreate).toHaveBeenCalledWith('tmux', undefined, 'vscode-dev')
   })
 
-  it('no host group for non-admin or empty list', () => {
+  it('no host group when list is empty', () => {
     setup({ hostTmux: [] })
     expect(screen.queryByText('本机 tmux')).toBeNull()
   })

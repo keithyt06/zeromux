@@ -568,7 +568,7 @@ export default function Sidebar({ sessions, docTabs, activeId, onSelect, onCreat
             {hostTmux.map(h => (
               <button
                 key={h.name}
-                onClick={() => onCreate('tmux', undefined, h.name)}
+                onClick={() => { onCreate('tmux', undefined, h.name); if (mobile) onToggle() }}
                 title={`${h.path}\n点击接入`}
                 className="flex items-center gap-2 w-[calc(100%-0.5rem)] px-3 py-1.5 mx-1 rounded text-xs text-[var(--text-secondary)] hover:bg-[var(--bg-tertiary)] hover:text-[var(--text-primary)]"
               >

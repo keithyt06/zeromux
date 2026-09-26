@@ -1063,6 +1063,9 @@ impl SessionManager {
         match tmux_target {
             // Attach target must already exist: never let `new-session -A` create
             // a stray session under a user-chosen name.
+            // Already bound to a zeromux session: a second binding would let closing
+            // either one kill-session the other's live shell.
+            Some(t) if self.tracked_tmux_names().contains(t) => return Err("该 tmux 会话已被接入".into()),
             Some(t) => match self.tmux.has(t).await {
                 Ok(true) => {}
                 Ok(false) => return Err(crate::tmux::TmuxError::NotFound.to_string()),
@@ -6115,6 +6118,21 @@ mod tmux_session_tests {
         let id = m.create_pty_session("o".into(), "bash", "/tmp", 80, 24, "u", Some("zmx-deadbeef")).await.unwrap();
         assert_eq!(m.tmux_binding(&id).unwrap().1, TmuxOrigin::Own);
         assert!(m.tracked_tmux_names().contains("zmx-deadbeef"));
+    }
+
+    #[tokio::test]
+    async fn attaching_an_already_tracked_tmux_session_errors() {
+        let Some(srv) = TestServer::start() else { return };
+        srv.ctl.run(&["new-session", "-d", "-s", "zmx-deadbeef"]).await.unwrap();
+        srv.ctl.run(&["new-session", "-d", "-s", "vscode-dev"]).await.unwrap();
+        let (m, _d) = mgr_with(srv.ctl.clone());
+        m.create_pty_session("o".into(), "bash", "/tmp", 80, 24, "u", Some("zmx-deadbeef")).await.unwrap();
+        let err = m.create_pty_session("o2".into(), "bash", "/tmp", 80, 24, "u", Some("zmx-deadbeef")).await.unwrap_err();
+        assert!(err.contains("已被接入"), "{err}");
+        m.create_pty_session("x".into(), "bash", "/tmp", 80, 24, "u", Some("vscode-dev")).await.unwrap();
+        let err = m.create_pty_session("x2".into(), "bash", "/tmp", 80, 24, "u", Some("vscode-dev")).await.unwrap_err();
+        assert!(err.contains("已被接入"), "{err}");
+        assert_eq!(m.list_sessions(None).len(), 2);
     }
 
     #[tokio::test]

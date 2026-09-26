@@ -15,6 +15,13 @@ use crate::{auth, auth::CurrentUser, AppState};
 #[folder = "frontend/dist/"]
 struct FrontendAssets;
 
+/// Compress HTTP responses (gzip/br) when the client accepts it. The embedded
+/// frontend bundle is ~1.4MB raw; mobile first load is dominated by it.
+/// WebSocket upgrades are unaffected: 101 responses carry no body.
+fn with_compression(router: Router) -> Router {
+    router.layer(tower_http::compression::CompressionLayer::new().gzip(true).br(true))
+}
+
 pub fn build_router(state: Arc<AppState>) -> Router {
     // API routes that require active user
     let api = Router::new()
@@ -125,15 +132,17 @@ pub fn build_router(state: Arc<AppState>) -> Router {
         )
         ;
 
-    Router::new()
-        .merge(api)
-        .merge(me_api)
-        .merge(events_ingest)
-        .merge(auth_routes)
-        .merge(ws)
-        .route("/assets/{*path}", get(serve_asset))
-        .fallback(get(spa_fallback))
-        .with_state(state)
+    with_compression(
+        Router::new()
+            .merge(api)
+            .merge(me_api)
+            .merge(events_ingest)
+            .merge(auth_routes)
+            .merge(ws)
+            .route("/assets/{*path}", get(serve_asset))
+            .fallback(get(spa_fallback))
+            .with_state(state),
+    )
 }
 
 /// GET /auth/mode — tells frontend which auth mode is available
@@ -6802,5 +6811,35 @@ mod create_session_req_tests {
         let json = r#"{"type":"claude","initial_prompt":"hello"}"#;
         let req: CreateSessionReq = serde_json::from_str(json).unwrap();
         assert_eq!(req.initial_prompt.as_deref(), Some("hello"));
+    }
+}
+
+#[cfg(test)]
+mod compression_tests {
+    use axum::{body::Body, http::Request, routing::get, Router};
+    use tower::ServiceExt;
+
+    // Mirrors build_router's outer layering so the test pins the SAME layer
+    // config (with_compression) rather than a hand-rolled copy.
+    fn app() -> Router {
+        super::with_compression(Router::new().route("/big", get(|| async { "x".repeat(4096) })))
+    }
+
+    #[tokio::test]
+    async fn gzip_when_accepted() {
+        let res = app()
+            .oneshot(Request::get("/big").header("accept-encoding", "gzip").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(res.headers().get("content-encoding").unwrap(), "gzip");
+    }
+
+    #[tokio::test]
+    async fn identity_when_not_accepted() {
+        let res = app()
+            .oneshot(Request::get("/big").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert!(res.headers().get("content-encoding").is_none());
     }
 }

@@ -152,6 +152,16 @@ impl TmuxCtl {
         self.info(name).await
     }
 
+    /// Session-level `mouse` toggle: `on` sends drag/wheel to tmux (copy-mode,
+    /// pane selection); `off` hands the mouse back to the browser for native
+    /// text selection. Per-session, so it never affects other tmux sessions.
+    /// `set-option -t` takes a target-pane (not target-session), so — like
+    /// `capture`/`info`/`scroll` above — the target needs the trailing `:`;
+    /// a bare `=name` gets "no such session" from real tmux.
+    pub async fn set_mouse(&self, name: &str, on: bool) -> Result<(), TmuxError> {
+        self.run(&["set-option", "-t", &format!("={name}:"), "mouse", if on { "on" } else { "off" }]).await.map(|_| ())
+    }
+
     pub async fn refresh_client_for_pid(&self, pid: u32) -> Result<(), TmuxError> {
         let out = self.run(&["list-clients", "-F", "#{client_pid}\t#{client_tty}"]).await?;
         let tty = out.lines()
@@ -444,5 +454,18 @@ pub(crate) mod tests {
     async fn refresh_unknown_pid_is_not_found() {
         let Some(srv) = TestServer::start() else { return };
         assert_eq!(srv.ctl.refresh_client_for_pid(1).await, Err(TmuxError::NotFound));
+    }
+
+    #[tokio::test]
+    async fn set_mouse_is_per_session() {
+        let Some(srv) = TestServer::start() else { return };
+        mk(&srv, "zmx-m1").await;
+        mk(&srv, "zmx-m2").await;
+        srv.ctl.set_mouse("zmx-m1", false).await.unwrap();
+        // show-options -t also takes a target-pane, like set-option (see set_mouse doc).
+        let v1 = srv.ctl.run(&["show-options", "-v", "-t", "=zmx-m1:", "mouse"]).await.unwrap();
+        let v2 = srv.ctl.run(&["show-options", "-v", "-t", "=zmx-m2:", "mouse"]).await.unwrap_or_default();
+        assert_eq!(v1.trim(), "off");
+        assert_ne!(v2.trim(), "off");
     }
 }

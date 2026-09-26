@@ -28,6 +28,9 @@ enum ClientMsg {
     /// Touch-drag scrolling for tmux terminals: drives server-side copy-mode.
     #[serde(rename = "scroll")]
     Scroll { op: String, #[serde(default)] n: u32 },
+    /// Desktop mouse/browser toggle for tmux terminals: session-level `mouse` option.
+    #[serde(rename = "mouse")]
+    Mouse { on: bool },
 }
 
 pub async fn ws_terminal(
@@ -204,6 +207,11 @@ async fn handle_ws(socket: WebSocket, session_id: String, state: Arc<AppState>) 
                                             let m = serde_json::json!({"type": "scroll_state", "in_mode": info.in_mode, "history_size": info.history_size});
                                             if ws_sink.send(Message::Text(m.to_string().into())).await.is_err() { break; }
                                         }
+                                    }
+                                }
+                                ClientMsg::Mouse { on } => {
+                                    if let Some((name, _)) = state.sessions.tmux_binding(&session_id) {
+                                        let _ = state.tmux.set_mouse(&name, on).await;
                                     }
                                 }
                             }

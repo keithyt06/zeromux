@@ -2,6 +2,8 @@ import { useEffect, useRef, useCallback, useState } from 'react'
 import { Terminal } from '@xterm/xterm'
 import { FitAddon } from '@xterm/addon-fit'
 import { WebglAddon } from '@xterm/addon-webgl'
+import { ClipboardAddon } from '@xterm/addon-clipboard'
+import { SearchAddon } from '@xterm/addon-search'
 import { wsUrl, getSessionStatus, getTmuxHealth, reviveSession } from '../lib/api'
 import type { SessionStatus, TmuxHealth } from '../lib/api'
 import type { Theme } from '../lib/theme'
@@ -15,6 +17,7 @@ import { TmuxHealthBar, LostBanner, EndedOverlay, ReconnectHint } from './Termin
 import { arrowSequence, rowHeight, linesFromDrag, bracketedPaste, submitSequence, controlSequence, launchSequence, type ArrowKey } from '../lib/terminalInput'
 import { shouldStickToBottom } from '../lib/scrollReplay'
 import { ScrollBatcher, inertiaLines, scheduleInertia, type ScrollMsg } from '../lib/terminalScroll'
+import { shouldShowShiftHint, mousePref, MOUSE_PREF_KEY } from '../lib/desktopHints'
 
 const FONT_SIZE = 14
 
@@ -80,6 +83,7 @@ export default function TerminalView({ sessionId, active, theme, tmuxName, tmuxO
   const containerRef = useRef<HTMLDivElement>(null)
   const termRef = useRef<Terminal | null>(null)
   const fitRef = useRef<FitAddon | null>(null)
+  const searchRef = useRef<SearchAddon | null>(null)
   const wsRef = useRef<WebSocket | null>(null)
   const initRef = useRef(false)
   // Terminal has no replay_done marker: self-arm a replay window on (re)connect
@@ -121,6 +125,14 @@ export default function TerminalView({ sessionId, active, theme, tmuxName, tmuxO
   // 软键盘是否弹起：仅触摸端用 VisualViewport 判断（见下方 effect）。
   // 弹起时隐藏底部状态栏，把空间让给常驻 composer + 终端。
   const [keyboardOpen, setKeyboardOpen] = useState(false)
+  // 桌面 Ctrl/Cmd+F：非 tmux 会话本地搜索当前屏；tmux 会话改开历史抽屉
+  // （xterm 只保留当前屏，搜索历史要走服务端 capture-pane）。
+  const [searchOpen, setSearchOpen] = useState(false)
+  const [searchQ, setSearchQ] = useState('')
+  // 桌面 Shift 拖选提示：tmux mouse=on 时首次鼠标按下提示一次（见 onMouseDownHint）。
+  const [shiftHint, setShiftHint] = useState(false)
+  // tmux 鼠标交给谁：true=tmux（滚轮/点选窗格），false=浏览器（原生拖选文字）。
+  const [mouseOn, setMouseOn] = useState(() => mousePref(localStorage))
 
   // Fetch status
   useEffect(() => {
@@ -151,14 +163,33 @@ export default function TerminalView({ sessionId, active, theme, tmuxName, tmuxO
   // keystroke right after a flick can't be followed by a stale `up` that
   // re-enters copy-mode.
   const cancelInertiaRef = useRef<() => void>(() => {})
+  // Set by the init effect's `wheel` listener on the container; cleared here.
+  // Desktop mouse-wheel over a tmux pane goes straight to tmux (mouse on) and
+  // can enter copy-mode without ever calling sendScroll, so scrollingRef stays
+  // stale (false) even though the pane really is in copy-mode — the next
+  // keystroke would then get eaten by tmux's copy-mode key table instead of
+  // reaching the shell. So on desktop tmux sessions any wheel event since the
+  // last exitScroll forces a cancel on the next keystroke regardless of
+  // scrollingRef; this is safe because the server-side cancel is a no-op
+  // outside copy-mode (T2's in_mode guard).
+  const wheelSinceInputRef = useRef(false)
   // Leave copy-mode before any keystroke so input isn't swallowed by tmux.
   const exitScroll = useCallback(() => {
     cancelInertiaRef.current()
-    if (!scrollingRef.current) return
+    const forceCancel = !isTouch && !!tmuxRef.current && wheelSinceInputRef.current
+    wheelSinceInputRef.current = false
+    if (!scrollingRef.current && !forceCancel) return
     scrollingRef.current = false
     setScrolling(false)
     sendScroll({ op: 'cancel', n: 1 })
-  }, [sendScroll])
+  }, [sendScroll, isTouch])
+
+  // 桌面 Shift 拖选提示：tmux mouse=on 时普通拖动交给 tmux（复制模式/选窗格），
+  // 只有 Shift+拖动才是浏览器原生选区。首次左键按下（非 Shift）提示一次。
+  const onMouseDownHint = useCallback((e: React.MouseEvent) => {
+    if (isTouch || !tmuxRef.current || e.shiftKey || e.button !== 0) return
+    if (shouldShowShiftHint(localStorage)) { setShiftHint(true); setTimeout(() => setShiftHint(false), 4000) }
+  }, [isTouch])
 
   // 所有 client→PTY 输入走这一条；term.onData 与 MobileKeyBar 共用。
   // 返回是否真正送出：重连窗口里 WS 未 OPEN 时为 false，调用方据此决定是否清空输入。
@@ -211,11 +242,16 @@ export default function TerminalView({ sessionId, active, theme, tmuxName, tmuxO
       theme: THEMES[theme],
       allowProposedApi: true,
       scrollback: 10000,
+      macOptionClickForcesSelection: true,
     })
 
     const fit = new FitAddon()
     term.loadAddon(fit)
     term.open(containerRef.current)
+    term.loadAddon(new ClipboardAddon())  // OSC52 from tmux copy-mode → system clipboard
+    const search = new SearchAddon()
+    term.loadAddon(search)
+    searchRef.current = search
 
     try {
       const webgl = new WebglAddon()
@@ -232,6 +268,18 @@ export default function TerminalView({ sessionId, active, theme, tmuxName, tmuxO
     } catch {
       // fallback to canvas
     }
+
+    // Ctrl/Cmd+F: tmux sessions open the history drawer (xterm only holds the
+    // current screen, not tmux's scrollback); bare-shell PTYs get in-terminal
+    // search. Returning false suppresses the browser's own find-in-page.
+    term.attachCustomKeyEventHandler(e => {
+      if (e.type === 'keydown' && (e.ctrlKey || e.metaKey) && e.key === 'f') {
+        if (tmuxRef.current) setHistoryOpen(true)
+        else setSearchOpen(true)
+        return false
+      }
+      return true
+    })
 
     fit.fit()
     termRef.current = term
@@ -317,10 +365,17 @@ export default function TerminalView({ sessionId, active, theme, tmuxName, tmuxO
     container?.addEventListener('touchend', onTouchEnd, { passive: true })
     container?.addEventListener('touchcancel', onTouchEnd, { passive: true })
 
+    // 桌面鼠标滚轮：tmux mouse=on 时滚轮直接喂给 tmux，可能不经 sendScroll
+    // 就进入 copy-mode（见 wheelSinceInputRef 注释）。只需记一个标记，真正
+    // 的 cancel 由下一次 exitScroll（keystroke/onData/onBinary）发出。
+    const onWheel = () => { wheelSinceInputRef.current = true }
+    container?.addEventListener('wheel', onWheel, { passive: true })
+
     return () => {
       container?.removeEventListener('touchstart', onTouchStart)
       container?.removeEventListener('touchmove', onTouchMove)
       container?.removeEventListener('touchend', onTouchEnd)
+      container?.removeEventListener('wheel', onWheel)
       container?.removeEventListener('touchcancel', onTouchEnd)
       cancelInertia()
       cancelInertiaRef.current = () => {}
@@ -383,6 +438,9 @@ export default function TerminalView({ sessionId, active, theme, tmuxName, tmuxO
             lastDims.current = { cols: dims.cols, rows: dims.rows }
           }
         }
+        // tmux 会话默认 mouse=on（tmux.conf）；用户上次关过就在（重）连接时同步关掉，
+        // 否则每次新建/重连的会话又会回到 tmux 接管鼠标。
+        if (tmuxRef.current && !mousePref(localStorage)) ws.send(JSON.stringify({ type: 'mouse', on: false }))
       }
 
       ws.onmessage = (evt) => {
@@ -529,7 +587,26 @@ export default function TerminalView({ sessionId, active, theme, tmuxName, tmuxO
     <div className="relative flex flex-col h-full">
       {tmuxName && <TmuxHealthBar health={health} />}
       {lost && <LostBanner onClose={() => setLost(false)} />}
-      <div ref={containerRef} className="xterm-container w-full flex-1 min-h-0" />
+      <div ref={containerRef} onMouseDown={onMouseDownHint} className="xterm-container w-full flex-1 min-h-0" />
+      {searchOpen && (
+        <div className="absolute top-2 right-3 z-10 flex items-center gap-1 px-2 py-1 rounded border border-[var(--border)] bg-[var(--bg-secondary)] text-xs">
+          <input autoFocus value={searchQ} onChange={e => { setSearchQ(e.target.value); searchRef.current?.findNext(e.target.value) }}
+            onKeyDown={e => {
+              if (e.key === 'Enter') {
+                if (e.shiftKey) searchRef.current?.findPrevious(searchQ)
+                else searchRef.current?.findNext(searchQ)
+              }
+              if (e.key === 'Escape') { setSearchOpen(false); termRef.current?.focus() }
+            }}
+            placeholder="搜索" className="w-40 bg-transparent outline-none text-[var(--text-primary)]" />
+          <button onClick={() => { setSearchOpen(false); termRef.current?.focus() }}>✕</button>
+        </div>
+      )}
+      {shiftHint && (
+        <div className="absolute top-2 left-1/2 -translate-x-1/2 z-10 px-3 py-1 rounded-full text-xs bg-[var(--bg-tertiary)] text-[var(--text-secondary)]">
+          按住 Shift 拖动可选择文字（{navigator.platform.includes('Mac') ? 'Mac 也可按 Option' : '或在历史中长按'}）
+        </div>
+      )}
       {tmuxName && scrolling && (
         <div className="absolute right-3 bottom-28 z-10 flex gap-1 text-xs">
           <button aria-label="scroll-top" onPointerDown={e => { e.preventDefault(); sendScroll({ op: 'top', n: 1 }) }}
@@ -587,11 +664,23 @@ export default function TerminalView({ sessionId, active, theme, tmuxName, tmuxO
         ) : (
           <span className="text-xs text-[var(--text-muted)]">Loading...</span>
         )}
+        {tmuxName && !isTouch && (
+          <button onClick={() => {
+              const on = !mouseOn
+              setMouseOn(on)
+              localStorage.setItem(MOUSE_PREF_KEY, on ? '1' : '0')
+              wsRef.current?.send(JSON.stringify({ type: 'mouse', on }))
+            }}
+            title={mouseOn ? '鼠标交给 tmux（滚轮滚动、点选窗格）' : '鼠标交给浏览器（直接拖选文字）'}
+            className="ml-auto text-[11px] text-[var(--text-secondary)] hover:text-[var(--text-primary)]">
+            {mouseOn ? '🖱 tmux' : '🖱 浏览器'}
+          </button>
+        )}
         {tmuxName && (
           <button
             onClick={async () => { if (await copyText(attachCommand(tmuxName))) { setChipCopied(true); setTimeout(() => setChipCopied(false), 1500) } }}
             title={attachCommand(tmuxName)}
-            className="ml-auto flex items-center gap-1 px-1.5 py-0.5 rounded border border-[var(--border)] text-[11px] font-mono text-[var(--text-secondary)] hover:text-[var(--text-primary)]"
+            className={`${isTouch ? 'ml-auto' : ''} flex items-center gap-1 px-1.5 py-0.5 rounded border border-[var(--border)] text-[11px] font-mono text-[var(--text-secondary)] hover:text-[var(--text-primary)]`}
           >
             {chipCopied ? '已复制' : `⧉ ${tmuxName}`}
           </button>

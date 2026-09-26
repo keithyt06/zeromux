@@ -6230,6 +6230,37 @@ mod tmux_session_tests {
     }
 
     #[tokio::test]
+    async fn killing_the_only_session_on_server_ends_it() {
+        let Some(srv) = TestServer::start() else { return };
+        srv.kill_boot();
+        let (m, _d) = mgr_with(srv.ctl.clone());
+        let id = m.create_pty_session("t".into(), "bash", "/tmp", 80, 24, "u", None).await.unwrap();
+        let (name, _) = m.tmux_binding(&id).unwrap();
+        for _ in 0..30 { if srv.ctl.has(&name).await.unwrap() { break; } tokio::time::sleep(std::time::Duration::from_millis(100)).await; }
+        assert_eq!(srv.ctl.list().await.unwrap().len(), 1, "ours is the only session");
+        srv.ctl.kill(&name).await.unwrap();      // server now empty (exit-empty off)
+        let mut ended = false;
+        for _ in 0..50 {
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            if let Some(s) = m.list_sessions(None).into_iter().find(|s| s.id == id) {
+                if matches!(s.status, SessionMeta::Ended) { ended = true; break; }
+            }
+        }
+        assert!(ended, "empty server answers 'no current target' — must still be has=false → Ended");
+    }
+
+    #[tokio::test]
+    async fn own_missing_on_empty_server_is_lost_not_server_down() {
+        let Some(srv) = TestServer::start() else { return };
+        srv.kill_boot();
+        let (m, _d) = mgr_with(srv.ctl.clone());
+        idle_tmux(&m, "o1", "zmx-o1", TmuxOrigin::Own);
+        assert!(matches!(m.tmux_preflight("o1").await, Preflight::Lost));
+        idle_tmux(&m, "e1", "gone-ext", TmuxOrigin::External);
+        assert!(matches!(m.tmux_preflight("e1").await, Preflight::Ended));
+    }
+
+    #[tokio::test]
     async fn attach_missing_target_errors_and_creates_nothing() {
         let Some(srv) = TestServer::start() else { return };
         let (m, _d) = mgr_with(srv.ctl.clone());

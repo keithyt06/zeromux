@@ -3,6 +3,7 @@ import { Terminal } from '@xterm/xterm'
 import { FitAddon } from '@xterm/addon-fit'
 import { WebglAddon } from '@xterm/addon-webgl'
 import { ClipboardAddon } from '@xterm/addon-clipboard'
+import { writeOnlyClipboard } from '../lib/clipboard'
 import { SearchAddon } from '@xterm/addon-search'
 import { wsUrl, getSessionStatus, getTmuxHealth, reviveSession } from '../lib/api'
 import type { SessionStatus, TmuxHealth } from '../lib/api'
@@ -17,7 +18,7 @@ import { TmuxHealthBar, LostBanner, EndedOverlay, ReconnectHint } from './Termin
 import { arrowSequence, rowHeight, linesFromDrag, bracketedPaste, submitSequence, controlSequence, launchSequence } from '../lib/terminalInput'
 import { shouldStickToBottom } from '../lib/scrollReplay'
 import { ScrollBatcher, inertiaLines, scheduleInertia, shouldCancelBeforeInput, type ScrollMsg } from '../lib/terminalScroll'
-import { shouldShowShiftHint, mousePref, MOUSE_PREF_KEY } from '../lib/desktopHints'
+import { shouldShowShiftHint, mousePref, MOUSE_PREF_KEY, mouseToggleApplies, shouldSendMouseOffOnConnect } from '../lib/desktopHints'
 import { historyPrompt } from '../lib/historyToAgent'
 
 const FONT_SIZE = 14
@@ -115,6 +116,8 @@ export default function TerminalView({ sessionId, active, theme, tmuxName, tmuxO
   // Ref twin of `tmuxName` for long-lived closures (WS handlers, touch listeners).
   const tmuxRef = useRef(tmuxName)
   useEffect(() => { tmuxRef.current = tmuxName }, [tmuxName])
+  const tmuxOriginRef = useRef(tmuxOrigin)
+  useEffect(() => { tmuxOriginRef.current = tmuxOrigin }, [tmuxOrigin])
   // Sidebar ⋯ 查看历史: a nonce bump (even while already open) should (re)open the drawer.
   // Consuming an external one-shot request is exactly an effect's job.
   // eslint-disable-next-line react-hooks/set-state-in-effect
@@ -280,7 +283,8 @@ export default function TerminalView({ sessionId, active, theme, tmuxName, tmuxO
     const fit = new FitAddon()
     term.loadAddon(fit)
     term.open(containerRef.current)
-    term.loadAddon(new ClipboardAddon())  // OSC52 from tmux copy-mode → system clipboard
+    // OSC52 from tmux copy-mode → system clipboard; reads refused (see lib/clipboard).
+    term.loadAddon(new ClipboardAddon(undefined, writeOnlyClipboard()))
     const search = new SearchAddon()
     term.loadAddon(search)
     searchRef.current = search
@@ -472,7 +476,8 @@ export default function TerminalView({ sessionId, active, theme, tmuxName, tmuxO
         }
         // tmux 会话默认 mouse=on（tmux.conf）；用户上次关过就在（重）连接时同步关掉，
         // 否则每次新建/重连的会话又会回到 tmux 接管鼠标。
-        if (tmuxRef.current && !mousePref(localStorage)) ws.send(JSON.stringify({ type: 'mouse', on: false }))
+        // Own sessions only: External ones (e.g. VSCode's) keep their own option.
+        if (shouldSendMouseOffOnConnect(!!tmuxRef.current, tmuxOriginRef.current, localStorage)) ws.send(JSON.stringify({ type: 'mouse', on: false }))
       }
 
       ws.onmessage = (evt) => {
@@ -708,7 +713,7 @@ export default function TerminalView({ sessionId, active, theme, tmuxName, tmuxO
         ) : (
           <span className="text-xs text-[var(--text-muted)]">Loading...</span>
         )}
-        {tmuxName && !isTouch && (
+        {tmuxName && mouseToggleApplies(tmuxOrigin) && !isTouch && (
           <button onClick={() => {
               const on = !mouseOn
               setMouseOn(on)

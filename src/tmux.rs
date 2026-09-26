@@ -121,14 +121,17 @@ impl TmuxCtl {
 
     pub async fn info(&self, name: &str) -> Result<PaneInfo, TmuxError> {
         let s = self.run(&["display-message", "-p", "-t", &format!("={name}:"),
-            "#{session_attached}\t#{pane_in_mode}\t#{history_size}\t#{pane_current_command}"]).await?;
+            "#{session_name}\t#{session_attached}\t#{pane_in_mode}\t#{history_size}\t#{pane_current_command}"]).await?;
         let f: Vec<&str> = s.trim_end_matches('\n').split('\t').collect();
-        if f.len() < 4 { return Err(TmuxError::Other(format!("bad info: {s}"))); }
+        // On a server with zero sessions tmux 3.4 exits 0 with every format
+        // field empty instead of erroring — an empty session_name means "gone".
+        if f.first().is_none_or(|n| n.is_empty()) { return Err(TmuxError::NotFound); }
+        if f.len() < 5 { return Err(TmuxError::Other(format!("bad info: {s}"))); }
         Ok(PaneInfo {
-            attached: f[0].parse().unwrap_or(0),
-            in_mode: f[1] == "1",
-            history_size: f[2].parse().unwrap_or(0),
-            current_command: f[3].to_string(),
+            attached: f[1].parse().unwrap_or(0),
+            in_mode: f[2] == "1",
+            history_size: f[3].parse().unwrap_or(0),
+            current_command: f[4].to_string(),
         })
     }
 
@@ -222,7 +225,10 @@ fn classify_stderr(err: &str) -> TmuxError {
         TmuxError::ServerDown
     } else if err.contains("can't find session") || err.contains("can't find pane")
         || err.contains("can't find window") || err.contains("session not found")
-        || err.contains("no sessions") {
+        || err.contains("no sessions")
+        // Zero-session server (tmux 3.4): has/kill/capture/list-clients answer
+        // "no current target", set-option answers "no such session".
+        || err.contains("no current target") || err.contains("no such session") {
         TmuxError::NotFound
     } else {
         TmuxError::Other(err.trim().to_string())
@@ -280,6 +286,13 @@ pub(crate) mod tests {
             let _ = std::process::Command::new("tmux")
                 .args(["-L", &socket, "set", "-g", "exit-empty", "off"]).status();
             Some(Self { ctl: TmuxCtl::new(Some(socket.clone())), socket })
+        }
+    }
+    impl TestServer {
+        /// Leave the server running with ZERO sessions (exit-empty is off).
+        pub(crate) fn kill_boot(&self) {
+            let _ = std::process::Command::new("tmux")
+                .args(["-L", &self.socket, "kill-session", "-t", "=boot"]).status();
         }
     }
     impl Drop for TestServer {
@@ -350,6 +363,27 @@ pub(crate) mod tests {
             .unwrap_or_default()
             .contains("zeromux-tmux.service");
         assert_eq!(h.in_unit, self_in_unit);
+    }
+
+    #[tokio::test]
+    async fn empty_server_reports_not_found_not_other() {
+        let Some(srv) = TestServer::start() else { return };
+        srv.kill_boot();
+        // exit-empty off keeps the empty server alive.
+        assert!(srv.ctl.health().await.server, "empty server must stay up");
+        assert_eq!(srv.ctl.has("zmx-nope").await, Ok(false));
+        assert_eq!(srv.ctl.kill("zmx-nope").await, Ok(()));
+        assert!(matches!(srv.ctl.info("zmx-nope").await, Err(TmuxError::NotFound)));
+        assert!(matches!(srv.ctl.capture("zmx-nope", 10, 1000, false).await, Err(TmuxError::NotFound)));
+        assert!(matches!(srv.ctl.set_mouse("zmx-nope", true).await, Err(TmuxError::NotFound)));
+        assert_eq!(srv.ctl.refresh_client_for_pid(1).await, Err(TmuxError::NotFound));
+        assert_eq!(srv.ctl.list().await.unwrap().len(), 0);
+    }
+
+    #[test]
+    fn classify_zero_session_messages() {
+        assert_eq!(classify_stderr("no current target\n"), TmuxError::NotFound);
+        assert_eq!(classify_stderr("no such session: =x:\n"), TmuxError::NotFound);
     }
 
     async fn mk(srv: &TestServer, name: &str) {

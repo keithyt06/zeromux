@@ -1,6 +1,7 @@
 import { render, screen, fireEvent, waitFor } from '@testing-library/react'
 import { describe, it, expect, vi, beforeEach } from 'vitest'
-import HistoryView, { chunkLines } from '../HistoryView'
+import HistoryView from '../HistoryView'
+import { chunkLines } from '../../lib/historySearch'
 import * as api from '../../lib/api'
 
 describe('chunkLines', () => {
@@ -72,6 +73,6 @@ describe('HistoryView', () => {
     await waitFor(() => expect(spy).toHaveBeenCalledWith('s', true))
     fireEvent.click(screen.getByText('发给 agent'))
     expect(onSend).toHaveBeenCalledWith('abc')
-    expect(onSend.mock.calls[0][0]).not.toMatch(/\x1b/)
+    expect(onSend.mock.calls[0][0].includes('\x1b')).toBe(false)
   })
 })

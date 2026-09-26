@@ -1,16 +1,9 @@
 import { useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react'
 import { getHistory } from '../lib/api'
 import { parseAnsiLine, stripAnsi, type Span } from '../lib/ansi'
-import { findMatches } from '../lib/historySearch'
+import { chunkLines, findMatches } from '../lib/historySearch'
 
 const CHUNK = 500
-
-export function chunkLines(text: string, size: number): string[] {
-  const lines = text.split('\n')
-  const out: string[] = []
-  for (let i = 0; i < lines.length; i += size) out.push(lines.slice(i, i + size).join('\n'))
-  return out
-}
 
 interface Props {
   sessionId: string

@@ -812,6 +812,11 @@ fn validate_work_dir_under_home(work_dir: &str) -> Result<(), (StatusCode, Strin
     Ok(())
 }
 
+/// Spec §5: tmux server down is a 503 (dependency unavailable), not a 500.
+fn pty_create_error_status(e: &str) -> StatusCode {
+    if e.contains("tmux 服务未运行") { StatusCode::SERVICE_UNAVAILABLE } else { StatusCode::INTERNAL_SERVER_ERROR }
+}
+
 async fn create_session(
     State(state): State<Arc<AppState>>,
     user: axum::Extension<CurrentUser>,
@@ -855,7 +860,7 @@ async fn create_session(
             state.sessions
                 .create_pty_session(name.clone(), &state.shell, &work_dir, state.default_cols, state.default_rows, &owner_id, req.tmux_target.as_deref())
                 .await
-                .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?
+                .map_err(|e| (pty_create_error_status(&e), e))?
         }
         crate::session_manager::SessionType::Claude => {
             state.sessions
@@ -4032,6 +4037,13 @@ async fn vault_resolve(
 mod path_safety_tests {
     use super::*;
     use std::os::unix::fs::symlink;
+
+    #[test]
+    fn tmux_server_down_create_is_503() {
+        let down = crate::tmux::TmuxError::ServerDown.to_string();
+        assert_eq!(pty_create_error_status(&down), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(pty_create_error_status("tmux 会话不存在"), StatusCode::INTERNAL_SERVER_ERROR);
+    }
 
     #[test]
     fn patch_rejects_ended_status() {

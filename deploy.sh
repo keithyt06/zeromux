@@ -73,6 +73,33 @@ ensure_tmux_unit() {
     sudo systemctl daemon-reload
   fi
   sudo systemctl enable zeromux-tmux.service >/dev/null 2>&1 || true
+
+  # needrestart (unattended-upgrades) would otherwise restart the tmux unit
+  # after a libc/libevent upgrade — killing every terminal. Opt it out.
+  if [ -d /etc/needrestart ]; then
+    local nr=/etc/needrestart/conf.d/zeromux-tmux.conf
+    local nr_want='$nrconf{override_rc}{qr(^zeromux-tmux)} = 0;'
+    if [ "$(sudo cat "$nr" 2>/dev/null || true)" != "$nr_want" ]; then
+      echo ">> Installing $nr (needrestart must never restart zeromux-tmux)"
+      sudo mkdir -p /etc/needrestart/conf.d
+      printf '%s\n' "$nr_want" | sudo tee "$nr" >/dev/null
+    fi
+  fi
+
+  # A tmux server already on the default socket that is NOT owned by
+  # zeromux-tmux.service (e.g. started by hand / VSCode) would hijack the socket:
+  # the unit could not own it, and its sessions die with whatever cgroup holds
+  # it. Refuse BEFORE touching anything. `-N` never starts a server.
+  local tpid
+  tpid="$(tmux -N display-message -p '#{pid}' 2>/dev/null || true)"
+  if [ -n "$tpid" ] && ! grep -q "zeromux-tmux.service" "/proc/$tpid/cgroup" 2>/dev/null; then
+    echo "!! ERROR: a tmux server (pid $tpid) is already running on the default socket" >&2
+    echo "!! and it is NOT managed by zeromux-tmux.service." >&2
+    echo "!! Terminals in it are not protected and would die / be orphaned on deploy." >&2
+    echo "!! Save your work in those sessions, run 'tmux kill-server', then re-run ./deploy.sh." >&2
+    exit 1
+  fi
+
   if ! systemctl is-active --quiet zeromux-tmux.service; then
     # tmux.conf must exist (and be non-empty) before the server starts; zeromux
     # writes it at boot, but on first install zeromux may not have run the new

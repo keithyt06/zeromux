@@ -8,6 +8,9 @@ User=ubuntu
 Group=ubuntu
 Environment=HOME=/home/ubuntu
 Environment=LANG=C.UTF-8
+Environment=PATH=/home/ubuntu/.local/bin:/home/ubuntu/.cargo/bin:/usr/local/bin:/usr/bin:/bin
+# Same env zeromux itself had, so terminals see the same variables as before.
+EnvironmentFile=-/etc/zeromux.env
 WorkingDirectory=/home/ubuntu
 # -D: stay in foreground so systemd owns the server process (and its cgroup).
 ExecStart=/usr/bin/tmux -D -f /home/ubuntu/.zeromux/tmux.conf

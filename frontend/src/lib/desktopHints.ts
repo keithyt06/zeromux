@@ -15,3 +15,14 @@ export function shouldShowShiftHint(storage: KV): boolean {
 export function mousePref(storage: KV): boolean {
   return storage.getItem(MOUSE_PREF_KEY) !== '0'
 }
+
+/** The mouse toggle / on-connect `mouse off` only touch sessions zeromux owns;
+ *  an External session (e.g. VSCode's) keeps whatever option its owner set. */
+export function mouseToggleApplies(origin: 'own' | 'external' | null | undefined): boolean {
+  return origin === 'own'
+}
+
+/** On (re)connect: re-apply the user's "mouse to browser" pref to Own sessions. */
+export function shouldSendMouseOffOnConnect(hasTmux: boolean, origin: 'own' | 'external' | null | undefined, storage: KV): boolean {
+  return hasTmux && mouseToggleApplies(origin) && !mousePref(storage)
+}

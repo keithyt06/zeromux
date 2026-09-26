@@ -35,3 +35,17 @@ describe('peerNamesKey / peerNamesFromKey (stable identity across polls)', () =>
     expect(peerNamesFromKey(peerNamesKey([]))).toEqual({})
   })
 })
+
+describe('peerNamesKey is injective (no separator injection)', () => {
+  it('a crafted session name cannot forge another peer\'s label', () => {
+    const attacker = 'innocuous\u0002zmx-ai-bbbbbb\u0001SPOOFED-LABEL'
+    const sessions = [
+      { peer_name: 'zmx-ai-bbbbbb', name: 'real-b' },
+      { peer_name: 'zmx-ai-aaaaaa', name: attacker },
+    ]
+    expect(peerNamesFromKey(peerNamesKey(sessions))).toEqual({
+      'zmx-ai-aaaaaa': attacker,
+      'zmx-ai-bbbbbb': 'real-b',
+    })
+  })
+})

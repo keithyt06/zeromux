@@ -29,6 +29,10 @@ export default function App() {
   const [authState, setAuthState] = useState<AuthState>('loading')
   const [user, setUser] = useState<UserInfo | null>(null)
   const [sessions, setSessions] = useState<SessionInfo[]>([])
+  const peerNames = useMemo(
+    () => Object.fromEntries(sessions.filter(s => s.peer_name).map(s => [s.peer_name as string, s.name])),
+    [sessions],
+  )
   const [hostTmux, setHostTmux] = useState<HostTmux[]>([])
   const [docTabs, setDocTabs] = useState<DocTab[]>(() => loadDocTabs())
   // Ref mirror so loadSessions (captures a stale docTabs closure) can resolve the
@@ -450,7 +454,7 @@ export default function App() {
                   {s.type === 'tmux' ? (
                     <TerminalView sessionId={s.id} active={isActive && view === 'none'} theme={themeCtx.theme} tmuxName={s.tmux_name} tmuxOrigin={s.tmux_origin} onClose={() => handleDelete(s.id)} historyRequest={historyReq?.id === s.id ? historyReq.nonce : 0} onAskAgent={(prompt) => handleCreate('claude', s.work_dir, undefined, prompt)} />
                   ) : (
-                    <AcpChatView sessionId={s.id} active={isActive && view === 'none'} agentType={s.type} onRegisterControls={registerControls} onQueueModeChange={handleQueueModeChange} showMetrics={!!metricsOpen[s.id]} onOpenMemory={s.type === 'crew' ? () => toggleOverlay(s.id, 'memory') : undefined} />
+                    <AcpChatView sessionId={s.id} active={isActive && view === 'none'} agentType={s.type} onRegisterControls={registerControls} onQueueModeChange={handleQueueModeChange} showMetrics={!!metricsOpen[s.id]} onOpenMemory={s.type === 'crew' ? () => toggleOverlay(s.id, 'memory') : undefined} peerNames={peerNames} />
                   )}
                 </div>
                 {view === 'files' && <FileBrowser sessionId={s.id} />}

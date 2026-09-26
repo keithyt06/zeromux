@@ -371,6 +371,9 @@ pub struct SessionManager {
     /// Fuzzy-search indexes, wired at startup. The turn-end hook asks it to rescan
     /// the session's work_dir when that lies inside the vault. None in tests.
     search: Mutex<Option<Arc<crate::fuzzy_index::SearchIndexes>>>,
+    /// OAuth (multi-user) mode, wired at startup. Claude sessions refuse
+    /// cross-session messages in this mode (spec 2026-09-26 v2).
+    oauth_mode: std::sync::atomic::AtomicBool,
     /// Per-run metrics writer channel. `record_run_metric` pushes into the
     /// session's in-memory VecDeque (under lock) and then `try_send`s here
     /// (outside the lock) so the async writer fsyncs off the conversation path.
@@ -399,6 +402,7 @@ pub struct SessionInfo {
     pub tmux_name: Option<String>,
     pub tmux_origin: Option<TmuxOrigin>,
     pub other_clients: u32,
+    pub peer_name: Option<String>,
 }
 
 // ── Git worktree helpers ──
@@ -523,6 +527,7 @@ struct SpawnPlan {
     owner_id: String,
     cols: u16,
     rows: u16,
+    source_task_id: Option<String>,
 }
 
 enum SpawnDecision {
@@ -572,6 +577,7 @@ fn decide_spawn(s: &mut Session) -> SpawnDecision {
             owner_id: s.owner_id.clone(),
             cols: s.cols,
             rows: s.rows,
+            source_task_id: s.source_task_id.clone(),
         })
     }
 }
@@ -627,6 +633,26 @@ fn apply_meta(
     (pn, pd)
 }
 
+/// Claude Code cross-session address for a ZeroMux Claude session. Derived from
+/// the session id (stable across resume/respawn); ASCII-only so peers can type
+/// it without quoting. `zmx-ai-` (not `zmx-`) so it can't be mistaken for a tmux
+/// terminal name `zmx-<id8>` (spec 2026-09-26 v3 §1a).
+fn peer_name_for(id: &str) -> String {
+    let n = id.char_indices().nth(6).map(|(i, _)| i).unwrap_or(id.len());
+    format!("zmx-ai-{}", &id[..n])
+}
+
+/// Accept peer messages only for interactive sessions in legacy (single-user)
+/// mode. OAuth tenants share one OS user, so the CLI's socket isolation does not
+/// separate them; scheduled runs are unattended.
+fn claude_inbound(oauth_mode: bool, source_task_id: Option<&str>) -> crate::acp::process::Inbound {
+    if oauth_mode || source_task_id.is_some() {
+        crate::acp::process::Inbound::Refuse
+    } else {
+        crate::acp::process::Inbound::Accept
+    }
+}
+
 fn session_info_of(s: &Session) -> SessionInfo {
     SessionInfo {
         id: s.id.clone(),
@@ -652,6 +678,7 @@ fn session_info_of(s: &Session) -> SessionInfo {
         },
         tmux_origin: s.tmux_origin,
         other_clients: 0,
+        peer_name: (s.session_type == SessionType::Claude).then(|| peer_name_for(&s.id)),
     }
 }
 
@@ -683,6 +710,7 @@ impl SessionManager {
             scheduled: Mutex::new(None),
             push: Mutex::new(None),
             search: Mutex::new(None),
+            oauth_mode: std::sync::atomic::AtomicBool::new(false),
             run_metrics_tx: crate::run_metrics::spawn_writer(),
             tmux,
         });
@@ -711,6 +739,11 @@ impl SessionManager {
     /// Wire the search indexes (called once at startup).
     pub fn set_search(&self, s: Arc<crate::fuzzy_index::SearchIndexes>) {
         *self.search.lock().unwrap() = Some(s);
+    }
+
+    /// Wire the auth mode (called once at startup).
+    pub fn set_oauth_mode(&self, on: bool) {
+        self.oauth_mode.store(on, std::sync::atomic::Ordering::Relaxed);
     }
 
     /// Clone push handle (lock-in / lock-out pattern): acquire lock, clone Arc, release lock.
@@ -1150,10 +1183,12 @@ impl SessionManager {
         work_dir: &str,
         owner_id: &str,
         resume: Option<&str>,
+        source_task_id: Option<&str>,
     ) -> Result<RunningProcess, String> {
-        let peer_name = format!("zmx-ai-{}", &id[..6.min(id.len())]);
-        let process = AcpProcess::spawn(&self.claude_path, work_dir, resume,
-                &peer_name, crate::acp::process::Inbound::Accept)
+        let peer_name = peer_name_for(id);
+        let inbound = claude_inbound(
+            self.oauth_mode.load(std::sync::atomic::Ordering::Relaxed), source_task_id);
+        let process = AcpProcess::spawn(&self.claude_path, work_dir, resume, &peer_name, inbound)
             .await
             .map_err(|e| format!("Failed to spawn Claude: {}", e))?;
 
@@ -1213,7 +1248,7 @@ impl SessionManager {
         let (effective_dir, worktree_path) = resolve_work_dir(work_dir, &id, self.worktree_isolation);
 
         let running = self
-            .spawn_claude(&id, &effective_dir.to_string_lossy(), owner_id, None)
+            .spawn_claude(&id, &effective_dir.to_string_lossy(), owner_id, None, source_task_id.as_deref())
             .await
             .map_err(|e| {
                 if let Some(wt) = &worktree_path {
@@ -1720,7 +1755,7 @@ impl SessionManager {
         };
 
         // 别人在 spawn：锁外轮询等待 running 出现（最多 ~30s）。
-        let Some(SpawnPlan { stype, resume_token: token, work_dir, owner_id, cols, rows }) = plan else {
+        let Some(SpawnPlan { stype, resume_token: token, work_dir, owner_id, cols, rows, source_task_id }) = plan else {
             for _ in 0..300 {
                 tokio::time::sleep(std::time::Duration::from_millis(100)).await;
                 let map = self.sessions.lock().unwrap();
@@ -1759,7 +1794,7 @@ impl SessionManager {
                     Some(ResumeToken::Claude(s)) => Some(s.as_str()),
                     _ => None,
                 };
-                self.spawn_claude(id, &work_dir, &owner_id, r).await
+                self.spawn_claude(id, &work_dir, &owner_id, r, source_task_id.as_deref()).await
             }
             SessionType::Codex => {
                 let r = match &token {
@@ -1800,7 +1835,7 @@ impl SessionManager {
                     e
                 );
                 let fresh = match stype {
-                    SessionType::Claude => self.spawn_claude(id, &work_dir, &owner_id, None).await,
+                    SessionType::Claude => self.spawn_claude(id, &work_dir, &owner_id, None, source_task_id.as_deref()).await,
                     SessionType::Codex => self.spawn_codex(id, &work_dir, &owner_id, None).await,
                     SessionType::Crew => self.spawn_crew(id, &work_dir, &owner_id, None).await,
                     // tmux: no bare-shell fallback — a bare shell silently loses
@@ -4695,6 +4730,35 @@ mod turn_state_tests {
             }),
             scrollback: VecDeque::new(), scrollback_bytes: 0,
         }
+    }
+
+    #[test]
+    fn peer_name_is_stable_prefix_of_session_id() {
+        assert_eq!(peer_name_for("3186986d-b29f-40d5-9cd3-20d8b9124d98"), "zmx-ai-318698");
+        assert_eq!(peer_name_for("abc"), "zmx-ai-abc");
+        // must not look like a tmux terminal name `zmx-<id8>` (tmux Own check uses starts_with("zmx-"))
+        assert!(peer_name_for("3186986d").starts_with("zmx-ai-"));
+    }
+
+    #[test]
+    fn inbound_refuses_oauth_and_scheduled_runs() {
+        use crate::acp::process::Inbound;
+        assert_eq!(claude_inbound(false, None), Inbound::Accept);
+        assert_eq!(claude_inbound(true, None), Inbound::Refuse, "OAuth: tenants share one OS user");
+        assert_eq!(claude_inbound(false, Some("task-1")), Inbound::Refuse, "unattended scheduled run");
+    }
+
+    #[test]
+    fn session_info_exposes_peer_name_for_claude_only() {
+        let s = running_session("3186986d-b29f");
+        assert_eq!(session_info_of(&s).peer_name.as_deref(), Some("zmx-ai-318698"));
+    }
+
+    #[test]
+    fn session_info_peer_name_none_for_non_claude() {
+        let mut s = running_session("t1");
+        s.session_type = SessionType::Tmux;
+        assert_eq!(session_info_of(&s).peer_name, None);
     }
 
     #[test]

@@ -567,6 +567,7 @@ async fn main() {
     // prior process, then start the supervised scheduler loop.
     state.sessions.set_scheduled_store(state.scheduled_tasks.clone());
     state.sessions.set_search(state.search.clone());
+    state.sessions.set_oauth_mode(oauth_configured);
     let _ = state.scheduled_tasks.reconcile_orphans(None);
     scheduled_tasks::spawn_scheduler(
         state.sessions.clone(),

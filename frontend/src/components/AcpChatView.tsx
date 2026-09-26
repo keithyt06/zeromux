@@ -2,6 +2,7 @@ import { useState, useEffect, useRef, useCallback, useMemo, memo, createElement 
 import { wsUrl, uploadSessionFile, getSessionRuns, getCrewMemory, putCrewSemantic, deleteCrewSemantic } from '../lib/api'
 import type { SemanticEntry } from '../lib/api'
 import { normalizeMemoryKey, parseSemanticValue } from '../lib/crewMemory'
+import { peerLabel } from '../lib/peer'
 import { ChevronDown, Wrench, Brain, AlertCircle, FileText, Terminal, Search, Bot, Paperclip, ListPlus, X, Ban, Check, type LucideIcon } from 'lucide-react'
 import MarkdownContent from './markdown/MarkdownContent'
 import Composer from './Composer'
@@ -81,12 +82,16 @@ interface Props {
   // 「全部 →」跳记忆面板（第 5 个 overlay view，由 App 拥有）。未传时 popover 里
   // 那个入口仅关弹层，不报错 —— composer 的就地写入不依赖面板存在。
   onOpenMemory?: () => void
+  // Claude peer name → session title, for labeling cross-session messages.
+  peerNames?: Record<string, string>
 }
+
+const EMPTY_PEERS: Record<string, string> = {}
 
 // `active` is accepted (App passes it for all session views) but no longer used:
 // the Composer owns its own textarea and we intentionally don't auto-focus it,
 // so switching to a chat session doesn't pop the mobile keyboard.
-export default function AcpChatView({ sessionId, agentType = 'claude', onRegisterControls, onQueueModeChange, showMetrics, onOpenMemory }: Props) {
+export default function AcpChatView({ sessionId, agentType = 'claude', onRegisterControls, onQueueModeChange, showMetrics, onOpenMemory, peerNames = EMPTY_PEERS }: Props) {
   // Raw wire-event log; the rendered transcript is DERIVED from it by grouping
   // on turn_id (T1). This is what fixes "send while streaming" misalignment:
   // a new prompt carries the NEXT turn_id, so it folds into its own group
@@ -847,6 +852,7 @@ export default function AcpChatView({ sessionId, agentType = 'claude', onRegiste
             onExpand={expandDensity}
             resolvedApprovals={resolvedApprovals}
             onResolveApproval={resolveApproval}
+            peerNames={peerNames}
           />
         ))}
         {notices.map(n => <NoticeBubble key={n.id} notice={n} />)}
@@ -861,18 +867,23 @@ export default function AcpChatView({ sessionId, agentType = 'claude', onRegiste
         {busy && (
           <div className="flex items-center gap-2 px-2 pb-1 text-xs">
             {stuck ? (
-              <>
-                <span className="text-[var(--accent-red)]">已静默 {silenceSecs}s，可能卡住</span>
-                <button
-                  onClick={interrupt}
-                  className="px-2 py-0.5 text-[10px] font-semibold text-[var(--accent-red)] border border-[var(--accent-red)] rounded hover:bg-[var(--accent-red)] hover:text-white transition-colors"
-                >
-                  中断
-                </button>
-              </>
+              <span className="text-[var(--accent-red)]">已静默 {silenceSecs}s，可能卡住</span>
             ) : (
               <span className="text-[var(--text-muted)] italic">已运行 {elapsed}s…</span>
             )}
+            {/* Always available while busy: a CLI-started (cross-session) turn is
+                autonomous work the user did not start and must be able to stop
+                from a phone (spec 2026-09-26 v2 §3e). */}
+            <button
+              onClick={interrupt}
+              className={`px-2 py-0.5 text-[10px] font-semibold border rounded transition-colors ${
+                stuck
+                  ? 'text-[var(--accent-red)] border-[var(--accent-red)] hover:bg-[var(--accent-red)] hover:text-white'
+                  : 'text-[var(--text-secondary)] border-[var(--border)] hover:text-[var(--text-primary)]'
+              }`}
+            >
+              中断
+            </button>
           </div>
         )}
         {(pending.length > 0 || uploading > 0) && (
@@ -1080,11 +1091,12 @@ export default function AcpChatView({ sessionId, agentType = 'claude', onRegiste
 // collect-merged turn has N userPrompts (P1) → N "You" bubbles, then one
 // assistant section. A turn with no blocks yet (prompt sent, nothing streamed)
 // renders just the user bubble(s).
-function TurnGroupViewImpl({ group, agentName = 'Claude', density = 'concise', onExpand, resolvedApprovals, onResolveApproval }: {
+function TurnGroupViewImpl({ group, agentName = 'Claude', density = 'concise', onExpand, resolvedApprovals, onResolveApproval, peerNames }: {
   group: TurnGroup; agentName?: string; density?: Density; onExpand?: () => void
   /** approval id → 本端已作出的决定；有值则卡片收起按钮，显示结果。 */
   resolvedApprovals?: Record<string, 'approve' | 'reject'>
   onResolveApproval?: (approvalId: string, action: 'approve' | 'reject') => void
+  peerNames?: Record<string, string>
 }) {
   const { visible, collapsedCount } = partitionBlocks(group.blocks, density)
   return (
@@ -1092,7 +1104,7 @@ function TurnGroupViewImpl({ group, agentName = 'Claude', density = 'concise', o
       {group.userPrompts.map((p, i) => (
         <div key={p.clientId ?? i}>
           <p className={`text-[11px] font-semibold mb-0.5 ${p.fromName ? 'text-[var(--accent-purple)]' : 'text-[var(--accent-blue)]'}`}>
-            {p.fromName ? `来自 @${p.fromName}` : 'You'}
+            {p.fromName ? `来自 @${peerLabel(p.fromName, peerNames ?? {})}` : 'You'}
           </p>
           <p className="text-sm text-[var(--text-primary)] whitespace-pre-wrap">{p.text}</p>
         </div>
@@ -1137,7 +1149,9 @@ const TurnGroupView = memo(
     // stabilizeGroups (:92, 2026-08-03 F-perf) deliberately keeps a completed
     // turn's object identity, so nothing else changes when the decision lands.
     prev.resolvedApprovals === next.resolvedApprovals &&
-    prev.onResolveApproval === next.onResolveApproval
+    prev.onResolveApproval === next.onResolveApproval &&
+    // Same reason: a renamed session must relabel already-finished peer bubbles.
+    prev.peerNames === next.peerNames
 )
 
 function NoticeBubble({ notice }: { notice: Notice }) {

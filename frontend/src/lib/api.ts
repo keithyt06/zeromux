@@ -20,6 +20,7 @@ export interface SessionInfo {
   tmux_name: string | null
   tmux_origin: 'own' | 'external' | null
   other_clients: number
+  peer_name?: string | null
 }
 
 export interface SessionStatus {

@@ -173,6 +173,22 @@ export default function SessionInfoBar({ session, onUpdate, onToggleFiles, onTog
       {/* Expanded panel */}
       {expanded && (
         <div className="px-3 pb-2 space-y-2">
+          {session.peer_name && (
+            <div className="flex items-center gap-2">
+              <span className="text-[10px] text-[var(--text-muted)] uppercase w-12">Peer</span>
+              <code className="text-[10px] text-[var(--text-primary)]">{session.peer_name}</code>
+              <button
+                onClick={() => navigator.clipboard?.writeText(session.peer_name as string)}
+                className="px-1.5 py-0.5 text-[10px] rounded border border-[var(--border)] text-[var(--text-secondary)] hover:text-[var(--text-primary)]"
+                title="复制跨会话消息地址"
+              >
+                复制
+              </button>
+              <span className="text-[10px] text-[var(--text-muted)]">
+                {session.running ? '在线' : '休眠 · 打开会话后才能收到消息'}
+              </span>
+            </div>
+          )}
           {/* Status selector */}
           <div className="flex items-center gap-2">
             <span className="text-[10px] text-[var(--text-muted)] uppercase w-12">Status</span>

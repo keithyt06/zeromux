@@ -138,6 +138,7 @@ export interface TmuxSession {
   windows: number
   attached: number
   created: number
+  path: string
 }
 
 export async function listTmuxSessions(): Promise<TmuxSession[]> {

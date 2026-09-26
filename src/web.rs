@@ -738,6 +738,7 @@ async fn tmux_health(
 }
 
 async fn list_tmux_sessions(
+    State(state): State<Arc<AppState>>,
     user: axum::Extension<CurrentUser>,
 ) -> Result<Json<serde_json::Value>, StatusCode> {
     // Host tmux sessions are shared OS state with no per-user owner metadata, so
@@ -751,32 +752,7 @@ async fn list_tmux_sessions(
     if !user.is_admin() {
         return Err(StatusCode::FORBIDDEN);
     }
-    let output = std::process::Command::new("tmux")
-        .args(["ls", "-F", "#{session_name}\t#{session_windows}\t#{session_attached}\t#{session_created}"])
-        .output();
-
-    let sessions: Vec<serde_json::Value> = match output {
-        Ok(o) if o.status.success() => {
-            String::from_utf8_lossy(&o.stdout)
-                .lines()
-                .filter_map(|line| {
-                    let fields: Vec<&str> = line.split('\t').collect();
-                    if fields.len() >= 4 {
-                        Some(serde_json::json!({
-                            "name": fields[0],
-                            "windows": fields[1].parse::<u32>().unwrap_or(0),
-                            "attached": fields[2].parse::<u32>().unwrap_or(0),
-                            "created": fields[3].parse::<i64>().unwrap_or(0),
-                        }))
-                    } else {
-                        None
-                    }
-                })
-                .collect()
-        }
-        _ => Vec::new(),
-    };
-
+    let sessions = state.tmux.list().await.unwrap_or_default();
     Ok(Json(serde_json::json!({ "sessions": sessions })))
 }
 

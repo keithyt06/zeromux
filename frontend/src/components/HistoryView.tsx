@@ -12,7 +12,13 @@ export function chunkLines(text: string, size: number): string[] {
   return out
 }
 
-interface Props { sessionId: string; title: string; onClose: () => void; split?: boolean }
+interface Props {
+  sessionId: string
+  title: string
+  onClose: () => void
+  split?: boolean
+  onSendToAgent?: (selectionOrTail: string) => void
+}
 
 // Loaded payload remembers which mode it was fetched in, so a mode toggle never
 // renders raw escapes (or strips a plain capture) while the refetch is in flight.
@@ -22,7 +28,7 @@ const parseChunks = (chunks: string[]): Span[][][] => chunks.map(c => c.split('\
 
 // Full tmux history as native, scrollable, long-press-selectable text. Blocks of
 // 500 lines with content-visibility keep 50k lines smooth on phones.
-export default function HistoryView({ sessionId, title, onClose, split }: Props) {
+export default function HistoryView({ sessionId, title, onClose, split, onSendToAgent }: Props) {
   const [ansi, setAnsi] = useState(false)
   const [loaded, setLoaded] = useState<Loaded | null>(null)
   const [error, setError] = useState<string | null>(null)
@@ -124,6 +130,13 @@ export default function HistoryView({ sessionId, title, onClose, split }: Props)
         <button className={btn} onClick={toBottom}>⤓ 底部</button>
         <button className={btn} onClick={() => text !== null && navigator.clipboard?.writeText(colored ? stripAnsi(text) : text)}>复制全部</button>
         <button className={btn} onClick={() => setAnsi(a => !a)}>{ansi ? '纯文本' : '颜色'}</button>
+        {onSendToAgent && (
+          <button className={btn} onClick={() => {
+            const sel = window.getSelection()?.toString() ?? ''
+            const payload = sel.trim() ? sel : (text ?? '').split('\n').slice(-200).join('\n')
+            if (window.confirm('内容可能包含密钥或令牌，确认发给 agent？')) onSendToAgent(payload)
+          }}>发给 agent</button>
+        )}
       </div>
     </div>
   )

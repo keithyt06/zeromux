@@ -18,6 +18,7 @@ import { arrowSequence, rowHeight, linesFromDrag, bracketedPaste, submitSequence
 import { shouldStickToBottom } from '../lib/scrollReplay'
 import { ScrollBatcher, inertiaLines, scheduleInertia, shouldCancelBeforeInput, type ScrollMsg } from '../lib/terminalScroll'
 import { shouldShowShiftHint, mousePref, MOUSE_PREF_KEY } from '../lib/desktopHints'
+import { historyPrompt } from '../lib/historyToAgent'
 
 const FONT_SIZE = 14
 
@@ -79,9 +80,11 @@ interface Props {
   onClose?: () => void
   /** Bumped (nonce) by the sidebar's ⋯ 查看历史 to open the history drawer. */
   historyRequest?: number
+  /** "发给 agent": open a new Claude session pre-filled with a history prompt. */
+  onAskAgent?: (prompt: string) => void
 }
 
-export default function TerminalView({ sessionId, active, theme, tmuxName, tmuxOrigin, onClose, historyRequest }: Props) {
+export default function TerminalView({ sessionId, active, theme, tmuxName, tmuxOrigin, onClose, historyRequest, onAskAgent }: Props) {
   const containerRef = useRef<HTMLDivElement>(null)
   const termRef = useRef<Terminal | null>(null)
   const fitRef = useRef<FitAddon | null>(null)
@@ -659,7 +662,11 @@ export default function TerminalView({ sessionId, active, theme, tmuxName, tmuxO
           onDone={hideReconnect}
         />
       )}
-      {historyOpen && <HistoryView sessionId={sessionId} title={tmuxName ?? ''} split={split} onClose={() => setHistoryOpen(false)} />}
+      {historyOpen && <HistoryView sessionId={sessionId} title={tmuxName ?? ''} split={split} onClose={() => setHistoryOpen(false)}
+        onSendToAgent={onAskAgent ? (t) => {
+          setHistoryOpen(false)
+          onAskAgent(historyPrompt({ name: tmuxName ?? '', workDir: status?.work_dir ?? '', text: t }))
+        } : undefined} />}
       {/* 触摸端：方向/启动键栏在上，常驻输入框贴底（最靠近软键盘）。历史抽屉全屏打开时隐藏两者；横屏分屏时左侧终端仍可用。 */}
       {isTouch && !(historyOpen && !split) && <MobileKeyBar onKey={handleBarKey} onHistory={tmuxName ? () => setHistoryOpen(true) : undefined} />}
       {isTouch && !(historyOpen && !split) && (

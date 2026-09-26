@@ -358,6 +358,7 @@ pub fn payload_for(kind: &str, name: &str, session_id: &str, fk: Option<&str>) -
             format!("⚠️ {name} 可能卡住"),
             "已静默约 10 分钟无输出".to_string(),
         ),
+        "term_ended" => (format!("⏹ {name} 已结束"), "终端会话已退出".to_string()),
         "test" => (
             "🔔 测试推送".to_string(),
             "如果你看到这条,推送链路正常".to_string(),
@@ -377,7 +378,7 @@ pub fn payload_for(kind: &str, name: &str, session_id: &str, fk: Option<&str>) -
 pub fn kind_allowed_by_levels(kind: &str, lvl_important: bool, lvl_routine: bool) -> bool {
     match kind {
         "test" => true,
-        "turn_done" => lvl_routine,
+        "turn_done" | "term_ended" => lvl_routine,
         _ => lvl_important, // run_failed / confirm / stuck
     }
 }
@@ -635,6 +636,15 @@ mod tests {
         assert!(c.body.contains("中断")); // 含中断原因
         let batch = confirm_batch_payload(3);
         assert!(batch.title.contains("3") && batch.title.contains("确认"));
+    }
+
+    #[test]
+    fn term_ended_payload_and_level() {
+        let p = payload_for("term_ended", "api", "sid", None);
+        assert_eq!(p.title, "⏹ api 已结束");
+        assert_eq!(p.body, "终端会话已退出");
+        assert!(kind_allowed_by_levels("term_ended", false, true));
+        assert!(!kind_allowed_by_levels("term_ended", true, false));
     }
 
     #[test]

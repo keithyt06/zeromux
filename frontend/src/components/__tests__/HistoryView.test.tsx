@@ -53,4 +53,13 @@ describe('HistoryView', () => {
     fireEvent.click(screen.getByText('颜色'))
     await waitFor(() => expect(spy).toHaveBeenCalledWith('s', true))
   })
+  it('send to agent asks for confirmation and sends the tail', async () => {
+    vi.spyOn(api, 'getHistory').mockResolvedValue({ text: 'a\nb', truncated: false })
+    vi.spyOn(window, 'confirm').mockReturnValue(true)
+    const onSend = vi.fn()
+    render(<HistoryView sessionId="s" title="t" onClose={() => {}} onSendToAgent={onSend} />)
+    await waitFor(() => expect(screen.getByText(/b/)).toBeInTheDocument())
+    fireEvent.click(screen.getByText('发给 agent'))
+    expect(onSend).toHaveBeenCalledWith('a\nb')
+  })
 })

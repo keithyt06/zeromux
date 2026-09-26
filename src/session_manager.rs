@@ -1019,7 +1019,19 @@ impl SessionManager {
             if let Some(m) = mgr_weak.upgrade() {
                 if let Some((name, _)) = m.tmux_binding(&sid_for_exit) {
                     if let Ok(false) = m.tmux.has(&name).await {
-                        m.mark_ended(&sid_for_exit);
+                        if m.mark_ended(&sid_for_exit) {
+                            // Not a deliberate close (that path removes the session
+                            // before killing, so tmux_binding above would be None) —
+                            // the terminal ended on its own. Push in the background
+                            // so the fan-out isn't blocked on network.
+                            if let (Some(p), Some(owner)) = (m.push_handle(), m.owner_of(&sid_for_exit)) {
+                                let title = m.session_name(&sid_for_exit).unwrap_or_default();
+                                let sid3 = sid_for_exit.clone();
+                                tokio::spawn(async move {
+                                    p.send_to_user(&owner, &crate::push::payload_for("term_ended", &title, &sid3, None)).await;
+                                });
+                            }
+                        }
                     }
                 }
             }
@@ -2251,12 +2263,23 @@ impl SessionManager {
 
     /// Never clears `running` and never touches a running/spawning session: a
     /// concurrent respawn that won the race must not be dropped.
-    fn mark_ended(&self, id: &str) {
+    /// Returns true iff this call actually transitioned the session to Ended
+    /// (false if the session was missing, already Ended, or a respawn won the
+    /// race) — the fan-out exit path uses this to push `term_ended` exactly
+    /// once, only on a real transition.
+    fn mark_ended(&self, id: &str) -> bool {
         if let Some(s) = self.sessions.lock().unwrap().get_mut(id) {
-            if s.running.is_none() && !s.spawning {
+            if s.running.is_none() && !s.spawning && s.status != SessionMeta::Ended {
                 s.status = SessionMeta::Ended;
+                return true;
             }
         }
+        false
+    }
+
+    /// Look up a session's owner_id. Returns None if the session doesn't exist.
+    pub fn owner_of(&self, id: &str) -> Option<String> {
+        self.sessions.lock().unwrap().get(id).map(|s| s.owner_id.clone())
     }
 
     /// "新建同名会话": the tmux session is now zeromux's own.
@@ -6327,6 +6350,36 @@ mod tmux_session_tests {
         m.mark_ended("sp");
         assert!(matches!(m.sessions.lock().unwrap().get("sp").unwrap().status, SessionMeta::Idle),
             "a spawning session must not be marked Ended");
+    }
+
+    #[test]
+    fn mark_ended_return_value_signals_real_transition_only() {
+        // The fan-out exit path (spawn_tmux) fires the `term_ended` push only
+        // when mark_ended returns true, so it must be true exactly once for a
+        // genuine Idle/no-running → Ended transition, and false for every case
+        // that must NOT push: no-op on a running/spawning session (asserted by
+        // the sibling test above), and false on a second call once already Ended
+        // (so a respawn-and-die-again cycle, or any duplicate fan-out exit check,
+        // can't double-push "已结束" for the same tmux session).
+        let (m, _d) = mgr_with(crate::tmux::TmuxCtl::new(Some("zmx-test-unused".into())));
+        let mut s = test_session_for_size();
+        s.id = "e1".into();
+        s.status = SessionMeta::Idle;
+        m.sessions.lock().unwrap().insert("e1".into(), s);
+        assert!(m.mark_ended("e1"), "Idle → Ended is a real transition");
+        assert!(!m.mark_ended("e1"), "already Ended: no second push");
+        assert!(!m.mark_ended("missing"), "no such session: false, not a panic");
+    }
+
+    #[test]
+    fn owner_of_looks_up_the_owning_user() {
+        let (m, _d) = mgr_with(crate::tmux::TmuxCtl::new(Some("zmx-test-unused".into())));
+        let mut s = test_session_for_size();
+        s.id = "e2".into();
+        s.owner_id = "alice".into();
+        m.sessions.lock().unwrap().insert("e2".into(), s);
+        assert_eq!(m.owner_of("e2"), Some("alice".into()));
+        assert_eq!(m.owner_of("missing"), None);
     }
 
     #[tokio::test]

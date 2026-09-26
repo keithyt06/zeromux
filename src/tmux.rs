@@ -121,19 +121,20 @@ impl TmuxCtl {
 
     pub async fn info(&self, name: &str) -> Result<PaneInfo, TmuxError> {
         let s = self.run(&["display-message", "-p", "-t", &format!("={name}:"),
-            "#{session_name}\t#{session_attached}\t#{pane_in_mode}\t#{history_size}\t#{alternate_on}\t#{mouse_any_flag}\t#{pane_current_command}"]).await?;
+            "#{session_name}\t#{session_attached}\t#{pane_in_mode}\t#{history_size}\t#{alternate_on}\t#{mouse_any_flag}\t#{mouse_sgr_flag}\t#{pane_current_command}"]).await?;
         let f: Vec<&str> = s.trim_end_matches('\n').split('\t').collect();
         // On a server with zero sessions tmux 3.4 exits 0 with every format
         // field empty instead of erroring — an empty session_name means "gone".
         if f.first().is_none_or(|n| n.is_empty()) { return Err(TmuxError::NotFound); }
-        if f.len() < 7 { return Err(TmuxError::Other(format!("bad info: {s}"))); }
+        if f.len() < 8 { return Err(TmuxError::Other(format!("bad info: {s}"))); }
         Ok(PaneInfo {
             attached: f[1].parse().unwrap_or(0),
             in_mode: f[2] == "1",
             history_size: f[3].parse().unwrap_or(0),
             alternate_on: f[4] == "1",
             mouse_any: f[5] == "1",
-            current_command: f[6].to_string(),
+            mouse_sgr: f[6] == "1",
+            current_command: f[7].to_string(),
         })
     }
 
@@ -147,7 +148,7 @@ impl TmuxCtl {
         let t = format!("={name}:");
         let pre = self.info(name).await?;
         let in_mode = pre.in_mode;
-        let route = scroll_route(in_mode, pre.alternate_on, pre.mouse_any);
+        let route = scroll_route(in_mode, pre.alternate_on, pre.mouse_any, pre.mouse_sgr);
         if route == ScrollRoute::AppWheel {
             if let Some(seq) = wheel_seq(op) {
                 self.run(&["send-keys", "-t", &t, "-l", &seq]).await?;
@@ -214,6 +215,8 @@ pub struct PaneInfo {
     pub attached: u32, pub in_mode: bool, pub history_size: u64,
     /// `#{alternate_on}` / `#{mouse_any_flag}`: fullscreen app with mouse reporting.
     pub alternate_on: bool, pub mouse_any: bool,
+    /// `#{mouse_sgr_flag}`: app asked for SGR (1006) mouse encoding — the only one we emit.
+    pub mouse_sgr: bool,
     pub current_command: String,
 }
 
@@ -222,8 +225,9 @@ pub enum ScrollRoute { CopyMode, AppWheel }
 
 /// A fullscreen app that asked for mouse events scrolls its own view, and
 /// never writes into tmux history — route to it unless we're already in copy-mode.
-pub fn scroll_route(in_mode: bool, alternate_on: bool, mouse_any: bool) -> ScrollRoute {
-    if !in_mode && alternate_on && mouse_any { ScrollRoute::AppWheel } else { ScrollRoute::CopyMode }
+/// Requires SGR encoding: X10-mouse apps would misparse our SGR bytes → CopyMode.
+pub fn scroll_route(in_mode: bool, alternate_on: bool, mouse_any: bool, mouse_sgr: bool) -> ScrollRoute {
+    if !in_mode && alternate_on && mouse_any && mouse_sgr { ScrollRoute::AppWheel } else { ScrollRoute::CopyMode }
 }
 
 /// SGR wheel events for AppWheel: up = button 64, down = 65, at cell 1;1.
@@ -450,8 +454,10 @@ pub(crate) mod tests {
         for in_mode in [false, true] {
             for alt in [false, true] {
                 for mouse in [false, true] {
-                    let want = if !in_mode && alt && mouse { ScrollRoute::AppWheel } else { ScrollRoute::CopyMode };
-                    assert_eq!(scroll_route(in_mode, alt, mouse), want, "in_mode={in_mode} alt={alt} mouse={mouse}");
+                    for sgr in [false, true] {
+                        let want = if !in_mode && alt && mouse && sgr { ScrollRoute::AppWheel } else { ScrollRoute::CopyMode };
+                        assert_eq!(scroll_route(in_mode, alt, mouse, sgr), want, "in_mode={in_mode} alt={alt} mouse={mouse} sgr={sgr}");
+                    }
                 }
             }
         }
@@ -483,7 +489,7 @@ pub(crate) mod tests {
         for _ in 0..50 {
             tokio::time::sleep(std::time::Duration::from_millis(100)).await;
             let i = srv.ctl.info("zmx-w1").await.unwrap();
-            if i.alternate_on && i.mouse_any { ready = true; break; }
+            if i.alternate_on && i.mouse_any && i.mouse_sgr { ready = true; break; }
         }
         assert!(ready, "app never entered alt-screen + mouse mode");
         let (i, route) = srv.ctl.scroll("zmx-w1", ScrollOp::Up(3)).await.unwrap();

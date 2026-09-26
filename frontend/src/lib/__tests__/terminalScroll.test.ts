@@ -96,16 +96,20 @@ describe('shouldCancelBeforeInput', () => {
 
 describe('pillFromScrollState', () => {
   it('copy-mode route follows in_mode (unchanged behavior)', () => {
-    expect(pillFromScrollState({ in_mode: true }, 'up')).toEqual({ scrolling: true, appScroll: false })
-    expect(pillFromScrollState({ in_mode: false }, 'up')).toEqual({ scrolling: false, appScroll: false })
-    expect(pillFromScrollState({ in_mode: false, app_scroll: false }, 'down')).toEqual({ scrolling: false, appScroll: false })
+    expect(pillFromScrollState({ in_mode: true }, 'up', false)).toEqual({ scrolling: true, appScroll: false })
+    expect(pillFromScrollState({ in_mode: false }, 'up', true)).toEqual({ scrolling: false, appScroll: false })
+    expect(pillFromScrollState({ in_mode: false, app_scroll: false }, 'down', true)).toEqual({ scrolling: false, appScroll: false })
   })
-  it('app-wheel route keeps the pill while reading, even though in_mode is false', () => {
-    expect(pillFromScrollState({ in_mode: false, app_scroll: true }, 'up')).toEqual({ scrolling: true, appScroll: true })
-    expect(pillFromScrollState({ in_mode: false, app_scroll: true }, 'down')).toEqual({ scrolling: true, appScroll: true })
+  it('app-wheel: up/top raise the pill even though in_mode is false', () => {
+    expect(pillFromScrollState({ in_mode: false, app_scroll: true }, 'up', false)).toEqual({ scrolling: true, appScroll: true })
+    expect(pillFromScrollState({ in_mode: false, app_scroll: true }, 'top', false)).toEqual({ scrolling: true, appScroll: true })
   })
-  it('app-wheel reply after the last sent op was bottom/cancel clears the pill (late replies cannot reopen it)', () => {
-    expect(pillFromScrollState({ in_mode: false, app_scroll: true }, 'bottom')).toEqual({ scrolling: false, appScroll: false })
-    expect(pillFromScrollState({ in_mode: false, app_scroll: true }, 'cancel')).toEqual({ scrolling: false, appScroll: false })
+  it('app-wheel: down keeps the current pill state and never raises it', () => {
+    expect(pillFromScrollState({ in_mode: false, app_scroll: true }, 'down', false)).toEqual({ scrolling: false, appScroll: false })
+    expect(pillFromScrollState({ in_mode: false, app_scroll: true }, 'down', true)).toEqual({ scrolling: true, appScroll: true })
+  })
+  it('app-wheel: bottom/cancel clear the pill (late replies cannot reopen it)', () => {
+    expect(pillFromScrollState({ in_mode: false, app_scroll: true }, 'bottom', true)).toEqual({ scrolling: false, appScroll: false })
+    expect(pillFromScrollState({ in_mode: false, app_scroll: true }, 'cancel', true)).toEqual({ scrolling: false, appScroll: false })
   })
 })

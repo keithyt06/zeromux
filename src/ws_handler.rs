@@ -167,7 +167,7 @@ async fn handle_ws(socket: WebSocket, session_id: String, state: Arc<AppState>) 
                         // Reading a fullscreen app via wheel events (AppWheel): there is no
                         // copy-mode to report and history doesn't grow — stay silent so the
                         // client's pill isn't cleared by `in_mode: false`.
-                        if crate::tmux::scroll_route(i.in_mode, i.alternate_on, i.mouse_any) == crate::tmux::ScrollRoute::AppWheel {
+                        if crate::tmux::scroll_route(i.in_mode, i.alternate_on, i.mouse_any, i.mouse_sgr) == crate::tmux::ScrollRoute::AppWheel {
                             continue;
                         }
                         // Alt-screen output never lands in history → new_lines is meaningless.

@@ -511,7 +511,7 @@ export default function TerminalView({ sessionId, active, theme, tmuxName, tmuxO
             return
           }
           if (msg.type === 'scroll_state') {
-            const p = pillFromScrollState(msg, lastScrollOpRef.current)
+            const p = pillFromScrollState(msg, lastScrollOpRef.current, scrollingRef.current)
             appScrollRef.current = p.appScroll
             scrollingRef.current = p.scrolling
             setScrolling(p.scrolling)

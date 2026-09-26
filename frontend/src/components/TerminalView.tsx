@@ -9,10 +9,12 @@ import { wsUrl, getSessionStatus, getTmuxHealth, reviveSession } from '../lib/ap
 import type { SessionStatus, TmuxHealth } from '../lib/api'
 import type { Theme } from '../lib/theme'
 import { b64encode, b64decode } from '../lib/base64'
-import { GitBranch, Folder, Circle } from 'lucide-react'
+import { GitBranch, Folder, Circle, ArrowUpToLine, ArrowDownToLine } from 'lucide-react'
 import { attachCommand, copyText } from '../lib/attachCommand'
 import MobileKeyBar, { type BarKey } from './MobileKeyBar'
 import Composer from './Composer'
+import ConnectionBar from './ConnectionBar'
+import type { WsStatus } from '../lib/wsStatus'
 import HistoryView from './HistoryView'
 import { TmuxHealthBar, LostBanner, EndedOverlay, ReconnectHint } from './TerminalNotices'
 import { arrowSequence, rowHeight, linesFromDrag, bracketedPaste, submitSequence, controlSequence, launchSequence } from '../lib/terminalInput'
@@ -145,9 +147,8 @@ export default function TerminalView({ sessionId, active, theme, tmuxName, tmuxO
   const split = isTouch && landscape
   const historySplit = historyOpen && split
   const [composerText, setComposerText] = useState('')
-  // 软键盘是否弹起：仅触摸端用 VisualViewport 判断（见下方 effect）。
-  // 弹起时隐藏底部状态栏，把空间让给常驻 composer + 终端。
-  const [keyboardOpen, setKeyboardOpen] = useState(false)
+  // Terminal WS status for ConnectionBar (display only; backoff logic untouched).
+  const [wsStatus, setWsStatus] = useState<{ status: WsStatus; since: number }>(() => ({ status: 'connecting', since: Date.now() }))
   // 桌面 Ctrl/Cmd+F：非 tmux 会话本地搜索当前屏；tmux 会话改开历史抽屉
   // （xterm 只保留当前屏，搜索历史要走服务端 capture-pane）。
   const [searchOpen, setSearchOpen] = useState(false)
@@ -476,6 +477,7 @@ export default function TerminalView({ sessionId, active, theme, tmuxName, tmuxO
       wsRef.current = ws
 
       ws.onopen = () => {
+        setWsStatus({ status: 'open', since: Date.now() })
         // Reset backoff only after the connection proves STABLE (~3s), not on the
         // instant it opens — otherwise an accept-then-immediately-close loop resets
         // attempt→0 every open and the 10s cap is never reached (permanent ~1s
@@ -555,6 +557,10 @@ export default function TerminalView({ sessionId, active, theme, tmuxName, tmuxO
 
       ws.onclose = () => {
         wsRef.current = null
+        // Keep `since` while already reconnecting: resetting it on every failed
+        // retry would re-arm ConnectionBar's delay and blink the bar off each
+        // backoff cycle (same pattern as AcpChatView).
+        if (!disposed) setWsStatus(prev => endedRef.current ? { status: 'ended', since: Date.now() } : prev.status === 'reconnecting' ? prev : { status: 'reconnecting', since: Date.now() })
         // A close before the stability timer fires means this open did NOT prove
         // stable — cancel the pending reset so `attempt` keeps escalating.
         clearTimeout(stableTimer)
@@ -640,13 +646,13 @@ export default function TerminalView({ sessionId, active, theme, tmuxName, tmuxO
     return () => window.removeEventListener('resize', handleResize)
   }, [handleResize])
 
-  // 键条 / composer / 状态栏占用高度，改变终端可用区；渲染后重新 fit，
-  // 避免底部行被遮 / canvas 尺寸过期。键盘弹起隐藏状态栏也会改变高度，需重算。
+  // 键条 / composer 占用高度，改变终端可用区；渲染后重新 fit，
+  // 避免底部行被遮 / canvas 尺寸过期。
   useEffect(() => {
     if (!isTouch) return
     const t = setTimeout(handleResize, 50)
     return () => clearTimeout(t)
-  }, [isTouch, keyboardOpen, handleResize])
+  }, [isTouch, handleResize])
 
   // Split history halves the terminal width; refit so tmux reflows to the new cols.
   useEffect(() => {
@@ -668,8 +674,6 @@ export default function TerminalView({ sessionId, active, theme, tmuxName, tmuxO
       const root = containerRef.current?.parentElement
       const overlap = Math.max(0, window.innerHeight - vv.height - vv.offsetTop)
       if (root) root.style.paddingBottom = `${overlap}px`
-      // overlap > 阈值 ≈ 软键盘弹起。阈值避开地址栏收合等小幅变化。
-      setKeyboardOpen(overlap > 120)
     }
     apply()
     vv.addEventListener('resize', apply)
@@ -679,9 +683,21 @@ export default function TerminalView({ sessionId, active, theme, tmuxName, tmuxO
       vv.removeEventListener('scroll', apply)
       const root = containerRef.current?.parentElement
       if (root) root.style.paddingBottom = ''
-      setKeyboardOpen(false)
     }
   }, [isTouch, active])
+
+  const scrollPill = tmuxName && scrolling ? (
+    <div className={`absolute right-3 z-10 flex gap-1 text-xs ${isTouch ? 'bottom-full mb-2' : 'bottom-28'}`}>
+      <button aria-label="scroll-top" onPointerDown={e => { e.preventDefault(); sendScroll({ op: 'top', n: 1 }) }}
+        className="flex items-center px-2.5 py-1.5 rounded-full bg-[var(--bg-tertiary)] border border-[var(--border)] shadow">
+        <ArrowUpToLine size={14} />
+      </button>
+      <button aria-label="scroll-bottom" onPointerDown={e => { e.preventDefault(); scrollToBottom() }}
+        className="flex items-center gap-1 px-3 py-1.5 rounded-full bg-[var(--accent-blue)] text-white shadow">
+        <ArrowDownToLine size={14} />{newLines > 0 ? `${newLines} 行新输出` : '回到底部'}
+      </button>
+    </div>
+  ) : null
 
   return (
     <div className="relative flex flex-col h-full">
@@ -707,14 +723,6 @@ export default function TerminalView({ sessionId, active, theme, tmuxName, tmuxO
           按住 Shift 拖动可选择文字（{navigator.platform.includes('Mac') ? 'Mac 也可按 Option' : '或在历史中长按'}）
         </div>
       )}
-      {tmuxName && scrolling && (
-        <div className="absolute right-3 bottom-28 z-10 flex gap-1 text-xs">
-          <button aria-label="scroll-top" onPointerDown={e => { e.preventDefault(); sendScroll({ op: 'top', n: 1 }) }}
-            className="px-2 py-1.5 rounded-full bg-[var(--bg-tertiary)] border border-[var(--border)] shadow">⤒顶</button>
-          <button aria-label="scroll-bottom" onPointerDown={e => { e.preventDefault(); scrollToBottom() }}
-            className="px-3 py-1.5 rounded-full bg-[var(--accent-blue)] text-white shadow">{newLines > 0 ? `↓ ${newLines} 行新输出` : '⏸ 已暂停跟随 · ⤓'}</button>
-        </div>
-      )}
       {ended && <EndedOverlay name={tmuxName ?? ''} origin={tmuxOrigin} onRevive={handleRevive} onClose={() => onClose?.()} />}
       {reconnected && (
         <ReconnectHint
@@ -727,23 +735,30 @@ export default function TerminalView({ sessionId, active, theme, tmuxName, tmuxO
           setHistoryOpen(false)
           onAskAgent(historyPrompt({ name: tmuxName ?? '', workDir: status?.work_dir ?? '', text: t }))
         } : undefined} />}
-      {/* 触摸端：方向/启动键栏在上，常驻输入框贴底（最靠近软键盘）。历史抽屉全屏打开时隐藏两者；横屏分屏时左侧终端仍可用。 */}
-      {isTouch && !(historyOpen && !split) && <MobileKeyBar onKey={handleBarKey} onHistory={tmuxName ? () => setHistoryOpen(true) : undefined} />}
+      {!isTouch && scrollPill}
+      {!isTouch && <ConnectionBar status={wsStatus.status} sinceMs={wsStatus.since} />}
+      {/* 触摸端：一个底部容器装 胶囊(浮于键栏之上) + 连接条 + 键栏 + 常驻输入框(贴底，最靠近软键盘)。
+          历史抽屉全屏打开时隐藏；横屏分屏时左侧终端仍可用。 */}
       {isTouch && !(historyOpen && !split) && (
-        <div className="px-2 py-1.5 border-t border-[var(--border)] bg-[var(--bg-secondary)]">
-          <Composer
-            value={composerText}
-            onChange={setComposerText}
-            onSend={sendComposer}
-            submitOnEnter={false}
-            placeholder="输入文字，点 ✈ 发送…"
-          />
+        <div data-testid="term-bottom" className="relative">
+          {scrollPill}
+          <ConnectionBar status={wsStatus.status} sinceMs={wsStatus.since} />
+          <MobileKeyBar onKey={handleBarKey} onHistory={tmuxName ? () => setHistoryOpen(true) : undefined} />
+          <div className="px-2 py-1.5 border-t border-[var(--border)] bg-[var(--bg-secondary)]">
+            <Composer
+              value={composerText}
+              onChange={setComposerText}
+              onSend={sendComposer}
+              submitOnEnter={false}
+              placeholder="输入文字，点 ✈ 发送…"
+            />
+          </div>
         </div>
       )}
-      {/* 状态栏：软键盘弹起时隐藏，把空间让给终端 + 常驻输入框。 */}
-      <div
-        className={`${isTouch && keyboardOpen ? 'hidden' : 'flex'} items-center gap-3 px-4 py-3 border-t border-[var(--border)] bg-[var(--bg-secondary)] min-h-[40px]`}
-      >
+      {isTouch && historyOpen && !split && scrollPill}
+      {/* 状态栏：仅桌面。触屏上路径本就被截断，顶栏已显示会话名，把高度让给终端。 */}
+      {!isTouch && (
+      <div className="flex items-center gap-3 px-4 py-3 border-t border-[var(--border)] bg-[var(--bg-secondary)] min-h-[40px]">
         {status ? (
           <>
             <div className="flex items-center gap-1.5 text-xs text-[var(--text-secondary)]">
@@ -768,7 +783,7 @@ export default function TerminalView({ sessionId, active, theme, tmuxName, tmuxO
         ) : (
           <span className="text-xs text-[var(--text-muted)]">Loading...</span>
         )}
-        {tmuxName && mouseToggleApplies(tmuxOrigin) && !isTouch && (
+        {tmuxName && mouseToggleApplies(tmuxOrigin) && (
           <button onClick={() => {
               const on = !mouseOn
               setMouseOn(on)
@@ -785,15 +800,16 @@ export default function TerminalView({ sessionId, active, theme, tmuxName, tmuxO
           <button
             onClick={async () => { if (await copyText(attachCommand(tmuxName))) { setChipCopied(true); setTimeout(() => setChipCopied(false), 1500) } }}
             title={attachCommand(tmuxName)}
-            className={`${isTouch ? 'ml-auto' : ''} flex items-center gap-1 px-1.5 py-0.5 rounded border border-[var(--border)] text-[11px] font-mono text-[var(--text-secondary)] hover:text-[var(--text-primary)]`}
+            className={`flex items-center gap-1 px-1.5 py-0.5 rounded border border-[var(--border)] text-[11px] font-mono text-[var(--text-secondary)] hover:text-[var(--text-primary)]`}
           >
             {chipCopied ? '已复制' : `⧉ ${tmuxName}`}
           </button>
         )}
-        {!isTouch && tmuxName && (
+        {tmuxName && (
           <button onClick={() => setHistoryOpen(true)} className="text-xs text-[var(--text-secondary)] hover:text-[var(--text-primary)]">历史</button>
         )}
       </div>
+      )}
     </div>
   )
 }

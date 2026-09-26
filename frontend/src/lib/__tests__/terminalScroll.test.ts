@@ -1,5 +1,5 @@
 import { describe, it, expect, vi } from 'vitest'
-import { dragToScroll, inertiaLines, ScrollBatcher } from '../terminalScroll'
+import { dragToScroll, inertiaLines, ScrollBatcher, scheduleInertia } from '../terminalScroll'
 
 describe('dragToScroll', () => {
   // linesFromDrag convention: finger moves UP → positive → newer content (scroll down).
@@ -39,6 +39,40 @@ describe('ScrollBatcher', () => {
     expect(send).toHaveBeenLastCalledWith({ op: 'up', n: 1 })
     vi.advanceTimersByTime(50)
     expect(send).toHaveBeenLastCalledWith({ op: 'down', n: 2 })
+    b.dispose()
+    vi.useRealTimers()
+  })
+})
+
+describe('scheduleInertia', () => {
+  it('feeds steps one per stepMs and cancel stops the rest', () => {
+    vi.useFakeTimers()
+    const add = vi.fn()
+    const cancel = scheduleInertia([-3, -2, -1], add, 16)
+    vi.advanceTimersByTime(0)
+    expect(add).toHaveBeenCalledTimes(1)
+    expect(add).toHaveBeenLastCalledWith(-3)
+    vi.advanceTimersByTime(16)
+    expect(add).toHaveBeenCalledTimes(2)
+    cancel()
+    vi.advanceTimersByTime(100)
+    expect(add).toHaveBeenCalledTimes(2)
+    vi.useRealTimers()
+  })
+})
+
+describe('ScrollBatcher.cancel', () => {
+  it('drops pending lines and stays usable', () => {
+    vi.useFakeTimers()
+    const send = vi.fn()
+    const b = new ScrollBatcher(send, 50)
+    b.add(-4)
+    b.cancel()
+    vi.advanceTimersByTime(100)
+    expect(send).not.toHaveBeenCalled()
+    b.add(2)
+    vi.advanceTimersByTime(50)
+    expect(send).toHaveBeenCalledWith({ op: 'down', n: 2 })
     b.dispose()
     vi.useRealTimers()
   })

@@ -196,7 +196,7 @@ async fn handle_ws(socket: WebSocket, session_id: String, state: Arc<AppState>) 
                                     let _ = input_tx.send(SessionInput::PtyResize(cols, rows)).await;
                                 }
                                 ClientMsg::Scroll { op, n } => {
-                                    // Awaited inline: bounded by TmuxCtl's 3s timeout.
+                                    // Awaited inline: up to 3 tmux calls (info, op, info), each 3s-bounded → ≤9s.
                                     if let (Some((name, _)), Some(op)) =
                                         (state.sessions.tmux_binding(&session_id), crate::tmux::ScrollOp::parse(&op, n))
                                     {

@@ -12,7 +12,7 @@ import Composer from './Composer'
 import { TmuxHealthBar, LostBanner, EndedOverlay } from './TerminalNotices'
 import { arrowSequence, rowHeight, linesFromDrag, bracketedPaste, submitSequence, controlSequence, launchSequence, type ArrowKey } from '../lib/terminalInput'
 import { shouldStickToBottom } from '../lib/scrollReplay'
-import { ScrollBatcher, inertiaLines, type ScrollMsg } from '../lib/terminalScroll'
+import { ScrollBatcher, inertiaLines, scheduleInertia, type ScrollMsg } from '../lib/terminalScroll'
 
 const FONT_SIZE = 14
 
@@ -134,8 +134,13 @@ export default function TerminalView({ sessionId, active, theme, tmuxName, tmuxO
   // Ref twin so the once-only init effect's touch batcher always calls the latest sendScroll.
   const sendScrollRef = useRef(sendScroll)
   useEffect(() => { sendScrollRef.current = sendScroll }, [sendScroll])
+  // Set by the init effect: stops in-flight inertia + drops batched lines, so a
+  // keystroke right after a flick can't be followed by a stale `up` that
+  // re-enters copy-mode.
+  const cancelInertiaRef = useRef<() => void>(() => {})
   // Leave copy-mode before any keystroke so input isn't swallowed by tmux.
   const exitScroll = useCallback(() => {
+    cancelInertiaRef.current()
     if (!scrollingRef.current) return
     scrollingRef.current = false
     setScrolling(false)
@@ -235,6 +240,7 @@ export default function TerminalView({ sessionId, active, theme, tmuxName, tmuxO
     })
 
     term.onBinary(data => {
+      exitScroll()
       const ws = wsRef.current
       if (ws?.readyState === WebSocket.OPEN) {
         const bytes = new Uint8Array(data.length)
@@ -250,10 +256,14 @@ export default function TerminalView({ sessionId, active, theme, tmuxName, tmuxO
     // tmux terminals: drag → batched copy-mode scroll ops over the WS (+ inertia).
     const batcher = new ScrollBatcher(m => sendScrollRef.current(m))
     let lastY = 0, lastT = 0, vel = 0
+    let stopInertia = () => {}
+    const cancelInertia = () => { stopInertia(); stopInertia = () => {}; batcher.cancel() }
+    cancelInertiaRef.current = cancelInertia
 
     const onTouchStart = (e: TouchEvent) => {
       // 仅单指进入滚动逻辑；多指（pinch）忽略。
       if (e.touches.length !== 1) { touchId = null; return }
+      cancelInertia()  // a new touch stops the previous flick
       startY = e.touches[0].clientY
       touchId = e.touches[0].identifier
       lastY = e.touches[0].clientY; lastT = performance.now(); vel = 0
@@ -283,7 +293,8 @@ export default function TerminalView({ sessionId, active, theme, tmuxName, tmuxO
       if (tmuxRef.current) {
         batcher.flush()
         const rh = rowHeight(term.element?.clientHeight ?? 0, term.rows, FONT_SIZE)
-        inertiaLines(vel, rh).forEach((l, i) => setTimeout(() => batcher.add(l), i * 16))
+        stopInertia()
+        stopInertia = scheduleInertia(inertiaLines(vel, rh), l => batcher.add(l))
       }
       vel = 0; lastT = 0
     }
@@ -298,6 +309,8 @@ export default function TerminalView({ sessionId, active, theme, tmuxName, tmuxO
       container?.removeEventListener('touchmove', onTouchMove)
       container?.removeEventListener('touchend', onTouchEnd)
       container?.removeEventListener('touchcancel', onTouchEnd)
+      cancelInertia()
+      cancelInertiaRef.current = () => {}
       batcher.dispose()
       if (scrollDebounceRef.current) clearTimeout(scrollDebounceRef.current)
       wsRef.current?.close()

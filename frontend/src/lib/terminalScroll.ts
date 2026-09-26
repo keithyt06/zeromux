@@ -29,6 +29,13 @@ export function inertiaLines(velocityPxPerMs: number, rh: number): number[] {
   return out
 }
 
+/** Feed inertia steps to `add`, one per `stepMs`. Returns a cancel that stops
+ *  any not-yet-fired steps (new touch, keystroke, unmount). */
+export function scheduleInertia(steps: number[], add: (l: number) => void, stepMs = STEP_MS): () => void {
+  const timers = steps.map((l, i) => setTimeout(() => add(l), i * stepMs))
+  return () => timers.forEach(clearTimeout)
+}
+
 export class ScrollBatcher {
   private pending = 0
   private timer: ReturnType<typeof setTimeout> | undefined
@@ -55,9 +62,14 @@ export class ScrollBatcher {
     if (m) this.send(m)
   }
 
-  dispose() {
+  /** Drop pending lines without sending; the batcher stays usable. */
+  cancel() {
     if (this.timer) clearTimeout(this.timer)
     this.timer = undefined
     this.pending = 0
+  }
+
+  dispose() {
+    this.cancel()
   }
 }

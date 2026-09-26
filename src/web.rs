@@ -1102,7 +1102,6 @@ async fn session_status(
 #[derive(serde::Deserialize)]
 struct HistoryQuery {
     #[serde(default)]
-    #[allow(dead_code)] // ansi takes effect in T12; accepted now so the query param doesn't 400.
     ansi: u8,
 }
 
@@ -1110,7 +1109,7 @@ async fn session_history(
     State(state): State<Arc<AppState>>,
     user: axum::Extension<CurrentUser>,
     axum::extract::Path(id): axum::extract::Path<String>,
-    Query(_q): Query<HistoryQuery>,
+    Query(q): Query<HistoryQuery>,
 ) -> Result<Json<crate::tmux::Captured>, (StatusCode, String)> {
     if !user.is_admin() && !state.sessions.is_owner(&id, &user.id) {
         return Err((StatusCode::FORBIDDEN, "forbidden".into()));
@@ -1122,7 +1121,7 @@ async fn session_history(
         .ok_or((StatusCode::BAD_REQUEST, "not a tmux terminal".into()))?;
     state
         .tmux
-        .capture(&name, 50_000, 5 * 1024 * 1024)
+        .capture(&name, 50_000, 5 * 1024 * 1024, q.ansi == 1)
         .await
         .map(Json)
         .map_err(|e| (StatusCode::SERVICE_UNAVAILABLE, e.to_string()))

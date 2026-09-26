@@ -1,5 +1,7 @@
-import { useEffect, useLayoutEffect, useRef, useState } from 'react'
+import { useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react'
 import { getHistory } from '../lib/api'
+import { parseAnsiLine, stripAnsi, type Span } from '../lib/ansi'
+import { findMatches } from '../lib/historySearch'
 
 const CHUNK = 500
 
@@ -10,53 +12,118 @@ export function chunkLines(text: string, size: number): string[] {
   return out
 }
 
-interface Props { sessionId: string; title: string; onClose: () => void }
+interface Props { sessionId: string; title: string; onClose: () => void; split?: boolean }
+
+// Loaded payload remembers which mode it was fetched in, so a mode toggle never
+// renders raw escapes (or strips a plain capture) while the refetch is in flight.
+interface Loaded { text: string; truncated: boolean; ansi: boolean }
+
+const parseChunks = (chunks: string[]): Span[][][] => chunks.map(c => c.split('\n').map(parseAnsiLine))
 
 // Full tmux history as native, scrollable, long-press-selectable text. Blocks of
 // 500 lines with content-visibility keep 50k lines smooth on phones.
-export default function HistoryView({ sessionId, title, onClose }: Props) {
-  const [text, setText] = useState<string | null>(null)
-  const [truncated, setTruncated] = useState(false)
+export default function HistoryView({ sessionId, title, onClose, split }: Props) {
+  const [ansi, setAnsi] = useState(false)
+  const [loaded, setLoaded] = useState<Loaded | null>(null)
   const [error, setError] = useState<string | null>(null)
+  const [q, setQ] = useState('')
+  const [idx, setIdx] = useState(0)
+  // Worker output tagged with the chunks it was computed from; stale results are ignored.
+  const [workerSpans, setWorkerSpans] = useState<{ src: string[]; spans: Span[][][] } | null>(null)
   const scrollRef = useRef<HTMLDivElement>(null)
 
   useEffect(() => {
     let cancelled = false
     ;(document.activeElement as HTMLElement | null)?.blur?.()   // drop the soft keyboard
-    getHistory(sessionId)
-      .then(r => { if (!cancelled) { setText(r.text); setTruncated(r.truncated) } })
+    getHistory(sessionId, ansi)
+      .then(r => { if (!cancelled) { setLoaded({ text: r.text, truncated: r.truncated, ansi }); setError(null) } })
       .catch(e => { if (!cancelled) setError(String(e?.message ?? e)) })
     return () => { cancelled = true }
-  }, [sessionId])
+  }, [sessionId, ansi])
+
+  const text = loaded?.text ?? null
+  const colored = loaded?.ansi ?? false
+  const chunks = useMemo(() => (text === null ? [] : chunkLines(text, CHUNK)), [text])
+  const plainChunks = useMemo(() => (colored ? chunks.map(stripAnsi) : chunks), [chunks, colored])
+  const matches = useMemo(() => findMatches(plainChunks, q), [plainChunks, q])
+  const cur = matches.length ? Math.min(idx, matches.length - 1) : -1
+
+  // SGR parsing of 50k lines runs in a worker; jsdom/old browsers parse inline.
+  const hasWorker = typeof Worker !== 'undefined'
+  const inlineSpans = useMemo(() => (colored && !hasWorker ? parseChunks(chunks) : null), [colored, hasWorker, chunks])
+  useEffect(() => {
+    if (!colored || !hasWorker) return
+    const w = new Worker(new URL('../lib/ansi.worker.ts', import.meta.url), { type: 'module' })
+    w.onmessage = (e: MessageEvent<Span[][][]>) => setWorkerSpans({ src: chunks, spans: e.data })
+    w.postMessage(chunks)
+    return () => w.terminate()
+  }, [colored, hasWorker, chunks])
+  const spans = colored ? (inlineSpans ?? (workerSpans?.src === chunks ? workerSpans.spans : null)) : null
 
   useLayoutEffect(() => {
     const el = scrollRef.current
     if (el && text !== null) el.scrollTop = el.scrollHeight
   }, [text])
 
+  // Bring the current match into view: the <mark> in plain mode, its block in color mode.
+  useEffect(() => {
+    if (cur < 0) return
+    const root = scrollRef.current
+    const el = root?.querySelector('[data-current]') ?? root?.querySelectorAll('pre')[matches[cur].chunk]
+    el?.scrollIntoView?.({ block: 'center' })
+  }, [cur, matches])
+
+  const step = (d: number) => { if (matches.length) setIdx((cur + d + matches.length) % matches.length) }
   const toTop = () => { if (scrollRef.current) scrollRef.current.scrollTop = 0 }
   const toBottom = () => { const el = scrollRef.current; if (el) el.scrollTop = el.scrollHeight }
   const btn = 'px-2.5 py-1.5 rounded border border-[var(--border)] text-xs text-[var(--text-secondary)] active:bg-[var(--bg-hover)]'
+  const preCls = 'px-3 m-0 text-[12px] leading-[1.35] font-mono whitespace-pre-wrap break-all text-[var(--text-primary)]'
+  const preStyle = { contentVisibility: 'auto', containIntrinsicSize: `auto ${CHUNK * 16}px` } as const
+  const rootCls = split
+    ? 'absolute inset-y-0 right-0 w-1/2 border-l border-[var(--border)]'
+    : 'absolute inset-0'
+
+  const renderChunk = (c: string, i: number) => {
+    if (spans?.[i]) {
+      return spans[i].map((line, li) => (
+        <span key={li}>
+          {line.map((sp, si) => (
+            <span key={si} style={{ color: sp.fg, background: sp.bg, fontWeight: sp.bold ? 600 : undefined }}>{sp.text}</span>
+          ))}
+          {li < spans[i].length - 1 ? '\n' : null}
+        </span>
+      ))
+    }
+    // Only the current match is highlighted — marking every hit in 50k lines is too heavy.
+    const m = cur >= 0 && !colored ? matches[cur] : null
+    if (!m || m.chunk !== i) return colored ? plainChunks[i] : c
+    return <>{c.slice(0, m.offset)}<mark data-current="">{c.slice(m.offset, m.offset + q.length)}</mark>{c.slice(m.offset + q.length)}</>
+  }
 
   return (
-    <div className="absolute inset-0 z-20 flex flex-col bg-[var(--bg-primary)]">
+    <div className={`${rootCls} z-20 flex flex-col bg-[var(--bg-primary)]`}>
       <div className="flex items-center gap-2 px-3 py-2 border-b border-[var(--border)] bg-[var(--bg-secondary)] text-xs">
-        <span className="flex-1 truncate font-medium text-[var(--text-primary)]">历史 · {title}</span>
+        <span className="shrink-0 max-w-[40%] truncate font-medium text-[var(--text-primary)]">历史 · {title}</span>
+        <input value={q} placeholder="搜索历史"
+          onChange={e => { setQ(e.target.value); setIdx(0) }}
+          onKeyDown={e => { if (e.key === 'Enter') step(e.shiftKey ? -1 : 1) }}
+          className="flex-1 min-w-0 px-2 py-1 rounded border border-[var(--border)] bg-[var(--bg-primary)] text-[var(--text-primary)] outline-none" />
+        <span className="shrink-0 tabular-nums text-[var(--text-muted)]">{matches.length ? `${cur + 1}/${matches.length}` : q ? '0/0' : ''}</span>
+        <button aria-label="上一个" onClick={() => step(-1)} className="px-1 text-[var(--text-secondary)]">▲</button>
+        <button aria-label="下一个" onClick={() => step(1)} className="px-1 text-[var(--text-secondary)]">▼</button>
         <button aria-label="关闭历史" onClick={onClose} className="px-2 text-[var(--text-muted)] hover:text-[var(--text-primary)]">✕</button>
       </div>
       <div ref={scrollRef} className="flex-1 min-h-0 overflow-y-auto overscroll-contain select-text" style={{ touchAction: 'pan-y', WebkitUserSelect: 'text' }}>
-        {truncated && <div className="px-3 py-1 text-[10px] text-[var(--text-muted)]">仅显示最近 5MB</div>}
+        {loaded?.truncated && <div className="px-3 py-1 text-[10px] text-[var(--text-muted)]">仅显示最近 5MB</div>}
         {error && <div className="px-3 py-2 text-xs text-[var(--accent-red)]">{error}</div>}
         {text === null && !error && <div className="px-3 py-2 text-xs text-[var(--text-muted)]">Loading...</div>}
-        {text !== null && chunkLines(text, CHUNK).map((c, i) => (
-          <pre key={i} className="px-3 m-0 text-[12px] leading-[1.35] font-mono whitespace-pre-wrap break-all text-[var(--text-primary)]"
-            style={{ contentVisibility: 'auto', containIntrinsicSize: `auto ${CHUNK * 16}px` }}>{c}</pre>
-        ))}
+        {chunks.map((c, i) => <pre key={i} className={preCls} style={preStyle}>{renderChunk(c, i)}</pre>)}
       </div>
       <div className="flex gap-2 px-3 py-2 border-t border-[var(--border)] bg-[var(--bg-secondary)]">
         <button className={btn} onClick={toTop}>⤒ 首行</button>
         <button className={btn} onClick={toBottom}>⤓ 底部</button>
-        <button className={btn} onClick={() => text !== null && navigator.clipboard?.writeText(text)}>复制全部</button>
+        <button className={btn} onClick={() => text !== null && navigator.clipboard?.writeText(colored ? stripAnsi(text) : text)}>复制全部</button>
+        <button className={btn} onClick={() => setAnsi(a => !a)}>{ansi ? '纯文本' : '颜色'}</button>
       </div>
     </div>
   )

@@ -89,9 +89,14 @@ impl TmuxCtl {
         }
     }
 
-    pub async fn capture(&self, name: &str, max_lines: u32, max_bytes: usize) -> Result<Captured, TmuxError> {
+    /// `ansi` adds `-e` so SGR color/attribute escapes are kept in the output.
+    pub async fn capture(&self, name: &str, max_lines: u32, max_bytes: usize, ansi: bool) -> Result<Captured, TmuxError> {
         let start = format!("-{max_lines}");
-        let text = self.run(&["capture-pane", "-p", "-J", "-S", &start, "-E", "-", "-t", &format!("={name}:")]).await?;
+        let target = format!("={name}:");
+        let mut args = vec!["capture-pane", "-p"];
+        if ansi { args.push("-e"); }
+        args.extend(["-J", "-S", &start, "-E", "-", "-t", &target]);
+        let text = self.run(&args).await?;
         Ok(truncate_head(text, max_bytes))
     }
 
@@ -400,14 +405,31 @@ pub(crate) mod tests {
         mk(&srv, "zmx-c1").await;
         srv.ctl.run(&["send-keys", "-t", "=zmx-c1:", "seq 1 500", "Enter"]).await.unwrap();
         tokio::time::sleep(std::time::Duration::from_millis(500)).await;
-        let full = srv.ctl.capture("zmx-c1", 50_000, 5 * 1024 * 1024).await.unwrap();
+        let full = srv.ctl.capture("zmx-c1", 50_000, 5 * 1024 * 1024, false).await.unwrap();
         assert!(!full.truncated);
         assert!(full.text.lines().any(|l| l == "1"));
         assert!(full.text.lines().any(|l| l == "500"));
-        let cut = srv.ctl.capture("zmx-c1", 50_000, 200).await.unwrap();
+        let cut = srv.ctl.capture("zmx-c1", 50_000, 200, false).await.unwrap();
         assert!(cut.truncated);
         assert!(cut.text.len() <= 200);
         assert!(!cut.text.lines().any(|l| l == "1"), "head is dropped, tail kept");
+    }
+
+    #[tokio::test]
+    async fn capture_ansi_keeps_sgr() {
+        let Some(srv) = TestServer::start() else { return };
+        mk(&srv, "zmx-a1").await;
+        srv.ctl.run(&["send-keys", "-t", "=zmx-a1:", "printf '\\033[31mRED\\033[0m\\n'", "Enter"]).await.unwrap();
+        // Poll (not a fixed sleep): under parallel `cargo test` the shell can be slow to start.
+        let mut plain = String::new();
+        for _ in 0..30 {
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            plain = srv.ctl.capture("zmx-a1", 100, 1 << 20, false).await.unwrap().text;
+            if plain.lines().any(|l| l == "RED") { break; }
+        }
+        let color = srv.ctl.capture("zmx-a1", 100, 1 << 20, true).await.unwrap().text;
+        assert!(!plain.contains('\x1b'));
+        assert!(color.contains("\x1b[31m"));
     }
 
     #[tokio::test]
@@ -437,7 +459,7 @@ pub(crate) mod tests {
         let mut before = String::new();
         for _ in 0..20 {
             tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-            let snap = srv.ctl.capture("zmx-q1", 100, 1 << 20).await.unwrap().text;
+            let snap = srv.ctl.capture("zmx-q1", 100, 1 << 20, false).await.unwrap().text;
             if !snap.trim().is_empty() && snap == before { break; }
             before = snap;
         }
@@ -446,7 +468,7 @@ pub(crate) mod tests {
             assert!(!i.in_mode);
         }
         tokio::time::sleep(std::time::Duration::from_millis(200)).await;
-        let after = srv.ctl.capture("zmx-q1", 100, 1 << 20).await.unwrap().text;
+        let after = srv.ctl.capture("zmx-q1", 100, 1 << 20, false).await.unwrap().text;
         assert_eq!(before.trim_end(), after.trim_end(), "no keystrokes may reach the shell");
     }
 

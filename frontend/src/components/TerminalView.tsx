@@ -68,6 +68,8 @@ const THEMES = {
   },
 }
 
+const LANDSCAPE_MQ = '(orientation: landscape) and (max-height: 500px)'
+
 interface Props {
   sessionId: string
   active: boolean
@@ -121,6 +123,17 @@ export default function TerminalView({ sessionId, active, theme, tmuxName, tmuxO
       (typeof matchMedia !== 'undefined' && matchMedia('(any-pointer: coarse)').matches) ||
       (typeof navigator !== 'undefined' && navigator.maxTouchPoints > 0)
   )
+  // Phone held sideways: history opens as a right half-pane beside the live terminal.
+  const [landscape, setLandscape] = useState(() => typeof matchMedia !== 'undefined' && matchMedia(LANDSCAPE_MQ).matches)
+  useEffect(() => {
+    if (typeof matchMedia === 'undefined') return
+    const mq = matchMedia(LANDSCAPE_MQ)
+    const on = () => setLandscape(mq.matches)
+    mq.addEventListener?.('change', on)
+    return () => mq.removeEventListener?.('change', on)
+  }, [])
+  const split = isTouch && landscape
+  const historySplit = historyOpen && split
   const [composerText, setComposerText] = useState('')
   // 软键盘是否弹起：仅触摸端用 VisualViewport 判断（见下方 effect）。
   // 弹起时隐藏底部状态栏，把空间让给常驻 composer + 终端。
@@ -560,6 +573,13 @@ export default function TerminalView({ sessionId, active, theme, tmuxName, tmuxO
     return () => clearTimeout(t)
   }, [isTouch, keyboardOpen, handleResize])
 
+  // Split history halves the terminal width; refit so tmux reflows to the new cols.
+  useEffect(() => {
+    if (!split) return
+    const t = setTimeout(handleResize, 50)
+    return () => clearTimeout(t)
+  }, [split, historyOpen, handleResize])
+
   // 软键盘遮挡补偿：仅触摸端 + active。用 VisualViewport 把容器底部内边距顶起
   // 键盘高度，使 composer 和终端区不被遮。只改 CSS（paddingBottom），不动
   // xterm 的 cols/rows（避免 PTY SIGWINCH 抖动 / TUI 重绘风暴）。
@@ -592,7 +612,7 @@ export default function TerminalView({ sessionId, active, theme, tmuxName, tmuxO
     <div className="relative flex flex-col h-full">
       {tmuxName && <TmuxHealthBar health={health} />}
       {lost && <LostBanner onClose={() => setLost(false)} />}
-      <div ref={containerRef} onMouseDown={onMouseDownHint} className="xterm-container w-full flex-1 min-h-0" />
+      <div ref={containerRef} onMouseDown={onMouseDownHint} className={`xterm-container ${historySplit ? 'w-1/2' : 'w-full'} flex-1 min-h-0`} />
       {searchOpen && (
         <div className="absolute top-2 right-3 z-10 flex items-center gap-1 px-2 py-1 rounded border border-[var(--border)] bg-[var(--bg-secondary)] text-xs">
           <input autoFocus value={searchQ} onChange={e => { setSearchQ(e.target.value); searchRef.current?.findNext(e.target.value) }}
@@ -627,10 +647,10 @@ export default function TerminalView({ sessionId, active, theme, tmuxName, tmuxO
           onDone={hideReconnect}
         />
       )}
-      {historyOpen && <HistoryView sessionId={sessionId} title={tmuxName ?? ''} onClose={() => setHistoryOpen(false)} />}
-      {/* 触摸端：方向/启动键栏在上，常驻输入框贴底（最靠近软键盘）。历史抽屉打开时隐藏两者。 */}
-      {isTouch && !historyOpen && <MobileKeyBar onKey={handleBarKey} onHistory={tmuxName ? () => setHistoryOpen(true) : undefined} />}
-      {isTouch && !historyOpen && (
+      {historyOpen && <HistoryView sessionId={sessionId} title={tmuxName ?? ''} split={split} onClose={() => setHistoryOpen(false)} />}
+      {/* 触摸端：方向/启动键栏在上，常驻输入框贴底（最靠近软键盘）。历史抽屉全屏打开时隐藏两者；横屏分屏时左侧终端仍可用。 */}
+      {isTouch && !(historyOpen && !split) && <MobileKeyBar onKey={handleBarKey} onHistory={tmuxName ? () => setHistoryOpen(true) : undefined} />}
+      {isTouch && !(historyOpen && !split) && (
         <div className="px-2 py-1.5 border-t border-[var(--border)] bg-[var(--bg-secondary)]">
           <Composer
             value={composerText}

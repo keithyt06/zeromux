@@ -32,6 +32,19 @@ describe('AcpChatView — send while disconnected (B8)', () => {
     expect(screen.getByText('连接断开,正在重连…')).toBeInTheDocument()
   })
 
+  it('bar stays visible across a failed retry (since is not reset by a repeat close)', async () => {
+    render(<AcpChatView sessionId="s1" active agentType="claude" />)
+    const first = ws.latest()
+    act(() => { first.fireOpen() })
+    act(() => { first.fireClose() })      // t=0: drop → retry scheduled at +1000ms
+    await act(async () => { vi.advanceTimersByTime(1000) })
+    const second = ws.latest()
+    expect(second).not.toBe(first)        // reconnect attempt actually happened
+    act(() => { second.fireClose() })     // retry fails without ever opening
+    await act(async () => { vi.advanceTimersByTime(600) })   // t=1600 > 1500 since first drop
+    expect(screen.getByText('连接断开,正在重连…')).toBeInTheDocument()
+  })
+
   it('open socket: send clears the box and emits one prompt frame', () => {
     render(<AcpChatView sessionId="s1" active agentType="claude" />)
     const sock = ws.latest()

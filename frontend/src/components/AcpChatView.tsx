@@ -383,7 +383,10 @@ export default function AcpChatView({ sessionId, agentType = 'claude', onRegiste
 
       ws.onclose = () => {
         wsRef.current = null
-        if (!disposed) setWsStatus({ status: 'reconnecting', since: Date.now() })
+        // Keep the ORIGINAL drop time across failed retries: a retry that never
+        // opens closes again while already 'reconnecting' — resetting `since`
+        // there would hide the bar for another delay window every backoff cycle.
+        if (!disposed) setWsStatus(prev => prev.status === 'reconnecting' ? prev : { status: 'reconnecting', since: Date.now() })
         // A close before the stability timer fires means this open did NOT prove
         // stable — cancel the pending reset so `attempt` keeps escalating.
         clearTimeout(stableTimer)

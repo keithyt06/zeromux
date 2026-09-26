@@ -1,6 +1,6 @@
 export type SessionType = 'tmux' | 'claude' | 'crew' | 'codex'
 
-export type SessionMetaStatus = 'running' | 'done' | 'blocked' | 'idle'
+export type SessionMetaStatus = 'running' | 'done' | 'blocked' | 'idle' | 'ended'
 
 export interface SessionInfo {
   id: string
@@ -211,6 +211,11 @@ export async function forgetQuickTarget(kind: 'dir' | 'note', path: string, agen
 
 export async function deleteSession(id: string): Promise<void> {
   await api(`/api/sessions/${id}`, { method: 'DELETE' })
+}
+
+export async function reviveSession(id: string): Promise<void> {
+  const res = await api(`/api/sessions/${id}/revive`, { method: 'POST' })
+  if (!res.ok) throw new Error(await res.text())
 }
 
 // Returns the user on 200, null on a genuine 401/403 (not authenticated), and THROWS

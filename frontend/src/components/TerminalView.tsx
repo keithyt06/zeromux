@@ -2,14 +2,14 @@ import { useEffect, useRef, useCallback, useState } from 'react'
 import { Terminal } from '@xterm/xterm'
 import { FitAddon } from '@xterm/addon-fit'
 import { WebglAddon } from '@xterm/addon-webgl'
-import { wsUrl, getSessionStatus, getTmuxHealth } from '../lib/api'
+import { wsUrl, getSessionStatus, getTmuxHealth, reviveSession } from '../lib/api'
 import type { SessionStatus, TmuxHealth } from '../lib/api'
 import type { Theme } from '../lib/theme'
 import { b64encode, b64decode } from '../lib/base64'
 import { GitBranch, Folder, Circle } from 'lucide-react'
 import MobileKeyBar, { type BarKey } from './MobileKeyBar'
 import Composer from './Composer'
-import { TmuxHealthBar } from './TerminalNotices'
+import { TmuxHealthBar, LostBanner, EndedOverlay } from './TerminalNotices'
 import { arrowSequence, rowHeight, linesFromDrag, bracketedPaste, submitSequence, controlSequence, launchSequence, type ArrowKey } from '../lib/terminalInput'
 import { shouldStickToBottom } from '../lib/scrollReplay'
 
@@ -66,9 +66,11 @@ interface Props {
   sessionId: string
   active: boolean
   theme: Theme
+  tmuxName?: string | null
+  onClose?: () => void
 }
 
-export default function TerminalView({ sessionId, active, theme }: Props) {
+export default function TerminalView({ sessionId, active, theme, tmuxName, onClose }: Props) {
   const containerRef = useRef<HTMLDivElement>(null)
   const termRef = useRef<Terminal | null>(null)
   const fitRef = useRef<FitAddon | null>(null)
@@ -83,6 +85,13 @@ export default function TerminalView({ sessionId, active, theme }: Props) {
   const scrollDebounceRef = useRef<ReturnType<typeof setTimeout> | undefined>(undefined)
   const [status, setStatus] = useState<SessionStatus | null>(null)
   const [health, setHealth] = useState<TmuxHealth | null>(null)
+  const [lost, setLost] = useState(false)
+  const [ended, setEnded] = useState(false)
+  // Ref twin of `ended` for the WS onclose closure: an Ended session must not
+  // auto-reconnect (each reconnect would just get tmux_ended again).
+  const endedRef = useRef(false)
+  // Bumped after revive to re-run the Connect WebSocket effect.
+  const [wsEpoch, setWsEpoch] = useState(0)
   // 触摸设备检测：any-pointer:coarse 或 maxTouchPoints>0，少漏触屏笔记本/iPad。
   // 触摸能力在页面生命周期内不变，用惰性初始化在挂载时算一次即可（避免 effect 内 setState）。
   const [isTouch] = useState(
@@ -102,12 +111,12 @@ export default function TerminalView({ sessionId, active, theme }: Props) {
       getSessionStatus(sessionId).then(s => {
         if (!cancelled) setStatus(s)
       }).catch(() => {})
-      getTmuxHealth().then(h => { if (!cancelled) setHealth(h) }).catch(() => {})
+      if (tmuxName) getTmuxHealth().then(h => { if (!cancelled) setHealth(h) }).catch(() => {})
     }
     fetchStatus()
     const interval = setInterval(fetchStatus, 10000)
     return () => { cancelled = true; clearInterval(interval) }
-  }, [sessionId])
+  }, [sessionId, tmuxName])
 
   // 所有 client→PTY 输入走这一条；term.onData 与 MobileKeyBar 共用。
   // 返回是否真正送出：重连窗口里 WS 未 OPEN 时为 false，调用方据此决定是否清空输入。
@@ -305,6 +314,12 @@ export default function TerminalView({ sessionId, active, theme }: Props) {
       ws.onmessage = (evt) => {
         try {
           const msg = JSON.parse(evt.data)
+          if (msg.type === 'notice') {
+            if (msg.kind === 'tmux_lost') setLost(true)
+            if (msg.kind === 'tmux_ended') { endedRef.current = true; setEnded(true) }
+            if (msg.kind === 'tmux_down') setHealth({ server: false, in_unit: false })
+            return
+          }
           if (msg.type === 'output') {
             termRef.current?.write(b64decode(msg.data), () => {
               if (scrollDebounceRef.current) clearTimeout(scrollDebounceRef.current)
@@ -328,7 +343,7 @@ export default function TerminalView({ sessionId, active, theme }: Props) {
         clearTimeout(stableTimer)
         // Auto-reconnect through idle-timeout proxy drops / transient closes so
         // the terminal never freezes silently. Exponential backoff, capped at 10s.
-        if (!disposed) {
+        if (!disposed && !endedRef.current) {
           const delay = Math.min(1000 * 2 ** attempt, 10000)
           attempt += 1
           retryTimer = setTimeout(connect, delay)
@@ -345,6 +360,17 @@ export default function TerminalView({ sessionId, active, theme }: Props) {
       if (stableTimer) clearTimeout(stableTimer)
       wsRef.current?.close()
     }
+  }, [sessionId, wsEpoch])
+
+  const handleRevive = useCallback(async () => {
+    try {
+      await reviveSession(sessionId)
+    } catch {
+      return // stay on the overlay; user can retry or close
+    }
+    endedRef.current = false
+    setEnded(false)
+    setWsEpoch(e => e + 1)
   }, [sessionId])
 
   const handleResize = useCallback(() => {
@@ -417,9 +443,11 @@ export default function TerminalView({ sessionId, active, theme }: Props) {
   }, [isTouch, active])
 
   return (
-    <div className="flex flex-col h-full">
-      <TmuxHealthBar health={health} />
+    <div className="relative flex flex-col h-full">
+      {tmuxName && <TmuxHealthBar health={health} />}
+      {lost && <LostBanner onClose={() => setLost(false)} />}
       <div ref={containerRef} className="xterm-container w-full flex-1 min-h-0" />
+      {ended && <EndedOverlay name={tmuxName ?? ''} onRevive={handleRevive} onClose={() => onClose?.()} />}
       {/* 触摸端：方向/启动键栏在上，常驻输入框贴底（最靠近软键盘）。 */}
       {isTouch && <MobileKeyBar onKey={handleBarKey} />}
       {isTouch && (

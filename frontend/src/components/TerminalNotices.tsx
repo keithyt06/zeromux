@@ -12,3 +12,24 @@ export function TmuxHealthBar({ health }: { health: TmuxHealth | null }) {
     </div>
   )
 }
+
+export function LostBanner({ onClose }: { onClose: () => void }) {
+  return (
+    <div role="status" className="flex items-center gap-2 px-3 py-1.5 text-xs bg-[var(--bg-tertiary)] text-[var(--text-secondary)] border-b border-[var(--border)]">
+      <span className="flex-1">tmux 会话已丢失（服务重启？），已在原目录新建，之前的输出不可恢复</span>
+      <button aria-label="关闭提示" onClick={onClose} className="px-1 text-[var(--text-muted)] hover:text-[var(--text-primary)]">✕</button>
+    </div>
+  )
+}
+
+export function EndedOverlay({ name, onRevive, onClose }: { name: string; onRevive: () => void; onClose: () => void }) {
+  return (
+    <div className="absolute inset-0 z-10 flex flex-col items-center justify-center gap-3 bg-[var(--bg-primary)]/90 text-sm text-[var(--text-primary)]">
+      <div>{name} 已在其他终端结束</div>
+      <div className="flex gap-2">
+        <button onClick={onRevive} className="px-3 py-1.5 rounded bg-[var(--accent-blue)] text-white">新建同名会话</button>
+        <button onClick={onClose} className="px-3 py-1.5 rounded border border-[var(--border)]">关闭</button>
+      </div>
+    </div>
+  )
+}

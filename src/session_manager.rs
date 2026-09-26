@@ -22,6 +22,7 @@ pub enum SessionMeta {
     Done,
     Blocked,
     Idle,
+    Ended,
 }
 
 impl Default for SessionMeta {
@@ -37,6 +38,7 @@ impl std::fmt::Display for SessionMeta {
             SessionMeta::Done => write!(f, "done"),
             SessionMeta::Blocked => write!(f, "blocked"),
             SessionMeta::Idle => write!(f, "idle"),
+            SessionMeta::Ended => write!(f, "ended"),
         }
     }
 }
@@ -915,23 +917,7 @@ impl SessionManager {
 
     /// Persist a session's metadata to the store (insert or update).
     fn persist_meta(&self, s: &Session) {
-        let pj = PersistedSession {
-            id: s.id.clone(),
-            name: s.name.clone(),
-            session_type: s.session_type,
-            work_dir: s.work_dir.clone(),
-            owner_id: s.owner_id.clone(),
-            description: s.description.clone(),
-            resume_token: s.resume_token.clone(),
-            worktree_path: s.worktree_path.as_ref().map(|p| p.to_string_lossy().to_string()),
-            created_ms: s.created_ms,
-            source_task_id: s.source_task_id.clone(),
-            name_is_auto: s.name_is_auto,
-            tmux_origin: s.tmux_origin.map(|o| o.as_str().to_string()),
-            cols: s.cols,
-            rows: s.rows,
-        };
-        if let Err(e) = self.store.upsert(&pj) {
+        if let Err(e) = self.store.upsert(&persisted_of(s)) {
             tracing::warn!("persist session {} failed: {}", s.id, e);
         }
     }
@@ -1021,6 +1007,16 @@ impl SessionManager {
             // Fan-out exiting: keep session metadata, clear running state so it
             // can be respawned from its resume_token (Task 5+).
             mark_fanout_ended(&mgr_weak, &sid_for_exit);
+            // The tmux client exited. If the tmux SESSION is gone too (killed from
+            // VSCode, or its last shell exited), this terminal is over — mark Ended
+            // so the next connect shows the overlay instead of recreating.
+            if let Some(m) = mgr_weak.upgrade() {
+                if let Some((name, _)) = m.tmux_binding(&sid_for_exit) {
+                    if let Ok(false) = m.tmux.has(&name).await {
+                        m.mark_ended(&sid_for_exit);
+                    }
+                }
+            }
         });
 
         Ok(RunningProcess {
@@ -1058,10 +1054,21 @@ impl SessionManager {
         };
         // Refuse rather than fall back to a bare shell: a bare shell silently
         // loses the "survives deploy / attach from VSCode" promise.
-        self.tmux.run(&["list-sessions"]).await.or_else(|e| match e {
-            crate::tmux::TmuxError::NotFound => Ok(String::new()), // server up, 0 sessions
-            e => Err(e.to_string()),
-        })?;
+        match tmux_target {
+            // Attach target must already exist: never let `new-session -A` create
+            // a stray session under a user-chosen name.
+            Some(t) => match self.tmux.has(t).await {
+                Ok(true) => {}
+                Ok(false) => return Err(crate::tmux::TmuxError::NotFound.to_string()),
+                Err(e) => return Err(e.to_string()),
+            },
+            None => {
+                self.tmux.run(&["list-sessions"]).await.or_else(|e| match e {
+                    crate::tmux::TmuxError::NotFound => Ok(String::new()), // server up, 0 sessions
+                    e => Err(e.to_string()),
+                })?;
+            }
+        }
         let running = self.spawn_tmux(&id, work_dir, cols, rows, Some(&tmux_name))?;
 
         let session = Session {
@@ -1758,7 +1765,9 @@ impl SessionManager {
                     SessionType::Claude => self.spawn_claude(id, &work_dir, &owner_id, None).await,
                     SessionType::Codex => self.spawn_codex(id, &work_dir, &owner_id, None).await,
                     SessionType::Crew => self.spawn_crew(id, &work_dir, &owner_id, None).await,
-                    SessionType::Tmux => self.spawn_tmux(id, &work_dir, cols, rows, None),
+                    // tmux: no bare-shell fallback — a bare shell silently loses
+                    // persistence. Preflight already decided Lost/Ended/ServerDown.
+                    SessionType::Tmux => Err(e.clone()),
                 };
                 match fresh {
                     Ok(rp) => {
@@ -2195,6 +2204,50 @@ impl SessionManager {
         if changed { let _ = self.store.update_size(id, cols, rows); }
     }
 
+    /// Decide how a connecting terminal client should proceed BEFORE ensure_running
+    /// spawns anything. Own+missing → Lost (ensure_running's `new-session -A`
+    /// recreates it under the same name); External+missing → Ended (never spawn:
+    /// someone else closed it).
+    pub async fn tmux_preflight(&self, id: &str) -> Preflight {
+        let (name, origin) = {
+            let map = self.sessions.lock().unwrap();
+            let Some(s) = map.get(id) else { return Preflight::Ready };
+            if matches!(s.status, SessionMeta::Ended) { return Preflight::Ended; }
+            if s.running.is_some() { return Preflight::Ready; }
+            match (&s.resume_token, s.tmux_origin) {
+                (Some(ResumeToken::Tmux(n)), Some(o)) => (n.clone(), o),
+                _ => return Preflight::Ready,
+            }
+        };
+        let decision = match self.tmux.has(&name).await {
+            Ok(exists) => decide_tmux_resume(origin, exists),
+            Err(_) => return Preflight::ServerDown,
+        };
+        if matches!(decision, Preflight::Ended) { self.mark_ended(id); }
+        decision
+    }
+
+    fn mark_ended(&self, id: &str) {
+        if let Some(s) = self.sessions.lock().unwrap().get_mut(id) {
+            s.status = SessionMeta::Ended;
+            s.running = None;
+        }
+    }
+
+    /// "新建同名会话": the tmux session is now zeromux's own.
+    pub fn revive(&self, id: &str) -> bool {
+        let snapshot = {
+            let mut map = self.sessions.lock().unwrap();
+            let Some(s) = map.get_mut(id) else { return false };
+            if !matches!(s.status, SessionMeta::Ended) { return false; }
+            s.status = SessionMeta::Idle;
+            s.tmux_origin = Some(TmuxOrigin::Own);
+            persisted_of(s)
+        };
+        if let Err(e) = self.store.upsert(&snapshot) { tracing::warn!("persist revive {} failed: {}", id, e); }
+        true
+    }
+
     pub fn tmux_binding(&self, id: &str) -> Option<(String, TmuxOrigin)> {
         let map = self.sessions.lock().unwrap();
         let s = map.get(id)?;
@@ -2338,6 +2391,37 @@ fn scheduled_session_type(agent_type: &str) -> SessionType {
     match agent_type {
         // 放行时在此加臂 —— 见上面的前置条件。当前刻意没有 "crew" / "codex" 臂。
         _ => SessionType::Claude,
+    }
+}
+
+/// Build the persisted row for a session (pure; callable under the sessions lock).
+fn persisted_of(s: &Session) -> PersistedSession {
+    PersistedSession {
+        id: s.id.clone(),
+        name: s.name.clone(),
+        session_type: s.session_type,
+        work_dir: s.work_dir.clone(),
+        owner_id: s.owner_id.clone(),
+        description: s.description.clone(),
+        resume_token: s.resume_token.clone(),
+        worktree_path: s.worktree_path.as_ref().map(|p| p.to_string_lossy().to_string()),
+        created_ms: s.created_ms,
+        source_task_id: s.source_task_id.clone(),
+        name_is_auto: s.name_is_auto,
+        tmux_origin: s.tmux_origin.map(|o| o.as_str().to_string()),
+        cols: s.cols,
+        rows: s.rows,
+    }
+}
+
+pub enum Preflight { Ready, Lost, Ended, ServerDown }
+
+/// Pure resume decision for a non-running tmux-backed terminal.
+pub fn decide_tmux_resume(origin: TmuxOrigin, exists: bool) -> Preflight {
+    match (exists, origin) {
+        (true, _) => Preflight::Ready,
+        (false, TmuxOrigin::Own) => Preflight::Lost,
+        (false, TmuxOrigin::External) => Preflight::Ended,
     }
 }
 
@@ -5903,6 +5987,76 @@ mod tmux_session_tests {
         let err = m.create_pty_session("t".into(), "bash", "/tmp", 80, 24, "u", None).await.unwrap_err();
         assert!(err.contains("tmux 服务未运行"), "{err}");
         assert!(m.list_sessions(None).is_empty());
+    }
+
+    #[test]
+    fn decide_resume_matrix() {
+        assert!(matches!(decide_tmux_resume(TmuxOrigin::Own, true), Preflight::Ready));
+        assert!(matches!(decide_tmux_resume(TmuxOrigin::External, true), Preflight::Ready));
+        assert!(matches!(decide_tmux_resume(TmuxOrigin::Own, false), Preflight::Lost));
+        assert!(matches!(decide_tmux_resume(TmuxOrigin::External, false), Preflight::Ended));
+    }
+
+    fn idle_tmux(m: &SessionManager, id: &str, name: &str, origin: TmuxOrigin) {
+        let mut s = test_session_for_size();
+        s.id = id.into();
+        s.resume_token = Some(ResumeToken::Tmux(name.into()));
+        s.tmux_origin = Some(origin);
+        m.sessions.lock().unwrap().insert(id.into(), s);
+    }
+
+    #[tokio::test]
+    async fn external_missing_marks_ended() {
+        let Some(srv) = TestServer::start() else { return };
+        let (m, _d) = mgr_with(srv.ctl.clone());
+        idle_tmux(&m, "e1", "gone-ext", TmuxOrigin::External);
+        assert!(matches!(m.tmux_preflight("e1").await, Preflight::Ended));
+        let st = m.list_sessions(None).into_iter().find(|s| s.id == "e1").unwrap().status;
+        assert!(matches!(st, SessionMeta::Ended));
+        // A second connect must not spawn anything either.
+        assert!(matches!(m.tmux_preflight("e1").await, Preflight::Ended));
+        assert!(m.revive("e1"));
+        assert_eq!(m.tmux_binding("e1").unwrap().1, TmuxOrigin::Own);
+        assert!(matches!(m.tmux_preflight("e1").await, Preflight::Lost), "revived → recreated as own");
+    }
+
+    #[tokio::test]
+    async fn own_missing_is_lost_and_server_down_reported() {
+        let Some(srv) = TestServer::start() else { return };
+        let (m, _d) = mgr_with(srv.ctl.clone());
+        idle_tmux(&m, "o1", "zmx-o1", TmuxOrigin::Own);
+        assert!(matches!(m.tmux_preflight("o1").await, Preflight::Lost));
+        let (m2, _d2) = mgr_with(crate::tmux::TmuxCtl::new(Some(format!("zmx-test-down2-{}", std::process::id()))));
+        idle_tmux(&m2, "o2", "zmx-o2", TmuxOrigin::Own);
+        assert!(matches!(m2.tmux_preflight("o2").await, Preflight::ServerDown));
+    }
+
+    #[tokio::test]
+    async fn killing_tmux_ends_the_session() {
+        let Some(srv) = TestServer::start() else { return };
+        let (m, _d) = mgr_with(srv.ctl.clone());
+        let id = m.create_pty_session("t".into(), "bash", "/tmp", 80, 24, "u", None).await.unwrap();
+        let (name, _) = m.tmux_binding(&id).unwrap();
+        for _ in 0..30 { if srv.ctl.has(&name).await.unwrap() { break; } tokio::time::sleep(std::time::Duration::from_millis(100)).await; }
+        srv.ctl.kill(&name).await.unwrap();      // e.g. killed from VSCode
+        let mut ended = false;
+        for _ in 0..50 {
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            if let Some(s) = m.list_sessions(None).into_iter().find(|s| s.id == id) {
+                if matches!(s.status, SessionMeta::Ended) { ended = true; break; }
+            }
+        }
+        assert!(ended, "fan-out exit + has=false must mark Ended");
+    }
+
+    #[tokio::test]
+    async fn attach_missing_target_errors_and_creates_nothing() {
+        let Some(srv) = TestServer::start() else { return };
+        let (m, _d) = mgr_with(srv.ctl.clone());
+        let err = m.create_pty_session("x".into(), "bash", "/tmp", 80, 24, "u", Some("no-such-sess")).await.unwrap_err();
+        assert!(err.contains("tmux 会话不存在"), "{err}");
+        assert!(m.list_sessions(None).is_empty());
+        assert!(!srv.ctl.has("no-such-sess").await.unwrap(), "must not create the target");
     }
 
     #[test]

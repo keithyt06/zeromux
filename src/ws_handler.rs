@@ -61,6 +61,18 @@ pub async fn ws_terminal(
 }
 
 async fn handle_ws(socket: WebSocket, session_id: String, state: Arc<AppState>) {
+    use crate::session_manager::Preflight;
+    let notice = |kind: &str| serde_json::json!({"type": "notice", "kind": kind}).to_string();
+    // Decide BEFORE ensure_running spawns anything: an Ended/unreachable tmux
+    // terminal must never be (re)created behind the user's back.
+    let pre = state.sessions.tmux_preflight(&session_id).await;
+    let mut socket = socket;
+    if matches!(pre, Preflight::Ended | Preflight::ServerDown) {
+        let kind = if matches!(pre, Preflight::Ended) { "tmux_ended" } else { "tmux_down" };
+        let _ = socket.send(Message::Text(notice(kind).into())).await;
+        let _ = socket.send(Message::Close(None)).await;
+        return;
+    }
     // Respawn the session if it's not running (e.g. after a server restart).
     if let Err(e) = state.sessions.ensure_running(&session_id).await {
         tracing::error!("ensure_running failed for {}: {}", session_id, e);
@@ -89,6 +101,9 @@ async fn handle_ws(socket: WebSocket, session_id: String, state: Arc<AppState>) 
 
     let (mut ws_sink, mut ws_stream) = socket.split();
     let logger = state.logger.clone();
+    if matches!(pre, Preflight::Lost) {
+        let _ = ws_sink.send(Message::Text(notice("tmux_lost").into())).await;
+    }
 
     // Replay scrollback history first (snapshot taken above, atomically with the
     // subscribe, so no frame is both replayed and delivered live).

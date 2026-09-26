@@ -413,7 +413,7 @@ export default function App() {
                 {/* Always keep terminal/chat mounted, hide with CSS when overlay is active */}
                 <div className={`h-full ${view !== 'none' ? 'hidden' : ''}`}>
                   {s.type === 'tmux' ? (
-                    <TerminalView sessionId={s.id} active={isActive && view === 'none'} theme={themeCtx.theme} />
+                    <TerminalView sessionId={s.id} active={isActive && view === 'none'} theme={themeCtx.theme} tmuxName={s.tmux_name} onClose={() => handleDelete(s.id)} />
                   ) : (
                     <AcpChatView sessionId={s.id} active={isActive && view === 'none'} agentType={s.type} onRegisterControls={registerControls} onQueueModeChange={handleQueueModeChange} showMetrics={!!metricsOpen[s.id]} onOpenMemory={s.type === 'crew' ? () => toggleOverlay(s.id, 'memory') : undefined} />
                   )}

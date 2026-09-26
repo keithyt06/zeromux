@@ -22,6 +22,7 @@ pub fn build_router(state: Arc<AppState>) -> Router {
         .route("/api/sessions", post(create_session))
         .route("/api/sessions/{id}", delete(delete_session))
         .route("/api/sessions/{id}", patch(update_session))
+        .route("/api/sessions/{id}/revive", post(revive_session))
         .route("/api/sessions/{id}/status", get(session_status))
         .route("/api/sessions/{id}/logs", get(session_logs))
         .route("/api/sessions/{id}/files", get(list_session_files))
@@ -933,6 +934,17 @@ async fn list_sessions(
     };
     let sessions = state.sessions.list_sessions(filter);
     Json(serde_json::json!({ "sessions": sessions }))
+}
+
+async fn revive_session(
+    State(state): State<Arc<AppState>>,
+    user: axum::Extension<CurrentUser>,
+    axum::extract::Path(id): axum::extract::Path<String>,
+) -> StatusCode {
+    if !user.is_admin() && !state.sessions.is_owner(&id, &user.id) {
+        return StatusCode::FORBIDDEN;
+    }
+    if state.sessions.revive(&id) { StatusCode::OK } else { StatusCode::CONFLICT }
 }
 
 async fn delete_session(

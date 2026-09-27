@@ -34,23 +34,23 @@ export default function WaitingPage({ user, onStatusChange, onLogout }: Props) {
         )}
 
         <div>
-          <h2 className="text-base font-bold text-[var(--text-primary)]">{user.login}</h2>
-          <p className="text-xs text-[var(--text-muted)] mt-1">Signed in via GitHub</p>
+          <h2 className="text-ui-base font-bold text-[var(--text-primary)]">{user.login}</h2>
+          <p className="text-ui-xs text-[var(--text-muted)] mt-1">Signed in via GitHub</p>
         </div>
 
         <div className="flex items-center justify-center gap-2 text-[var(--accent-yellow)]">
           <Clock size={16} className="animate-pulse" />
-          <span className="text-sm font-medium">Waiting for approval</span>
+          <span className="text-ui-sm font-medium">Waiting for approval</span>
         </div>
 
-        <p className="text-xs text-[var(--text-secondary)] leading-relaxed">
+        <p className="text-ui-xs text-[var(--text-secondary)] leading-relaxed">
           An administrator needs to approve your account before you can access ZeroMux.
           This page will automatically update once approved.
         </p>
 
         <button
           onClick={onLogout}
-          className="flex items-center justify-center gap-1.5 w-full py-2 text-sm text-[var(--text-secondary)] hover:text-[var(--accent-red)] transition-colors"
+          className="flex items-center justify-center gap-1.5 w-full py-2 text-ui-sm text-[var(--text-secondary)] hover:text-[var(--accent-red)] transition-colors"
         >
           <LogOut size={14} />
           Sign out

@@ -1,6 +1,6 @@
 import { useState, useEffect, useCallback, useRef } from 'react'
 import { X, ChevronLeft, Search, FileText, Folder } from 'lucide-react'
-import { listVault, getVaultFile, searchPaths, warmSearchIndex, resolveWikiLink } from '../lib/api'
+import { listVault, getVaultFile, warmSearchIndex, resolveWikiLink } from '../lib/api'
 import { filterVaultEntries, resolveVaultImageSrc } from '../lib/vault'
 import QuickTargets from './QuickTargets'
 import { notifyQuickTargetsChanged } from '../lib/quickTargetsBus'
@@ -8,7 +8,12 @@ import MarkdownContent from './markdown/MarkdownContent'
 import SearchResults from './SearchResults'
 import type { DirListEntry, SearchResult, NoteHit } from '../lib/api'
 import { docTitleFromPath } from '../lib/docTabs'
+import { usePathSearch } from '../lib/usePathSearch'
 import type { AskAgentTarget } from '../lib/askAgent'
+
+// With the inotify watcher live, re-query only while indexing (building the
+// index). Once built, zero results during a refresh are real misses.
+const vaultRequery = (r: SearchResult) => !!r.notes?.indexing
 
 export default function VaultReader({ onClose, onTitleChange, target, onAskAgent }: {
   onClose?: () => void
@@ -20,9 +25,7 @@ export default function VaultReader({ onClose, onTitleChange, target, onAskAgent
   const [cwd, setCwd] = useState('')
   const [entries, setEntries] = useState<DirListEntry[]>([])
   const [query, setQuery] = useState('')
-  const [search, setSearch] = useState<SearchResult | null>(null)
-  const [searchFailed, setSearchFailed] = useState(false)
-  const [retryTick, setRetryTick] = useState(0)
+  const { result: search, failed: searchFailed, retry: retrySearch } = usePathSearch(query, { scope: 'notes', limit: 50, debounceMs: 200, requeryWhile: vaultRequery })
   const [openPath, setOpenPath] = useState('')
   const [content, setContent] = useState('')
   const [truncated, setTruncated] = useState(false)
@@ -31,7 +34,6 @@ export default function VaultReader({ onClose, onTitleChange, target, onAskAgent
   // and FileBrowser.openFile (reviews 2026-08-03/06/07). A slow read of note A
   // resolving AFTER a fast read of note B (tapped second) must not overwrite B.
   const openReqRef = useRef(0)
-  const searchReqRef = useRef(0)
 
   // `ignore` invalidates a stale directory listing when cwd changes before the
   // in-flight listVault resolves (matches FileBrowser's listing effect).
@@ -42,26 +44,6 @@ export default function VaultReader({ onClose, onTitleChange, target, onAskAgent
       .catch(() => { if (!ignore) setEntries([]) })
     return () => { ignore = true }
   }, [cwd])
-
-  useEffect(() => {
-    let again: ReturnType<typeof setTimeout> | undefined
-    const run = () => {
-      const req = ++searchReqRef.current
-      if (!query.trim()) { setSearch(null); setSearchFailed(false); return }
-      searchPaths(query, 'notes', 50)
-        .then(r => {
-          if (searchReqRef.current !== req) return
-          setSearch(r); setSearchFailed(false)
-          // With the inotify watcher live, re-query only while indexing (building the index).
-          // Once built, zero results during a refresh are real misses.
-          const n = r.notes
-          if (n?.indexing) again = setTimeout(run, 4000)
-        })
-        .catch(() => { if (searchReqRef.current === req) { setSearch(null); setSearchFailed(true) } })
-    }
-    const t = setTimeout(run, 200)
-    return () => { clearTimeout(t); if (again) clearTimeout(again) }
-  }, [query, retryTick])
 
   useEffect(() => { warmSearchIndex('notes') }, [])
 
@@ -166,7 +148,7 @@ export default function VaultReader({ onClose, onTitleChange, target, onAskAgent
           ) : searchFailed ? (
             <div className="px-3 py-2 flex items-center justify-between gap-2 text-xs text-[var(--text-secondary)]">
               <span>搜索暂时不可用</span>
-              <button type="button" onClick={() => setRetryTick(t => t + 1)} className="px-2 py-1 min-h-[44px] rounded bg-[var(--bg-tertiary)]">重试</button>
+              <button type="button" onClick={retrySearch} className="px-2 py-1 min-h-[44px] rounded bg-[var(--bg-tertiary)]">重试</button>
             </div>
           ) : <div className="px-3 py-2 text-xs text-[var(--text-secondary)]">搜索中…</div>
         ) : (

@@ -1,7 +1,6 @@
-import { useState, useEffect, useCallback, useRef } from 'react'
+import { useEffect } from 'react'
 import { ChevronLeft, Home, Folder, FolderGit2 } from 'lucide-react'
-import type { DirEntry } from '../lib/api'
-import { listDirectories } from '../lib/api'
+import { useDirBrowser } from '../lib/useDirBrowser'
 import QuickTargets from './QuickTargets'
 
 /** Inline directory browser, mirroring the New Session "Select directory" flow.
@@ -13,41 +12,11 @@ export default function DirectoryPicker({ initialPath, onSelect, onCancel }: {
   onSelect: (path: string) => void
   onCancel: () => void
 }) {
-  const [currentPath, setCurrentPath] = useState('')
-  const [parentPath, setParentPath] = useState<string | null>(null)
-  const [homePath, setHomePath] = useState('')
-  const [dirs, setDirs] = useState<DirEntry[]>([])
-  const [loading, setLoading] = useState(false)
-  const [error, setError] = useState<string | null>(null)
+  // Blank currentPath disables "使用此目录" so a failed listing can't commit ''
+  // as work_dir; the out-of-order guard lives in useDirBrowser.
+  const { currentPath, parentPath, homePath, dirs, loading, error, load } = useDirBrowser()
 
-  // Guard against out-of-order listings: on the JuiceFS/S3-backed FS a listing can
-  // take seconds (listDirectories carries an 8s abort), and the nav buttons stay
-  // clickable while loading, so a second tap can start a newer fetch that resolves
-  // BEFORE the first. Without this token a stale response would overwrite the newer
-  // listing — and currentPath is what "使用此目录" commits as work_dir, so the
-  // session/scheduled task would run in the wrong directory. Drop superseded writes.
-  const dirReqRef = useRef(0)
-  const loadDirs = useCallback(async (path?: string) => {
-    const req = ++dirReqRef.current
-    setLoading(true)
-    setError(null)
-    try {
-      const data = await listDirectories(path)
-      if (dirReqRef.current !== req) return
-      setCurrentPath(data.current)
-      setParentPath(data.parent)
-      setHomePath(data.home)
-      setDirs(data.entries)
-    } catch (e) {
-      if (dirReqRef.current !== req) return
-      // Surface the failure instead of silently committing an empty path: a
-      // blank currentPath would otherwise let "使用此目录" return '' as work_dir.
-      setError(e instanceof Error ? e.message : '无法加载目录')
-    }
-    if (dirReqRef.current === req) setLoading(false)
-  }, [])
-
-  useEffect(() => { loadDirs(initialPath || undefined) }, [loadDirs, initialPath])
+  useEffect(() => { load(initialPath || undefined) }, [load, initialPath])
 
   return (
     <div className="border border-[var(--border)] rounded-lg overflow-hidden bg-[var(--bg-secondary)]">
@@ -67,7 +36,7 @@ export default function DirectoryPicker({ initialPath, onSelect, onCancel }: {
         {parentPath && (
           <button
             type="button"
-            onClick={() => loadDirs(homePath)}
+            onClick={() => load(homePath)}
             className="p-0.5 text-[var(--text-secondary)] hover:text-[var(--text-primary)] rounded transition-colors"
             title="主目录"
           >
@@ -97,7 +66,7 @@ export default function DirectoryPicker({ initialPath, onSelect, onCancel }: {
       {parentPath && (
         <button
           type="button"
-          onClick={() => loadDirs(parentPath)}
+          onClick={() => load(parentPath)}
           className="flex items-center gap-2 w-full px-3 py-1.5 text-xs text-[var(--text-secondary)] hover:bg-[var(--bg-hover)] transition-colors"
         >
           <ChevronLeft size={12} className="shrink-0" />
@@ -118,7 +87,7 @@ export default function DirectoryPicker({ initialPath, onSelect, onCancel }: {
             <button
               key={d.path}
               type="button"
-              onClick={() => loadDirs(d.path)}
+              onClick={() => load(d.path)}
               className="flex items-center gap-2 w-full px-3 py-1.5 text-xs text-[var(--text-primary)] hover:bg-[var(--bg-hover)] transition-colors"
             >
               {d.is_git ? (

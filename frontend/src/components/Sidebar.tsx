@@ -1,7 +1,7 @@
 import { useState, useEffect, useCallback, useRef } from 'react'
-import type { SessionInfo, SessionType, DirEntry, UserInfo, SearchResult, DirHit, NoteHit, HostTmux } from '../lib/api'
+import type { SessionInfo, SessionType, UserInfo, SearchResult, DirHit, NoteHit, HostTmux } from '../lib/api'
 import { isOrphan, matchHostTmux } from '../lib/hostTmux'
-import { listDirectories, getSchedulerHealth, getVaultMeta, searchPaths, warmSearchIndex } from '../lib/api'
+import { getSchedulerHealth, getVaultMeta, warmSearchIndex } from '../lib/api'
 import { shouldShowVault } from '../lib/vault'
 import type { Theme, ThemePref } from '../lib/theme'
 import { Terminal, Plus, X, PanelLeftClose, PanelLeft, Sun, Moon, Folder, FolderGit2, ChevronLeft, Home, LogOut, Users, Clock, Bell, BookOpen, Settings, Pencil, Search } from 'lucide-react'
@@ -12,6 +12,8 @@ import PromptManager from './PromptManager'
 import PushSettings from './PushSettings'
 import { usePromptPresets } from '../lib/usePromptPresets'
 import { usePolling } from '../lib/usePolling'
+import { useDirBrowser } from '../lib/useDirBrowser'
+import { usePathSearch } from '../lib/usePathSearch'
 import { applyPreset } from '../lib/applyPreset'
 import { isStuck } from '../lib/stuck'
 import { ClaudeCodeIcon, CrewIcon, CodexIcon } from './BrandIcons'
@@ -74,6 +76,17 @@ function TurnDot({ s }: { s: SessionInfo }) {
   return <span className={`w-2 h-2 rounded-full shrink-0 ${cls}`} title={stuck ? '可能卡住' : undefined} />
 }
 
+// Still building (indexing) or rebuilding with no hits → re-query in 4s so the
+// user never has to retype after a restart. Dirs: re-query on refreshing+empty
+// (scheduled rebuild). Notes: re-query only during indexing (initial build can
+// take 50s+). Once built, inotify keeps live, so zero results during refresh
+// are real misses. Module-level so usePathSearch gets a stable predicate.
+const sidebarRequery = (r: SearchResult) => {
+  const pending = (s: { indexing: boolean; refreshing: boolean; items: unknown[] } | null) =>
+    !!s && (s.indexing || (s.refreshing && s.items.length === 0))
+  return pending(r.dirs) || !!r.notes?.indexing
+}
+
 type NewSessionStep = 'closed' | 'quick' | 'pick-type' | 'pick-dir' | 'pick-prompt' | 'manage-prompts'
 
 /** Per-agent-type icon used in session list rows. Kept in one place so the
@@ -97,10 +110,6 @@ export default function Sidebar({ sessions, docTabs, activeId, onSelect, onCreat
   // Search on the New Session first screen. The query lives at Sidebar level so
   // going pick-type → back keeps it; openTypePicker clears it.
   const [query, setQuery] = useState('')
-  const [searchResult, setSearchResult] = useState<SearchResult | null>(null)
-  const [searchResultQuery, setSearchResultQuery] = useState('')   // query the shown result answers
-  const [searchFailed, setSearchFailed] = useState(false)
-  const searchReqRef = useRef(0)
   // Set when a search hit fixed the dir: after picking a type, create directly
   // instead of showing the prompt page (a middle page would undo "one tap").
   const [pendingSkipPrompt, setPendingSkipPrompt] = useState(false)
@@ -138,78 +147,15 @@ export default function Sidebar({ sessions, docTabs, activeId, onSelect, onCreat
   // Vault availability (gate the Obsidian sidebar entry on server config)
   useEffect(() => { getVaultMeta().then(m => setVaultEnabled(shouldShowVault(m))).catch(() => {}) }, [])
 
-  // Directory browser state
-  const [currentPath, setCurrentPath] = useState('')
-  const [parentPath, setParentPath] = useState<string | null>(null)
-  const [homePath, setHomePath] = useState('')
-  const [dirs, setDirs] = useState<DirEntry[]>([])
-  const [loading, setLoading] = useState(false)
-  // 加载失败（超时/网络/权限）时记下来，连同上次的 path，供「重试」按钮用。
-  // 没有它时 fetch 卡住会永远停在 Loading…（手机弱网下的实际表现）。
-  const [dirError, setDirError] = useState<string | null>(null)
-  const lastDirPath = useRef<string | undefined>(undefined)
-  // Monotonic request token: a slow listing (JuiceFS/S3, 8s abort) leaves the nav
-  // buttons clickable, so a second tap can start a newer fetch that resolves before
-  // the first. Without this, a stale response overwrites the newer listing — and
-  // currentPath is committed as the new session's work_dir, so the agent would run
-  // in the wrong directory. Drop superseded writes. (lastDirPath only feeds retry.)
-  const dirReqRef = useRef(0)
+  // Directory browser state. Failures (timeout/network/permission) surface as
+  // dir.error with a 「重试」 button instead of hanging on Loading….
+  const dir = useDirBrowser()
 
   const ThemeIcon = theme === 'dark' ? Sun : Moon
 
-  const loadDirs = useCallback(async (path?: string) => {
-    const req = ++dirReqRef.current
-    lastDirPath.current = path
-    setLoading(true)
-    setDirError(null)
-    try {
-      const data = await listDirectories(path)
-      if (dirReqRef.current !== req) return
-      setCurrentPath(data.current)
-      setParentPath(data.parent)
-      setHomePath(data.home)
-      setDirs(data.entries)
-    } catch (e) {
-      if (dirReqRef.current !== req) return
-      // 超时（AbortError）或网络/权限错误：显式报错 + 让用户重试，
-      // 而不是静默停在 Loading…。
-      const msg = e instanceof DOMException && e.name === 'AbortError'
-        ? '加载超时，请重试'
-        : (e instanceof Error ? e.message : '加载失败')
-      setDirError(msg)
-    }
-    if (dirReqRef.current === req) setLoading(false)
-  }, [])
-
-  const runSearch = useCallback((query: string) => {
-    // Inner named function so the indexing re-query can recurse without the
-    // callback referencing itself (react-hooks/immutability).
-    const run = (q: string) => {
-      const req = ++searchReqRef.current
-      if (!q.trim()) { setSearchResult(null); setSearchFailed(false); return }
-      searchPaths(q, vaultEnabled ? 'dirs,notes' : 'dirs')
-        .then(r => {
-          if (searchReqRef.current !== req) return
-          setSearchResult(r); setSearchResultQuery(q); setSearchFailed(false)
-          // Still building (indexing) or rebuilding with no hits → re-query in 4s so
-          // the user never has to retype after a restart. Superseded by any newer query.
-          // Dirs: re-query on refreshing+empty (scheduled rebuild). Notes: re-query only
-          // during indexing (initial build can take 50s+). Once built, inotify keeps live,
-          // so zero results during refresh are real misses.
-          const pending = (s: { indexing: boolean; refreshing: boolean; items: unknown[] } | null) =>
-            !!s && (s.indexing || (s.refreshing && s.items.length === 0))
-          if (pending(r.dirs) || !!r.notes?.indexing) setTimeout(() => { if (searchReqRef.current === req) run(q) }, 4000)
-        })
-        .catch(() => { if (searchReqRef.current === req) { setSearchResult(null); setSearchFailed(true) } })
-    }
-    run(query)
-  }, [vaultEnabled])
-
-  useEffect(() => {
-    if (step !== 'quick') return
-    const t = setTimeout(() => runSearch(query), 150)
-    return () => clearTimeout(t)
-  }, [query, step, runSearch])
+  const search = usePathSearch(query, {
+    scope: vaultEnabled ? 'dirs,notes' : 'dirs', debounceMs: 150, enabled: step === 'quick', requeryWhile: sidebarRequery,
+  })
 
   const openTypePicker = () => {
     setStep('quick')
@@ -217,9 +163,8 @@ export default function Sidebar({ sessions, docTabs, activeId, onSelect, onCreat
     setPendingDir(null)   // start clean on every open so a leftover dir can't leak in
     setPendingSkipPrompt(false)
     setPendingAgentContext(null)
-    setQuery('')
-    setSearchResult(null)
-    setCurrentPath('')    // a stale browse path must not hijack pick-prompt's Back
+    setQuery('')          // also clears the search result (empty query → null)
+    dir.reset()           // a stale browse path must not hijack pick-prompt's Back
     setCreateError(null)  // a failed earlier attempt must not bleed into the next one
     warmSearchIndex('dirs,notes')
   }
@@ -231,7 +176,7 @@ export default function Sidebar({ sessions, docTabs, activeId, onSelect, onCreat
       // otherwise pick a dir. (Attaching existing tmux lives in the session list.)
       if (pendingDir) { runCreate(() => onCreate('tmux', pendingDir)); return }
       setStep('pick-dir')
-      loadDirs()
+      dir.load()
     } else if (pendingDir && pendingSkipPrompt) {
       runCreate(() => onCreate(type, pendingDir))
     } else if (pendingDir) {
@@ -242,7 +187,7 @@ export default function Sidebar({ sessions, docTabs, activeId, onSelect, onCreat
       setStep('pick-prompt')
     } else {
       setStep('pick-dir')
-      loadDirs()
+      dir.load()
     }
   }
 
@@ -331,7 +276,6 @@ export default function Sidebar({ sessions, docTabs, activeId, onSelect, onCreat
     // Consuming an external one-shot request is exactly an effect's job.
     setPendingType(null)
     setQuery('')            // never show the previous open's query/results
-    setSearchResult(null)
     askAgent(askAgentRequest)
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [askAgentRequest])
@@ -644,11 +588,11 @@ export default function Sidebar({ sessions, docTabs, activeId, onSelect, onCreat
                           <span className="ml-auto text-[10px] text-[var(--text-muted)] truncate">{h.path}</span>
                         </button>
                       ))}
-                      {searchResult || searchFailed ? (
+                      {search.result || search.failed ? (
                         <SearchResults
-                          result={searchResult ?? { dirs: null, notes: null }}
-                          failed={searchFailed}
-                          onRetry={() => runSearch(query)}
+                          result={search.result ?? { dirs: null, notes: null }}
+                          failed={search.failed}
+                          onRetry={search.retry}
                           showNotes={vaultEnabled}
                           onPickDir={pickDirHit}
                           onDirMenu={{
@@ -715,10 +659,10 @@ export default function Sidebar({ sessions, docTabs, activeId, onSelect, onCreat
                       onKeyDown={e => {
                         // Ignore Enter while an IME is composing (pinyin), and when the
                         // shown results belong to an older query (debounce not yet fired).
-                        if (e.key !== 'Enter' || e.nativeEvent.isComposing || !searchResult || searchResultQuery !== query) return
+                        if (e.key !== 'Enter' || e.nativeEvent.isComposing || !search.result || search.resultQuery !== query) return
                         e.preventDefault()
-                        const first = [...(searchResult.dirs?.items ?? []).map(h => ({ t: 'd' as const, h, s: h.score })),
-                          ...(vaultEnabled ? searchResult.notes?.items ?? [] : []).map(h => ({ t: 'n' as const, h, s: h.score }))]
+                        const first = [...(search.result.dirs?.items ?? []).map(h => ({ t: 'd' as const, h, s: h.score })),
+                          ...(vaultEnabled ? search.result.notes?.items ?? [] : []).map(h => ({ t: 'n' as const, h, s: h.score }))]
                           .sort((a, b) => b.s - a.s)[0]
                         if (!first) return
                         if (first.t === 'd') pickDirHit(first.h as DirHit); else pickNoteHit(first.h as NoteHit)
@@ -739,7 +683,7 @@ export default function Sidebar({ sessions, docTabs, activeId, onSelect, onCreat
                       needs a way back — matching pick-dir. */}
                   <div className="flex items-center gap-1 px-2 py-1.5 border-b border-[var(--border)]">
                     <button
-                      onClick={() => { setPendingDir(null); setPendingSkipPrompt(false); setPendingAgentContext(null); setCurrentPath(''); setStep('quick') }}
+                      onClick={() => { setPendingDir(null); setPendingSkipPrompt(false); setPendingAgentContext(null); dir.reset(); setStep('quick') }}
                       className="p-0.5 text-[var(--text-secondary)] hover:text-[var(--text-primary)] rounded transition-colors"
                       title="返回"
                     >
@@ -831,9 +775,9 @@ export default function Sidebar({ sessions, docTabs, activeId, onSelect, onCreat
                     <span className="text-[10px] font-semibold text-[var(--text-muted)] uppercase tracking-wider truncate flex-1">
                       Select directory
                     </span>
-                    {parentPath && (
+                    {dir.parentPath && (
                       <button
-                        onClick={() => loadDirs(homePath)}
+                        onClick={() => dir.load(dir.homePath)}
                         className="p-0.5 text-[var(--text-secondary)] hover:text-[var(--text-primary)] rounded transition-colors"
                         title="Home"
                       >
@@ -844,12 +788,12 @@ export default function Sidebar({ sessions, docTabs, activeId, onSelect, onCreat
 
                   {/* Current path display + use-this button */}
                   <div className="px-3 py-1.5 border-b border-[var(--border)]">
-                    <div className="text-[10px] text-[var(--text-muted)] truncate mb-1" title={currentPath}>
-                      {currentPath.replace(homePath, '~')}
+                    <div className="text-[10px] text-[var(--text-muted)] truncate mb-1" title={dir.currentPath}>
+                      {dir.currentPath.replace(dir.homePath, '~')}
                     </div>
                     <button
-                      onClick={() => selectDir(currentPath)}
-                      disabled={!currentPath || creating}
+                      onClick={() => selectDir(dir.currentPath)}
+                      disabled={!dir.currentPath || creating}
                       className="w-full py-1 text-[10px] font-semibold bg-[var(--accent-blue)] hover:bg-[var(--accent-blue-hover)] text-white rounded transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
                     >
                       Use this directory
@@ -857,9 +801,9 @@ export default function Sidebar({ sessions, docTabs, activeId, onSelect, onCreat
                   </div>
 
                   {/* Navigation: parent */}
-                  {parentPath && (
+                  {dir.parentPath && (
                     <button
-                      onClick={() => loadDirs(parentPath)}
+                      onClick={() => dir.load(dir.parentPath ?? undefined)}
                       className="flex items-center gap-2 w-full px-3 py-1.5 text-xs text-[var(--text-secondary)] hover:bg-[var(--bg-hover)] transition-colors"
                     >
                       <ChevronLeft size={12} className="shrink-0" />
@@ -869,25 +813,25 @@ export default function Sidebar({ sessions, docTabs, activeId, onSelect, onCreat
 
                   {/* Directory list */}
                   <div className="max-h-48 overflow-y-auto">
-                    {loading ? (
+                    {dir.loading ? (
                       <div className="px-3 py-2 text-[10px] text-[var(--text-muted)]">Loading...</div>
-                    ) : dirError ? (
+                    ) : dir.error ? (
                       <div className="px-3 py-2 flex items-center justify-between gap-2">
-                        <span className="text-[10px] text-[var(--accent-red)] truncate">{dirError}</span>
+                        <span className="text-[10px] text-[var(--accent-red)] truncate">{dir.error}</span>
                         <button
-                          onClick={() => loadDirs(lastDirPath.current)}
+                          onClick={dir.retry}
                           className="shrink-0 px-2 py-0.5 text-[10px] font-semibold bg-[var(--bg-hover)] hover:bg-[var(--border)] text-[var(--text-primary)] rounded transition-colors"
                         >
                           重试
                         </button>
                       </div>
-                    ) : dirs.length === 0 ? (
+                    ) : dir.dirs.length === 0 ? (
                       <div className="px-3 py-2 text-[10px] text-[var(--text-muted)]">No subdirectories</div>
                     ) : (
-                      dirs.map(d => (
+                      dir.dirs.map(d => (
                         <button
                           key={d.path}
-                          onClick={() => loadDirs(d.path)}
+                          onClick={() => dir.load(d.path)}
                           className="flex items-center gap-2 w-full px-3 py-1.5 text-xs text-[var(--text-primary)] hover:bg-[var(--bg-hover)] transition-colors"
                         >
                           {d.is_git ? (
@@ -907,7 +851,7 @@ export default function Sidebar({ sessions, docTabs, activeId, onSelect, onCreat
                 <>
                   <div className="flex items-center gap-1 px-2 py-1.5 border-b border-[var(--border)]">
                     <button
-                      onClick={() => setStep(currentPath && !pendingAgentContext && !pendingSkipPrompt ? 'pick-dir' : 'pick-type')}
+                      onClick={() => setStep(dir.currentPath && !pendingAgentContext && !pendingSkipPrompt ? 'pick-dir' : 'pick-type')}
                       className="p-0.5 text-[var(--text-secondary)] hover:text-[var(--text-primary)] rounded transition-colors"
                       title="Back"
                     >

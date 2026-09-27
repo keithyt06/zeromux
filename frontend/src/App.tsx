@@ -6,6 +6,7 @@ import { closeConfirmMessage } from './lib/closeSession'
 import { notifyQuickTargetsChanged } from './lib/quickTargetsBus'
 import { resyncPush, shouldResyncNow } from './lib/push'
 import { useTheme } from './lib/theme'
+import { useIsNarrow } from './lib/useMediaQuery'
 import Sidebar from './components/Sidebar'
 import TerminalView from './components/TerminalView'
 import AcpChatView from './components/AcpChatView'
@@ -69,7 +70,7 @@ export default function App() {
     setQueueModes(prev => (prev[sid] === mode ? prev : { ...prev, [sid]: mode }))
   }, [])
   const themeCtx = useTheme()
-  const isMobile = useMemo(() => window.innerWidth < 768, [])
+  const isMobile = useIsNarrow()
   const [sidebarOpen, setSidebarOpen] = useState(!isMobile)
   const [confirmCount, setConfirmCount] = useState(0)
   // One-shot request from the sidebar's ⋯ menu (查看历史) → the active

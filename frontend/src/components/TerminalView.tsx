@@ -12,6 +12,7 @@ import { readTerminalTheme } from '../lib/terminalTheme'
 import { b64encode, b64decode } from '../lib/base64'
 import { GitBranch, Folder, Circle, ArrowUpToLine, ArrowDownToLine } from 'lucide-react'
 import { attachCommand, copyText } from '../lib/attachCommand'
+import { useIsTouch } from '../lib/useMediaQuery'
 import MobileKeyBar, { type BarKey } from './MobileKeyBar'
 import Composer from './Composer'
 import ConnectionBar from './ConnectionBar'
@@ -83,12 +84,7 @@ export default function TerminalView({ sessionId, active, theme, tmuxName, tmuxO
   // eslint-disable-next-line react-hooks/set-state-in-effect
   useEffect(() => { if (historyRequest) setHistoryOpen(true) }, [historyRequest])
   // 触摸设备检测：any-pointer:coarse 或 maxTouchPoints>0，少漏触屏笔记本/iPad。
-  // 触摸能力在页面生命周期内不变，用惰性初始化在挂载时算一次即可（避免 effect 内 setState）。
-  const [isTouch] = useState(
-    () =>
-      (typeof matchMedia !== 'undefined' && matchMedia('(any-pointer: coarse)').matches) ||
-      (typeof navigator !== 'undefined' && navigator.maxTouchPoints > 0)
-  )
+  const isTouch = useIsTouch()
   // Phone held sideways: history opens as a right half-pane beside the live terminal.
   const [landscape, setLandscape] = useState(() => typeof matchMedia !== 'undefined' && matchMedia(LANDSCAPE_MQ).matches)
   useEffect(() => {

@@ -1,4 +1,5 @@
-// First-screen budget gate: entry JS + CSS referenced by dist/index.html,
+// First-screen budget gate: entry JS, modulepreloaded JS and CSS referenced by
+// dist/index.html,
 // measured as their precompressed .br size (what browsers actually download).
 import { readFileSync, statSync, existsSync } from 'node:fs'
 import { join } from 'node:path'
@@ -8,6 +9,8 @@ export function entryAssets(indexHtml) {
   const out = []
   for (const m of indexHtml.matchAll(/<script[^>]+src="\/(assets\/[^"]+\.js)"/g)) out.push(m[1])
   for (const m of indexHtml.matchAll(/<link[^>]+rel="stylesheet"[^>]+href="\/(assets\/[^"]+\.css)"/g)) out.push(m[1])
+  // modulepreload = fetched eagerly on first paint, so it counts against the budget.
+  for (const m of indexHtml.matchAll(/<link[^>]+rel="modulepreload"[^>]+href="\/(assets\/[^"]+\.js)"/g)) out.push(m[1])
   return out
 }
 

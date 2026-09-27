@@ -8,15 +8,10 @@ export default defineConfig({
     outDir: 'dist',
     emptyOutDir: true,
     chunkSizeWarningLimit: 800,
-    rollupOptions: {
-      output: {
-        manualChunks(id) {
-          if (id.includes('/node_modules/mermaid/') || id.includes('/node_modules/mermaid-')) {
-            return 'mermaid'
-          }
-        },
-      },
-    },
+    // No manualChunks: a 'mermaid' group (rolldown) also captured vite's shared
+    // preload helper, so the entry statically imported + modulepreloaded the
+    // whole mermaid chunk (~534KB br). MermaidBlock's dynamic import('mermaid')
+    // splits it naturally.
   },
   server: {
     proxy: {

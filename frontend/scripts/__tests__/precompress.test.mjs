@@ -40,6 +40,12 @@ describe('check-size', () => {
     const html = '<script type="module" crossorigin src="/assets/index-Ab.js"></script><link rel="stylesheet" crossorigin href="/assets/index-Cd.css">'
     expect(entryAssets(html)).toEqual(['assets/index-Ab.js', 'assets/index-Cd.css'])
   })
+  it('counts <link rel="modulepreload"> targets as first-screen (the browser fetches them eagerly)', () => {
+    const html = '<script type="module" crossorigin src="/assets/index-Ab.js"></script>'
+      + '<link rel="modulepreload" crossorigin href="/assets/mermaid-Zz.js">'
+      + '<link rel="stylesheet" crossorigin href="/assets/index-Cd.css">'
+    expect(entryAssets(html).sort()).toEqual(['assets/index-Ab.js', 'assets/index-Cd.css', 'assets/mermaid-Zz.js'])
+  })
   it('sums .br sizes against the limit', async () => {
     const d = mkdtempSync(join(tmpdir(), 'cs-'))
     const { mkdirSync } = await import('node:fs')

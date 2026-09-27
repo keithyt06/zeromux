@@ -204,7 +204,7 @@ happy-dom 15 有 `<dialog>.showModal` 但**无 Popover API**;`text-[8-11px]` 现
 
 **阴影 / 层次**:暗色靠明度 + 1px 边框分层,**仅浮层**用 `--shadow-overlay: 0 8px 24px rgb(0 0 0 / .45)`;亮色 `--shadow-overlay: 0 8px 24px rgb(31 35 40 / .12)` + `--shadow-card: 0 1px 2px rgb(31 35 40 / .06)`。
 
-**层级**:`--z-sticky 10`、`--z-drawer 30`、`--z-popover 40`、`--z-modal 50`、`--z-toast 60`;工具类 `.z-sticky` 等(Tailwind v4 写法 `z-(--z-modal)` 在 plan 首个 task 验证,不可用则用自定义类)。原生 `<dialog>` 在 top-layer,不参与 z 表。
+**层级**:`--z-sticky 10`、`--z-drawer 30`、`--z-modal 50`、`--z-popover 55`(高于遗留手写 `z-50` 遮罩)、`--z-toast 60`;工具类 `.z-sticky` 等(Tailwind v4 写法 `z-(--z-modal)` 在 plan 首个 task 验证,不可用则用自定义类)。原生 `<dialog>` 在 top-layer,不参与 z 表。
 
 **动效**:`--ease-out: cubic-bezier(.2,.8,.2,1)`、`--dur-fast 120ms`(hover/press)、`--dur-base 200ms`(面板/Sheet 进入)、退出 150ms ease-in;`prefers-reduced-motion: reduce` 时时长归零、呼吸停止。
 

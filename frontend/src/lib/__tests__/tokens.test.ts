@@ -40,4 +40,14 @@ describe('design tokens v2', () => {
     expect(t.dark['--ansi-0']).toBe('#484f58')
     expect(t.light['--ansi-15']).toBe('#8c959f')
   })
+  it('z-layers: popover sits above legacy z-50 overlays, below toasts', () => {
+    const z = (n: string) => Number(css.match(new RegExp(`--z-${n}:\\s*(\\d+)`))?.[1])
+    expect(z('sticky')).toBeLessThan(z('drawer'))
+    expect(z('drawer')).toBeLessThan(z('modal'))
+    // Hand-rolled `fixed inset-0 z-50` overlays (FileBrowser root picker) host
+    // Menus that portal to #overlay-root — the popover must clear them.
+    expect(z('popover')).toBeGreaterThan(50)
+    expect(z('popover')).toBeGreaterThan(z('modal'))
+    expect(z('popover')).toBeLessThan(z('toast'))
+  })
 })

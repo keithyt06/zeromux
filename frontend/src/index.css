@@ -90,8 +90,8 @@
   --r-sheet: 16px;
   --z-sticky: 10;
   --z-drawer: 30;
-  --z-popover: 40;
   --z-modal: 50;
+  --z-popover: 55; /* above legacy hand-rolled `z-50` overlays that host Menus */
   --z-toast: 60;
   --ease-out: cubic-bezier(0.2, 0.8, 0.2, 1);
   --dur-fast: 120ms;

@@ -1,9 +1,10 @@
-import { useState, useEffect, useCallback, useRef } from 'react'
+import { useState, useEffect, useCallback } from 'react'
 import { MoreVertical, X, FileText, Folder, Terminal, Repeat, MessageSquarePlus } from 'lucide-react'
 import type { SessionType, QuickTarget } from '../lib/api'
 import { listQuickTargets, forgetQuickTarget } from '../lib/api'
 import { coerceAgent } from '../lib/quickTargets'
 import { subscribeQuickTargets } from '../lib/quickTargetsBus'
+import { useLatestRequest } from '../lib/useLatestRequest'
 import { ClaudeCodeIcon, CrewIcon, CodexIcon } from './BrandIcons'
 
 /** 行首图标 = 这一行会开出什么。比行尾一个小写标签的信息量更高，且省下约 44px 宽度
@@ -36,22 +37,22 @@ export default function QuickTargets({ kind, onPick, onChangeAgent, onPickWithPr
   // 「乐观 mutation」（forget 先改本地 state 再 refetch）两个条件，正是本 repo 修过
   // 12 次的 stale-response clobber 场景：一个乐观写之前发出的旧 GET 迟到，会把刚
   // 移除的条目复活成 ghost。fetch 顶部 bump，每个乐观写前也 bump，await 后守卫。
-  const reqRef = useRef(0)
+  const req = useLatestRequest()
 
   const load = useCallback(async () => {
-    const req = ++reqRef.current
+    const r = req.begin()
     try {
       const data = await listQuickTargets(kind)
-      if (reqRef.current !== req) return
+      if (!req.isCurrent(r)) return
       setItems(data?.top ?? [])
     } catch {
-      if (reqRef.current !== req) return
+      if (!req.isCurrent(r)) return
       // 快速入口是加速器：失败就安静地不显示，让用户回落到目录浏览，而不是弹错误
       // 挡住新建会话。
       setItems([])
     }
-    if (reqRef.current === req) setLoaded(true)
-  }, [kind])
+    if (req.isCurrent(r)) setLoaded(true)
+  }, [kind, req])
 
   useEffect(() => { load() }, [load])
   // 事件驱动刷新：没有它，列表就是挂载时的静态快照（VaultReader 常驻挂载，会一直
@@ -59,12 +60,12 @@ export default function QuickTargets({ kind, onPick, onChangeAgent, onPickWithPr
   useEffect(() => subscribeQuickTargets(load), [load])
 
   const forget = useCallback(async (it: QuickTarget) => {
-    reqRef.current++      // 使任何在途 GET 失效，否则旧快照会让这条复活成 ghost
+    req.bump()      // 使任何在途 GET 失效，否则旧快照会让这条复活成 ghost
     setItems(prev => prev.filter(x => !(x.path === it.path && x.agent === it.agent)))
     setOpenMenu(null)
     try { await forgetQuickTarget(kind, it.path, it.agent) } catch { /* 下次 load 会纠正 */ }
     load()
-  }, [kind, load])
+  }, [kind, load, req])
 
   const pick = (it: QuickTarget) => {
     if (it.kind === 'note') { onPick(it.path, null); return }

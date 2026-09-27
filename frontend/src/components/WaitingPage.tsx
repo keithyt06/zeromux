@@ -1,6 +1,8 @@
-import { useEffect } from 'react'
+import { useCallback } from 'react'
 import { Clock, LogOut } from 'lucide-react'
 import type { UserInfo } from '../lib/api'
+import { request } from '../lib/http'
+import { usePolling } from '../lib/usePolling'
 
 interface Props {
   user: UserInfo
@@ -9,21 +11,16 @@ interface Props {
 }
 
 export default function WaitingPage({ user, onStatusChange, onLogout }: Props) {
-  // Poll /api/me every 5 seconds to detect approval
-  useEffect(() => {
-    const interval = setInterval(async () => {
-      try {
-        const res = await fetch('/api/me', { credentials: 'same-origin' })
-        if (res.ok) {
-          const data = await res.json()
-          if (data.status === 'active') {
-            onStatusChange()
-          }
-        }
-      } catch { /* ignore */ }
-    }, 5000)
-    return () => clearInterval(interval)
+  // Poll /api/me every 5 seconds to detect approval (paused while the tab is hidden)
+  const checkApproval = useCallback(async () => {
+    try {
+      const data = await request<UserInfo>('/api/me')
+      if (data.status === 'active') {
+        onStatusChange()
+      }
+    } catch { /* ignore */ }
   }, [onStatusChange])
+  usePolling(checkApproval, 5000)
 
   return (
     <div className="h-full bg-[var(--bg-primary)] flex items-center justify-center">

@@ -1,8 +1,9 @@
-import { useState, useCallback, useRef } from 'react'
+import { useState, useCallback } from 'react'
 import {
   type PromptPreset,
   listPrompts, createPrompt, updatePrompt, deletePrompt,
 } from './api'
+import { useLatestRequest } from './useLatestRequest'
 
 /**
  * Shared data/CRUD/error state for prompt presets. Both the Sidebar pick-prompt
@@ -27,24 +28,24 @@ export function usePromptPresets() {
   // authoritative (latest-started) reload's result. Same class as SessionInfoBar notes
   // (review 2026-08-15) and AgentDashboard events (2026-08-11). No optimistic-write bump
   // is needed here — this hook has no optimistic setState, only re-list-after-mutation.
-  const reqRef = useRef(0)
+  const req = useLatestRequest()
 
   const reload = useCallback(async () => {
-    const myReq = ++reqRef.current
+    const myReq = req.begin()
     setLoading(true)
     setError(null)
     try {
       const data = await listPrompts()
-      if (myReq !== reqRef.current) return // superseded by a newer reload — drop this stale list
+      if (!req.isCurrent(myReq)) return // superseded by a newer reload — drop this stale list
       setPresets(data)
     } catch (e) {
-      if (myReq !== reqRef.current) return
+      if (!req.isCurrent(myReq)) return
       setError(e instanceof Error ? e.message : 'Failed to load presets')
       setPresets([])
     }
-    if (myReq !== reqRef.current) return
+    if (!req.isCurrent(myReq)) return
     setLoading(false)
-  }, [])
+  }, [req])
 
   // add/edit return whether the write succeeded, so callers (PromptManager) can
   // keep the edit form open on failure instead of discarding the user's draft.

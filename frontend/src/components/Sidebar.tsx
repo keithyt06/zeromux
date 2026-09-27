@@ -11,6 +11,7 @@ import ScheduledTasksPanel from './ScheduledTasksPanel'
 import PromptManager from './PromptManager'
 import PushSettings from './PushSettings'
 import { usePromptPresets } from '../lib/usePromptPresets'
+import { usePolling } from '../lib/usePolling'
 import { applyPreset } from '../lib/applyPreset'
 import { isStuck } from '../lib/stuck'
 import { ClaudeCodeIcon, CrewIcon, CodexIcon } from './BrandIcons'
@@ -129,18 +130,10 @@ export default function Sidebar({ sessions, docTabs, activeId, onSelect, onCreat
   const isAdmin = user?.role === 'admin'
 
   // Poll scheduler health (once on mount, then every 60s)
-  useEffect(() => {
-    let cancelled = false
-    const check = async () => {
-      try {
-        const h = await getSchedulerHealth()
-        if (!cancelled) setSchedulerHealthy(h.healthy)
-      } catch { /* ignore */ }
-    }
-    check()
-    const id = setInterval(check, 60_000)
-    return () => { cancelled = true; clearInterval(id) }
+  const pollSchedulerHealth = useCallback(async () => {
+    try { setSchedulerHealthy((await getSchedulerHealth()).healthy) } catch { /* ignore */ }
   }, [])
+  usePolling(pollSchedulerHealth, 60_000)
 
   // Vault availability (gate the Obsidian sidebar entry on server config)
   useEffect(() => { getVaultMeta().then(m => setVaultEnabled(shouldShowVault(m))).catch(() => {}) }, [])

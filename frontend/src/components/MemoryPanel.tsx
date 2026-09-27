@@ -1,8 +1,9 @@
-import { useState, useEffect, useCallback, useRef } from 'react'
+import { useState, useEffect, useCallback } from 'react'
 import { Brain, X, RefreshCw, AlertCircle } from 'lucide-react'
 import type { CrewMemory } from '../lib/api'
 import { getCrewMemory, putCrewSemantic, deleteCrewSemantic, putCrewMemoryDoc } from '../lib/api'
 import { normalizeMemoryKey, parseSemanticValue, mdLines, dropMdLine } from '../lib/crewMemory'
+import { useLatestRequest } from '../lib/useLatestRequest'
 
 /** 第 5 个 overlay view。记忆在 Crew 侧是全局的（一份 Gateway 一份记忆），所以
  *  本组件不接 sessionId —— 从任意 Crew 会话打开看到的是同一份数据。 */
@@ -20,22 +21,22 @@ export default function MemoryPanel() {
   // token）与「乐观 mutation」（写入/删除先改本地 state 再 refetch）两个条件，正是
   // 本 repo 修过十余次的 stale-response clobber 场景。fetch 顶部 bump，每个乐观写
   // 前也 bump，await 后守卫。
-  const reqRef = useRef(0)
+  const req = useLatestRequest()
 
   const load = useCallback(async () => {
-    const req = ++reqRef.current
+    const r = req.begin()
     setLoading(true)
     try {
       const data = await getCrewMemory()
-      if (reqRef.current !== req) return
+      if (!req.isCurrent(r)) return
       setMem(data)
       setErr(null)
     } catch (e) {
-      if (reqRef.current !== req) return
+      if (!req.isCurrent(r)) return
       setErr(e instanceof Error ? e.message : String(e))
     }
-    if (reqRef.current === req) setLoading(false)
-  }, [])
+    if (req.isCurrent(r)) setLoading(false)
+  }, [req])
 
   useEffect(() => { load() }, [load])
 
@@ -47,7 +48,7 @@ export default function MemoryPanel() {
     try {
       const { key, value } = normalizeMemoryKey(text)
       await putCrewSemantic(key, value)
-      reqRef.current++   // 使任何在途 GET 失效，否则写入前的快照会盖掉新行
+      req.bump()   // 使任何在途 GET 失效，否则写入前的快照会盖掉新行
       setMem(prev => prev && ({
         ...prev,
         semantic: [{
@@ -61,15 +62,15 @@ export default function MemoryPanel() {
       setErr(e instanceof Error ? e.message : String(e))
     }
     setSaving(false)
-  }, [draft, saving])
+  }, [draft, saving, req])
 
   const removeSemantic = useCallback(async (key: string) => {
     setConfirming(null)
-    reqRef.current++
+    req.bump()
     setMem(prev => prev && ({ ...prev, semantic: prev.semantic.filter(e => e.key !== key) }))
     try { await deleteCrewSemantic(key) } catch { /* 下次 load 会纠正 */ }
     load()
-  }, [load])
+  }, [load, req])
 
   // markdown 层（preferences / projects）没有 per-line DELETE：Gateway 的 PUT 是
   // 整文件。所以「删一行」= 本地重组 markdown 后整体 PUT。这也是为什么「让它记住」
@@ -78,11 +79,11 @@ export default function MemoryPanel() {
     setConfirming(null)
     const cur = mem?.[doc] ?? ''
     const next = dropMdLine(cur, idx)
-    reqRef.current++
+    req.bump()
     setMem(prev => prev && ({ ...prev, [doc]: next }))
     try { await putCrewMemoryDoc(doc, next) } catch { /* 下次 load 会纠正 */ }
     load()
-  }, [mem, load])
+  }, [mem, load, req])
 
   const semantic = mem?.semantic ?? []
   const prefLines = mdLines(mem?.preferences ?? '')

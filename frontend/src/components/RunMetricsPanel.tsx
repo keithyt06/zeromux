@@ -1,7 +1,8 @@
-import { useState, useEffect, useCallback, useRef } from 'react'
+import { useState, useEffect, useCallback } from 'react'
 import { ChevronRight, ThumbsUp, ThumbsDown } from 'lucide-react'
 import { getSessionRuns, postRunVerdict } from '../lib/api'
 import type { RunMetric, RunStats, RunOutcome } from '../lib/api'
+import { useLatestRequest } from '../lib/useLatestRequest'
 
 interface Props {
   sessionId: string
@@ -61,16 +62,16 @@ export function RunMetricsPanel({ sessionId, turnStartedMs, running, refreshKey 
   // order — a slow earlier load overwriting a fast later one drops the newest run
   // rows and reverts stats, and it does NOT self-correct until the next turn. Mirror
   // the reqRef pattern every sibling loader uses. (review 2026-08-12, F-METRICS-STALE)
-  const reqRef = useRef(0)
+  const req = useLatestRequest()
   const load = useCallback(async () => {
-    const req = ++reqRef.current
+    const r = req.begin()
     try {
       const data = await getSessionRuns(sessionId, { limit: 50 })
-      if (reqRef.current !== req) return
+      if (!req.isCurrent(r)) return
       setRuns(data.runs)
       setStats(data.stats)
     } catch { /* ignore */ }
-  }, [sessionId])
+  }, [sessionId, req])
 
   // On mount + whenever the parent signals a turn boundary.
   useEffect(() => { load() }, [load, refreshKey])
@@ -92,7 +93,7 @@ export function RunMetricsPanel({ sessionId, turnStartedMs, running, refreshKey 
     // POST and would clobber the human mark back to unmarked until the next turn.
     // Same reqRef discipline the sibling optimistic mutation uses (AgentDashboard
     // handleDelete).
-    reqRef.current++
+    req.bump()
     // Optimistic: flip the row immediately, mark it human-sourced.
     setRuns(prev => prev.map(r =>
       r.run_id === runId ? { ...r, verdict, verdict_source: 'human' } : r
@@ -102,7 +103,7 @@ export function RunMetricsPanel({ sessionId, turnStartedMs, running, refreshKey 
     } catch {
       load()  // reconcile on failure
     }
-  }, [sessionId, load])
+  }, [sessionId, load, req])
 
   const elapsed = running && turnStartedMs != null
     ? Math.max(0, Math.floor((nowMs - turnStartedMs) / 1000))

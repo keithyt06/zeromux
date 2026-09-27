@@ -1,6 +1,8 @@
-import { useState, useEffect, useCallback, useRef } from 'react'
+import { useState, useEffect, useCallback } from 'react'
 import { listEvents, deleteEvent } from '../lib/api'
 import type { AgentEvent } from '../lib/api'
+import { useLatestRequest } from '../lib/useLatestRequest'
+import { usePolling } from '../lib/usePolling'
 import { Trash2, RefreshCw, Bot, Wrench, CheckCircle, AlertCircle, Flag, Zap } from 'lucide-react'
 
 interface Props {
@@ -43,9 +45,9 @@ export default function AgentDashboard({ sessionId }: Props) {
   // filter UI highlights "All". A delete's in-flight refresh could likewise resurrect
   // the just-removed row. Bump at the TOP of every call and drop stale responses.
   // (review 2026-08-11, F-FE — the tracked stale-response class.)
-  const reqRef = useRef(0)
+  const req = useLatestRequest()
   const loadEvents = useCallback(async () => {
-    const req = ++reqRef.current
+    const r = req.begin()
     setLoading(true)
     try {
       const data = await listEvents({
@@ -54,28 +56,25 @@ export default function AgentDashboard({ sessionId }: Props) {
         event: filter.event,
         limit: 100,
       })
-      if (reqRef.current !== req) return
+      if (!req.isCurrent(r)) return
       setEvents(data.events)
     } catch {
-      if (reqRef.current !== req) return
+      if (!req.isCurrent(r)) return
     }
-    if (reqRef.current === req) setLoading(false)
-  }, [sessionId, filter])
+    if (req.isCurrent(r)) setLoading(false)
+  }, [sessionId, filter, req])
 
   useEffect(() => { loadEvents() }, [loadEvents])
 
-  // Auto-refresh every 10s
-  useEffect(() => {
-    const interval = setInterval(loadEvents, 10000)
-    return () => clearInterval(interval)
-  }, [loadEvents])
+  // Auto-refresh every 10s (paused while the tab is hidden).
+  usePolling(loadEvents, 10_000, { immediate: false })
 
   const handleDelete = async (id: string) => {
     try {
       await deleteEvent(id)
       // Invalidate any loadEvents already in flight so its (pre-delete) snapshot
       // can't resurrect the row we're optimistically removing here.
-      reqRef.current++
+      req.bump()
       setEvents(prev => prev.filter(e => e.id !== id))
     } catch { /* ignore */ }
   }

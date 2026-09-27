@@ -1,4 +1,4 @@
-import { render, screen, waitFor, fireEvent } from '@testing-library/react'
+import { render, screen, waitFor, fireEvent, act } from '@testing-library/react'
 import { describe, it, expect, vi, beforeEach } from 'vitest'
 import AgentDashboard from '../AgentDashboard'
 import * as api from '../../lib/api'
@@ -44,11 +44,15 @@ describe('AgentDashboard stale-response race', () => {
 
     // The slow claude-only fetch finally resolves with just the claude row. It must
     // NOT clobber the newer "All" result (which shows both rows).
-    resolveSlow({ events: [ev('a-claude', 'claude')], total: 1 })
-    await waitFor(() => {
-      // codex row still present → stale filtered response was dropped.
-      expect(screen.getByText('sum-b-codex')).toBeInTheDocument()
+    // Fence with act (not waitFor): waitFor's first synchronous check runs BEFORE
+    // the stale response's microtask commits, so it passed even with the guard
+    // removed (verified 2026-09-27). act flushes the stale commit first.
+    await act(async () => {
+      resolveSlow({ events: [ev('a-claude', 'claude')], total: 1 })
+      await Promise.resolve(); await Promise.resolve()
     })
+    // codex row still present → stale filtered response was dropped.
+    expect(screen.getByText('sum-b-codex')).toBeInTheDocument()
     expect(screen.getByText('sum-a-claude')).toBeInTheDocument()
   })
 })

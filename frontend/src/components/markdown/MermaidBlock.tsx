@@ -69,13 +69,13 @@ export default function MermaidBlock({ code }: Props) {
   if (state.kind === 'error') {
     return (
       <div className="mermaid-err bg-[var(--bg-secondary)] border border-[var(--border)] rounded-md p-3 my-2">
-        <pre className="text-[12px] text-[var(--text-secondary)] font-mono overflow-x-auto">{code}</pre>
-        <p className="text-[var(--accent-red)] text-xs mt-1">Mermaid: {state.msg}</p>
+        <pre className="text-ui-2xs text-[var(--text-secondary)] font-mono overflow-x-auto">{code}</pre>
+        <p className="text-[var(--accent-red)] text-ui-xs mt-1">Mermaid: {state.msg}</p>
       </div>
     )
   }
   return (
-    <pre className="mermaid-pending bg-[var(--bg-secondary)] border border-[var(--border)] rounded-md p-3 my-2 overflow-x-auto text-[12px] text-[var(--text-secondary)] opacity-60 font-mono">
+    <pre className="mermaid-pending bg-[var(--bg-secondary)] border border-[var(--border)] rounded-md p-3 my-2 overflow-x-auto text-ui-2xs text-[var(--text-secondary)] opacity-60 font-mono">
       {code}
     </pre>
   )

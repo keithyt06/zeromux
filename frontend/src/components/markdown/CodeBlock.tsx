@@ -13,7 +13,7 @@ export default function CodeBlock({ className, children, ...props }: CodeProps) 
 
   if (!isBlock) {
     return (
-      <code className="px-1 py-0.5 bg-[var(--code-bg)] border border-[var(--border)] rounded text-[12px] text-[var(--text-bright)] font-mono" {...props}>
+      <code className="px-1 py-0.5 bg-[var(--code-bg)] border border-[var(--border)] rounded text-ui-2xs text-[var(--text-bright)] font-mono" {...props}>
         {children}
       </code>
     )
@@ -23,7 +23,7 @@ export default function CodeBlock({ className, children, ...props }: CodeProps) 
     const raw = String(children).replace(/\n$/, '')
     if (!isComplete) {
       return (
-        <pre className="mermaid-pending bg-[var(--bg-secondary)] border border-[var(--border)] rounded-md p-3 my-2 overflow-x-auto text-[12px] text-[var(--text-secondary)] opacity-60 font-mono">
+        <pre className="mermaid-pending bg-[var(--bg-secondary)] border border-[var(--border)] rounded-md p-3 my-2 overflow-x-auto text-ui-2xs text-[var(--text-secondary)] opacity-60 font-mono">
           {raw}
         </pre>
       )
@@ -33,7 +33,7 @@ export default function CodeBlock({ className, children, ...props }: CodeProps) 
 
   // Generic block code; rehype-highlight has already coloured the children.
   return (
-    <code className={`text-[12px] ${className ?? ''}`} {...props}>
+    <code className={`text-ui-2xs ${className ?? ''}`} {...props}>
       {children}
     </code>
   )

@@ -30,7 +30,7 @@ export default function DirectoryPicker({ initialPath, onSelect, onCancel }: {
         >
           <ChevronLeft size={14} />
         </button>
-        <span className="text-[10px] font-semibold text-[var(--text-muted)] uppercase tracking-wider truncate flex-1">
+        <span className="text-ui-2xs font-semibold text-[var(--text-muted)] uppercase tracking-wider truncate flex-1">
           选择目录
         </span>
         {parentPath && (
@@ -47,14 +47,14 @@ export default function DirectoryPicker({ initialPath, onSelect, onCancel }: {
 
       {/* Current path + use-this button */}
       <div className="px-3 py-1.5 border-b border-[var(--border)]">
-        <div className="text-[10px] text-[var(--text-muted)] truncate mb-1 font-mono" title={currentPath}>
+        <div className="text-ui-2xs text-[var(--text-muted)] truncate mb-1 font-mono" title={currentPath}>
           {homePath && currentPath.startsWith(homePath) ? currentPath.replace(homePath, '~') : currentPath}
         </div>
         <button
           type="button"
           onClick={() => onSelect(currentPath)}
           disabled={!currentPath}
-          className="w-full py-1 text-[10px] font-semibold bg-[var(--accent-blue)] hover:bg-[var(--accent-blue-hover)] text-white rounded transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
+          className="w-full py-1 text-ui-2xs font-semibold bg-[var(--accent-blue)] hover:bg-[var(--accent-blue-hover)] text-white rounded transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
         >
           使用此目录
         </button>
@@ -67,7 +67,7 @@ export default function DirectoryPicker({ initialPath, onSelect, onCancel }: {
         <button
           type="button"
           onClick={() => load(parentPath)}
-          className="flex items-center gap-2 w-full px-3 py-1.5 text-xs text-[var(--text-secondary)] hover:bg-[var(--bg-hover)] transition-colors"
+          className="flex items-center gap-2 w-full px-3 py-1.5 text-ui-xs text-[var(--text-secondary)] hover:bg-[var(--bg-hover)] transition-colors"
         >
           <ChevronLeft size={12} className="shrink-0" />
           <span>..</span>
@@ -77,18 +77,18 @@ export default function DirectoryPicker({ initialPath, onSelect, onCancel }: {
       {/* Directory list */}
       <div className="max-h-48 overflow-y-auto">
         {loading ? (
-          <div className="px-3 py-2 text-[10px] text-[var(--text-muted)]">加载中...</div>
+          <div className="px-3 py-2 text-ui-2xs text-[var(--text-muted)]">加载中...</div>
         ) : error ? (
-          <div className="px-3 py-2 text-[10px] text-[var(--accent-red)] break-words">{error}</div>
+          <div className="px-3 py-2 text-ui-2xs text-[var(--accent-red)] break-words">{error}</div>
         ) : dirs.length === 0 ? (
-          <div className="px-3 py-2 text-[10px] text-[var(--text-muted)]">没有子目录</div>
+          <div className="px-3 py-2 text-ui-2xs text-[var(--text-muted)]">没有子目录</div>
         ) : (
           dirs.map(d => (
             <button
               key={d.path}
               type="button"
               onClick={() => load(d.path)}
-              className="flex items-center gap-2 w-full px-3 py-1.5 text-xs text-[var(--text-primary)] hover:bg-[var(--bg-hover)] transition-colors"
+              className="flex items-center gap-2 w-full px-3 py-1.5 text-ui-xs text-[var(--text-primary)] hover:bg-[var(--bg-hover)] transition-colors"
             >
               {d.is_git ? (
                 <FolderGit2 size={13} className="text-[var(--accent-green-text)] shrink-0" />

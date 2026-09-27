@@ -2,7 +2,7 @@ import { describe, it, expect } from 'vitest'
 import { mkdtempSync, writeFileSync, existsSync, readFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
-import { brotliDecompressSync, gunzipSync } from 'node:zlib'
+import { brotliDecompressSync } from 'node:zlib'
 import { randomBytes } from 'node:crypto'
 import { shouldCompress, compressFile } from '../precompress.mjs'
 import { entryAssets, budgetReport } from '../check-size.mjs'
@@ -17,21 +17,21 @@ describe('precompress', () => {
     expect(shouldCompress('assets/tiny.js', 500)).toBe(false)
     expect(shouldCompress('assets/index-a.js.br', 9000)).toBe(false)
   })
-  it('writes .br and .gz that round-trip', async () => {
+  it('writes only a round-tripping .br (no .gz: HTTPS browsers send br; old clients get runtime gzip)', async () => {
     const d = mkdtempSync(join(tmpdir(), 'pc-'))
     const f = join(d, 'a.js')
     writeFileSync(f, 'const x = 1;\n'.repeat(500))
     await compressFile(f)
     expect(brotliDecompressSync(readFileSync(f + '.br')).toString()).toBe(readFileSync(f, 'utf8'))
-    expect(gunzipSync(readFileSync(f + '.gz')).toString()).toBe(readFileSync(f, 'utf8'))
+    expect(existsSync(f + '.gz')).toBe(false)
   })
   it('skips a variant that would not be smaller', async () => {
     const d = mkdtempSync(join(tmpdir(), 'pc-'))
     const f = join(d, 'r.js')
     writeFileSync(f, randomBytes(1200))
     await compressFile(f)
-    // random-ish bytes: at least one variant must be skipped rather than bloating
-    expect(existsSync(f + '.br') && existsSync(f + '.gz')).toBe(false)
+    // random bytes: brotli can't shrink them, so no variant is written rather than bloating
+    expect(existsSync(f + '.br')).toBe(false)
   })
 })
 

@@ -240,9 +240,10 @@ fn serve_embedded(path: &str, accept: &str) -> Response {
     try_serve_embedded_enc(path, accept).unwrap_or_else(|| StatusCode::NOT_FOUND.into_response())
 }
 
-/// Serve an embedded dist file, preferring the build-time `.br` / `.gz`
-/// sibling (frontend/scripts/precompress.mjs, brotli q11) when the client
-/// accepts it. MIME is always derived from the ORIGINAL path. The runtime
+/// Serve an embedded dist file, preferring the build-time `.br` sibling
+/// (frontend/scripts/precompress.mjs, brotli q11) when the client accepts it.
+/// No `.gz` is emitted any more, so a gzip-only client gets identity here and
+/// the runtime CompressionLayer gzips it. MIME is always derived from the ORIGINAL path. The runtime
 /// CompressionLayer skips responses that already carry Content-Encoding.
 fn try_serve_embedded_enc(path: &str, accept: &str) -> Option<Response> {
     if path.ends_with(".br") || path.ends_with(".gz") {
@@ -6907,6 +6908,25 @@ mod precompressed_tests {
         assert_eq!(h.get("content-encoding").unwrap(), "br");
         assert_eq!(h.get("vary").unwrap(), "Accept-Encoding");
         assert!(h.get("content-security-policy").is_some());
+    }
+
+    #[tokio::test]
+    async fn gzip_only_client_gets_runtime_gzip_not_a_precompressed_gz() {
+        // precompress.mjs emits .br only; the embedded path hands back identity
+        // and the outer CompressionLayer gzips it on the fly.
+        assert!(FrontendAssets::get("sw.js.gz").is_none());
+        let res = try_serve_embedded_enc("sw.js", "gzip").expect("sw.js embedded");
+        assert!(res.headers().get("content-encoding").is_none());
+        use tower::ServiceExt;
+        let app = super::with_compression(Router::new().route(
+            "/sw.js",
+            get(|| async { try_serve_embedded_enc("sw.js", "gzip").unwrap() }),
+        ));
+        let res = app
+            .oneshot(axum::http::Request::get("/sw.js").header("accept-encoding", "gzip").body(axum::body::Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(res.headers().get("content-encoding").unwrap(), "gzip");
     }
 
     #[test]

@@ -1,11 +1,13 @@
-// Build-time precompression: emit .br (q11) and .gz (level 9) next to every
-// compressible dist asset. The Rust server serves these verbatim (web.rs
+// Build-time precompression: emit .br (q11) next to every compressible dist
+// asset. The Rust server serves these verbatim (web.rs
 // try_serve_embedded), so the expensive q11 cost is paid once per build, not
 // per request (runtime tower-http br defaults to q4 ≈ 77KB larger on the main
-// bundle). A variant that isn't smaller is skipped.
+// bundle). A variant that isn't smaller is skipped. No .gz: browsers on HTTPS
+// always send br, and a .gz set would embed ~1.26MB more into the binary for
+// nothing — gzip-only clients get identity → runtime CompressionLayer gzip.
 import { readdirSync, statSync, readFileSync, writeFileSync } from 'node:fs'
 import { join, relative } from 'node:path'
-import { brotliCompressSync, gzipSync, constants } from 'node:zlib'
+import { brotliCompressSync, constants } from 'node:zlib'
 import { fileURLToPath } from 'node:url'
 
 const EXT = /\.(js|mjs|css|html|svg|json|txt|map)$/i
@@ -25,8 +27,6 @@ export async function compressFile(abs) {
     },
   })
   if (br.length < src.length) { writeFileSync(abs + '.br', br); out.br = br.length }
-  const gz = gzipSync(src, { level: 9 })
-  if (gz.length < src.length) { writeFileSync(abs + '.gz', gz); out.gz = gz.length }
   return out
 }
 

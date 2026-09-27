@@ -44,8 +44,14 @@ export function useTheme() {
       applyResolvedTheme(t)
       setTheme(t)
     }
-    mq.addEventListener('change', on)
-    return () => mq.removeEventListener('change', on)
+    // Safari < 14 has no addEventListener on MediaQueryList; fall back to
+    // the deprecated addListener/removeListener pair it replaced.
+    if (mq.addEventListener) {
+      mq.addEventListener('change', on)
+      return () => mq.removeEventListener('change', on)
+    }
+    mq.addListener?.(on)
+    return () => mq.removeListener?.(on)
   }, [])
 
   const setPref = useCallback((p: ThemePref) => {

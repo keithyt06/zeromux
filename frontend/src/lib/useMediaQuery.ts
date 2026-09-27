@@ -8,8 +8,14 @@ export function useMediaQuery(query: string): boolean {
     (cb) => {
       if (typeof matchMedia === 'undefined') return () => {}
       const mq = matchMedia(query)
-      mq.addEventListener('change', cb)
-      return () => mq.removeEventListener('change', cb)
+      // Safari < 14 has no addEventListener on MediaQueryList; fall back to
+      // the deprecated addListener/removeListener pair it replaced.
+      if (mq.addEventListener) {
+        mq.addEventListener('change', cb)
+        return () => mq.removeEventListener('change', cb)
+      }
+      mq.addListener?.(cb)
+      return () => mq.removeListener?.(cb)
     },
     () => typeof matchMedia !== 'undefined' && matchMedia(query).matches,
     () => false,

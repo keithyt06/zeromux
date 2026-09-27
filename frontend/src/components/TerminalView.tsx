@@ -84,6 +84,8 @@ export default function TerminalView({ sessionId, active, theme, tmuxName, tmuxO
   // eslint-disable-next-line react-hooks/set-state-in-effect
   useEffect(() => { if (historyRequest) setHistoryOpen(true) }, [historyRequest])
   // 触摸设备检测：any-pointer:coarse 或 maxTouchPoints>0，少漏触屏笔记本/iPad。
+  // Now live (useSyncExternalStore): only flips if an external touch device is
+  // attached/detached mid-session. The xterm/WS effect below doesn't depend on it.
   const isTouch = useIsTouch()
   // Phone held sideways: history opens as a right half-pane beside the live terminal.
   const [landscape, setLandscape] = useState(() => typeof matchMedia !== 'undefined' && matchMedia(LANDSCAPE_MQ).matches)

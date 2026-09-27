@@ -24,7 +24,7 @@ export function useAsyncResource<T>(key: string | null, fetcher: () => Promise<T
   }
 
   useEffect(() => {
-    if (key === null) return
+    if (key === null) { req.bump(); return }
     const t = req.begin()
     fetcherRef.current().then(
       v => { if (req.isCurrent(t)) { setDataState(v); setError(undefined); setLoading(false) } },
@@ -39,5 +39,5 @@ export function useAsyncResource<T>(key: string | null, fetcher: () => Promise<T
     setLoading(false)
   }, [req])
 
-  return { data, loading, error, reload, setData }
+  return { data, loading: key !== null && loading, error, reload, setData }
 }

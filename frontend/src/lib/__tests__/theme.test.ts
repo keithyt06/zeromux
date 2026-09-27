@@ -53,4 +53,13 @@ describe('theme', () => {
     const { result } = renderHook(() => useTheme())
     expect(result.current.pref).toBe('light')
   })
+  it('falls back to addListener/removeListener when addEventListener is missing (old Safari)', () => {
+    const listeners: ((e: { matches: boolean }) => void)[] = []
+    const mq = { matches: false, addListener: (f: (e: { matches: boolean }) => void) => listeners.push(f), removeListener: () => {} }
+    vi.stubGlobal('matchMedia', (q: string) => (q.includes('prefers-color-scheme: light') ? mq : { matches: false, addListener() {}, removeListener() {} }))
+    const { result } = renderHook(() => useTheme())
+    expect(result.current.theme).toBe('dark')
+    act(() => { mq.matches = true; listeners.forEach(f => f({ matches: true })) })
+    expect(result.current.theme).toBe('light')
+  })
 })

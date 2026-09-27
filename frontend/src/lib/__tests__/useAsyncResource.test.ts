@@ -45,6 +45,18 @@ describe('useAsyncResource', () => {
     await act(async () => slowA.resolve('A'))
     expect(result.current.data).toBe('B')
   })
+  it('a slow response for the old key is dropped when the key changes to null', async () => {
+    const slowA = deferred<string>()
+    const { result, rerender } = renderHook(({ k }: { k: string | null }) => useAsyncResource(k, async () => slowA.promise), { initialProps: { k: 'a' as string | null } })
+    rerender({ k: null })
+    await act(async () => slowA.resolve('A'))
+    expect(result.current.data).toBeUndefined()
+  })
+  it('reload() with a null key does not leave loading stuck true', () => {
+    const { result } = renderHook(() => useAsyncResource(null, async () => 1))
+    act(() => result.current.reload())
+    expect(result.current.loading).toBe(false)
+  })
   it('setData (optimistic) wins over an in-flight reload', async () => {
     let n = 0
     const d = deferred<string[]>()

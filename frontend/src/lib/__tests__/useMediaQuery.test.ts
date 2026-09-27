@@ -29,4 +29,17 @@ describe('useMediaQuery', () => {
     expect(result.current).toBe(true)
     Object.defineProperty(navigator, 'maxTouchPoints', { value: 0, configurable: true })
   })
+  it('falls back to addListener/removeListener when addEventListener is missing (old Safari)', () => {
+    const state: Record<string, boolean> = { '(max-width: 767px)': true }
+    const ls: Record<string, (() => void)[]> = {}
+    vi.stubGlobal('matchMedia', (q: string) => ({
+      get matches() { return !!state[q] },
+      addListener: (f: () => void) => { (ls[q] ||= []).push(f) },
+      removeListener: (f: () => void) => { ls[q] = (ls[q] || []).filter(x => x !== f) },
+    }))
+    const { result } = renderHook(() => useMediaQuery('(max-width: 767px)'))
+    expect(result.current).toBe(true)
+    act(() => { state['(max-width: 767px)'] = false; ls['(max-width: 767px)']?.forEach(f => f()) })
+    expect(result.current).toBe(false)
+  })
 })

@@ -1,6 +1,7 @@
 import { render, screen, fireEvent, waitFor } from '@testing-library/react'
 import { describe, it, expect, vi, beforeEach } from 'vitest'
 import HistoryView from '../HistoryView'
+import { DialogHost } from '../ui'
 import { chunkLines } from '../../lib/historySearch'
 import * as api from '../../lib/api'
 
@@ -68,23 +69,23 @@ describe('HistoryView', () => {
   })
   it('send to agent asks for confirmation and sends the tail', async () => {
     vi.spyOn(api, 'getHistory').mockResolvedValue({ text: 'a\nb', truncated: false })
-    vi.spyOn(window, 'confirm').mockReturnValue(true)
     const onSend = vi.fn()
-    render(<HistoryView sessionId="s" title="t" onClose={() => {}} onSendToAgent={onSend} />)
+    render(<><HistoryView sessionId="s" title="t" onClose={() => {}} onSendToAgent={onSend} /><DialogHost /></>)
     await waitFor(() => expect(screen.getByText(/b/)).toBeInTheDocument())
     fireEvent.click(screen.getByText('发给 agent'))
-    expect(onSend).toHaveBeenCalledWith('a\nb')
+    fireEvent.click(await screen.findByText('发送'))
+    await waitFor(() => expect(onSend).toHaveBeenCalledWith('a\nb'))
   })
   it('send to agent strips ANSI escapes in color mode', async () => {
     const spy = vi.spyOn(api, 'getHistory').mockResolvedValue({ text: 'a\x1b[31mb\x1b[0mc', truncated: false })
-    vi.spyOn(window, 'confirm').mockReturnValue(true)
     const onSend = vi.fn()
-    render(<HistoryView sessionId="s" title="t" onClose={() => {}} onSendToAgent={onSend} />)
+    render(<><HistoryView sessionId="s" title="t" onClose={() => {}} onSendToAgent={onSend} /><DialogHost /></>)
     await waitFor(() => expect(spy).toHaveBeenCalledWith('s', false))
     fireEvent.click(screen.getByText('颜色'))
     await waitFor(() => expect(spy).toHaveBeenCalledWith('s', true))
     fireEvent.click(screen.getByText('发给 agent'))
-    expect(onSend).toHaveBeenCalledWith('abc')
+    fireEvent.click(await screen.findByText('发送'))
+    await waitFor(() => expect(onSend).toHaveBeenCalledWith('abc'))
     expect(onSend.mock.calls[0][0].includes('\x1b')).toBe(false)
   })
 })

@@ -4,10 +4,13 @@ import { modalStack, restoreFocus } from './modalStack'
 let openSheets = 0
 const KEYBOARD_PX = 120
 
-function keyboardHeight(): number | null {
+/** Visual-viewport box while the soft keyboard is up, else null. iOS Safari
+ *  keeps fixed/top-layer boxes on the layout viewport, so the sheet must be
+ *  placed at vv.offsetTop explicitly (not anchored to the layout bottom). */
+function keyboardBox(): { top: number; height: number } | null {
   const vv = typeof window !== 'undefined' ? window.visualViewport : null
   if (!vv) return null
-  return window.innerHeight - vv.height > KEYBOARD_PX ? vv.height : null
+  return window.innerHeight - vv.height > KEYBOARD_PX ? { top: vv.offsetTop, height: vv.height } : null
 }
 
 /** Panel / drawer on a native modal <dialog>. bottom: two snap points, drag
@@ -20,7 +23,7 @@ export function Sheet({ open, onClose, side, title, actions, snap = 'half', chil
   const bodyRef = useRef<HTMLDivElement>(null)
   const opener = useRef<Element | null>(null)
   const titleId = useId()
-  const [kb, setKb] = useState<number | null>(() => (side === 'bottom' ? keyboardHeight() : null))
+  const [kb, setKb] = useState<{ top: number; height: number } | null>(() => (side === 'bottom' ? keyboardBox() : null))
   const drag = useRef<{ y: number; t: number } | null>(null)
   const [dy, setDy] = useState(0)
   const downOnSelf = useRef(false)
@@ -47,15 +50,22 @@ export function Sheet({ open, onClose, side, title, actions, snap = 'half', chil
   useEffect(() => {
     if (!open || side !== 'bottom' || !window.visualViewport) return
     const vv = window.visualViewport
-    const on = () => setKb(keyboardHeight())
+    const on = () => setKb(prev => {
+      const next = keyboardBox()
+      return prev && next && prev.top === next.top && prev.height === next.height ? prev : next
+    })
+    // iOS pans the visual viewport (scroll) without resizing it.
     vv.addEventListener('resize', on)
-    return () => vv.removeEventListener('resize', on)
+    vv.addEventListener('scroll', on)
+    return () => { vv.removeEventListener('resize', on); vv.removeEventListener('scroll', on) }
   }, [open, side])
 
   if (!open) return null
 
   const effSnap = side === 'bottom' && kb != null ? 'full' : snap
-  const height = side === 'bottom' ? (kb != null ? `${kb}px` : effSnap === 'full' ? 'calc(100dvh - env(safe-area-inset-top) - 8px)' : '50dvh') : undefined
+  const height = side === 'bottom' ? (kb != null ? `${kb.height}px` : effSnap === 'full' ? 'calc(100dvh - env(safe-area-inset-top) - 8px)' : '50dvh') : undefined
+  // Keyboard up: forced-full snap covers exactly the visual viewport.
+  const pin = side === 'bottom' && kb != null ? { top: kb.top, bottom: 'auto', margin: 0 } : undefined
 
   const onDown = (e: PointerEvent) => {
     if ((bodyRef.current?.scrollTop ?? 0) > 0) return
@@ -95,7 +105,7 @@ export function Sheet({ open, onClose, side, title, actions, snap = 'half', chil
         downOnSelf.current = false
         if (self) onClose()
       }}
-      style={{ height, transform: dy ? `translateY(${dy}px)` : undefined, transition: dy ? 'none' : 'transform var(--dur-base) var(--ease-out)' }}
+      style={{ height, ...pin, transform: dy ? `translateY(${dy}px)` : undefined, transition: dy ? 'none' : 'transform var(--dur-base) var(--ease-out)' }}
       className={`${base} ${bySide} flex flex-col`}
     >
       {side === 'bottom' && (

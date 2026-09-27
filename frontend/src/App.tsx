@@ -1,6 +1,6 @@
 import { useState, useEffect, useCallback, useMemo, useRef } from 'react'
 import type { SessionInfo, SessionType, UserInfo, HostTmux } from './lib/api'
-import { listSessions, listSessionsWithHost, createSession, deleteSession, closeCheck, restoreSession, checkAuth, legacyLogin, clearAuth, renameSession, listConfirmations, getSessionStatus, isAuthError } from './lib/api'
+import { listSessions, listSessionsWithHost, createSession, deleteSession, closeCheck, checkAuth, legacyLogin, clearAuth, renameSession, listConfirmations, getSessionStatus, isAuthError } from './lib/api'
 import { deepLinkView } from './lib/deeplink'
 import { closeConfirmMessage } from './lib/closeSession'
 import { notifyQuickTargetsChanged } from './lib/quickTargetsBus'
@@ -18,7 +18,8 @@ import GitViewer from './components/GitViewer'
 import AgentDashboard from './components/AgentDashboard'
 import VaultReader from './components/VaultReader'
 import MemoryPanel from './components/MemoryPanel'
-import Toast from './components/Toast'
+import { Toaster, DialogHost, toast, confirm } from './components/ui'
+import { undoCloseToast } from './lib/undoCloseToast'
 import { type DocTab, newDocTab, isDocTabId, loadDocTabs, saveDocTabs, resolveActivePane, DEFAULT_DOC_TITLE } from './lib/docTabs'
 import { pickDocTabForTarget } from './lib/docTarget'
 import type { AskAgentTarget } from './lib/askAgent'
@@ -313,14 +314,11 @@ export default function App() {
     setDocTabs(prev => prev.map(t => t.id === id ? { ...t, title: title ?? DEFAULT_DOC_TITLE } : t))
   }, [])
 
-  const [undoToast, setUndoToast] = useState<{ id: string; name: string; durationMs: number } | null>(null)
-  const [failToast, setFailToast] = useState<string | null>(null)
-
   const handleDelete = useCallback(async (id: string) => {
     const s = sessions.find(x => x.id === id)
     if (s?.tmux_name) {
       const msg = closeConfirmMessage(s.name, await closeCheck(id))
-      if (msg && !window.confirm(msg)) return
+      if (msg && !(await confirm({ title: msg, confirmLabel: '关闭', danger: true }))) return
     }
     let r: { pending_until?: number }
     try {
@@ -340,7 +338,7 @@ export default function App() {
     // silently hit 410.
     if (r.pending_until && s) {
       const durationMs = Math.max(1000, (r.pending_until ?? 0) - Date.now() - 500) || 4500
-      setUndoToast({ id, name: s.name, durationMs })
+      toast.push(undoCloseToast(id, s.name, durationMs, async () => { await loadSessions(); setActiveId(id) }))
     }
   }, [activeId, docTabs, sessions, loadSessions])
 
@@ -454,7 +452,7 @@ export default function App() {
                 {/* Always keep terminal/chat mounted, hide with CSS when overlay is active */}
                 <div className={`h-full ${view !== 'none' ? 'hidden' : ''}`}>
                   {s.type === 'tmux' ? (
-                    <TerminalView sessionId={s.id} active={isActive && view === 'none'} theme={themeCtx.theme} tmuxName={s.tmux_name} tmuxOrigin={s.tmux_origin} onClose={() => handleDelete(s.id)} historyRequest={historyReq?.id === s.id ? historyReq.nonce : 0} onAskAgent={(prompt) => { handleCreate('claude', s.work_dir, undefined, prompt).catch(() => setFailToast('创建会话失败')) }} />
+                    <TerminalView sessionId={s.id} active={isActive && view === 'none'} theme={themeCtx.theme} tmuxName={s.tmux_name} tmuxOrigin={s.tmux_origin} onClose={() => handleDelete(s.id)} historyRequest={historyReq?.id === s.id ? historyReq.nonce : 0} onAskAgent={(prompt) => { handleCreate('claude', s.work_dir, undefined, prompt).catch(() => toast.push({ message: '创建会话失败' })) }} />
                   ) : (
                     <AcpChatView sessionId={s.id} active={isActive && view === 'none'} agentType={s.type} onRegisterControls={registerControls} onQueueModeChange={handleQueueModeChange} showMetrics={!!metricsOpen[s.id]} onOpenMemory={s.type === 'crew' ? () => toggleOverlay(s.id, 'memory') : undefined} peerNames={peerNames} />
                   )}
@@ -481,22 +479,7 @@ export default function App() {
             </div>
           )}
         </div>
-        {undoToast && (
-          <Toast
-            key={undoToast.id}
-            message={`已关闭 ${undoToast.name}`}
-            actionLabel="撤销"
-            durationMs={undoToast.durationMs}
-            onAction={async () => {
-              if (await restoreSession(undoToast.id)) { await loadSessions(); setActiveId(undoToast.id) }
-              else setFailToast('撤销失败，会话已关闭')
-            }}
-            onDone={() => setUndoToast(null)}
-          />
-        )}
-        {failToast && (
-          <Toast message={failToast} durationMs={3000} onDone={() => setFailToast(null)} />
-        )}
+        <Toaster /><DialogHost />
       </main>
     </div>
   )

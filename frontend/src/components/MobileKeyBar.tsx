@@ -1,5 +1,5 @@
 import { useState } from 'react'
-import { ArrowUp, ArrowDown, CornerDownLeft, type LucideIcon } from 'lucide-react'
+import { ArrowUp, ArrowDown, CornerDownLeft, History, type LucideIcon } from 'lucide-react'
 import type { AgentKey, ControlKey } from '../lib/terminalInput'
 
 export type BarKey = 'up' | 'down' | 'left' | 'right' | 'enter' | ControlKey | AgentKey
@@ -39,7 +39,7 @@ export default function MobileKeyBar({ onKey, onHistory }: { onKey: (key: BarKey
     <div className="flex items-stretch gap-1 px-2 py-1.5 border-t border-[var(--border)] bg-[var(--bg-secondary)]">
       {onHistory && (
         <button aria-label="history" onPointerDown={(e) => { e.preventDefault(); onHistory() }}
-          style={{ touchAction: 'manipulation' }} className={`${btnCls} text-base`}>📜</button>
+          style={{ touchAction: 'manipulation' }} className={btnCls}><History size={18} /></button>
       )}
       {page === 0 ? (
         <>
@@ -60,7 +60,7 @@ export default function MobileKeyBar({ onKey, onHistory }: { onKey: (key: BarKey
               aria-label={key}
               onPointerDown={(e) => { e.preventDefault(); onKey(key) }}
               style={{ touchAction: 'manipulation' }}
-              className={`${btnCls} text-xs font-mono`}
+              className={`${btnCls} text-ui-xs font-mono`}
             >
               {label}
             </button>
@@ -73,14 +73,14 @@ export default function MobileKeyBar({ onKey, onHistory }: { onKey: (key: BarKey
             aria-label={key}
             onPointerDown={(e) => { e.preventDefault(); onKey(key) }}
             style={{ touchAction: 'manipulation' }}
-            className={`${btnCls} text-xs font-mono`}
+            className={`${btnCls} text-ui-xs font-mono`}
           >
             {label}
           </button>
         ))
       )}
       <button aria-label="more-keys" onPointerDown={(e) => { e.preventDefault(); setPage(p => 1 - p) }}
-        style={{ touchAction: 'manipulation' }} className={`${btnCls} text-xs`}>{page === 0 ? '⋯' : '↩︎'}</button>
+        style={{ touchAction: 'manipulation' }} className={`${btnCls} text-ui-xs`}>{page === 0 ? '⋯' : '↩︎'}</button>
     </div>
   )
 }

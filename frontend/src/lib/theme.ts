@@ -1,4 +1,4 @@
-import { useState, useEffect, useCallback } from 'react'
+import { useState, useEffect, useLayoutEffect, useCallback } from 'react'
 
 export type ThemePref = 'system' | 'dark' | 'light'
 /** Resolved theme actually painted. Name kept for existing importers. */
@@ -34,6 +34,10 @@ export function applyResolvedTheme(t: Theme) {
 export function useTheme() {
   const [pref, setPrefState] = useState<ThemePref>(readPref)
   const [theme, setTheme] = useState<Theme>(() => resolveTheme(readPref(), systemLight()))
+
+  // Idempotent; self-heals if theme-boot.js failed to load. Later changes are
+  // already applied synchronously in setPref / the MQ listener — this re-run is a no-op.
+  useLayoutEffect(() => { applyResolvedTheme(theme) }, [theme])
 
   useEffect(() => {
     if (typeof matchMedia === 'undefined') return

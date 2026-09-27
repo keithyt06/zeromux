@@ -47,6 +47,14 @@ describe('theme', () => {
     act(() => { result.current.setPref('light'); classAtSet = document.documentElement.classList.contains('light') })
     expect(classAtSet).toBe(true)
   })
+  it('self-heals on mount if theme-boot.js did not run (applies the resolved theme)', () => {
+    mockSystem(false)
+    localStorage.setItem('zeromux_theme', 'light')
+    document.documentElement.style.colorScheme = ''
+    renderHook(() => useTheme())
+    expect(document.documentElement.classList.contains('light')).toBe(true)
+    expect(document.documentElement.style.colorScheme).toBe('light')
+  })
   it('legacy stored value keeps working', () => {
     mockSystem(false)
     localStorage.setItem('zeromux_theme', 'light')

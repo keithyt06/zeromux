@@ -160,6 +160,15 @@ describe('Sidebar New Session search', () => {
     expect(input.className).not.toMatch(/\btext-xs\b/)
   })
 
+  it('session rename input is 16px (I-15: iOS zooms on <16px inputs)', () => {
+    const sess = { id: 's1', name: 'alpha', session_type: 'tmux', work_dir: '/w', created_at: 0 } as unknown as api.SessionInfo
+    setup({ sessions: [sess] })
+    fireEvent.doubleClick(screen.getByTitle('Double-click to rename'))
+    const input = screen.getByDisplayValue('alpha')
+    expect(input.className).toContain('text-ui-input')
+    expect(input.className).not.toMatch(/\btext-xs\b/)
+  })
+
   it('askAgentRequest opens the popover even when the desktop sidebar is collapsed', async () => {
     vi.spyOn(api, 'warmSearchIndex').mockResolvedValue()
     const { onToggle } = setup({ open: false, mobile: false, askAgentRequest: { absDir: '/v/a', relPath: 'a/n.md', kind: 'note', nonce: 1 } })

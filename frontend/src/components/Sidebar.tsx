@@ -445,7 +445,7 @@ export default function Sidebar({ sessions, docTabs, activeId, onSelect, onCreat
                       if (e.key === 'Enter') commitRename(s.id, (e.target as HTMLInputElement).value)
                       else if (e.key === 'Escape') setEditingId(null)
                     }}
-                    className="flex-1 min-w-0 bg-[var(--bg-primary)] border border-[var(--accent-blue)] rounded px-1 py-0 text-xs text-[var(--text-primary)] outline-none"
+                    className="flex-1 min-w-0 bg-[var(--bg-primary)] border border-[var(--accent-blue)] rounded px-1 py-0 text-ui-input text-[var(--text-primary)] outline-none"
                   />
                 ) : (
                   <span

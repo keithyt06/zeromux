@@ -81,4 +81,12 @@ describe('PushSettings', () => {
     expect(await screen.findByText(/开启失败/)).toBeInTheDocument()
     expect(screen.getByRole('switch')).toHaveAttribute('aria-checked', 'false')
   })
+
+  it('test-push failure shows a toast', async () => {
+    vi.mocked(pushLib.getPushState).mockResolvedValue('enabled')
+    vi.mocked(pushLib.sendTestPush).mockRejectedValueOnce(new Error('500'))
+    render(<><Toaster /><PushSettings open onClose={() => {}} /></>)
+    fireEvent.click(await screen.findByRole('button', { name: /测试推送/ }))
+    expect(await screen.findByText('测试推送发送失败')).toBeInTheDocument()
+  })
 })

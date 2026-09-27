@@ -179,7 +179,7 @@ function TestPushButton() {
   const [sent, setSent] = useState(false)
   return (
     <button
-      onClick={async () => { try { await sendTestPush(); setSent(true); setTimeout(() => setSent(false), 2000) } catch { /* noop */ } }}
+      onClick={async () => { try { await sendTestPush(); setSent(true); setTimeout(() => setSent(false), 2000) } catch { toast.push({ message: '测试推送发送失败' }) } }}
       className="text-ui-xs px-2 py-1 rounded bg-[var(--surface-3)] text-[var(--fg)] hover:opacity-80"
     >
       {sent ? '已发送 ✓' : '发送测试推送'}

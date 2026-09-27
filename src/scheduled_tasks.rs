@@ -89,14 +89,24 @@ pub enum ScheduleInput {
     Cron { expr: String },
 }
 
+/// UI weekday convention (0=Sun..6=Sat) → cron day-of-week NAME. Names, not
+/// numbers: the `cron` crate numbers days 1=Sun..7=Sat and rejects 0, so
+/// passing the UI numbers through made weekly tasks fire a day early and
+/// rejected Sunday. Out-of-range input yields a token the crate rejects, so
+/// the caller's parse-validation turns it into a 400.
+fn weekday_name(d: u32) -> String {
+    const NAMES: [&str; 7] = ["SUN", "MON", "TUE", "WED", "THU", "FRI", "SAT"];
+    NAMES.get(d as usize).map_or_else(|| format!("BAD{d}"), |n| n.to_string())
+}
+
 /// Build a 6-field cron string (sec min hour dom mon dow), evaluated by the
-/// scheduler in Asia/Shanghai. No UTC offset baked in. Weekly weekdays use the
-/// cron crate convention (0/7=Sun, 1=Mon..6=Sat).
+/// scheduler in Asia/Shanghai. No UTC offset baked in. Weekly `weekdays` are
+/// the UI convention (0=Sun..6=Sat) and are emitted as day NAMES (SUN..SAT).
 pub fn schedule_to_cron(s: &ScheduleInput) -> String {
     match s {
         ScheduleInput::Daily { hour, minute } => format!("0 {} {} * * *", minute, hour),
         ScheduleInput::Weekly { weekdays, hour, minute } => {
-            let dows = weekdays.iter().map(|d| d.to_string()).collect::<Vec<_>>().join(",");
+            let dows = weekdays.iter().map(|&d| weekday_name(d)).collect::<Vec<_>>().join(",");
             format!("0 {} {} * * {}", minute, hour, if dows.is_empty() { "*".to_string() } else { dows })
         }
         ScheduleInput::Cron { expr } => expr.clone(),
@@ -142,9 +152,9 @@ mod tests {
 
     #[test]
     fn weekday_cron_skips_weekend() {
-        // "0 0 9 * * 1-5" = 09:00 Mon-Fri. 2026-06-06 is a Saturday;
+        // "0 0 9 * * MON-FRI" = 09:00 Mon-Fri. 2026-06-06 is a Saturday;
         // a window over Sat 09:00 Shanghai must yield no fire.
-        let weekday = "0 0 9 * * 1-5";
+        let weekday = "0 0 9 * * MON-FRI";
         let last = Utc.with_ymd_and_hms(2026, 6, 6, 0, 59, 0).unwrap(); // Sat 08:59 CST
         let now = Utc.with_ymd_and_hms(2026, 6, 6, 1, 1, 0).unwrap();   // Sat 09:01 CST
         assert!(due_fire_points(weekday, last, now).unwrap().is_empty(),
@@ -186,7 +196,27 @@ mod tests {
     }
     #[test]
     fn weekly_to_cron() {
-        assert_eq!(schedule_to_cron(&ScheduleInput::Weekly { weekdays: vec![1,2,3,4,5], hour: 9, minute: 0 }), "0 0 9 * * 1,2,3,4,5");
+        assert_eq!(schedule_to_cron(&ScheduleInput::Weekly { weekdays: vec![1,2,3,4,5], hour: 9, minute: 0 }), "0 0 9 * * MON,TUE,WED,THU,FRI");
+        assert_eq!(schedule_to_cron(&ScheduleInput::Weekly { weekdays: vec![0, 6], hour: 9, minute: 0 }), "0 0 9 * * SUN,SAT");
+    }
+    // UI weekday numbers (0=Sun..6=Sat) must fire on that actual day. The cron
+    // crate numbers 1=Sun..7=Sat, so passing numbers through fired a day early.
+    #[test]
+    fn weekly_fires_on_the_chosen_day() {
+        // 09:00 Shanghai == 01:00 UTC. 2026-09-27 is a Sunday, 2026-09-28 a Monday.
+        let fires_in_week = |days: Vec<u32>| {
+            let spec = schedule_to_cron(&ScheduleInput::Weekly { weekdays: days, hour: 9, minute: 0 });
+            let last = Utc.with_ymd_and_hms(2026, 9, 26, 12, 0, 0).unwrap(); // Sat 20:00 CST
+            let now = Utc.with_ymd_and_hms(2026, 10, 3, 12, 0, 0).unwrap();  // next Sat 20:00 CST
+            due_fire_points(&spec, last, now).unwrap()
+        };
+        assert_eq!(fires_in_week(vec![1]), vec![Utc.with_ymd_and_hms(2026, 9, 28, 1, 0, 0).unwrap()], "[1] = Monday");
+        assert_eq!(fires_in_week(vec![0]), vec![Utc.with_ymd_and_hms(2026, 9, 27, 1, 0, 0).unwrap()], "[0] = Sunday");
+    }
+    #[test]
+    fn weekly_out_of_range_day_is_rejected() {
+        let spec = schedule_to_cron(&ScheduleInput::Weekly { weekdays: vec![7], hour: 9, minute: 0 });
+        assert!(cron::Schedule::from_str(&spec).is_err(), "{spec} must not parse");
     }
     #[test]
     fn reclaim_gates() {

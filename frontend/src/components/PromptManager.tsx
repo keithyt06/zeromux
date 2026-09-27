@@ -13,8 +13,9 @@ interface Props {
   onClose: () => void
 }
 
+// text-ui-input (16px): smaller makes iOS Safari zoom on focus (I-15).
 const inputCls =
-  'w-full rounded bg-[var(--surface-2)] border border-[var(--border)] p-2 text-ui-xs text-[var(--fg)] focus:outline-none focus:border-[var(--accent)]'
+  'w-full rounded bg-[var(--surface-2)] border border-[var(--border)] p-2 text-ui-input text-[var(--fg)] focus:outline-none focus:border-[var(--accent)]'
 
 // Mirror the backend caps (src/prompts.rs TITLE_MAX / BODY_MAX) so an over-length
 // draft is blocked client-side with inline feedback instead of round-tripping to a 400.

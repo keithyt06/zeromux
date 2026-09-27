@@ -85,3 +85,12 @@ describe('PromptManager', () => {
     expect(screen.getByLabelText('delete')).toBeInTheDocument() // back to normal row
   })
 })
+
+describe('PromptManager input size (I-15)', () => {
+  it('title and body fields are 16px (text-ui-input)', () => {
+    setup()
+    fireEvent.click(screen.getByText('新建'))
+    expect(screen.getByPlaceholderText(/标题/)).toHaveClass('text-ui-input')
+    expect(screen.getByPlaceholderText('prompt 全文')).toHaveClass('text-ui-input')
+  })
+})

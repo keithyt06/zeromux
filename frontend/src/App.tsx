@@ -403,7 +403,7 @@ export default function App() {
         onOpenVault={handleOpenVault}
         askAgentRequest={askAgentRequest}
         onOpenHistory={(id) => { setActiveId(id); setHistoryReq({ id, nonce: Date.now() }) }}
-        onOpenPanel={setPanel}
+        onOpenPanel={p => { setPanel(p); if (isMobile) setSidebarOpen(false) }}
       />
       <main className="flex-1 min-w-0 flex flex-col">
         {/* Info bar for active session */}

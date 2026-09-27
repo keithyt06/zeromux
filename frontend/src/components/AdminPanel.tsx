@@ -60,7 +60,7 @@ export default function AdminPanel({ open, onClose }: Props) {
     >
       <div className="p-4 space-y-4">
         {loading ? (
-          <div className="text-ui-sm text-[var(--fg-subtle)]">Loading...</div>
+          <div className="text-ui-sm text-[var(--fg-subtle)]">加载中…</div>
         ) : (
           <>
             {/* Pending users */}
@@ -113,7 +113,7 @@ function UserRow({ user, onApprove, onRemove }: {
         <div className="text-ui-xs font-medium text-[var(--fg)] truncate">
           {user.github_login}
           {user.role === 'admin' && (
-            <span className="ml-1.5 text-ui-2xs text-[var(--peer)] font-normal">admin</span>
+            <span className="ml-1.5 px-1 rounded text-ui-2xs text-[var(--fg-muted)] bg-[var(--surface-3)] font-normal">admin</span>
           )}
         </div>
         {user.display_name && (

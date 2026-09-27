@@ -366,18 +366,24 @@ function TaskRow({ task, onToggle, onRun, onEdit, onDelete, onHistory }: {
 
 type Kind = ScheduleInput['kind']
 
+// Index = UI weekday number (0=Sun..6=Sat); must match weekday_name in src/scheduled_tasks.rs.
+const DOW_NAMES = ['SUN', 'MON', 'TUE', 'WED', 'THU', 'FRI', 'SAT']
+
 // eslint-disable-next-line react-refresh/only-export-components -- pure helper exported for unit tests
 export function parseCronToForm(spec: string): { kind: Kind; hour: number; minute: number; weekdays: number[] } | null {
   // 6-field seconds-first cron as produced by the backend schedule_to_cron
-  // (src/scheduled_tasks.rs): "0 M H * * *" (daily) or "0 M H * * D,D" (weekly).
+  // (src/scheduled_tasks.rs): "0 M H * * *" (daily) or "0 M H * * MON,FRI"
+  // (weekly, day NAMES). Numeric day-of-week is deliberately NOT mapped: the
+  // cron crate numbers 1=Sun..7=Sat (legacy specs were written with the UI's
+  // 0=Sun numbers and fire a day early), so those stay in cron mode verbatim.
   const f = spec.trim().split(/\s+/)
   if (f.length !== 6 || f[0] !== '0' || f[3] !== '*' || f[4] !== '*') return null
   const minute = Number(f[1]), hour = Number(f[2])
   if (!Number.isInteger(minute) || !Number.isInteger(hour)) return null
   if (f[5] === '*') return { kind: 'daily', hour, minute, weekdays: [1, 2, 3, 4, 5] }
-  const days = f[5].split(',').map(Number)
-  if (days.some(d => !Number.isInteger(d) || d < 0 || d > 7)) return null
-  return { kind: 'weekly', hour, minute, weekdays: days.map(d => (d === 7 ? 0 : d)) }
+  const days = f[5].toUpperCase().split(',').map(n => DOW_NAMES.indexOf(n))
+  if (days.some(d => d < 0)) return null
+  return { kind: 'weekly', hour, minute, weekdays: days }
 }
 
 export function TaskForm({ task, onCancel, onSaved }: {
@@ -443,7 +449,8 @@ export function TaskForm({ task, onCancel, onSaved }: {
     }
   }
 
-  const inputCls = 'w-full bg-[var(--surface-2)] border border-[var(--border)] rounded px-2 py-1.5 text-ui-xs text-[var(--fg)] outline-none focus:border-[var(--accent)]'
+  // text-ui-input (16px): anything smaller makes iOS Safari zoom on focus (I-15).
+  const inputCls = 'w-full bg-[var(--surface-2)] border border-[var(--border)] rounded px-2 py-1.5 text-ui-input text-[var(--fg)] outline-none focus:border-[var(--accent)]'
   const labelCls = 'block text-ui-2xs font-semibold text-[var(--fg-subtle)] uppercase tracking-wider mb-1'
 
   return (

@@ -1,13 +1,13 @@
 # S3+S4 会话内体验(Focus 区)—— 设计
 
 日期:2026-09-27
-状态:v1(用户确认四个关键选择:D / C / C / C,其余由主会话按判断补全;待审阅 spec 文本)
+状态:v2(2026-09-27 CTO + PM + 高级 UI/UX 三方交叉评审后修订,见 §0.3;**§0.3 与正文冲突时以 §0.3 为准**,plan 阶段按 §0.3 落实)
 基线:`main` @ `3601fb4`(P0 止血已上线)
 上游:
 - 总体设计 `docs/superpowers/specs/2026-09-26-frontend-triage-focus-redesign-design.md`(下称「总 spec」)—— 本文取代其 §5(S3)与 §6(S4)纲要。
 - 前端审计 `docs/superpowers/audits/2026-09-26-frontend-ux-audit.md`(§/I-/B- 编号均指它)。
 
-**依赖顺序**:本 spec 的实施**必须**在 S1(token + primitives + 数据层)与 S2(AppShell + zustand store)之后。本文引用的 `<Sheet>`、`<Popover>`、`<Menu>`、`toast`、`useAsyncResource`、`useLatestRequest`、`usePolling`、`useIsNarrow/useIsTouch`、zustand store 均由 S1/S2 产出(总 spec §3.3–3.4、§4.7)。
+**依赖顺序**:本 spec 的实施**必须**在 S1(token + primitives + 数据层)与 S2(AppShell + zustand store)之后。本文引用的 `<Sheet>`、`<Popover>`、`<Menu>`、`<SegmentedControl>`、`confirm()`、`toast`、`lib/format.ts`、`useAsyncResource`、`useLatestRequest`、`usePolling`、`useIsNarrow/useIsTouch`、zustand store 均由 S1/S2 产出(总 spec §3.3–3.4、§4.7)。
 
 ---
 
@@ -34,6 +34,28 @@
 | Context 面板**按会话常驻挂载 + hidden** | 修复现 overlay 条件挂载关掉即丢状态(审计 §1.1);与 I-1 同构 |
 | WebGL 预算 4(active + 最近 3) | 浏览器上限 ~16(未验证);4 足够覆盖「来回切两三个终端」,其余 DOM 渲染 |
 | 队列模式 chip 放 composer 左侧 | 高频且影响发送语义,必须在发送键视野内(审计 §3.3 痛点) |
+
+### 0.3 v2 修订(三方交叉评审;优先于正文)
+
+| # | 修订 | 来源 | 影响正文 |
+|---|---|---|---|
+| V1 | **ContextPanel 从 5 tab 收为 3 tab**:**Git**(内部 SegmentedControl「改动 / 历史」)、**文件**、**运行**(RunMetrics 列表;AgentDashboard 事件列表并入其下半段,若实施时证明无独立价值则删)。**记忆 tab 删除**,统一走 composer 的 ⌘ 记忆弹层(内含完整列表 + 编辑,取代 MemoryPanel 全屏) | PM | §2.2 表格、§2.3 记忆、§0.2 第 4 行 |
+| V2 | **删**:`⌘1…5`、`Esc Esc` 中断、`⌘⇧Enter`、右栏拖宽、1024–1279px 覆盖形态、每会话记忆面板状态(`zmx_ctx:<sid>`)、自定义键编辑器 | PM | §2.2、§2.3、§4.2、§4.3 |
+| V3 | **ContextPanel 形态简化**:≥ 1280px 右栏 **固定 360px**;< 1280px 一律 `Sheet side="bottom"`(两档)。默认展开态**只按会话类型**(agent 展开 / tmux 收起),用户切换仅在当前页面生命周期内记住(不持久化) | PM | §2.2 形态表 |
+| V4 | **键栏**:收起/展开保留(全局记忆);**不做自定义键编辑器**,改为第二页硬编码补 `^R`、`^L`、`Home`、`End` | PM | §4.2 |
+| V5 | **手机「终端报错发给 agent」一击**:HistoryView 底部「发给…」在**无选区时**直接取尾部 200 行(现有语义),默认目标 ★ 直接发送,菜单只在长按时出现;目标 ≤ 2 击 | PM | §4.3、§5.2 |
+| V6 | **SendToMenu 是「发给 agent」唯一实现**:⚡ 问 agent(笔记)、HistoryView「发给 agent」、Git「让 agent 处理」、终端选中文本 全部调用它;`App.tsx:454` `onAskAgent` 删除 | PM | §2.4(已是此意,明确「⚡」也收编) |
+| V7 | **预设只有一个入口**:composer 行首 `/`;⌘K 新建模式的 prompt 框复用同一补全组件;删除 composer ListPlus 按钮、Sidebar Settings 的 PromptManager 入口;管理只在 `/` 列表底部「管理…」 | PM | §2.3 |
+| V8 | **队列模式 chip 一击切换**(Collect ⇄ Interrupt,不开菜单);chip 放输入框内左下角;📎 与 ⌘ 收进输入框内「＋」;发送键 36px | PM + UI/UX | §2.3 |
+| V9 | **状态表达统一为 StatusDot(+ 可选文字)**:摘要卡出错**不用左边框**,改为 `--danger` 4% 底色 + 结论区错误文字;Interrupt 模式发送键不变色,改为 chip 高亮 + 发送键旁 `text-ui-2xs` 「将打断」 | UI/UX | §3.4、§2.3 |
+| V10 | **成本/耗时格式统一走 `lib/format.ts`**:列表/顶栏 `$0.42`,摘要卡与运行 tab 详情 `$0.4213`;耗时 `3m12s` / `12s` / `0.4s`,`tabular-nums` | UI/UX | §3.4、§2.1 |
+| V11 | **TurnTimeline 步骤图标**用 StatusDot 同源 12px 图标(✓/⟳/┊ 字符弃用);耗时右对齐 `.num`;thinking `--fg-subtle` 斜体 | UI/UX | §3.3 |
+| V12 | **SummaryCard 布局**:结论下方**一行**合并「改动文件 chip(可点)· N 步 · 耗时 · $」,「过程 ▾」右对齐 | UI/UX | §3.4 |
+| V13 | **WebGL 预算推迟**:B3 仅保留「隐藏终端 status 拉取收敛」;WebGL LRU 等出现 context lost 报告再做(保留 §4.5 作为备选设计) | PM + CTO(未验证闪烁风险) | §4.5、§6 B3 |
+| V14 | **S2 v2 已取消手机底部 Tab**(总 spec §0.4 R20):Focus 区手机布局为 顶栏(‹ 分诊 (N) · 会话名 · ⋯)+ 内容 + composer/键栏;FAB ⏭ 位于 composer 上方右侧 | PM | §2.1、§5.2 可视高度目标因此 ≥ 82% 可达 |
+| V15 | **会话动作走 `lib/sessionActions.ts` 注册表**(总 spec R23);FocusHeader `⋯` 不再单独实现重命名/关闭/复制;**删除手动 Blocked/Done 状态**(与 attention 双系统,总 spec R24) | PM | §2.1 |
+| V16 | **所有 emoji 图标换 lucide**(📜 → `History`、⧉ → `Copy`、🖱 → `Mouse`、👍👎 → `ThumbsUp/Down`) | UI/UX | §4.2 |
+| V17 | **与总 spec 的重复消除**:「终端 status 轮询只在 active」只由本 spec §4.6 负责(总 spec §3.4 已移除);「GitViewer loadLog stale 守卫 / B5 / B6」只由本 spec §2.2 负责 | CTO | — |
 
 ---
 

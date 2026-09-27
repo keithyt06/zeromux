@@ -1,7 +1,7 @@
 # 前端重设计「Triage + Focus」—— 设计
 
 日期:2026-09-26
-状态:v1(PM + CTO 交叉评审后收敛;用户已确认方向「按建议来」,待审阅 spec 文本)
+状态:v2(2026-09-27 CTO + PM + 高级 UI/UX 三方交叉评审后修订 §3 S1 与若干 S2 条目,见 §0.4;P0 已上线 3601fb4)
 基线:`main` @ `acb3ea3`
 输入:
 - 前端审计 `docs/superpowers/audits/2026-09-26-frontend-ux-audit.md`(以下简称「审计」,§/I-/B- 编号均指它)
@@ -35,6 +35,47 @@
 - `Cargo.toml:9` tower-http 只开 `cors`、`set-header`,**无压缩**;`frontend/dist/assets/index-*.js` 1,364,669 B 原样下发。
 - `SessionInfo`(`session_manager.rs:386-406`)无成本/结果/片段/当前步骤字段;`lifetime_cost_usd` 存在于 `Session`(`:331`)但未导出。
 - 所有 fan-out 事件经唯一咽喉 `emit`(`:3555`)→ `record_and_broadcast`(`:2025`,锁内、无 I/O)。
+
+### 0.4 v2 修订(2026-09-27 三方交叉评审)
+
+用户要求:「大刀阔斧但要美观、便捷、功能不重复」。三份评审(CTO / PM / 高级 UI/UX)的关键断言主会话已复核:
+`--text-muted` #484f58 on #11161d = **2.19:1**(170+ 处使用,S1 对比度验收必挂);br q4 → q11 预压实测 JS 388,540 → 312,657、CSS 8,820 → 7,556(**腾出 ~77KB**);
+happy-dom 15 有 `<dialog>.showModal` 但**无 Popover API**;`text-[8-11px]` 现 180 处(非 136),调色板直用 16、`z-*` 26、原生弹窗 17;stale 测试现存 4 个 `*.stale.test.tsx` + 3 个含 reqRef 断言的文件。
+
+| # | 修订 | 来源 | 裁决理由 |
+|---|---|---|---|
+| R1 | **Primitives 不用 Radix**:Sheet/Dialog 用原生 `<dialog>`(top-layer,天然越过 `contain: paint`/overflow/z-index,无需 portal);Popover/Menu 用定位 `div` + 自写点外/Esc(不用 Popover API) | CTO(体积)+ 主会话(happy-dom 无 Popover API,不可测) | Radix 三件 25–35KB br 会吃掉全部余量;原生 ≈3KB;Popover 自写与现有 6 处手写遮罩同构,只是收敛为一个组件 |
+| R2 | **S1 第一件事是构建期 br q11 预压 + 体积门禁**(`scripts/check-size.mjs`) | CTO | 在线 q11 每请求 ~2s CPU 不可行;预压腾出 77KB,让后续所有工作不再为 3KB 余量卡脖子 |
+| R3 | **token 终值采用 UI/UX 表**(§3.1 v2),`--text-muted`(→ `--fg-subtle`)暗 #848d97 / 亮 #5f6873,在最深的 surface-3 上仍 ≥ 4.5:1(主会话复算;UI/UX 原值 #7d8590/#6e7781 在 surface-3 仅 4.08/4.01);新语义层 `--color-*` 为唯一真源,旧 `--bg-*`/`--text-*`/`--accent-*` 保留为兼容别名 | UI/UX + CTO(`@theme inline`) | 修对比度是全局可见变化,**明确告知用户**(非「零视觉变化」) |
+| R4 | **状态视觉收敛为 5 种语义**:danger(error)、stuck(橙,与 error 分开)、attention(approval/confirm/done_unread)、running(= accent + 呼吸)、muted(idle/ended);StatusDot 以**形状 + 颜色**区分(色弱) | PM(4 种)+ UI/UX(6 种)折中 | stuck 与 error 处理动作不同(中断 vs 查看),须分色;approval/confirm/done_unread 都是「该你了」,同色不同形 |
+| R5 | **密度按 `(pointer: coarse)` 切换**(桌面紧凑 13px 正文 / 32px 行;触屏舒适 15px / 44px 行),与布局断点解耦 | UI/UX | 同一 token 两套密度,CSS 实现比 JS 分支便宜;iPad + 触控板等混合设备按指针判定更准 |
+| R6 | **字号阶梯**:2xs 12 / xs 13 / sm 14 / base 15 / input 16 / lg 17 / xl 20;12px 仅角标/时间戳;16px 只给 input(I-15) | UI/UX | Tailwind 默认 `text-xs`=12px 不改名(避免 111 处静默变化,CTO);新增命名 `text-ui-*` 层,旧类逐文件迁 |
+| R7 | **lint 门禁用棘轮(ratchet)**:记录当前计数,只许减不许增,第一天即上线 | CTO | 不必先迁完 180 处才上门禁 |
+| R8 | **主题三态无闪烁**:`public/theme-boot.js` 同步脚本(CSP `script-src 'self'` 禁内联)在首帧前设 class + `color-scheme`;xterm/mermaid 读**已解析**主题 | CTO | 现 `useEffect` 设 class,亮色用户每次先闪暗 |
+| R9 | **`request<T>` 超时按端点显式,不设默认**;`useAsyncResource` 只有 key 变化才清 data,`reload` 不清 | CTO | createSession(隔离 24s)、上传、JuiceFS git diff 会被 15s 误杀;fe5396b 修过「写后闪空」 |
+| R10 | **push 客户端单独迁移**:`lib/push.ts` 的 `enablePush` 现在 subscribe 500 仍写本地已启用(真 bug),PushSettings.toggle 无 catch | CTO | 统一抛错会暴露未处理 rejection,须同时补 catch |
+| R11 | **S1 只迁「不会被 S2/S3 重写」的站点**。AcpChatView、GitViewer、FileBrowser、App.tsx 轮询/焦点、SessionInfoBar 的 reqRef/原生弹窗/hover-only/小字号**留给 S2/S3 的重写**;S1 验收相应改为「S1 负责文件清零 + 全局棘轮不增」 | CTO | 避免 S1 迁完 S3 又重写一遍(重复劳动) |
+| R12 | **新增 primitives**:Kbd、Badge、SegmentedControl、Tooltip(仅桌面)、Skeleton;EmptyState 并入 PaneStatus。**推迟**:StatusDot 与 PaneStatus 实现推到 S2/S3(状态集由 triage 定;Git/Files 面板 S3 重写),但 S1 **锁定其 token 与形态规范** | UI/UX + CTO | 规范先锁、实现跟需求 |
+| R13 | **手机上 Menu/Popover 一律以 bottom Sheet 呈现**;Sheet 最多一层(禁 Sheet 套 Sheet) | UI/UX + PM | 锚定浮层遇 iOS 软键盘会被顶出屏幕(未验证,S1 真机确认) |
+| R14 | **图标只用 lucide,禁 emoji**(📜、👍、⧉ 等) | UI/UX | 视觉一致;emoji 跨平台渲染不一(P0 的「⤒→不」同类) |
+| R15 | **`lib/format.ts`**:成本(列表/顶栏 2 位,详情 4 位)、耗时、相对时间统一;数字 `tabular-nums` | UI/UX + PM | 审计 §3.3「三处精度不一」 |
+| R16 | **sanitize 回归测试锁死 `popover`/`popovertarget`/`dialog` 属性与元素不被放行** | CTO | 若将来放行,笔记可免 JS 弹出穿透 `contain: paint` 的全屏层(I-16) |
+| R17 | **截图基线工具进 S1**(playwright-core,P0 T8 已验证可用;gstack browse 需 bun 未装) | CTO | S1 是第一次动全局视觉,须有前后对比 |
+
+**对 S2 的修订(本版一并记录,S2 plan 时落实)**:
+
+| # | 修订 | 来源 |
+|---|---|---|
+| R20 | **手机底部 Tab 栏取消**。会话页全屏,左上「‹ 分诊 (3)」;分诊页底部常驻「搜索或新建…」输入条(= ⌘K 入口);会话页仅 FAB ⏭(「需要你」> 0 时)。 | PM(三方中两方指出 Tab 重复 ⌘K;占 ~90px 与终端可视高度目标冲突) |
+| R21 | **⌘K 空状态**直接列 quick targets + 最近会话(否则手机新建常用目录比现在更慢) | PM |
+| R22 | **新建会话唯一实现 = ⌘K 新建模式**;Sidebar 六步状态机、「+新建」Tab 在 v2 上线当天删除(不留两周);其他入口(QuickTargets、⚡、SendToMenu「新开」、搜索结果「在此开 agent」)只做**预填 ⌘K** | PM |
+| R23 | **`lib/sessionActions.ts` 动作注册表**:重命名/置顶/关闭/复制 peer/复制 attach 等只注册一次,TriageRow ⋯、FocusHeader ⋯、⌘K 动作三处都从它渲染 | PM |
+| R24 | **砍**:置顶(与 attention 排序冲突)、`K`/`⌘[`(保留 `J` 与 `⌘]`)、顶栏横滑手势(与 iOS 边缘返回冲突)、手动 Blocked/Done 状态(与 attention 双系统) | PM |
+| R25 | **补**:`document.title` 计数 + PWA `navigator.setAppBadge`;分诊行「忽略」(不进会话清提醒);定时任务「立即运行」后「打开会话」 | PM |
+| R26 | **TriageRow 两行**(名称 + 状态/耗时;片段 + 行内动作),成本仅桌面显示 | UI/UX |
+| R27 | **队列模式 chip 点一下即切换**(只有两个值,不开菜单) | PM |
+
+**对 S3+S4 spec(2026-09-27-focus-session-experience-design.md)的修订**由该文件 v2 记录(ContextPanel 3 tab、删 Esc Esc/⌘⇧Enter/⌘1-5/自定义键编辑器/可拖宽/每会话记忆等)。
 
 ---
 
@@ -81,71 +122,189 @@
 
 ---
 
-## 3. S1 地基
+## 3. S1 地基(v2)
 
-### 3.1 设计 token(Tailwind v4 `@theme`)
+> 本节为 v2(按 §0.4 R1–R17 重写)。S1 目标:**让后续 S2/S3/S4 只用组件和 token 拼界面,不再手写样式与遮罩**;同时一次性修正全局对比度与字号。S1 会产生**全局可见的视觉变化**(次要文字变亮、小字放大、主题跟随系统),不改信息架构。
 
-在 `index.css` 以 `@theme` 声明,颜色映射到现有 CSS 变量(保留 `:root` / `:root.light` 覆盖机制):
+### 3.0 构建与体积(第一件事)
 
-| 类别 | token | 取值 |
+- **构建期预压**:`vite build` 后运行 `scripts/precompress.mjs`,对 `dist/**/*.{js,css,html,svg,json,woff2?}` 生成 `.br`(Node `zlib` brotli q11)与 `.gz`(level 9),仅对 ≥ 1KB 且压缩后更小的文件。
+- **后端**:`try_serve_embedded`(`web.rs:222`)按请求 `Accept-Encoding` 优先返回嵌入的 `path.br` / `path.gz`,设 `Content-Encoding` 与 `Vary: Accept-Encoding`,MIME 仍按原路径推断。**CompressionLayer 保留**给动态 JSON(P0),但对已带 `Content-Encoding` 的响应 tower-http 自动跳过(已核实)。
+- **体积门禁** `scripts/check-size.mjs`:读取 `dist/index.html` 引用的入口 JS + CSS 的 `.br`,合计 **≤ 330KB**(当前 ≈ 320KB,留 10KB 给 S1 自身增长;S2 起每期 plan 须声明其预算并更新阈值)。接入 `npm run build`(构建失败即挡住部署)。
+- **不引入**:Radix、Ariakit、Base UI、motion、cmdk、虚拟列表库。S1 **零新增运行时依赖**。
+
+### 3.1 设计 token(v2 终值)
+
+**机制**:`index.css` 中 `:root` / `:root.light` 定义新语义变量(唯一真源);旧变量改为指向新变量的别名(兼容 170+ 处现有用法);`@theme inline { --color-*: var(--*) }` 暴露给 Tailwind 工具类。
+
+**颜色**(对比度按 surface-1 计):
+
+| token | 暗 | 亮 | 旧别名 |
+|---|---|---|---|
+| `--surface-0` | #0d1117 | #ffffff | — (xterm 背景) |
+| `--surface-1` | #11161d | #f6f8fa | `--bg-primary` |
+| `--surface-2` | #161c25 | #eef1f4 | `--bg-secondary` |
+| `--surface-3` | #1f2630 | #e4e8ec | `--bg-tertiary` |
+| `--surface-hover` | #243040 | #dce3ea | `--bg-hover` |
+| `--border` | #2a323d | #d0d7de | `--border` |
+| `--border-subtle` | #1f252e | #e4e8ec | `--border-light` |
+| `--fg-strong` | #e6edf3 | #1f2328 | `--text-bright` |
+| `--fg` | #cdd6e0 | #1f2328 | `--text-primary` |
+| `--fg-muted` | #9aa5b1(7.3:1) | #59636e | `--text-secondary` |
+| `--fg-subtle` | **#848d97**(s1 5.4 / s3 4.53) | **#5f6873**(s1 5.31 / s3 4.72) | `--text-muted`(**值变**) |
+| `--accent` | #58a6ff | #0969da | `--accent-blue` |
+| `--accent-hover` | #79c0ff | #0550ae | `--accent-blue-hover` |
+| `--on-accent` | #0d1117 | #ffffff | — |
+| `--danger` | #f85149 | #cf222e | `--accent-red` |
+| `--stuck` | #f0883e | #bc4c00 | — |
+| `--attention` | #d29922 | #9a6700 | `--accent-yellow` |
+| `--success` | #3fb950 | #1a7f37 | `--accent-green-text` |
+| `--running` | = `--accent` | = `--accent` | — |
+| `--brand` | #f7b500 | #b08800 | `--accent-brand` |
+| `--focus-ring` | #58a6ff99 | #0969da80 | — |
+
+- 删除 `--color-info`(与 accent 重复)。`--accent-green`/`--accent-green-hover`(按钮底)保留为 `--success-solid` 别名;`--accent-purple*`(peer 标签)保留为 `--peer`。
+- `--ansi-0..15` 保留,xterm 运行时读取(§3.1.3)。
+
+**状态语义**(R4,S2/S3 的 StatusDot/分诊唯一来源):
+
+| 语义 | 颜色 | 形态(8px) | 覆盖的 Attention |
+|---|---|---|---|
+| danger | `--danger` | 实心 + 内白点 | error |
+| stuck | `--stuck` | 实心 + 静态外环 | stuck |
+| attention | `--attention` | 菱形 | approval、confirm、done_unread |
+| running | `--running` | 实心 + 呼吸(opacity .5↔1,1.6s) | running |
+| muted | `--fg-subtle` | 空心环 | idle、ended |
+
+**字号**(R6;新命名层 `text-ui-*`,不覆盖 Tailwind 默认 `text-xs/sm/base`):
+
+| token | px / 行高 | 用途 |
 |---|---|---|
-| 语义色 | `--color-surface-{0,1,2,3}`、`--color-border{,-subtle}`、`--color-fg{,-muted,-subtle,-strong}`、`--color-accent`、`--color-success`、`--color-warning`、`--color-danger`、`--color-info` | 映射现有 `--bg-*`/`--text-*`/`--accent-*` |
-| 状态色 | `--color-state-{error,stuck,done,running,idle,waiting}` | 分诊与所有状态点唯一来源 |
-| 字号 | `--text-2xs:12px`、`--text-xs:13px`、`--text-sm:14px`、`--text-base:16px`、`--text-lg:18px` | **下限 12px**;手机正文 14px;输入框 16px(I-15) |
-| 圆角 | `--radius-sm:4px`、`--radius-md:8px`、`--radius-lg:12px`、`--radius-full` | |
-| 阴影 | `--shadow-{sm,md,lg}`(暗色用边框+微光,亮色用投影) | |
-| 层级 | `--z-{base:0,sticky:10,drawer:30,popover:40,modal:50,toast:60}` | 取代散落 z-10…z-50 |
-| 动效 | `--ease-out`、`--dur-{fast:120ms,base:200ms}`;`prefers-reduced-motion` 时归零 | CSS transition,无动画库 |
-| 字体 | `--font-sans`(system-ui 栈 + PingFang SC)、`--font-mono`(JetBrains Mono 栈) | 取代 `TerminalView.tsx:301` 写死 |
+| `text-ui-2xs` | 12 / 16 | 角标、时间戳、kbd(**仅此**可用 12) |
+| `text-ui-xs` | 13 / 18 | 桌面次要文字、手机辅助文字、代码块 |
+| `text-ui-sm` | 14 / 20 | 桌面正文 |
+| `text-ui-base` | 15 / 24(中文 1.6) | 手机正文、对话正文 |
+| `text-ui-input` | 16 / 24 | **仅**输入框(I-15) |
+| `text-ui-lg` | 17 / 24,600 | 面板标题 |
+| `text-ui-xl` | 20 / 28,600 | 页面标题(登录、空态) |
 
-- **主题**:新增「跟随系统」(`prefers-color-scheme`)为默认;`lib/theme.ts` 三态 `system/dark/light`。
-- **消除硬编码**:审计 §2.1 列出的 24 处 Tailwind 调色板直用、GitViewer 硬编码色、`LoginPage` GitHub 按钮;mermaid 按当前主题初始化(B13)。
-- **xterm 主题**:`TerminalView.tsx:27-72` THEMES 改为运行时 `getComputedStyle` 读 `--ansi-*`,主题切换时 `term.options.theme = …`。
-- **门禁**:`scripts/lint-tokens.sh`(或 eslint 规则)拒绝 `text-\[(8|9|10|11)px\]`、`(text|bg|border)-(zinc|gray|yellow|orange|green|red|blue)-\d+`、`z-\d+`;接入 `npm run lint`。
+- 数字列一律 `tabular-nums`(工具类 `.num`)。
+
+**密度**(R5):
+
+```css
+:root { --row-h: 32px; --ctl-h: 28px; --hit: 28px; --pad-x: 12px; }
+@media (pointer: coarse) { :root { --row-h: 44px; --ctl-h: 36px; --hit: 44px; --pad-x: 16px; } }
+```
+工具类 `.row`(min-height: var(--row-h))、`.ctl`、IconButton 命中区用 `--hit`。**正文字号不随 pointer 自动切换**(由组件按场景选 `text-ui-sm`/`text-ui-base`),避免全局静默变化。
+
+**间距**:4px 基数,只用 Tailwind 默认 `0/0.5/1/2/3/4/5/6/8`(即 0/2/4/8/12/16/20/24/32px);lint 不强制(棘轮只管字号/颜色/层级)。
+
+**圆角**:`--radius-sm 4`(chip/kbd)、`--radius-md 8`(按钮、行、输入)、`--radius-lg 12`(卡片、浮层)、`--radius-sheet 16`(Sheet 顶角)。
+
+**阴影 / 层次**:暗色靠明度 + 1px 边框分层,**仅浮层**用 `--shadow-overlay: 0 8px 24px rgb(0 0 0 / .45)`;亮色 `--shadow-overlay: 0 8px 24px rgb(31 35 40 / .12)` + `--shadow-card: 0 1px 2px rgb(31 35 40 / .06)`。
+
+**层级**:`--z-sticky 10`、`--z-drawer 30`、`--z-popover 40`、`--z-modal 50`、`--z-toast 60`;工具类 `.z-sticky` 等(Tailwind v4 写法 `z-(--z-modal)` 在 plan 首个 task 验证,不可用则用自定义类)。原生 `<dialog>` 在 top-layer,不参与 z 表。
+
+**动效**:`--ease-out: cubic-bezier(.2,.8,.2,1)`、`--dur-fast 120ms`(hover/press)、`--dur-base 200ms`(面板/Sheet 进入)、退出 150ms ease-in;`prefers-reduced-motion: reduce` 时时长归零、呼吸停止。
+
+**字体**(系统栈,不自托管):
+- `--font-sans: -apple-system, BlinkMacSystemFont, "PingFang SC", "Hiragino Sans GB", "Microsoft YaHei", system-ui, sans-serif`
+- `--font-mono: ui-monospace, "SF Mono", "JetBrains Mono", Menlo, Consolas, monospace`(xterm 同源,取代 `TerminalView.tsx:301` 写死)
+- `body` 默认 `font-family: var(--font-sans)`、`-webkit-font-smoothing: antialiased`。
+
+#### 3.1.1 主题三态
+
+- `lib/theme.ts`:`ThemePref = 'system'|'dark'|'light'`(存 `zeromux_theme`,缺省 `system`);`resolvedTheme: 'dark'|'light'`;`matchMedia('(prefers-color-scheme: light)')` 监听。**class 切换在 setter / media 回调中同步执行**,再 setState(子组件 effect 读到的已是新值,CTO §3 时序陷阱)。
+- `public/theme-boot.js`(`index.html` `<head>` 同步引用,早于 CSS 外的一切):读 localStorage + media,设 `documentElement.classList` 与 `style.colorScheme`,防首帧闪烁。
+- `index.html` 与 `manifest.json` 的 `theme-color` 改为两条 `<meta name="theme-color" media="(prefers-color-scheme: …)">`(暗 #11161d、亮 #f6f8fa);品牌黄仅保留在图标。
+- 设置入口:Sidebar Settings 的主题项改为三态 SegmentedControl。
+
+#### 3.1.2 消除硬编码
+
+审计 §2.1 列出的调色板直用(现 16 处)、GitViewer graph/高亮 hex、`LoginPage` GitHub 按钮、`AcpChatView` fallback,**仅在 S1 负责的文件中**迁到 token(R11);其余由棘轮兜底。mermaid 按 `resolvedTheme` 初始化并在主题切换后重渲染(B13)。
+
+#### 3.1.3 xterm 主题
+
+`lib/terminalTheme.ts`:`readTerminalTheme(): ITheme` 用 `getComputedStyle(documentElement)` 读 `--surface-0`、`--fg`、`--accent`、`--ansi-0..15`、`--term-selection`;TerminalView 初始化与 `resolvedTheme` 变化时调用(取代 `TerminalView.tsx:27-72` THEMES)。`--ansi-*` 值以现 THEMES 为准(两处取值不一致时以 xterm THEMES 为准,因为那是用户实际看到的终端色)。
+
+#### 3.1.4 门禁(棘轮)
+
+`scripts/lint-tokens.mjs`:扫描 `src/**/*.tsx`(排除 `__tests__`),统计五类计数:`text-[8-11px]`、Tailwind 调色板直用、`z-\d+`、原生 `alert/confirm/prompt`、emoji 图标(📜👍👎⧉🖱✎ 等清单)。与 `scripts/lint-tokens.baseline.json` 比较:**任一类增加即失败**;减少时打印提示要求同步下调 baseline。接入 `npm run lint`。
 
 ### 3.2 响应式
 
-- 断点:`md` = 768px、`lg` = 1024px(Tailwind 默认)。布局切换全部用 CSS 断点。
-- `lib/useMediaQuery.ts`:`matchMedia` 监听,取代 `App.tsx:72` 单次判定(B11)。
-- 统一移动判定:**布局**看宽度(`md`),**输入方式**看 `(any-pointer: coarse)`;两者分别暴露 `useIsNarrow()` / `useIsTouch()`,TerminalView 现有触屏判定(`:131-135`)改用后者。
+- 断点:`md` 768、`lg` 1024、`xl` 1280(Tailwind 默认)。布局切换用 CSS 断点。
+- `lib/useMediaQuery.ts`:`useMediaQuery(q)`(`useSyncExternalStore` + `matchMedia`);导出 `useIsNarrow()` = `(max-width: 767px)`、`useIsTouch()` = `(any-pointer: coarse)`。
+- `App.tsx:72` 单次 `isMobile` 改用 `useIsNarrow()`(B11)。**只替换判定来源,不改 App 其余逻辑**(I-2/I-3 所在文件,S2 才重构)。
+- TerminalView 触屏判定(`:131-135`)改用 `useIsTouch()`。
 
-### 3.3 Primitives(`components/ui/`)
+### 3.3 Primitives(`components/ui/`,零依赖)
 
-依赖 Radix(按需:`@radix-ui/react-dialog`、`-popover`、`-dropdown-menu`),全部 portal 到 `#overlay-root`(`index.html` 新增,**不在** `.vault-reading-surface` 内,I-16)。
-
-| 组件 | 职责 | 取代 |
+| 组件 | 实现 | 规范 |
 |---|---|---|
-| `<Sheet side="right\|bottom\|full" title actions>` | 面板/抽屉;bottom 用 VisualViewport 键盘补偿;手机 bottom 支持下拉关闭 | Admin/Scheduled/Push 全屏面板(消除「无定位祖先才全屏」隐式行为,审计 §4.2)、DirectoryPicker modal |
-| `<Popover>` | 锚定浮层 + Esc + 点外关闭 | `Sidebar.tsx:599,980,1019`、`AcpChatView.tsx:914,963` 手写遮罩 |
-| `<Menu items>` | 行菜单,触屏 44px 行高 | SessionRowMenu、QuickTargets/SearchResults 行内操作 |
-| `<ConfirmInline>` / `confirm()` promise API | 替代原生 `alert/confirm/prompt`(~17 处) | 两段确认先例 `PromptManager.tsx:63-78` |
-| `toast.push({msg, action?, durationMs, key?})` | 队列 + 同 key 去重;撤销 toast 时长公式不变(I-18) | 单槽 `undoToast`(`App.tsx:315`) |
-| `<IconButton>` | 强制 `aria-label`、触屏 ≥44px 命中区 | 散落 `p-0.5`/`p-1` 图标按钮 |
-| `<StatusDot state>` | 语义状态点(running 呼吸、stuck 脉冲) | TurnDot、`SessionInfoBar.tsx:37` |
-| `<PaneStatus kind="loading\|empty\|error">` | 统一空态/加载/错误 | Git/FileBrowser 重复占位 |
+| `Dialog` | 原生 `<dialog>` + `showModal()`(StrictMode:先判 `el.open`);Esc 由浏览器处理并映射 `onClose`;关闭后焦点回触发元素 | 居中,`--radius-lg`,`max-width: min(480px, 100vw - 24px)` |
+| `Sheet` | 基于 Dialog;`side = 'bottom' \| 'right' \| 'full'` | bottom:两档 `half`(50% 可视视口)/`full`(100% − safe-top − 8px);键盘弹出时高度取 `visualViewport.height` 并锁 full;底部 padding `max(12px, env(safe-area-inset-bottom))`;顶部 16px 圆角 + 把手;**下拉关闭**:仅把手区或内容 `scrollTop=0` 时响应,位移 > 30% 或速度 > 0.5px/ms。right:360px。full:手机 = 全屏页。**禁止 Sheet 内再开 Sheet**(dev 下 console.error) |
+| `Popover` | 定位 `div`(fixed,`getBoundingClientRect` + VisualViewport 计算,碰撞翻转),挂在 `document.body` 末尾的 `#overlay-root`(非 `.xterm-container`、非 `.vault-reading-surface` 内);点外(pointerdown capture)与 Esc 关闭 | offset 6px,`max-width: min(320px, 100vw - 24px)`;**窄屏(useIsNarrow)自动改用 `Sheet side="bottom"`**(R13) |
+| `Menu` | 基于 Popover;items `{label, icon?, danger?, kbd?, onSelect}` | 行高 `--row-h`;↑↓ / Home / End / 首字母跳转 / Enter;危险项 `--danger` 文字 |
+| `toast` | 模块级队列 + `<Toaster/>`(App 挂一次);`toast.push({ message, action?, durationMs, key? })` | 同 key 去重;同屏 ≤ 3;桌面右下、手机底部居中(`bottom: calc(env(safe-area-inset-bottom) + 16px)`);带 action 的 toast 在 pointer 按住时暂停计时;**撤销关闭 toast 时长公式不变(I-18)** |
+| `confirm()` | `await confirm({ title, body?, confirmLabel, danger? }): Promise<boolean>`,渲染 Dialog | 替代原生 `window.confirm`;**`ConfirmInline` 不做**(与 confirm 二选一,PM;行内两段确认仍可用现有模式) |
+| `prompt()` | `await promptText({ title, initial?, placeholder? }): Promise<string \| null>` | 替代原生 `window.prompt`(FileBrowser 新建/重命名等) |
+| `IconButton` | `<button>`,强制 `label`(aria-label + 桌面 Tooltip);视觉 28/36px,命中区 `--hit`(伪元素扩展) | 图标 16/18px(lucide) |
+| `Tooltip` | 仅 `(hover: hover)` 设备渲染;500ms 延迟 | 触屏不渲染 |
+| `Kbd` | `<kbd>` 样式 | `text-ui-2xs`,`--radius-sm`,`--surface-3` 底 |
+| `Badge` | 计数 / 点 | `text-ui-2xs` `.num`,`--attention`/`--danger` 两色 |
+| `SegmentedControl` | radio 组语义;←→ 切换 | 高 `--ctl-h`;选中 `--surface-3` + `--fg-strong` |
+| `Skeleton` | 行级占位 | `--surface-3` + 1.2s shimmer(reduced-motion 下静态) |
 
-**测试**:每个 primitive 有组件测(键盘、Esc、焦点回归、portal 挂载点);新增测试「给侧栏根加 `relative` 后 Sheet 仍全屏」。
+- **StatusDot、PaneStatus**:S1 只锁规范(§3.1 状态表、R12),实现在 S2/S3。
+- 全部 primitives 有组件测(键盘、Esc、焦点回归、`#overlay-root` 挂载点、窄屏 Popover→Sheet)。新增「给侧栏根加 `relative` 后 Sheet 仍全屏」(`<dialog>` top-layer 天然满足)。
+- sanitize 回归(R16):`components/markdown/__tests__/sanitize.test.ts` 增 case:`<div popover>`、`<button popovertarget>`、`<dialog open>` 均被剥离。
 
 ### 3.4 数据层收敛
 
-- `lib/api/` 按域拆分 `api.ts`(sessions/git/files/vault/scheduler/push/memory/prompts/auth),统一 `request<T>(path, init & {timeoutMs?})`:`!res.ok` 抛 `ApiError(status, message)`,默认 15s AbortController。**轮询 catch 行为不变**(I-3:只有 `isAuthError` 登出)。`WaitingPage` 改走 `request`(B12)。
-- `lib/useLatestRequest.ts`:
-  ```ts
-  useLatestRequest(): { begin(): Token; isCurrent(t: Token): boolean; bump(): void }
-  ```
-  三点显式(请求前 `begin`、await 后 `isCurrent`、乐观写前 `bump`),**不做**包装 `run()` 以免藏掉第三点(I-8)。
-- `lib/useAsyncResource.ts`:`(key, fetcher) → {data, loading, error, reload}`,内部用 `useLatestRequest`;key 变化立即 `loading=true` 并清 data。
-- 迁移审计 §4.1 的 13 处 reqRef + 5 处无守卫(GitViewer.loadLog、ScheduledTasksPanel.load、ConfirmationQueue.reload、AdminPanel.load、PushSettings)。**每迁一处:先注释守卫确认对应 stale 测试变红,再迁;无测试者先补。** 7 个 `*.stale.test.tsx` 必须原样通过。
-- `lib/usePolling.ts`:`(fn, intervalMs, {enabled})`,`document.visibilityState==='hidden'` 暂停、恢复可见立即跑一次。迁移审计 §4.3 的全部轮询;TerminalView status/health 轮询**只在 `active` 时启用**(每次触发 `web.rs` 同步 git 子进程)。
-- 合并 `useDirBrowser`(Sidebar + DirectoryPicker)、`usePathSearch`(Sidebar + VaultReader,含 4s 重查)。
+- **`lib/http.ts`**:`request<T>(path, init?: RequestInit & { timeoutMs?: number; parse?: 'json' | 'text' | 'none' }): Promise<T>` —— 复用 `api()` 的 header/credentials;`!res.ok` → `throw new ApiError(res.status, bodyText || statusText)`;`timeoutMs` 仅在显式传入时启用 AbortController(**无默认超时**,R9)。`api()` 保留(push 等暂未迁移的调用方)。
+- **`lib/api.ts` 拆分**为 `lib/api/{core,sessions,git,files,vault,scheduler,push,memory,prompts,auth,search}.ts`,`lib/api.ts` 变为 `export * from './api/…'` 的聚合(所有 `import … from '../lib/api'` 与 `vi.spyOn(api, …)` 不变)。拆分 PR 只搬不改语义;语义变更(`throw new Error` → `ApiError`)在拆分后的独立 task,**逐域**进行并跑该域测试。4 个 `if (!res.ok) return null/默认值` 的函数(`api.ts:170,235,477,500`)**保持原语义**(调用方依赖降级)。
+- **`lib/useLatestRequest.ts`**:`{ begin(): number; isCurrent(t: number): boolean; bump(): void }`(三点显式,不做 `run()` 包装,I-8)。
+- **`lib/useAsyncResource.ts`**:`(key: string | null, fetcher: () => Promise<T>) → { data, loading, error, reload, setData }`;key 变化 → 同步清 data + loading(render-phase reset,同 B4 修法);`reload()` **不清 data**;`setData` 供乐观写(内部先 bump)。key 为 `null` 时不请求。
+- **`lib/usePolling.ts`**:`usePolling(fn, intervalMs, { enabled })`;`visibilityState==='hidden'` 暂停,恢复可见立即跑一次。
+- **迁移范围(R11)**,按顺序,每处:**先注释守卫 → 跑对应测试确认变红 → 迁移 → 变绿**;无测试者先补 stale 测试:
+  1. `lib/usePromptPresets.ts:30`(`usePromptPresets.test.ts`)
+  2. `QuickTargets.tsx:39`(`QuickTargets.test.tsx`)
+  3. `MemoryPanel.tsx:23`(补 `MemoryPanel.stale.test.tsx`)
+  4. `RunMetricsPanel.tsx:64`(`RunMetricsPanel.stale.test.tsx`)
+  5. `AgentDashboard.tsx:46`(`AgentDashboard.stale.test.tsx`)
+  6. `DirectoryPicker.tsx:29` + `Sidebar.tsx` 目录浏览 → `useDirBrowser`(`DirectoryPicker.stale.test.tsx` + `Sidebar.newflow.test.tsx`;**保持 P0 的 `creatingRef`/`runCreate` 守卫原样**)
+  7. `Sidebar.tsx` 搜索 + `VaultReader.tsx:34` → `usePathSearch`(`Sidebar.search.test.tsx` + `VaultReader.test.tsx`;S2 ⌘K 复用)
+  8. 无守卫站点:`AdminPanel.load`、`ScheduledTasksPanel.load`、`ConfirmationQueue.reload`(随 §3.5 改 Sheet 一并迁)
+  9. push:`lib/push.ts` 改用 `request`(修 `enablePush` 在 subscribe 失败时仍写本地已启用,R10);`PushSettings.toggle` 补 catch + toast
+- **不迁(留 S2/S3)**:`AcpChatView.tsx` memReqRef、`GitViewer.tsx` selectedHashRef/wtReqRef/loadLog、`FileBrowser.tsx` openReqRef、App.tsx 全部轮询与焦点逻辑、`TerminalView.tsx` status 轮询(S3+S4 spec §4.6 负责)。
+- 轮询迁到 `usePolling`:`Sidebar` 调度器健康 60s、`AgentDashboard` 10s、`WaitingPage` 5s(并改用 `request`,B12)。
 
-### 3.5 S1 验收
+### 3.5 S1 负责的界面迁移
 
-- `text-[8-11px]` 与调色板直用 grep 为 0;原生 `alert/confirm/prompt` 为 0;hover-only 控件为 0(审计 §2.6 四处)。
-- 亮/暗/系统三主题下截图无对比度失败(对比度 ≥ 4.5:1 正文,≥ 3:1 辅助)。
-- 69 个既有测试文件 + 新增测试全绿;`npm run lint` 含 token 门禁通过。
+只迁**不会被 S2/S3 重写**的组件,每个文件一次提交 + 前后截图:
 
----
+| 文件 | 迁移内容 |
+|---|---|
+| `AdminPanel`、`ScheduledTasksPanel`、`PushSettings` | 改为 `<Sheet side="full">`,挂载点从 Sidebar 上移到 App;字号/颜色 token 化;原生 confirm → `confirm()`;修 B2(编辑时调度类型/时分回填) |
+| `PromptManager` | 在 `<Sheet>` 内;token 化 |
+| `DirectoryPicker`、`QuickTargets`、`SearchResults` | token 化;行内操作 → `<Menu>`;hover-only 清零 |
+| `HistoryView` | token 化;原生 confirm → `confirm()`;📜 等 emoji → lucide |
+| `MobileKeyBar` | 📜 → lucide `History`;token 化 |
+| `LoginPage`、`WaitingPage` | token 化(GitHub 按钮色走 token);`text-ui-xl` 标题 |
+| `VaultReader` | 原生 alert → toast;列表 loading/error 用 Skeleton/简单错误行 |
+| `Toast`(旧) | 被 `toast` 队列取代;App 的 `undoToast`/`failToast` 改用 `toast.push`(I-18 公式与测试不变) |
+| `Sidebar` | **仅**:三处手写遮罩 → `<Popover>`/`<Sheet>`;主题三态;面板挂载上移;token 化。新建状态机**不重构**(S2 删除) |
+
+### 3.6 S1 验收
+
+- `npm run build` 内的体积门禁通过(入口 JS + CSS br ≤ 330KB);线上 `curl -H 'Accept-Encoding: br'` 取到的是预压版本(体积 ≈ q11)。
+- 棘轮:五类计数**全部低于**起始 baseline;§3.5 列出的文件中五类计数为 0。
+- 对比度:`scripts/contrast.mjs` 自动校验 token 表 —— 暗/亮两主题下 `--fg`/`--fg-muted`/`--fg-subtle` 在 `--surface-0..3` 上均 ≥ 4.5:1;`--danger`/`--stuck`/`--attention`/`--accent`/`--success` 在 `--surface-1` 上 ≥ 4.5:1(文字用)。
+- 主题:system/dark/light 三态切换无首帧闪烁(截图:冷启动亮色系统 → 首帧即亮);xterm 与 mermaid 跟随。
+- 截图回归:390×844 与 1440×900 × 暗/亮 × {登录、侧栏、定时任务 Sheet、推送 Sheet、Admin Sheet、tmux 终端、Claude 会话} 前后对比,存 `docs/superpowers/screens/s1/`。
+- 既有测试全绿;新增 primitives / hooks / 脚本测试全绿;`npm run lint` 含棘轮通过。
 
 ## 4. S2 分诊与导航(本期核心)
 

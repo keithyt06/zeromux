@@ -1,5 +1,8 @@
 import { describe, it, expect } from 'vitest'
+import { createElement } from 'react'
+import { render } from '@testing-library/react'
 import { sanitizeStreamingMarkdown, unwrapMarkdownFence } from '../sanitize'
+import MarkdownContent from '../MarkdownContent'
 
 describe('sanitizeStreamingMarkdown', () => {
   it('closes an unclosed code fence', () => {
@@ -80,5 +83,14 @@ describe('unwrapMarkdownFence', () => {
     // code block balanced. Pins correct behavior against future refactors.
     const wrapped = '```markdown\n# H\n```\ncode\n```\n```'
     expect(unwrapMarkdownFence(wrapped)).toBe('# H\n```\ncode\n```')
+  })
+})
+
+describe('sanitize schema regression (R16)', () => {
+  it('strips popover / popovertarget / dialog so notes cannot open top-layer overlays', () => {
+    const html = '<div popover id="p">x</div><button popovertarget="p">go</button><dialog open>y</dialog>'
+    const { container } = render(createElement(MarkdownContent, { text: html, isComplete: true, enableRawHtml: true }))
+    expect(container.innerHTML).not.toMatch(/popover/i)
+    expect(container.innerHTML).not.toMatch(/<dialog/i)
   })
 })

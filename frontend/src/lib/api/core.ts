@@ -1,9 +1,6 @@
 // Core HTTP plumbing: token storage, ApiError, the api() wrapper, wsUrl.
 // Every other domain module imports from here.
-
-function getToken(): string {
-  return localStorage.getItem('zeromux_token') || ''
-}
+import { getToken } from '../apiToken'
 
 export function setToken(token: string, maxAge?: number) {
   localStorage.setItem('zeromux_token', token)

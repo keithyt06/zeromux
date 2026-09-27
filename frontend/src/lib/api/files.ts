@@ -1,10 +1,5 @@
 import { api } from './core'
-
-// Duplicated from core.ts (not exported there, so not re-exported here either —
-// keeps the module's public surface identical to pre-split api.ts).
-function getToken(): string {
-  return localStorage.getItem('zeromux_token') || ''
-}
+import { getToken } from '../apiToken'
 
 export interface DirEntry {
   name: string

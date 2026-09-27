@@ -108,7 +108,7 @@ export default function HistoryView({ sessionId, title, onClose, split, onSendTo
         <input value={q} placeholder="搜索历史"
           onChange={e => { setQ(e.target.value); setIdx(0) }}
           onKeyDown={e => { if (e.key === 'Enter') step(e.shiftKey ? -1 : 1) }}
-          className="flex-1 min-w-0 px-2 py-1 rounded border border-[var(--border)] bg-[var(--bg-primary)] text-[var(--text-primary)] outline-none" />
+          className="flex-1 min-w-0 px-2 py-1 rounded border border-[var(--border)] bg-[var(--bg-primary)] text-[var(--text-primary)] text-ui-input outline-none" />
         <span className="shrink-0 tabular-nums text-[var(--text-muted)]">{matches.length ? `${cur + 1}/${matches.length}` : q ? '0/0' : ''}</span>
         <button aria-label="上一个" onClick={() => step(-1)} className="px-1 text-[var(--text-secondary)]">▲</button>
         <button aria-label="下一个" onClick={() => step(1)} className="px-1 text-[var(--text-secondary)]">▼</button>

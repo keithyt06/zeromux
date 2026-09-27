@@ -302,7 +302,7 @@ export default function TerminalView({ sessionId, active, theme, tmuxName, tmuxO
     const term = new Terminal({
       cursorBlink: true,
       fontSize: FONT_SIZE,
-      fontFamily: "'JetBrains Mono', 'Fira Code', 'Cascadia Code', Menlo, monospace",
+      fontFamily: getComputedStyle(document.documentElement).getPropertyValue('--font-mono').trim() || 'ui-monospace, Menlo, monospace',
       theme: THEMES[theme],
       allowProposedApi: true,
       scrollback: 10000,

@@ -1,97 +1,198 @@
 @import "tailwindcss";
 @import "@xterm/xterm/css/xterm.css";
 
-/* ── Theme variables ── */
+/* ── Design tokens v2 (spec 2026-09-26 §3.1) ─────────────────────────────
+   Semantic variables below are the single source of truth. Legacy names
+   (--bg-*, --text-*, --accent-*) are aliases kept so existing call sites keep
+   working; new code must use the semantic names (enforced by review, and the
+   ratchet in scripts/lint-tokens.mjs blocks new raw palette colors). */
 
 :root {
-  --bg-primary:   #11161d;
-  --bg-secondary: #161c25;
-  --bg-tertiary:  #1f2630;
-  --bg-hover:     #243040;
-  --border:       #2a323d;
-  --border-light: #21262d;
-  --text-primary: #cdd6e0;
-  --text-bright:  #e6edf3;
-  --text-secondary: #9aa5b1;
-  --text-muted:   #484f58;
-  --accent-blue:  #58a6ff;
-  --accent-blue-hover: #79c0ff;
-  --accent-green: #238636;
-  --accent-green-hover: #2ea043;
-  --accent-green-text: #56d364;
-  --accent-purple: #a371f7;
-  --accent-purple-dim: #8b5cf6;
-  --accent-purple-bg: #1c1c2e;
-  --accent-purple-text: #a5a0c8;
-  --accent-yellow: #d29922;
-  --accent-red:   #f85149;
-  --btn-disabled-bg: #21262d;
-  --btn-disabled-text: #484f58;
-  --code-bg:      #1c2128;
-  --accent-brand: #f7b500;
-  /* ANSI 16-color palette for the history view (mirrors TerminalView THEMES). */
-  --ansi-0: #484f58;
-  --ansi-1: #ff7b72;
-  --ansi-2: #3fb950;
-  --ansi-3: #d29922;
-  --ansi-4: #58a6ff;
-  --ansi-5: #bc8cff;
-  --ansi-6: #39c5cf;
-  --ansi-7: #b1bac4;
-  --ansi-8: #6e7681;
-  --ansi-9: #ffa198;
-  --ansi-10: #56d364;
-  --ansi-11: #e3b341;
-  --ansi-12: #79c0ff;
-  --ansi-13: #d2a8ff;
-  --ansi-14: #56d4dd;
-  --ansi-15: #f0f6fc;
+  color-scheme: dark;
+  --surface-0: #0d1117;
+  --surface-1: #11161d;
+  --surface-2: #161c25;
+  --surface-3: #1f2630;
+  --surface-hover: #243040;
+  --border: #2a323d;
+  --border-subtle: #1f252e;
+  --fg-strong: #e6edf3;
+  --fg: #cdd6e0;
+  --fg-muted: #9aa5b1;
+  --fg-subtle: #848d97;
+  --accent: #58a6ff;
+  --accent-hover: #79c0ff;
+  --on-accent: #0d1117;
+  --danger: #f85149;
+  --stuck: #f0883e;
+  --attention: #d29922;
+  --success: #3fb950;
+  --success-solid: #238636;
+  --success-solid-hover: #2ea043;
+  --running: var(--accent);
+  --brand: #f7b500;
+  --peer: #a371f7;
+  --peer-dim: #8b5cf6;
+  --peer-bg: #1c1c2e;
+  --peer-fg: #a5a0c8;
+  --focus-ring: #58a6ff99;
+  --code-bg: #1c2128;
+  --disabled-bg: #21262d;
+  --disabled-fg: #6e7681;
+  --term-selection: #264f78;
+  --shadow-overlay: 0 8px 24px rgb(0 0 0 / 0.45);
+  --shadow-card: none;
+
+  /* ANSI 16 — xterm reads these at runtime (lib/terminalTheme.ts). */
+  --ansi-0: #484f58;  --ansi-1: #ff7b72;  --ansi-2: #3fb950;  --ansi-3: #d29922;
+  --ansi-4: #58a6ff;  --ansi-5: #bc8cff;  --ansi-6: #39c5cf;  --ansi-7: #b1bac4;
+  --ansi-8: #6e7681;  --ansi-9: #ffa198;  --ansi-10: #56d364; --ansi-11: #e3b341;
+  --ansi-12: #79c0ff; --ansi-13: #d2a8ff; --ansi-14: #56d4dd; --ansi-15: #f0f6fc;
+  --term-fg: #c9d1d9;
+
+  /* Legacy aliases */
+  --bg-primary: var(--surface-1);
+  --bg-secondary: var(--surface-2);
+  --bg-tertiary: var(--surface-3);
+  --bg-hover: var(--surface-hover);
+  --border-light: var(--border-subtle);
+  --text-primary: var(--fg);
+  --text-bright: var(--fg-strong);
+  --text-secondary: var(--fg-muted);
+  --text-muted: var(--fg-subtle);
+  --accent-blue: var(--accent);
+  --accent-blue-hover: var(--accent-hover);
+  --accent-green: var(--success-solid);
+  --accent-green-hover: var(--success-solid-hover);
+  --accent-green-text: var(--success);
+  --accent-purple: var(--peer);
+  --accent-purple-dim: var(--peer-dim);
+  --accent-purple-bg: var(--peer-bg);
+  --accent-purple-text: var(--peer-fg);
+  --accent-yellow: var(--attention);
+  --accent-red: var(--danger);
+  --accent-brand: var(--brand);
+  --btn-disabled-bg: var(--disabled-bg);
+  --btn-disabled-text: var(--disabled-fg);
+
+  /* Density (pointer-driven, spec R5) */
+  --row-h: 32px;
+  --ctl-h: 28px;
+  --hit: 28px;
+  --pad-x: 12px;
+
+  /* Shape / layering / motion */
+  --radius-sm: 4px;
+  --radius-md: 8px;
+  --radius-lg: 12px;
+  --radius-sheet: 16px;
+  --z-sticky: 10;
+  --z-drawer: 30;
+  --z-popover: 40;
+  --z-modal: 50;
+  --z-toast: 60;
+  --ease-out: cubic-bezier(0.2, 0.8, 0.2, 1);
+  --dur-fast: 120ms;
+  --dur-base: 200ms;
+
+  --font-sans: -apple-system, BlinkMacSystemFont, "PingFang SC", "Hiragino Sans GB", "Microsoft YaHei", system-ui, sans-serif;
+  --font-mono: ui-monospace, "SF Mono", "JetBrains Mono", Menlo, Consolas, monospace;
 }
 
 :root.light {
-  --bg-primary:   #ffffff;
-  --bg-secondary: #f6f8fa;
-  --bg-tertiary:  #eaeef2;
-  --bg-hover:     #dce3ea;
-  --border:       #d0d7de;
-  --border-light: #e1e4e8;
-  --text-primary: #1f2328;
-  --text-bright:  #1f2328;
-  --text-secondary: #656d76;
-  --text-muted:   #8c959f;
-  --accent-blue:  #0969da;
-  --accent-blue-hover: #0550ae;
-  --accent-green: #1a7f37;
-  --accent-green-hover: #15803d;
-  --accent-green-text: #1a7f37;
-  --accent-purple: #8250df;
-  --accent-purple-dim: #6639ba;
-  --accent-purple-bg: #f3f0ff;
-  --accent-purple-text: #6e5494;
-  --accent-yellow: #9a6700;
-  --accent-red:   #cf222e;
-  --btn-disabled-bg: #eaeef2;
-  --btn-disabled-text: #8c959f;
-  --code-bg:      #f6f8fa;
-  --accent-brand: #b08800;
-  /* ANSI 16-color palette for the history view (mirrors TerminalView THEMES). */
-  --ansi-0: #24292f;
-  --ansi-1: #cf222e;
-  --ansi-2: #1a7f37;
-  --ansi-3: #9a6700;
-  --ansi-4: #0969da;
-  --ansi-5: #8250df;
-  --ansi-6: #1b7c83;
-  --ansi-7: #6e7781;
-  --ansi-8: #57606a;
-  --ansi-9: #a40e26;
-  --ansi-10: #116329;
-  --ansi-11: #7d4e00;
-  --ansi-12: #0550ae;
-  --ansi-13: #6639ba;
-  --ansi-14: #136061;
-  --ansi-15: #8c959f;
+  color-scheme: light;
+  --surface-0: #ffffff;
+  --surface-1: #f6f8fa;
+  --surface-2: #eef1f4;
+  --surface-3: #e4e8ec;
+  --surface-hover: #dce3ea;
+  --border: #d0d7de;
+  --border-subtle: #e4e8ec;
+  --fg-strong: #1f2328;
+  --fg: #1f2328;
+  --fg-muted: #59636e;
+  --fg-subtle: #5f6873;
+  --accent: #0969da;
+  --accent-hover: #0550ae;
+  --on-accent: #ffffff;
+  --danger: #cf222e;
+  --stuck: #bc4c00;
+  --attention: #9a6700;
+  --success: #1a7f37;
+  --success-solid: #1a7f37;
+  --success-solid-hover: #15803d;
+  --brand: #b08800;
+  --peer: #8250df;
+  --peer-dim: #6639ba;
+  --peer-bg: #f3f0ff;
+  --peer-fg: #6e5494;
+  --focus-ring: #0969da80;
+  --code-bg: #f6f8fa;
+  --disabled-bg: #eaeef2;
+  --disabled-fg: #8c959f;
+  --term-selection: #b6d4fe;
+  --shadow-overlay: 0 8px 24px rgb(31 35 40 / 0.12);
+  --shadow-card: 0 1px 2px rgb(31 35 40 / 0.06);
+
+  --ansi-0: #24292f;  --ansi-1: #cf222e;  --ansi-2: #1a7f37;  --ansi-3: #9a6700;
+  --ansi-4: #0969da;  --ansi-5: #8250df;  --ansi-6: #1b7c83;  --ansi-7: #6e7781;
+  --ansi-8: #57606a;  --ansi-9: #a40e26;  --ansi-10: #116329; --ansi-11: #7d4e00;
+  --ansi-12: #0550ae; --ansi-13: #6639ba; --ansi-14: #136061; --ansi-15: #8c959f;
+  --term-fg: #1f2328;
 }
+
+@media (pointer: coarse) {
+  :root { --row-h: 44px; --ctl-h: 36px; --hit: 44px; --pad-x: 16px; }
+}
+@media (prefers-reduced-motion: reduce) {
+  :root { --dur-fast: 0ms; --dur-base: 0ms; }
+}
+
+@theme inline {
+  --color-surface-0: var(--surface-0);
+  --color-surface-1: var(--surface-1);
+  --color-surface-2: var(--surface-2);
+  --color-surface-3: var(--surface-3);
+  --color-surface-hover: var(--surface-hover);
+  --color-border: var(--border);
+  --color-border-subtle: var(--border-subtle);
+  --color-fg-strong: var(--fg-strong);
+  --color-fg: var(--fg);
+  --color-fg-muted: var(--fg-muted);
+  --color-fg-subtle: var(--fg-subtle);
+  --color-accent: var(--accent);
+  --color-accent-hover: var(--accent-hover);
+  --color-on-accent: var(--on-accent);
+  --color-danger: var(--danger);
+  --color-stuck: var(--stuck);
+  --color-attention: var(--attention);
+  --color-success: var(--success);
+  --color-running: var(--running);
+  --color-peer: var(--peer);
+  --font-sans: var(--font-sans);
+  --font-mono: var(--font-mono);
+  --text-ui-2xs: 12px;   --text-ui-2xs--line-height: 16px;
+  --text-ui-xs: 13px;    --text-ui-xs--line-height: 18px;
+  --text-ui-sm: 14px;    --text-ui-sm--line-height: 20px;
+  --text-ui-base: 15px;  --text-ui-base--line-height: 24px;
+  --text-ui-input: 16px; --text-ui-input--line-height: 24px;
+  --text-ui-lg: 17px;    --text-ui-lg--line-height: 24px;
+  --text-ui-xl: 20px;    --text-ui-xl--line-height: 28px;
+  --radius-sm: var(--radius-sm);
+  --radius-md: var(--radius-md);
+  --radius-lg: var(--radius-lg);
+}
+
+html { font-family: var(--font-sans); -webkit-font-smoothing: antialiased; }
+.num { font-variant-numeric: tabular-nums; }
+.row { min-height: var(--row-h); }
+.ctl { min-height: var(--ctl-h); }
+.z-sticky { z-index: var(--z-sticky); }
+.z-drawer { z-index: var(--z-drawer); }
+.z-popover { z-index: var(--z-popover); }
+.z-modal { z-index: var(--z-modal); }
+.z-toast { z-index: var(--z-toast); }
+.focus-ring:focus-visible { outline: 2px solid var(--focus-ring); outline-offset: 2px; }
 
 /* Vault reading surface: keeps the app's active (dark) theme — no color-var
    overrides — per user preference for a dark background. Notes carry their own

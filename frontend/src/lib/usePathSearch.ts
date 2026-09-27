@@ -21,6 +21,11 @@ export function usePathSearch(
 
   useEffect(() => {
     if (!enabled) return
+    // Empty query clears synchronously (no debounce) and invalidates any
+    // in-flight request, so reopen / Back can't flash a previous result.
+    // Must live in the effect (not render) because it also bumps the request ref.
+    // eslint-disable-next-line react-hooks/set-state-in-effect
+    if (!query.trim()) { req.bump(); setResult(null); setFailed(false); return }
     let again: ReturnType<typeof setTimeout> | undefined
     const run = (q: string) => {
       const t = req.begin()

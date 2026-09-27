@@ -1,7 +1,6 @@
-import { useEffect, useEffectEvent, useLayoutEffect, useRef, useState, useSyncExternalStore, type ReactNode } from 'react'
+import { useEffect, useEffectEvent, useLayoutEffect, useRef, useState, type ReactNode } from 'react'
 import { createPortal } from 'react-dom'
 import { Sheet } from './Sheet'
-import { modalStack } from './modalStack'
 import { useIsNarrow } from '../../lib/useMediaQuery'
 
 const GAP = 6
@@ -18,14 +17,14 @@ const layers: HTMLElement[] = []
  *  .vault-reading-surface (contain:paint would clip it). On phones it becomes
  *  a bottom Sheet — anchored layers get pushed off-screen by the soft keyboard.
  *  Exception: when the anchor already lives inside a modal (a Sheet/Dialog) it
- *  stays anchored and portals into the topmost modal — outside it the page is
+ *  stays anchored and portals into that dialog — outside it the page is
  *  inert, and a Sheet inside a Sheet is not allowed. */
 export function Popover({ open, onClose, anchor, placement = 'bottom', align = 'start', children, sheetTitle }: {
   open: boolean; onClose: () => void; anchor: HTMLElement | null; placement?: 'top' | 'bottom'; align?: 'start' | 'end'; children: ReactNode; sheetTitle?: string
 }) {
   const narrow = useIsNarrow()
-  const modalTop = useSyncExternalStore(modalStack.subscribe, modalStack.top, modalStack.top)
-  const inModal = !!anchor?.closest('dialog')
+  const hostDialog = anchor?.closest('dialog') ?? null
+  const inModal = !!hostDialog
   const asSheet = narrow && !inModal
   const ref = useRef<HTMLDivElement>(null)
   const [pos, setPos] = useState<{ top: number; left: number } | null>(null)
@@ -85,7 +84,7 @@ export function Popover({ open, onClose, anchor, placement = 'bottom', align = '
 
   if (!open) return null
   if (asSheet) return <Sheet open side="bottom" onClose={onClose} title={sheetTitle}>{children}</Sheet>
-  const host = modalTop ?? document.getElementById('overlay-root') ?? document.body
+  const host = hostDialog ?? document.getElementById('overlay-root') ?? document.body
   return createPortal(
     <div ref={ref} className="fixed z-popover min-w-[160px] max-w-[min(320px,calc(100vw-24px))] max-h-[calc(100dvh-24px)] overflow-y-auto rounded-[var(--r-lg)] bg-[var(--surface-2)] text-[var(--fg)] border border-[var(--border)] shadow-[var(--shadow-overlay)] py-1"
       style={{ top: pos?.top ?? -9999, left: pos?.left ?? -9999 }}>

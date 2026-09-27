@@ -3,6 +3,7 @@ import { describe, it, expect, vi, afterEach } from 'vitest'
 import { useState } from 'react'
 import { Popover } from '../Popover'
 import { Sheet } from '../Sheet'
+import { Dialog } from '../Dialog'
 
 function H({ narrow = false }: { narrow?: boolean }) {
   vi.stubGlobal('matchMedia', (q: string) => ({ matches: narrow && q.includes('max-width'), addEventListener() {}, removeEventListener() {} }))
@@ -68,5 +69,13 @@ describe('Popover', () => {
     expect(screen.queryByText('item')).not.toBeNull()
     fireEvent.keyDown(document, { key: 'Escape' })
     expect(screen.queryByText('item')).toBeNull()
+  })
+  it('host follows the ANCHOR: a page popover does not jump into an unrelated open Dialog', () => {
+    const root = document.createElement('div'); root.id = 'overlay-root'; document.body.appendChild(root)
+    render(<><Dialog open onClose={() => {}} title="unrelated">d</Dialog><H /></>)
+    const dlg = screen.getByRole('dialog', { hidden: true })
+    expect(dlg.contains(screen.getByText('item'))).toBe(false)
+    expect(root.contains(screen.getByText('item'))).toBe(true)
+    root.remove()
   })
 })

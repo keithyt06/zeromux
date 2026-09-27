@@ -1,5 +1,5 @@
 import { useEffect, useId, useRef, type ReactNode, type MouseEvent } from 'react'
-import { modalStack } from './modalStack'
+import { modalStack, restoreFocus } from './modalStack'
 
 /** Native <dialog> modal. Lives in the browser top layer, so ancestors'
  *  `contain: paint` / overflow / z-index can't clip or reorder it (replaces
@@ -9,6 +9,8 @@ export function Dialog({ open, onClose, title, children, className = '', labelle
 }) {
   const ref = useRef<HTMLDialogElement>(null)
   const opener = useRef<Element | null>(null)
+  // The <dialog> node is gone by the time open=false runs its branch; remember it.
+  const lastEl = useRef<HTMLDialogElement | null>(null)
   const titleId = useId()
 
   useEffect(() => {
@@ -20,16 +22,18 @@ export function Dialog({ open, onClose, title, children, className = '', labelle
         el.showModal()
       }
       modalStack.push(el)
+      lastEl.current = el
       return () => modalStack.pop(el)
     }
     // open=false renders null (the <dialog> is already gone, ref is null), so
     // restore focus here rather than gating on the element.
     el?.close()
-    ;(opener.current as HTMLElement | null)?.focus?.()
+    restoreFocus(opener.current, lastEl.current)
     opener.current = null
+    lastEl.current = null
   }, [open])
 
-  useEffect(() => () => { (opener.current as HTMLElement | null)?.focus?.() }, [])
+  useEffect(() => () => { restoreFocus(opener.current, lastEl.current) }, [])
 
   // Only a press that both started and ended on the backdrop closes: a text
   // selection dragged out of an input must not dismiss (and lose) the dialog.

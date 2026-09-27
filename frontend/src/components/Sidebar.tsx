@@ -10,6 +10,7 @@ import PromptManager from './PromptManager'
 import { Popover, Menu, SegmentedControl } from './ui'
 import { usePromptPresets } from '../lib/usePromptPresets'
 import { usePolling } from '../lib/usePolling'
+import { useIsNarrow } from '../lib/useMediaQuery'
 import { useDirBrowser } from '../lib/useDirBrowser'
 import { usePathSearch } from '../lib/usePathSearch'
 import { applyPreset } from '../lib/applyPreset'
@@ -118,6 +119,8 @@ export default function Sidebar({ sessions, docTabs, activeId, onSelect, onCreat
   const [pendingAgentContext, setPendingAgentContext] = useState<AskAgentTarget | null>(null)
   const presetStore = usePromptPresets()
   const [showSettings, setShowSettings] = useState(false)
+  // Same predicate Popover uses to render as a bottom Sheet (which has its own title).
+  const narrow = useIsNarrow()
   // Anchors as state (not refs): the collapsed rail / ⚡ open the popover in the
   // same render that first mounts the button, when a ref would still be null.
   const [newBtn, setNewBtn] = useState<HTMLButtonElement | null>(null)
@@ -541,9 +544,11 @@ export default function Sidebar({ sessions, docTabs, activeId, onSelect, onCreat
               )}
               {step === 'quick' && (
                 <>
-                  <div className="px-3 py-1.5 text-[10px] font-semibold text-[var(--text-muted)] uppercase tracking-wider">
-                    新建会话
-                  </div>
+                  {!narrow && (
+                    <div className="px-3 py-1.5 text-[10px] font-semibold text-[var(--text-muted)] uppercase tracking-wider">
+                      新建会话
+                    </div>
+                  )}
                   {/* Results area is the only part that grows; capped so the popover (which
                       grows UPWARD from the bottom anchor) never pushes the input off-screen. */}
                   <div className="max-h-[40vh] overflow-y-auto border-b border-[var(--border)]">

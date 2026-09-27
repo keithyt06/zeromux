@@ -156,4 +156,12 @@ describe('New session popover (T12)', () => {
     fireEvent.click(screen.getByText('Settings'))
     expect(screen.getByRole('menu')).not.toContainElement(g)
   })
+
+  it('as a bottom Sheet the quick step does not repeat the 新建会话 title', async () => {
+    vi.stubGlobal('matchMedia', (q: string) => ({ matches: q.includes('max-width'), addEventListener() {}, removeEventListener() {} }))
+    setup({ mobile: true })
+    fireEvent.click(screen.getByText('New session'))
+    await screen.findByText('其他目录…')
+    expect(screen.getAllByText('新建会话')).toHaveLength(1)
+  })
 })

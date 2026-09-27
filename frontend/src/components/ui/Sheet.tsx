@@ -1,5 +1,5 @@
 import { useEffect, useId, useRef, useState, type ReactNode, type PointerEvent } from 'react'
-import { modalStack } from './modalStack'
+import { modalStack, restoreFocus } from './modalStack'
 
 let openSheets = 0
 const KEYBOARD_PX = 120
@@ -36,8 +36,11 @@ export function Sheet({ open, onClose, side, title, actions, snap = 'half', chil
     return () => {
       openSheets--
       if (el) modalStack.pop(el)
+      // Check before close(): closing moves focus to body, and an unmounted
+      // dialog's contains() no longer sees its old descendants.
+      const target = opener.current
       if (el?.open) el.close()
-      ;(opener.current as HTMLElement | null)?.focus?.()
+      restoreFocus(target, el)
     }
   }, [open])
 

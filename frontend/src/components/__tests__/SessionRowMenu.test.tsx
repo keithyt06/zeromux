@@ -1,5 +1,6 @@
 import { render, screen, fireEvent, waitFor } from '@testing-library/react'
-import { describe, it, expect, vi } from 'vitest'
+import { describe, it, expect, vi, afterEach } from 'vitest'
+import { useState } from 'react'
 import SessionRowMenu from '../SessionRowMenu'
 import type { SessionInfo } from '../../lib/api'
 
@@ -27,5 +28,28 @@ describe('SessionRowMenu', () => {
     expect(screen.queryByText('复制接续命令')).toBeNull()
     fireEvent.click(screen.getByText('关闭'))
     expect(onClose).toHaveBeenCalled()
+  })
+})
+
+describe('SessionRowMenu rename on a narrow viewport (T12 fix)', () => {
+  afterEach(() => vi.unstubAllGlobals())
+  it('choosing 重命名 keeps the rename input focused (Sheet close must not steal focus back)', async () => {
+    vi.stubGlobal('matchMedia', (q: string) => ({ matches: q.includes('max-width'), addEventListener() {}, removeEventListener() {} }))
+    const commit = vi.fn()
+    // Mirrors Sidebar: onRename mounts an autoFocus input that commits on blur.
+    function Row() {
+      const [editing, setEditing] = useState(false)
+      return (<>
+        {editing && <input aria-label="rename" autoFocus defaultValue="api" onBlur={e => { commit(e.target.value); setEditing(false) }} />}
+        <SessionRowMenu session={s({ type: 'claude', tmux_name: null, tmux_origin: null })} onRename={() => setEditing(true)} onClose={vi.fn()} />
+      </>)
+    }
+    render(<Row />)
+    fireEvent.click(screen.getByLabelText('会话菜单'))
+    expect(screen.getByRole('dialog', { hidden: true }).dataset.side).toBe('bottom')
+    fireEvent.click(screen.getByText('重命名'))
+    await new Promise(r => requestAnimationFrame(() => r(null)))
+    expect(commit).not.toHaveBeenCalled()
+    expect(document.activeElement).toBe(screen.getByLabelText('rename'))
   })
 })

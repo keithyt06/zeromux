@@ -10,3 +10,12 @@ export const modalStack = {
   top(): HTMLElement | null { return stack[stack.length - 1] ?? null },
   subscribe(cb: () => void) { subs.add(cb); return () => { subs.delete(cb) } },
 }
+
+/** Return focus to `target` only if focus is lost (null/body) or still inside
+ *  the layer that is closing (a detached element counts as lost). If something already took focus on purpose (e.g.
+ *  a rename input mounted by the chosen menu item), leave it there. */
+export function restoreFocus(target: Element | null | undefined, closing: Element | null | undefined) {
+  const a = document.activeElement
+  if (a && a !== document.body && a.isConnected && !(closing && closing.contains(a))) return
+  ;(target as HTMLElement | null)?.focus?.()
+}

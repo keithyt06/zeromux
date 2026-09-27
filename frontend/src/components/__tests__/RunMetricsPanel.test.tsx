@@ -18,7 +18,7 @@ const runs: RunMetric[] = [
   },
 ]
 const stats: RunStats = {
-  count: 2, avg_ms: 3500, p50_ms: 3000, p95_ms: 4000, max_ms: 4000,
+  count: 2, avg_ms: 3500, p50_ms: 3000, p95_ms: 4000, max_ms: 3_720_000,
   completed_count: 1, errored_count: 0, timeout_count: 1, cancelled_count: 0,
 }
 
@@ -38,5 +38,12 @@ describe('RunMetricsPanel', () => {
     // honest per-outcome labels for the timeout run (appears as both a pill
     // label and a timeline row label)
     expect(screen.getAllByText('超时').length).toBeGreaterThan(0)
+  })
+  it('uses the shared formatters: >1h as XhYYm, detail cost at 4 decimals', async () => {
+    const { RunMetricsPanel } = await import('../RunMetricsPanel')
+    render(<RunMetricsPanel sessionId="s1" turnStartedMs={null} running={false} />)
+    expect(await screen.findByText('1h02m')).toBeInTheDocument()
+    expect(screen.getByText('3.5s')).toBeInTheDocument()
+    expect(screen.getByText('$0.0123')).toBeInTheDocument()
   })
 })

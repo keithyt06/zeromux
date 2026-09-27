@@ -3,6 +3,7 @@ import { ChevronRight, ThumbsUp, ThumbsDown } from 'lucide-react'
 import { getSessionRuns, postRunVerdict } from '../lib/api'
 import type { RunMetric, RunStats, RunOutcome } from '../lib/api'
 import { useLatestRequest } from '../lib/useLatestRequest'
+import { formatCost, formatDuration } from '../lib/format'
 
 interface Props {
   sessionId: string
@@ -24,13 +25,8 @@ const OUTCOME: Record<RunOutcome, { label: string; color: string }> = {
   cancelled: { label: '已取消', color: 'var(--accent-purple)' },
 }
 
-function fmtDuration(ms: number | null): string {
-  if (ms == null) return '—'
-  const s = ms / 1000
-  if (s < 60) return `${s.toFixed(s < 10 ? 1 : 0)}s`
-  const m = Math.floor(s / 60)
-  return `${m}m${String(Math.floor(s % 60)).padStart(2, '0')}s`
-}
+// Detail view: missing values render as 「—」.
+const dur = (ms: number | null) => formatDuration(ms) || '—'
 
 function fmtTime(ms: number): string {
   try {
@@ -125,9 +121,9 @@ export function RunMetricsPanel({ sessionId, turnStartedMs, running, refreshKey 
         {stats && stats.count > 0 && (
           <div className="flex flex-wrap gap-1">
             <Pill label="次数" value={String(stats.count)} />
-            <Pill label="均值" value={fmtDuration(stats.avg_ms)} />
-            <Pill label="P95" value={fmtDuration(stats.p95_ms)} />
-            <Pill label="最长" value={fmtDuration(stats.max_ms)} />
+            <Pill label="均值" value={dur(stats.avg_ms)} />
+            <Pill label="P95" value={dur(stats.p95_ms)} />
+            <Pill label="最长" value={dur(stats.max_ms)} />
             {stats.completed_count > 0 && <Pill label="完成" value={String(stats.completed_count)} />}
             {stats.errored_count > 0 && <Pill label="出错" value={String(stats.errored_count)} />}
             {stats.timeout_count > 0 && <Pill label="超时" value={String(stats.timeout_count)} />}
@@ -169,10 +165,10 @@ function RunRow({ run, onVerdict }: { run: RunMetric; onVerdict: (id: string, v:
         className="text-[var(--text-muted)] tabular-nums shrink-0"
         title={isClaude ? '成本（仅 Claude）' : '该后端不上报成本'}
       >
-        {isClaude && run.cost_usd != null ? `$${run.cost_usd.toFixed(4)}` : '—'}
+        {(isClaude && formatCost(run.cost_usd, 'long')) || '—'}
       </span>
       <span className="ml-auto text-[var(--text-secondary)] tabular-nums shrink-0">
-        {fmtDuration(run.duration_ms)}
+        {dur(run.duration_ms)}
       </span>
       <div className="flex items-center gap-0.5 shrink-0">
         <button

@@ -196,47 +196,86 @@ async fn get_me(
 }
 
 /// Serve static assets from the Vite build output
-async fn serve_asset(axum::extract::Path(path): axum::extract::Path<String>) -> Response {
-    serve_embedded(&format!("assets/{}", path))
+async fn serve_asset(
+    axum::extract::Path(path): axum::extract::Path<String>,
+    headers: axum::http::HeaderMap,
+) -> Response {
+    serve_embedded(&format!("assets/{}", path), accept_encoding(&headers))
 }
 
 /// SPA fallback: serve index.html for any non-API/WS/asset route
-async fn spa_fallback(uri: axum::http::Uri) -> Response {
+async fn spa_fallback(uri: axum::http::Uri, headers: axum::http::HeaderMap) -> Response {
+    let accept = accept_encoding(&headers);
     let path = uri.path().trim_start_matches('/');
 
     // Try exact file match first (e.g. favicon.svg)
     if !path.is_empty() && !path.contains("..") {
-        if let Some(resp) = try_serve_embedded(path) {
+        if let Some(resp) = try_serve_embedded_enc(path, accept) {
             return resp;
         }
     }
 
     // Fallback to index.html (SPA routing)
-    serve_embedded("index.html")
+    serve_embedded("index.html", accept)
 }
 
-fn serve_embedded(path: &str) -> Response {
-    try_serve_embedded(path).unwrap_or_else(|| StatusCode::NOT_FOUND.into_response())
+fn accept_encoding(headers: &axum::http::HeaderMap) -> &str {
+    headers.get(axum::http::header::ACCEPT_ENCODING).and_then(|v| v.to_str().ok()).unwrap_or("")
 }
 
-fn try_serve_embedded(path: &str) -> Option<Response> {
-    FrontendAssets::get(path).map(|file| {
-        let mime = mime_guess::from_path(path).first_or_octet_stream();
-        Response::builder()
-            .header("Content-Type", mime.as_ref())
-            .header("Cache-Control", "public, max-age=3600")
-            // Global CSP backstop (defense-in-depth): even if a raw endpoint were
-            // misconfigured, agent-generated content can't execute in the app origin.
-            .header(
-                "Content-Security-Policy",
-                "default-src 'self'; img-src 'self' data:; style-src 'self' 'unsafe-inline'; \
-                 script-src 'self'; worker-src 'self'; \
-                 connect-src 'self' ws: wss:; frame-src 'self'; \
-                 object-src 'none'; base-uri 'self'",
-            )
-            .body(axum::body::Body::from(file.data.to_vec()))
-            .unwrap()
-    })
+/// Pick the best precompressed variant the client accepts. `q=0` disables.
+fn pick_encoding(accept: &str) -> Option<&'static str> {
+    let allows = |name: &str| {
+        accept.split(',').any(|part| {
+            let mut it = part.trim().split(';');
+            let tok = it.next().unwrap_or("").trim();
+            let q0 = it.any(|p| p.trim().replace(' ', "") == "q=0");
+            tok.eq_ignore_ascii_case(name) && !q0
+        })
+    };
+    if allows("br") { Some("br") } else if allows("gzip") { Some("gzip") } else { None }
+}
+
+fn serve_embedded(path: &str, accept: &str) -> Response {
+    try_serve_embedded_enc(path, accept).unwrap_or_else(|| StatusCode::NOT_FOUND.into_response())
+}
+
+/// Serve an embedded dist file, preferring the build-time `.br` / `.gz`
+/// sibling (frontend/scripts/precompress.mjs, brotli q11) when the client
+/// accepts it. MIME is always derived from the ORIGINAL path. The runtime
+/// CompressionLayer skips responses that already carry Content-Encoding.
+fn try_serve_embedded_enc(path: &str, accept: &str) -> Option<Response> {
+    if path.ends_with(".br") || path.ends_with(".gz") {
+        return None;
+    }
+    let original = FrontendAssets::get(path)?;
+    let mime = mime_guess::from_path(path).first_or_octet_stream();
+    let (body, enc) = match pick_encoding(accept) {
+        Some("br") => FrontendAssets::get(&format!("{path}.br"))
+            .map(|f| (f.data, Some("br")))
+            .unwrap_or((original.data, None)),
+        Some("gzip") => FrontendAssets::get(&format!("{path}.gz"))
+            .map(|f| (f.data, Some("gzip")))
+            .unwrap_or((original.data, None)),
+        _ => (original.data, None),
+    };
+    let mut b = Response::builder()
+        .header("Content-Type", mime.as_ref())
+        .header("Cache-Control", "public, max-age=3600")
+        .header("Vary", "Accept-Encoding")
+        // Global CSP backstop (defense-in-depth): even if a raw endpoint were
+        // misconfigured, agent-generated content can't execute in the app origin.
+        .header(
+            "Content-Security-Policy",
+            "default-src 'self'; img-src 'self' data:; style-src 'self' 'unsafe-inline'; \
+             script-src 'self'; worker-src 'self'; \
+             connect-src 'self' ws: wss:; frame-src 'self'; \
+             object-src 'none'; base-uri 'self'",
+        );
+    if let Some(e) = enc {
+        b = b.header("Content-Encoding", e);
+    }
+    Some(b.body(axum::body::Body::from(body.to_vec())).unwrap())
 }
 
 // ── Directory listing ──
@@ -6619,7 +6658,7 @@ mod upload_helpers_tests {
 
     #[test]
     fn embedded_response_has_csp() {
-        if let Some(resp) = try_serve_embedded("index.html") {
+        if let Some(resp) = try_serve_embedded_enc("index.html", "") {
             let csp = resp
                 .headers()
                 .get("Content-Security-Policy")
@@ -6841,5 +6880,46 @@ mod compression_tests {
             .await
             .unwrap();
         assert!(res.headers().get("content-encoding").is_none());
+    }
+}
+
+#[cfg(test)]
+mod precompressed_tests {
+    use super::*;
+
+    #[test]
+    fn pick_encoding_prefers_br_then_gzip() {
+        assert_eq!(pick_encoding("gzip, deflate, br"), Some("br"));
+        assert_eq!(pick_encoding("gzip"), Some("gzip"));
+        assert_eq!(pick_encoding("br;q=0, gzip"), Some("gzip"));
+        assert_eq!(pick_encoding("identity"), None);
+        assert_eq!(pick_encoding(""), None);
+    }
+
+    #[test]
+    fn serves_br_variant_with_original_mime_when_present() {
+        // sw.js is always in dist and >=1KB, so precompress emits sw.js.br.
+        // (index.html itself is ~767 bytes, under precompress's 1KB floor, so
+        // it never gets a .br sibling — sw.js is used here instead.)
+        let res = try_serve_embedded_enc("sw.js", "br").expect("sw.js embedded");
+        let h = res.headers();
+        assert_eq!(h.get("content-type").unwrap(), "text/javascript");
+        assert_eq!(h.get("content-encoding").unwrap(), "br");
+        assert_eq!(h.get("vary").unwrap(), "Accept-Encoding");
+        assert!(h.get("content-security-policy").is_some());
+    }
+
+    #[test]
+    fn falls_back_to_identity_without_accept() {
+        let res = try_serve_embedded_enc("index.html", "").expect("index.html embedded");
+        assert!(res.headers().get("content-encoding").is_none());
+        assert_eq!(res.headers().get("vary").unwrap(), "Accept-Encoding");
+    }
+
+    #[test]
+    fn never_serves_a_variant_as_its_own_path() {
+        // Requesting the .br file directly must not be served (would give the
+        // browser compressed bytes with an octet-stream type).
+        assert!(try_serve_embedded_enc("index.html.br", "br").is_none());
     }
 }

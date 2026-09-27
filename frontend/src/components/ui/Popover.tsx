@@ -68,6 +68,8 @@ export function Popover({ open, onClose, anchor, placement = 'bottom', align = '
     }
     const key = (e: KeyboardEvent) => {
       if (e.key !== 'Escape' || layers[layers.length - 1] !== el) return
+      // IME: Esc cancels the composition candidate, not the layer (same guard as Composer).
+      if (e.isComposing || e.keyCode === 229) return
       // Keep the Esc from also cancelling a host Sheet/Dialog or an outer layer.
       e.preventDefault(); e.stopPropagation()
       close(); anchor?.focus()

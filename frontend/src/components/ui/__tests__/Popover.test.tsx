@@ -60,4 +60,13 @@ describe('Popover', () => {
     expect(inner).toHaveBeenCalledTimes(1)
     expect(outer).not.toHaveBeenCalled()
   })
+  it('Esc during IME composition does not close (confirms the candidate instead)', () => {
+    render(<H />)
+    fireEvent.keyDown(document, { key: 'Escape', isComposing: true })
+    expect(screen.queryByText('item')).not.toBeNull()
+    fireEvent.keyDown(document, { key: 'Escape', keyCode: 229 })
+    expect(screen.queryByText('item')).not.toBeNull()
+    fireEvent.keyDown(document, { key: 'Escape' })
+    expect(screen.queryByText('item')).toBeNull()
+  })
 })

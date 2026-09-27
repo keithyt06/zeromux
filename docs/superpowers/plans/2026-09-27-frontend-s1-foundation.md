@@ -749,7 +749,7 @@ git commit -m "chore(frontend): token ratchet, contrast checker and isolated scr
 - Test: `frontend/src/lib/__tests__/tokens.test.ts`(新建)
 
 **Interfaces:**
-- Produces(CSS 变量,S2/S3 依赖其名字):`--surface-0..3`、`--surface-hover`、`--border`、`--border-subtle`、`--fg-strong`、`--fg`、`--fg-muted`、`--fg-subtle`、`--accent`、`--accent-hover`、`--on-accent`、`--danger`、`--stuck`、`--attention`、`--success`、`--success-solid`、`--success-solid-hover`、`--running`、`--brand`、`--peer`、`--focus-ring`、`--code-bg`、`--disabled-bg`、`--disabled-fg`、`--term-selection`、`--ansi-0..15`、`--row-h`、`--ctl-h`、`--hit`、`--pad-x`、`--radius-{sm,md,lg,sheet}`、`--shadow-overlay`、`--shadow-card`、`--z-{sticky,drawer,popover,modal,toast}`、`--ease-out`、`--dur-fast`、`--dur-base`、`--font-sans`、`--font-mono`。
+- Produces(CSS 变量,S2/S3 依赖其名字):`--surface-0..3`、`--surface-hover`、`--border`、`--border-subtle`、`--fg-strong`、`--fg`、`--fg-muted`、`--fg-subtle`、`--accent`、`--accent-hover`、`--on-accent`、`--danger`、`--stuck`、`--attention`、`--success`、`--success-solid`、`--success-solid-hover`、`--running`、`--brand`、`--peer`、`--focus-ring`、`--code-bg`、`--disabled-bg`、`--disabled-fg`、`--term-selection`、`--ansi-0..15`、`--row-h`、`--ctl-h`、`--hit`、`--pad-x`、`--r-{sm,md,lg,sheet}`(非 `--radius-*`:该命名空间属 Tailwind rounded-* 刻度)、`--shadow-overlay`、`--shadow-card`、`--z-{sticky,drawer,popover,modal,toast}`、`--ease-out`、`--dur-fast`、`--dur-base`、`--font-sans`、`--font-mono`。
 - Tailwind 工具类(由 `@theme inline` 生成):`bg-surface-0..3`、`text-fg`、`text-fg-muted`、`text-fg-subtle`、`text-fg-strong`、`text-accent`、`text-danger`、`text-stuck`、`text-attention`、`text-success`、`border-border`、`border-border-subtle` 等;字号 `text-ui-2xs|xs|sm|base|input|lg|xl`;`font-sans`、`font-mono`。
 - 自定义工具类:`.num`、`.row`、`.ctl`、`.z-sticky|drawer|popover|modal|toast`、`.focus-ring`。
 
@@ -894,10 +894,10 @@ Expected: FAIL(`--surface-0` 未定义等)。
   --pad-x: 12px;
 
   /* Shape / layering / motion */
-  --radius-sm: 4px;
-  --radius-md: 8px;
-  --radius-lg: 12px;
-  --radius-sheet: 16px;
+  --r-sm: 4px;
+  --r-md: 8px;
+  --r-lg: 12px;
+  --r-sheet: 16px;
   --z-sticky: 10;
   --z-drawer: 30;
   --z-popover: 40;
@@ -990,9 +990,6 @@ Expected: FAIL(`--surface-0` 未定义等)。
   --text-ui-input: 16px; --text-ui-input--line-height: 24px;
   --text-ui-lg: 17px;    --text-ui-lg--line-height: 24px;
   --text-ui-xl: 20px;    --text-ui-xl--line-height: 28px;
-  --radius-sm: var(--radius-sm);
-  --radius-md: var(--radius-md);
-  --radius-lg: var(--radius-lg);
 }
 
 html { font-family: var(--font-sans); -webkit-font-smoothing: antialiased; }
@@ -1007,7 +1004,7 @@ html { font-family: var(--font-sans); -webkit-font-smoothing: antialiased; }
 .focus-ring:focus-visible { outline: 2px solid var(--focus-ring); outline-offset: 2px; }
 ```
 
-> `--text-ui-*--line-height` 是 Tailwind v4 字号 token 的配套行高写法;`@theme inline` 中 `--radius-sm: var(--radius-sm)` 自引用可能被 Tailwind 视为循环 —— 若构建报错或 `rounded-sm` 失效,把这三行删掉(直接用 `rounded-[var(--radius-md)]` 或 Tailwind 默认 `rounded-md` = 6px 也可,S1 不强制),在报告中说明。
+> `--text-ui-*--line-height` 是 Tailwind v4 字号 token 的配套行高写法。圆角用 `--r-*` 而非 `--radius-*`:Tailwind v4 的 `rounded-*` 直接读 `--radius-*`,同名会全局改写 41 处 `rounded-md/lg`(T3 fix round 1 实测);primitive 显式写 `rounded-[var(--r-md)]`。
 
 `--disabled-fg` 从 `#484f58` 改为 `#6e7681`:禁用态文字原值与 `--text-muted` 同为 2.19:1,禁用态不要求 4.5,但 3:1 以下在手机阳光下不可读。
 
@@ -2657,7 +2654,7 @@ export function Dialog({ open, onClose, title, children, className = '', labelle
       onClick={onBackdrop}
       className={`bg-transparent p-0 m-auto backdrop:bg-black/50 ${className}`}
     >
-      <div className="bg-[var(--surface-2)] text-[var(--fg)] border border-[var(--border)] rounded-[var(--radius-lg)] shadow-[var(--shadow-overlay)] w-[min(480px,calc(100vw-24px))]">
+      <div className="bg-[var(--surface-2)] text-[var(--fg)] border border-[var(--border)] rounded-[var(--r-lg)] shadow-[var(--shadow-overlay)] w-[min(480px,calc(100vw-24px))]">
         {title && <h2 id={titleId} className="px-4 pt-4 text-ui-lg font-semibold text-[var(--fg-strong)]">{title}</h2>}
         {children}
       </div>
@@ -2746,7 +2743,7 @@ export function Sheet({ open, onClose, side, title, actions, snap = 'half', chil
   const bySide = {
     full: 'inset-0 w-screen h-[100dvh]',
     right: 'ml-auto mr-0 h-[100dvh] w-[360px] border-l border-[var(--border)]',
-    bottom: 'mt-auto mb-0 w-screen rounded-t-[var(--radius-sheet)] border-t border-[var(--border)] shadow-[var(--shadow-overlay)]',
+    bottom: 'mt-auto mb-0 w-screen rounded-t-[var(--r-sheet)] border-t border-[var(--border)] shadow-[var(--shadow-overlay)]',
   }[side]
 
   return (
@@ -2826,7 +2823,7 @@ export function DialogHost() {
     else cur.resolve(typeof v === 'string' ? (v.trim() || null) : null)
     setQueue(q => q.slice(1))
   }
-  const btn = 'ctl px-3 rounded-[var(--radius-md)] text-ui-sm'
+  const btn = 'ctl px-3 rounded-[var(--r-md)] text-ui-sm'
   return (
     <Dialog open={!!cur} onClose={() => done(cur?.kind === 'confirm' ? false : null)} title={cur?.title}>
       {cur && (
@@ -2834,7 +2831,7 @@ export function DialogHost() {
           {cur.kind === 'confirm' && cur.body && <p className="text-ui-sm text-[var(--fg-muted)] whitespace-pre-wrap">{cur.body}</p>}
           {cur.kind === 'prompt' && (
             <input autoFocus value={text} placeholder={cur.placeholder} onChange={e => setText(e.target.value)}
-              className="w-full px-3 py-2 text-ui-input bg-[var(--surface-1)] border border-[var(--border)] rounded-[var(--radius-md)] outline-none focus:border-[var(--accent)]" />
+              className="w-full px-3 py-2 text-ui-input bg-[var(--surface-1)] border border-[var(--border)] rounded-[var(--r-md)] outline-none focus:border-[var(--accent)]" />
           )}
           <div className="flex justify-end gap-2">
             <button type="button" onClick={() => done(cur.kind === 'confirm' ? false : null)} className={`${btn} text-[var(--fg-muted)] hover:bg-[var(--surface-hover)]`}>
@@ -2886,7 +2883,7 @@ function ToastRow({ it }: { it: Item }) {
   return (
     <div role="status" data-toast-id={it.id}
       onPointerDown={it.action ? pause : undefined} onPointerUp={it.action ? start : undefined}
-      className="pointer-events-auto flex items-center gap-3 px-4 min-h-[var(--row-h)] rounded-[var(--radius-md)] bg-[var(--surface-3)] border border-[var(--border)] shadow-[var(--shadow-overlay)] text-ui-sm text-[var(--fg)]">
+      className="pointer-events-auto flex items-center gap-3 px-4 min-h-[var(--row-h)] rounded-[var(--r-md)] bg-[var(--surface-3)] border border-[var(--border)] shadow-[var(--shadow-overlay)] text-ui-sm text-[var(--fg)]">
       <span className="flex-1">{it.message}</span>
       {it.action && (
         <button className="font-medium text-[var(--accent)]" onClick={async () => { await it.action!.onClick(); toast.dismiss(it.id) }}>{it.action.label}</button>
@@ -3342,7 +3339,7 @@ export function Popover({ open, onClose, anchor, placement = 'bottom', align = '
   if (narrow) return <Sheet open side="bottom" onClose={onClose} title={sheetTitle}>{children}</Sheet>
   const host = document.getElementById('overlay-root') ?? document.body
   return createPortal(
-    <div ref={ref} className="fixed z-popover min-w-[160px] max-w-[min(320px,calc(100vw-24px))] rounded-[var(--radius-lg)] bg-[var(--surface-2)] border border-[var(--border)] shadow-[var(--shadow-overlay)] py-1"
+    <div ref={ref} className="fixed z-popover min-w-[160px] max-w-[min(320px,calc(100vw-24px))] rounded-[var(--r-lg)] bg-[var(--surface-2)] border border-[var(--border)] shadow-[var(--shadow-overlay)] py-1"
       style={{ top: pos?.top ?? -9999, left: pos?.left ?? -9999 }}>
       {children}
     </div>,
@@ -3414,7 +3411,7 @@ export function IconButton({ label, icon: Icon, active, danger, size = 'md', cla
   return (
     <Tooltip label={label}>
       <button type="button" aria-label={label} {...rest}
-        className={`relative inline-flex items-center justify-center min-w-[var(--hit)] min-h-[var(--hit)] rounded-[var(--radius-md)] transition-colors duration-[var(--dur-fast)] focus-ring ${tone} ${className}`}>
+        className={`relative inline-flex items-center justify-center min-w-[var(--hit)] min-h-[var(--hit)] rounded-[var(--r-md)] transition-colors duration-[var(--dur-fast)] focus-ring ${tone} ${className}`}>
         <span className={`inline-flex items-center justify-center ${vis}`}><Icon size={size === 'sm' ? 16 : 18} /></span>
       </button>
     </Tooltip>
@@ -3438,7 +3435,7 @@ export function Tooltip({ label, children }: { label: string; children: ReactEle
   return (
     <span className="relative inline-flex" onMouseEnter={() => { t.current = setTimeout(() => setShow(true), 500) }} onMouseLeave={() => { clearTimeout(t.current); setShow(false) }}>
       {cloneElement(children, { 'aria-describedby': show ? id : undefined })}
-      {show && <span id={id} role="tooltip" className="absolute top-full mt-1 left-1/2 -translate-x-1/2 z-popover whitespace-nowrap px-2 py-1 rounded-[var(--radius-sm)] bg-[var(--surface-3)] border border-[var(--border)] text-ui-2xs text-[var(--fg)] pointer-events-none">{label}</span>}
+      {show && <span id={id} role="tooltip" className="absolute top-full mt-1 left-1/2 -translate-x-1/2 z-popover whitespace-nowrap px-2 py-1 rounded-[var(--r-sm)] bg-[var(--surface-3)] border border-[var(--border)] text-ui-2xs text-[var(--fg)] pointer-events-none">{label}</span>}
     </span>
   )
 }
@@ -3450,7 +3447,7 @@ export function Tooltip({ label, children }: { label: string; children: ReactEle
 // Kbd.tsx
 import type { ReactNode } from 'react'
 export function Kbd({ children }: { children: ReactNode }) {
-  return <kbd className="px-1.5 py-0.5 rounded-[var(--radius-sm)] bg-[var(--surface-3)] border border-[var(--border)] text-ui-2xs font-mono text-[var(--fg-muted)]">{children}</kbd>
+  return <kbd className="px-1.5 py-0.5 rounded-[var(--r-sm)] bg-[var(--surface-3)] border border-[var(--border)] text-ui-2xs font-mono text-[var(--fg-muted)]">{children}</kbd>
 }
 ```
 
@@ -3474,11 +3471,11 @@ export function SegmentedControl<T extends string>({ value, options, onChange, l
     if (e.key === 'ArrowLeft' || e.key === 'ArrowUp') { e.preventDefault(); onChange(options[(i - 1 + options.length) % options.length].value) }
   }
   return (
-    <div role="radiogroup" aria-label={label} className="inline-flex p-0.5 rounded-[var(--radius-md)] bg-[var(--surface-2)] border border-[var(--border-subtle)]">
+    <div role="radiogroup" aria-label={label} className="inline-flex p-0.5 rounded-[var(--r-md)] bg-[var(--surface-2)] border border-[var(--border-subtle)]">
       {options.map(o => (
         <button key={o.value} type="button" role="radio" aria-checked={o.value === value} tabIndex={o.value === value ? 0 : -1}
           onKeyDown={onKey} onClick={() => onChange(o.value)}
-          className={`ctl px-3 rounded-[calc(var(--radius-md)-2px)] text-ui-xs transition-colors duration-[var(--dur-fast)] ${o.value === value ? 'bg-[var(--surface-3)] text-[var(--fg-strong)]' : 'text-[var(--fg-muted)] hover:text-[var(--fg)]'}`}>
+          className={`ctl px-3 rounded-[calc(var(--r-md)-2px)] text-ui-xs transition-colors duration-[var(--dur-fast)] ${o.value === value ? 'bg-[var(--surface-3)] text-[var(--fg-strong)]' : 'text-[var(--fg-muted)] hover:text-[var(--fg)]'}`}>
           {o.label}
         </button>
       ))}
@@ -3493,7 +3490,7 @@ export function Skeleton({ rows = 3 }: { rows?: number }) {
   return (
     <div aria-busy="true" aria-label="加载中" className="space-y-2 p-3">
       {Array.from({ length: rows }, (_, i) => (
-        <div key={i} className="h-4 rounded-[var(--radius-sm)] bg-[var(--surface-3)] motion-safe:animate-pulse" style={{ width: `${90 - i * 15}%` }} />
+        <div key={i} className="h-4 rounded-[var(--r-sm)] bg-[var(--surface-3)] motion-safe:animate-pulse" style={{ width: `${90 - i * 15}%` }} />
       ))}
     </div>
   )

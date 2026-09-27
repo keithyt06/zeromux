@@ -30,6 +30,7 @@ function resolve(map) {
   }
   return Object.fromEntries(Object.entries(map).map(([k, v]) => [k, get(v)]))
 }
+// Note: `:root` blocks nested in @media are merged into the dark map too — never declare color tokens inside a media `:root`.
 export function parseThemes(css) {
   const dark = block(css, ':root')
   const light = { ...dark, ...block(css, ':root.light') }

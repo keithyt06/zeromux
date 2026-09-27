@@ -7,7 +7,7 @@ import type { Theme, ThemePref } from '../lib/theme'
 import { Terminal, Plus, X, PanelLeftClose, PanelLeft, Sun, Moon, Folder, FolderGit2, ChevronLeft, Home, LogOut, Users, Clock, Bell, BookOpen, Settings, Pencil, Search } from 'lucide-react'
 import { type DocTab } from '../lib/docTabs'
 import PromptManager from './PromptManager'
-import { Sheet } from './ui'
+import { Popover, Menu, SegmentedControl } from './ui'
 import { usePromptPresets } from '../lib/usePromptPresets'
 import { usePolling } from '../lib/usePolling'
 import { useDirBrowser } from '../lib/useDirBrowser'
@@ -118,6 +118,10 @@ export default function Sidebar({ sessions, docTabs, activeId, onSelect, onCreat
   const [pendingAgentContext, setPendingAgentContext] = useState<AskAgentTarget | null>(null)
   const presetStore = usePromptPresets()
   const [showSettings, setShowSettings] = useState(false)
+  // Anchors as state (not refs): the collapsed rail / ⚡ open the popover in the
+  // same render that first mounts the button, when a ref would still be null.
+  const [newBtn, setNewBtn] = useState<HTMLButtonElement | null>(null)
+  const [settingsBtn, setSettingsBtn] = useState<HTMLButtonElement | null>(null)
   const [vaultEnabled, setVaultEnabled] = useState(false)
   const [schedulerHealthy, setSchedulerHealthy] = useState(true)
   const [editingId, setEditingId] = useState<string | null>(null)
@@ -275,28 +279,6 @@ export default function Sidebar({ sessions, docTabs, activeId, onSelect, onCreat
     askAgent(askAgentRequest)
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [askAgentRequest])
-
-  // Mobile keyboard compensation: the popover is anchored to the bottom, so lift it
-  // by however much the on-screen keyboard overlaps the layout viewport.
-  const popRef = useRef<HTMLDivElement>(null)
-  useEffect(() => {
-    if (!mobile || step === 'closed') return
-    const vv = window.visualViewport
-    if (!vv) return
-    const el = popRef.current
-    const apply = () => {
-      const overlap = Math.max(0, window.innerHeight - vv.height - vv.offsetTop)
-      if (el) el.style.transform = overlap ? `translateY(-${overlap}px)` : ''
-    }
-    apply()
-    vv.addEventListener('resize', apply)
-    vv.addEventListener('scroll', apply)
-    return () => {
-      vv.removeEventListener('resize', apply)
-      vv.removeEventListener('scroll', apply)
-      if (el) el.style.transform = ''
-    }
-  }, [mobile, step])
 
   const handleSelect = (id: string) => {
     onSelect(id)
@@ -539,6 +521,7 @@ export default function Sidebar({ sessions, docTabs, activeId, onSelect, onCreat
       {/* New session */}
       <div className="relative px-2 py-3 border-t border-[var(--border)]">
         <button
+          ref={setNewBtn}
           onClick={openTypePicker}
           className="flex items-center gap-2 w-full px-3 py-2 text-sm font-medium text-[var(--accent-brand)] border border-[var(--accent-brand)]/40 hover:bg-[var(--accent-brand)]/10 rounded-lg transition-colors min-h-[40px]"
         >
@@ -546,10 +529,8 @@ export default function Sidebar({ sessions, docTabs, activeId, onSelect, onCreat
           <span>New session</span>
         </button>
 
-        {step !== 'closed' && (
-          <>
-            <div className="fixed inset-0 z-10" onClick={close} />
-            <div ref={popRef} className={`absolute bottom-full left-2 mb-1 bg-[var(--bg-tertiary)] border border-[var(--border)] rounded-lg py-1 ${mobile ? 'w-[calc(100vw-1rem)]' : step === 'quick' ? 'w-80' : 'w-56'} z-20 shadow-xl`}>
+        <Popover open={step !== 'closed'} onClose={close} anchor={newBtn} placement="bottom" sheetTitle="新建会话">
+            <div className={mobile ? '' : step === 'quick' || step === 'manage-prompts' ? 'w-80 max-w-full' : 'w-56'}>
               {createError && (
                 <div role="alert" className="mx-2 my-1 px-2 py-1.5 rounded text-xs text-[var(--accent-red)] bg-[var(--bg-tertiary)] border border-[var(--accent-red)]/40">
                   {createError}
@@ -834,8 +815,7 @@ export default function Sidebar({ sessions, docTabs, activeId, onSelect, onCreat
                 </>
               )}
 
-              {/* manage-prompts keeps the prompt page underneath its Sheet. */}
-              {(step === 'pick-prompt' || step === 'manage-prompts') && (
+              {step === 'pick-prompt' && (
                 <>
                   <div className="flex items-center gap-1 px-2 py-1.5 border-b border-[var(--border)]">
                     <button
@@ -910,10 +890,22 @@ export default function Sidebar({ sessions, docTabs, activeId, onSelect, onCreat
                 </>
               )}
 
+              {/* A sub-view of the same popover, never a second Sheet: on phones the
+                  popover already IS a bottom Sheet (no Sheet-in-Sheet). */}
               {step === 'manage-prompts' && (
-                <Sheet open side="bottom" title="管理常用 prompt" onClose={() => setStep('pick-prompt')}
-                  actions={<button onClick={() => setStep('pick-prompt')} aria-label="关闭" className="p-1 text-[var(--fg-muted)] hover:text-[var(--fg)] rounded transition-colors"><X size={18} /></button>}>
+                <>
+                  <div className="flex items-center gap-1 px-2 min-h-[var(--row-h)] border-b border-[var(--border)]">
+                    <button
+                      onClick={() => setStep('pick-prompt')}
+                      aria-label="返回"
+                      className="inline-flex items-center justify-center min-w-[var(--hit)] min-h-[var(--hit)] text-[var(--fg-muted)] hover:text-[var(--fg)] rounded-[var(--r-sm)] transition-colors"
+                    >
+                      <ChevronLeft size={14} />
+                    </button>
+                    <span className="text-ui-2xs font-semibold text-[var(--fg-subtle)] uppercase tracking-wider">管理常用 prompt</span>
+                  </div>
                   <PromptManager
+                    embedded
                     presets={presetStore.presets}
                     error={presetStore.error}
                     onAdd={presetStore.add}
@@ -921,60 +913,42 @@ export default function Sidebar({ sessions, docTabs, activeId, onSelect, onCreat
                     onRemove={presetStore.remove}
                     onClose={() => setStep('pick-prompt')}
                   />
-                </Sheet>
+                </>
               )}
             </div>
-          </>
-        )}
+        </Popover>
+
+        <div className="flex justify-center py-2">
+          <SegmentedControl
+            label="主题"
+            value={themePref}
+            onChange={onSetThemePref}
+            options={[{ value: 'system', label: '跟随系统' }, { value: 'light', label: '浅色' }, { value: 'dark', label: '深色' }]}
+          />
+        </div>
 
         <button
-          onClick={() => setShowSettings(true)}
+          ref={setSettingsBtn}
+          onClick={() => setShowSettings(v => !v)}
+          aria-haspopup="menu"
+          aria-expanded={showSettings}
           className="flex items-center gap-2 w-full px-3 py-2 text-sm text-[var(--text-secondary)] hover:text-[var(--text-primary)] hover:bg-[var(--bg-tertiary)] rounded-lg transition-colors min-h-[40px]"
         >
           <Settings size={14} />
           <span>Settings</span>
         </button>
 
-        {showSettings && (
-          <>
-            <div className="fixed inset-0 z-10" onClick={() => setShowSettings(false)} />
-            <div className={`absolute bottom-full left-2 mb-1 bg-[var(--bg-tertiary)] border border-[var(--border)] rounded-lg py-1 ${mobile ? 'w-[calc(100vw-1rem)]' : 'w-56'} z-20 shadow-xl`}>
-              <div className="px-3 py-1.5 text-[10px] font-semibold text-[var(--text-muted)] uppercase tracking-wider">Settings</div>
-              <div className="flex items-center gap-1 px-3 py-2">
-                <ThemeIcon size={14} className="shrink-0 text-[var(--fg-muted)]" />
-                {(['system', 'light', 'dark'] as const).map(p => (
-                  <button key={p} onClick={() => onSetThemePref(p)} aria-pressed={themePref === p}
-                    className={`flex-1 px-1.5 py-1 rounded-md text-ui-xs whitespace-nowrap ${themePref === p ? 'bg-[var(--surface-hover)] text-[var(--fg-strong)]' : 'text-[var(--fg-muted)] hover:text-[var(--fg)]'}`}>
-                    {p === 'system' ? '跟随系统' : p === 'light' ? '浅色' : '深色'}
-                  </button>
-                ))}
-              </div>
-              <button
-                onClick={() => { setShowSettings(false); onOpenPanel('push') }}
-                className="flex items-center gap-2.5 w-full px-3 py-2 text-xs text-[var(--text-primary)] hover:bg-[var(--bg-hover)] transition-colors"
-              >
-                <Bell size={14} className="shrink-0" />
-                <span className="flex-1 text-left">推送通知</span>
-              </button>
-              <button
-                onClick={() => { setShowSettings(false); onOpenPanel('prompts') }}
-                className="flex items-center gap-2.5 w-full px-3 py-2 text-xs text-[var(--text-primary)] hover:bg-[var(--bg-hover)] transition-colors"
-              >
-                <Pencil size={14} className="shrink-0" />
-                <span className="flex-1 text-left">常用 prompt 管理</span>
-              </button>
-              {isAdmin && (
-                <button
-                  onClick={() => { setShowSettings(false); onOpenPanel('admin') }}
-                  className="flex items-center gap-2.5 w-full px-3 py-2 text-xs text-[var(--text-primary)] hover:bg-[var(--bg-hover)] transition-colors"
-                >
-                  <Users size={14} className="shrink-0" />
-                  <span className="flex-1 text-left">用户管理</span>
-                </button>
-              )}
-            </div>
-          </>
-        )}
+        <Menu
+          open={showSettings}
+          onClose={() => setShowSettings(false)}
+          anchor={settingsBtn}
+          title="设置"
+          items={[
+            { label: '推送通知', icon: Bell, onSelect: () => onOpenPanel('push') },
+            { label: '常用 prompt 管理', icon: Pencil, onSelect: () => onOpenPanel('prompts') },
+            ...(isAdmin ? [{ label: '用户管理', icon: Users, onSelect: () => onOpenPanel('admin') }] : []),
+          ]}
+        />
 
       </div>
     </div>

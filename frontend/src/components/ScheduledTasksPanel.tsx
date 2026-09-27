@@ -14,7 +14,7 @@ import {
   replayRun,
 } from '../lib/api'
 import { useLatestRequest } from '../lib/useLatestRequest'
-import { Sheet, confirm } from './ui'
+import { Sheet, confirm, IconButton } from './ui'
 
 interface Props {
   open: boolean
@@ -146,10 +146,7 @@ export default function ScheduledTasksPanel({ open, onClose }: Props) {
               <ChevronLeft size={18} />
             </button>
           )}
-          <button onClick={onClose} aria-label="关闭"
-            className="p-1 text-[var(--fg-muted)] hover:text-[var(--fg)] rounded transition-colors">
-            <X size={18} />
-          </button>
+          <IconButton label="关闭" icon={X} onClick={onClose} />
         </>
       }
     >

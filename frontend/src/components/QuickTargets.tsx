@@ -1,11 +1,12 @@
 import { useState, useEffect, useCallback } from 'react'
-import { MoreVertical, X, FileText, Folder, Terminal, Repeat, MessageSquarePlus } from 'lucide-react'
+import { MoreHorizontal, X, FileText, Folder, Terminal, Repeat, MessageSquarePlus } from 'lucide-react'
 import type { SessionType, QuickTarget } from '../lib/api'
 import { listQuickTargets, forgetQuickTarget } from '../lib/api'
 import { coerceAgent } from '../lib/quickTargets'
 import { subscribeQuickTargets } from '../lib/quickTargetsBus'
 import { useLatestRequest } from '../lib/useLatestRequest'
 import { ClaudeCodeIcon, CrewIcon, CodexIcon } from './BrandIcons'
+import { IconButton, Menu, type MenuItem } from './ui'
 
 /** 行首图标 = 这一行会开出什么。比行尾一个小写标签的信息量更高，且省下约 44px 宽度
  *  给目录名和 hint（224px 弹层里这是决定性的）。 */
@@ -31,7 +32,7 @@ export default function QuickTargets({ kind, onPick, onChangeAgent, onPickWithPr
 }) {
   const [items, setItems] = useState<QuickTarget[]>([])
   const [loaded, setLoaded] = useState(false)
-  const [openMenu, setOpenMenu] = useState<string | null>(null)   // path|agent 的 key
+  const [menu, setMenu] = useState<{ it: QuickTarget; anchor: HTMLElement } | null>(null)
 
   // 单调请求令牌。本组件同时具备「慢 GET」（JueceFS/S3 上的 per-row 守卫）与
   // 「乐观 mutation」（forget 先改本地 state 再 refetch）两个条件，正是本 repo 修过
@@ -62,7 +63,7 @@ export default function QuickTargets({ kind, onPick, onChangeAgent, onPickWithPr
   const forget = useCallback(async (it: QuickTarget) => {
     req.bump()      // 使任何在途 GET 失效，否则旧快照会让这条复活成 ghost
     setItems(prev => prev.filter(x => !(x.path === it.path && x.agent === it.agent)))
-    setOpenMenu(null)
+    setMenu(null)
     try { await forgetQuickTarget(kind, it.path, it.agent) } catch { /* 下次 load 会纠正 */ }
     load()
   }, [kind, load, req])
@@ -76,14 +77,22 @@ export default function QuickTargets({ kind, onPick, onChangeAgent, onPickWithPr
     onPick(it.path, agent)
   }
 
+  // 操作单：破坏性操作下沉一层，这一层本身即确认（故不再加 confirm 弹窗）。
+  const menuItems = (it: QuickTarget): MenuItem[] => [
+    ...(it.kind === 'dir' && onChangeAgent ? [{ label: '换 agent 类型', icon: Repeat, onSelect: () => onChangeAgent(it.path) }] : []),
+    ...(it.kind === 'dir' && onPickWithPrompt ? [{ label: '带 prompt 打开', icon: MessageSquarePlus, onSelect: () => onPickWithPrompt(it.path, coerceAgent(it.agent)) }] : []),
+    { label: '从列表移除', icon: X, danger: true, onSelect: () => { forget(it) } },
+  ]
+
   if (!loaded || items.length === 0) return null
 
   return (
+    <>
     <ul className="border-b border-[var(--border)] max-h-72 overflow-y-auto">
       {items.map(it => {
         const key = `${it.path}|${it.agent}`
         return (
-          <li key={key} className="relative border-b border-[var(--border)] last:border-b-0">
+          <li key={key} className="border-b border-[var(--border)] last:border-b-0">
             <div className="flex items-stretch">
               {/* 整行 = 唯一主目标。min-h-[48px] 满足触控最小尺寸（v1 的 py-1.5 只有约 28px）。 */}
               <button
@@ -98,61 +107,30 @@ export default function QuickTargets({ kind, onPick, onChangeAgent, onPickWithPr
                   {/* hint 独占第 2 行：内联时在 224px 下必被截成 "…"，而它唯一的作用
                       就是区分同名（vault 里多个 _index.md）。 */}
                   {it.hint && (
-                    <span className="truncate text-[10px] text-[var(--text-muted)]">{it.hint}</span>
+                    <span className="truncate text-ui-2xs text-[var(--text-muted)]">{it.hint}</span>
                   )}
                 </span>
               </button>
-              {/* 行级操作单入口。刻意不用 opacity-0 group-hover:opacity-100 —— Tailwind v4
+              {/* 行级操作单入口，常显。刻意不用 opacity-0 group-hover:opacity-100 —— Tailwind v4
                   把它编译进 @media (hover:hover)，手机上整条规则不生效，元素会永久
                   opacity:0 但仍可点击（隐形按钮）。用户主设备是手机。 */}
-              <button
-                type="button"
-                data-testid="qt-menu"
-                onClick={() => setOpenMenu(cur => (cur === key ? null : key))}
-                className="shrink-0 w-8 flex items-center justify-center text-[var(--text-secondary)] hover:text-[var(--text-primary)] hover:bg-[var(--bg-hover)] transition-colors"
-                title="更多操作"
-              >
-                <MoreVertical size={14} />
-              </button>
+              <span className="shrink-0 flex items-center pr-1">
+                <IconButton
+                  label="更多"
+                  icon={MoreHorizontal}
+                  size="sm"
+                  data-testid="qt-menu"
+                  aria-haspopup="menu"
+                  aria-expanded={menu?.it === it}
+                  onClick={e => { const anchor = e.currentTarget; setMenu(cur => (cur?.it === it ? null : { it, anchor })) }}
+                />
+              </span>
             </div>
-
-            {/* 展开的操作单：每项 ≥44px 整行 + 文字标签。破坏性操作下沉一层，
-                这一层本身即确认（故不再加 confirm 弹窗）。 */}
-            {openMenu === key && (
-              <div className="border-t border-[var(--border)] bg-[var(--bg-secondary)]">
-                {it.kind === 'dir' && onChangeAgent && (
-                  <button
-                    type="button"
-                    data-testid="qt-changeagent"
-                    onClick={() => { setOpenMenu(null); onChangeAgent(it.path) }}
-                    className="flex items-center gap-2 w-full px-3 py-2.5 text-[11px] text-[var(--text-secondary)] hover:bg-[var(--bg-hover)]"
-                  >
-                    <Repeat size={13} className="shrink-0" />换 agent 类型
-                  </button>
-                )}
-                {it.kind === 'dir' && onPickWithPrompt && (
-                  <button
-                    type="button"
-                    data-testid="qt-withprompt"
-                    onClick={() => { setOpenMenu(null); onPickWithPrompt(it.path, coerceAgent(it.agent)) }}
-                    className="flex items-center gap-2 w-full px-3 py-2.5 text-[11px] text-[var(--text-secondary)] hover:bg-[var(--bg-hover)]"
-                  >
-                    <MessageSquarePlus size={13} className="shrink-0" />带 prompt 打开
-                  </button>
-                )}
-                <button
-                  type="button"
-                  data-testid="qt-forget"
-                  onClick={() => forget(it)}
-                  className="flex items-center gap-2 w-full px-3 py-2.5 text-[11px] text-[var(--text-secondary)] hover:text-[var(--accent-red)] hover:bg-[var(--bg-hover)]"
-                >
-                  <X size={13} className="shrink-0" />从列表移除
-                </button>
-              </div>
-            )}
           </li>
         )
       })}
     </ul>
+    <Menu open={!!menu} onClose={() => setMenu(null)} anchor={menu?.anchor ?? null} items={menu ? menuItems(menu.it) : []} title={menu?.it.display} />
+    </>
   )
 }

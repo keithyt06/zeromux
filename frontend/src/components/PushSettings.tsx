@@ -2,7 +2,7 @@ import { useState, useEffect } from 'react'
 import { X, BellOff, BellRing } from 'lucide-react'
 import { getPushState, enablePush, disablePush, getLevels, setLevels, sendTestPush } from '../lib/push'
 import type { PushState, PushLevels } from '../lib/push'
-import { Sheet, toast } from './ui'
+import { Sheet, toast, IconButton } from './ui'
 
 interface Props {
   open: boolean
@@ -50,10 +50,7 @@ export default function PushSettings({ open, onClose }: Props) {
       onClose={onClose}
       title="推送通知"
       actions={
-        <button onClick={onClose} aria-label="关闭"
-          className="p-1 text-[var(--fg-muted)] hover:text-[var(--fg)] rounded transition-colors">
-          <X size={18} />
-        </button>
+        <IconButton label="关闭" icon={X} onClick={onClose} />
       }
     >
       <div className="p-3 flex flex-col gap-4">

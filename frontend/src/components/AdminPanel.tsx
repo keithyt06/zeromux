@@ -3,7 +3,7 @@ import { Check, Trash2, X, Shield, Clock } from 'lucide-react'
 import type { AdminUser } from '../lib/api'
 import { listUsers, approveUser, removeUser } from '../lib/api'
 import { useLatestRequest } from '../lib/useLatestRequest'
-import { Sheet } from './ui'
+import { Sheet, IconButton } from './ui'
 
 interface Props {
   open: boolean
@@ -52,10 +52,7 @@ export default function AdminPanel({ open, onClose }: Props) {
       onClose={onClose}
       title="用户管理"
       actions={
-        <button onClick={onClose} aria-label="关闭"
-          className="p-1 text-[var(--fg-muted)] hover:text-[var(--fg)] rounded transition-colors">
-          <X size={18} />
-        </button>
+        <IconButton label="关闭" icon={X} onClick={onClose} />
       }
     >
       <div className="p-4 space-y-4">

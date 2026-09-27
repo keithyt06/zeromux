@@ -1,15 +1,16 @@
-import { useState } from 'react'
-import { MoreVertical, Zap, Repeat, MessageSquarePlus, FolderInput } from 'lucide-react'
+import { useState, type MouseEvent } from 'react'
+import { MoreHorizontal, Zap, Repeat, MessageSquarePlus, FolderInput } from 'lucide-react'
 import type { SearchResult, DirHit, NoteHit } from '../lib/api'
 import { RowIcon } from './QuickTargets'
 import { orderSections, compactHint } from '../lib/searchOrder'
+import { IconButton, Menu, type MenuItem } from './ui'
 
 function Hint({ text }: { text: string }) {
-  return text ? <span className="truncate text-[10px] text-[var(--text-muted)]">{text}</span> : null
+  return text ? <span className="truncate text-ui-2xs text-[var(--text-muted)]">{text}</span> : null
 }
 
 function Status({ text }: { text: string }) {
-  return <div className="px-3 py-2 text-[10px] text-[var(--text-muted)]">{text}</div>
+  return <div className="px-3 py-2 text-ui-2xs text-[var(--text-muted)]">{text}</div>
 }
 
 export default function SearchResults({ result, showNotes, onPickDir, onDirMenu, onPickNote, onAskAgent, onOpenHere, onRetry, failed }: {
@@ -23,15 +24,25 @@ export default function SearchResults({ result, showNotes, onPickDir, onDirMenu,
   onRetry?: () => void
   failed?: boolean
 }) {
-  const [openMenu, setOpenMenu] = useState<string | null>(null)
+  const [menu, setMenu] = useState<{ key: string; anchor: HTMLElement; items: MenuItem[]; title: string } | null>(null)
+  const toggleMenu = (key: string, title: string, items: MenuItem[]) => (e: MouseEvent<HTMLButtonElement>) => {
+    const anchor = e.currentTarget
+    setMenu(cur => (cur?.key === key ? null : { key, anchor, items, title }))
+  }
+  const more = (key: string, title: string, items: MenuItem[]) => (
+    <span className="shrink-0 flex items-center pr-1">
+      <IconButton label="更多" icon={MoreHorizontal} size="sm" data-testid="sr-menu" aria-haspopup="menu"
+        aria-expanded={menu?.key === key} onClick={toggleMenu(key, title, items)} />
+    </span>
+  )
 
   if (failed) {
     return (
       <div className="px-3 py-2 flex items-center justify-between gap-2">
-        <span className="text-[10px] text-[var(--text-muted)]">搜索暂时不可用</span>
+        <span className="text-ui-2xs text-[var(--text-muted)]">搜索暂时不可用</span>
         {onRetry && (
           <button type="button" onClick={onRetry}
-            className="shrink-0 px-2 py-1 min-h-[44px] text-[10px] font-semibold bg-[var(--bg-hover)] rounded">重试</button>
+            className="shrink-0 px-2 py-1 min-h-[44px] text-ui-2xs font-semibold bg-[var(--bg-hover)] rounded">重试</button>
         )}
       </div>
     )
@@ -39,14 +50,13 @@ export default function SearchResults({ result, showNotes, onPickDir, onDirMenu,
 
   const rowBtn = 'flex items-start gap-2 flex-1 min-w-0 px-3 py-2 min-h-[48px] text-left hover:bg-[var(--bg-hover)] transition-colors'
   const sideBtn = 'shrink-0 w-11 flex items-center justify-center text-[var(--text-secondary)] hover:text-[var(--text-primary)] hover:bg-[var(--bg-hover)] transition-colors'
-  const menuItem = 'flex items-center gap-2 w-full px-3 py-2.5 text-[11px] text-[var(--text-secondary)] hover:bg-[var(--bg-hover)]'
 
   const dirSection = () => {
     const s = result.dirs
     if (!s) return null
     return (
       <div key="dirs">
-        <div className="px-3 pt-2 pb-1 text-[10px] font-semibold text-[var(--text-muted)] uppercase tracking-wider">目录</div>
+        <div className="px-3 pt-2 pb-1 text-ui-2xs font-semibold text-[var(--text-muted)] uppercase tracking-wider">目录</div>
         {s.indexing ? <Status text="正在建立目录索引…" />
           : s.items.length === 0 ? <Status text={s.refreshing ? '索引刷新中…' : '未找到（仅索引 6 层内）· 用「其他目录…」浏览'} />
           : (
@@ -63,21 +73,11 @@ export default function SearchResults({ result, showNotes, onPickDir, onDirMenu,
                           <Hint text={h.hint} />
                         </span>
                       </button>
-                      {onDirMenu && h.agent && (
-                        <button type="button" data-testid="sr-menu" className={sideBtn} title="更多操作"
-                          onClick={() => setOpenMenu(c => (c === key ? null : key))}><MoreVertical size={14} /></button>
-                      )}
+                      {onDirMenu && h.agent && more(key, h.display, [
+                        { label: '换 agent 类型', icon: Repeat, onSelect: () => onDirMenu.changeAgent(h) },
+                        { label: '带 prompt 打开', icon: MessageSquarePlus, onSelect: () => onDirMenu.withPrompt(h) },
+                      ])}
                     </div>
-                    {openMenu === key && onDirMenu && (
-                      <div className="border-t border-[var(--border)] bg-[var(--bg-secondary)]">
-                        <button type="button" className={menuItem} onClick={() => { setOpenMenu(null); onDirMenu.changeAgent(h) }}>
-                          <Repeat size={13} className="shrink-0" />换 agent 类型
-                        </button>
-                        <button type="button" className={menuItem} onClick={() => { setOpenMenu(null); onDirMenu.withPrompt(h) }}>
-                          <MessageSquarePlus size={13} className="shrink-0" />带 prompt 打开
-                        </button>
-                      </div>
-                    )}
                   </li>
                 )
               })}
@@ -92,7 +92,7 @@ export default function SearchResults({ result, showNotes, onPickDir, onDirMenu,
     if (!s || !showNotes) return null
     return (
       <div key="notes">
-        <div className="px-3 pt-2 pb-1 text-[10px] font-semibold text-[var(--text-muted)] uppercase tracking-wider">笔记</div>
+        <div className="px-3 pt-2 pb-1 text-ui-2xs font-semibold text-[var(--text-muted)] uppercase tracking-wider">笔记</div>
         {s.indexing ? <Status text="正在建立笔记索引…" />
           : s.items.length === 0 ? <Status text="无匹配笔记" />
           : (
@@ -113,18 +113,10 @@ export default function SearchResults({ result, showNotes, onPickDir, onDirMenu,
                           ≥44px target (never hover-only — invisible-but-tappable on phones). */}
                       <button type="button" data-testid="sr-ask" className={sideBtn} title="问 agent"
                         onClick={() => onAskAgent(h)}><Zap size={14} /></button>
-                      {h.kind === 'folder' && onOpenHere && (
-                        <button type="button" data-testid="sr-menu" className={sideBtn} title="更多操作"
-                          onClick={() => setOpenMenu(c => (c === key ? null : key))}><MoreVertical size={14} /></button>
-                      )}
+                      {h.kind === 'folder' && onOpenHere && more(key, h.display, [
+                        { label: '在此开 agent', icon: FolderInput, onSelect: () => onOpenHere(h) },
+                      ])}
                     </div>
-                    {openMenu === key && onOpenHere && (
-                      <div className="border-t border-[var(--border)] bg-[var(--bg-secondary)]">
-                        <button type="button" className={menuItem} onClick={() => { setOpenMenu(null); onOpenHere(h) }}>
-                          <FolderInput size={13} className="shrink-0" />在此开 agent
-                        </button>
-                      </div>
-                    )}
                   </li>
                 )
               })}
@@ -134,5 +126,10 @@ export default function SearchResults({ result, showNotes, onPickDir, onDirMenu,
     )
   }
 
-  return <div>{orderSections(result, showNotes).map(k => (k === 'dirs' ? dirSection() : noteSection()))}</div>
+  return (
+    <div>
+      {orderSections(result, showNotes).map(k => (k === 'dirs' ? dirSection() : noteSection()))}
+      <Menu open={!!menu} onClose={() => setMenu(null)} anchor={menu?.anchor ?? null} items={menu?.items ?? []} title={menu?.title} />
+    </div>
+  )
 }

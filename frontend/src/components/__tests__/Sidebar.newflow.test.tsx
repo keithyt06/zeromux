@@ -1,5 +1,5 @@
 import { render, screen, fireEvent, waitFor } from '@testing-library/react'
-import { describe, it, expect, vi, beforeEach } from 'vitest'
+import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
 import Sidebar from '../Sidebar'
 import * as api from '../../lib/api'
 
@@ -116,5 +116,44 @@ describe('Sidebar panel entries route to App (T11)', () => {
       expect(onOpenPanel).toHaveBeenLastCalledWith(p)
     }
     expect(screen.queryByRole('dialog', { hidden: true })).toBeNull()
+  })
+})
+
+describe('New session popover (T12)', () => {
+  beforeEach(() => {
+    vi.restoreAllMocks()
+    vi.spyOn(api, 'getSchedulerHealth').mockResolvedValue({ heartbeat_ms: 1, healthy: true })
+    vi.spyOn(api, 'getVaultMeta').mockResolvedValue({ enabled: false, name: '' })
+    vi.spyOn(api, 'listPrompts').mockResolvedValue([])
+    vi.spyOn(api, 'listQuickTargets').mockResolvedValue({ top: [
+      { kind: 'dir', path: '/w/p', agent: 'claude', display: 'p', hint: '/w/p' },
+    ] })
+  })
+  afterEach(() => vi.unstubAllGlobals())
+
+  it('manage-prompts is a sub-view of the same popover (no second Sheet), back returns to pick-prompt', async () => {
+    // Narrow: the popover itself is the bottom Sheet — a manager Sheet would nest.
+    vi.stubGlobal('matchMedia', (q: string) => ({ matches: q.includes('max-width'), addEventListener() {}, removeEventListener() {} }))
+    setup({ mobile: true })
+    fireEvent.click(screen.getByText('New session'))
+    fireEvent.click(await screen.findByTestId('qt-menu'))
+    fireEvent.click(await screen.findByText('带 prompt 打开'))
+    fireEvent.click(await screen.findByText('✎ 管理'))
+    expect(await screen.findByText('还没有常用 prompt，点下面新建。')).toBeInTheDocument()
+    expect(screen.getAllByRole('dialog', { hidden: true })).toHaveLength(1)
+    expect(screen.queryByLabelText('close manager')).toBeNull()      // one close, not two
+    fireEvent.click(screen.getByLabelText('返回'))
+    expect(await screen.findByText('Initial prompt (optional)')).toBeInTheDocument()
+  })
+
+  it('theme is a segmented control, not a menu item', () => {
+    const onSetThemePref = vi.fn()
+    setup({ onSetThemePref })
+    const g = screen.getByRole('radiogroup', { name: '主题' })
+    expect(screen.getByRole('radio', { name: '深色' })).toHaveAttribute('aria-checked', 'true')
+    fireEvent.click(screen.getByRole('radio', { name: '浅色' }))
+    expect(onSetThemePref).toHaveBeenCalledWith('light')
+    fireEvent.click(screen.getByText('Settings'))
+    expect(screen.getByRole('menu')).not.toContainElement(g)
   })
 })

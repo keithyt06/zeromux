@@ -1,7 +1,7 @@
 {
-  "smallText": 140,
+  "smallText": 128,
   "paletteColor": 22,
-  "zIndex": 16,
+  "zIndex": 11,
   "nativeDialog": 15,
   "emojiIcon": 10
 }

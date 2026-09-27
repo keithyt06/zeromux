@@ -68,7 +68,7 @@ describe('QuickTargets stale-response 防护', () => {
     await act(async () => {
       ;(row.querySelector('[data-testid="qt-menu"]') as HTMLElement).click()
     })
-    await act(async () => { screen.getByTestId('qt-forget').click() })
+    await act(async () => { screen.getByText('从列表移除').click() })
     expect(screen.queryByText('gone')).not.toBeInTheDocument()   // 乐观移除已生效
 
     // 陈旧快照（仍含 gone）现在到达。有 reqRef bump → 丢弃；无 bump → gone 复活。

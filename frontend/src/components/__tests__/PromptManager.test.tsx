@@ -1,5 +1,5 @@
 import { render, screen, fireEvent, waitFor } from '@testing-library/react'
-import { describe, it, expect, vi } from 'vitest'
+import { describe, it, expect, vi, afterEach } from 'vitest'
 import PromptManager from '../PromptManager'
 import type { PromptPreset } from '../../lib/api'
 
@@ -92,5 +92,25 @@ describe('PromptManager input size (I-15)', () => {
     fireEvent.click(screen.getByText('新建'))
     expect(screen.getByPlaceholderText(/标题/)).toHaveClass('text-ui-input')
     expect(screen.getByPlaceholderText('prompt 全文')).toHaveClass('text-ui-input')
+  })
+})
+
+describe('PromptManager hosted in a Sheet / touch (T12)', () => {
+  afterEach(() => vi.unstubAllGlobals())
+  it('embedded: no inner close button and no inner max-height (host scrolls)', () => {
+    render(<PromptManager embedded presets={[preset('p1', 'one')]} error={null} onAdd={vi.fn()} onEdit={vi.fn()} onRemove={vi.fn()} onClose={vi.fn()} />)
+    expect(screen.queryByLabelText('close manager')).toBeNull()
+    expect(screen.getByText('one').closest('.flex-col')!.className).not.toMatch(/max-h-/)
+  })
+  it('does not autofocus the title on touch devices (I-15)', () => {
+    vi.stubGlobal('matchMedia', (q: string) => ({ matches: q.includes('coarse'), addEventListener() {}, removeEventListener() {} }))
+    setup()
+    fireEvent.click(screen.getByText('新建'))
+    expect(document.activeElement).not.toBe(screen.getByPlaceholderText(/标题/))
+  })
+  it('autofocuses the title with a fine pointer', () => {
+    setup()
+    fireEvent.click(screen.getByText('新建'))
+    expect(document.activeElement).toBe(screen.getByPlaceholderText(/标题/))
   })
 })

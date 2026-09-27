@@ -1,6 +1,7 @@
 import { useState } from 'react'
 import { Pencil, Trash2, Plus, X } from 'lucide-react'
 import type { PromptPreset } from '../lib/api'
+import { useIsTouch } from '../lib/useMediaQuery'
 
 interface Props {
   presets: PromptPreset[]
@@ -11,6 +12,9 @@ interface Props {
   onEdit: (id: string, fields: { title?: string; body?: string }) => Promise<boolean>
   onRemove: (id: string) => void
   onClose: () => void
+  /** Hosted by a Sheet/Popover that already provides close/back and scrolling:
+   *  drop the inner X and the inner list max-height (one close, one scroller). */
+  embedded?: boolean
 }
 
 // text-ui-input (16px): smaller makes iOS Safari zoom on focus (I-15).
@@ -22,7 +26,9 @@ const inputCls =
 const TITLE_MAX = 200
 const BODY_MAX = 20000
 
-export default function PromptManager({ presets, error, onAdd, onEdit, onRemove, onClose }: Props) {
+export default function PromptManager({ presets, error, onAdd, onEdit, onRemove, onClose, embedded = false }: Props) {
+  // No autoFocus on touch: the soft keyboard would pop over the form (I-15).
+  const touch = useIsTouch()
   // editingId === null && formOpen === true => new; editingId set => editing that row.
   const [formOpen, setFormOpen] = useState(false)
   const [editingId, setEditingId] = useState<string | null>(null)
@@ -54,7 +60,7 @@ export default function PromptManager({ presets, error, onAdd, onEdit, onRemove,
       {error && <div className="text-ui-2xs text-[var(--danger)]">{error}</div>}
 
       {!formOpen && (
-        <div className="flex flex-col gap-1 max-h-60 overflow-y-auto">
+        <div className={`flex flex-col gap-1 ${embedded ? '' : 'max-h-60 overflow-y-auto'}`}>
           {presets.length === 0 && (
             <div className="text-ui-2xs text-[var(--fg-subtle)] px-1 py-2">还没有常用 prompt，点下面新建。</div>
           )}
@@ -86,7 +92,7 @@ export default function PromptManager({ presets, error, onAdd, onEdit, onRemove,
       {formOpen ? (
         <div className="flex flex-col gap-2">
           <input value={draftTitle} onChange={e => setDraftTitle(e.target.value)}
-            placeholder="标题，如「审查 PR」" autoFocus className={inputCls} />
+            placeholder="标题，如「审查 PR」" autoFocus={!touch} className={inputCls} />
           <textarea value={draftBody} onChange={e => setDraftBody(e.target.value)}
             placeholder="prompt 全文" className={`${inputCls} h-24 resize-none`} />
           <div className="text-ui-2xs text-[var(--fg-subtle)] leading-snug">
@@ -108,8 +114,10 @@ export default function PromptManager({ presets, error, onAdd, onEdit, onRemove,
             className="flex items-center gap-1 px-2 py-1 text-ui-2xs font-semibold text-[var(--accent)] hover:opacity-80">
             <Plus size={12} /> 新建
           </button>
-          <button onClick={onClose} aria-label="close manager"
-            className="p-1 text-[var(--fg-subtle)] hover:text-[var(--fg)]"><X size={12} /></button>
+          {!embedded && (
+            <button onClick={onClose} aria-label="close manager"
+              className="p-1 text-[var(--fg-subtle)] hover:text-[var(--fg)]"><X size={12} /></button>
+          )}
         </div>
       )}
     </div>

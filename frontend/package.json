@@ -6,7 +6,7 @@
   "scripts": {
     "dev": "vite",
     "build": "tsc -b && vite build && node scripts/precompress.mjs dist && node scripts/check-size.mjs dist 337920",
-    "lint": "eslint .",
+    "lint": "eslint . && node scripts/lint-tokens.mjs",
     "preview": "vite preview",
     "test": "vitest run",
     "test:watch": "vitest"

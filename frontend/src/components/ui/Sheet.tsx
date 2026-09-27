@@ -1,4 +1,5 @@
 import { useEffect, useId, useRef, useState, type ReactNode, type PointerEvent } from 'react'
+import { modalStack } from './modalStack'
 
 let openSheets = 0
 const KEYBOARD_PX = 120
@@ -22,6 +23,7 @@ export function Sheet({ open, onClose, side, title, actions, snap = 'half', chil
   const [kb, setKb] = useState<number | null>(() => (side === 'bottom' ? keyboardHeight() : null))
   const drag = useRef<{ y: number; t: number } | null>(null)
   const [dy, setDy] = useState(0)
+  const downOnSelf = useRef(false)
 
   useEffect(() => {
     if (!open) return
@@ -30,8 +32,10 @@ export function Sheet({ open, onClose, side, title, actions, snap = 'half', chil
     const el = ref.current
     opener.current = document.activeElement
     if (el && !el.open) el.showModal()
+    if (el) modalStack.push(el)
     return () => {
       openSheets--
+      if (el) modalStack.pop(el)
       if (el?.open) el.close()
       ;(opener.current as HTMLElement | null)?.focus?.()
     }
@@ -53,7 +57,7 @@ export function Sheet({ open, onClose, side, title, actions, snap = 'half', chil
   const onDown = (e: PointerEvent) => {
     if ((bodyRef.current?.scrollTop ?? 0) > 0) return
     drag.current = { y: e.clientY, t: performance.now() }
-    ;(e.target as Element).setPointerCapture?.(e.pointerId)
+    e.currentTarget.setPointerCapture?.(e.pointerId)
   }
   const onMove = (e: PointerEvent) => { if (drag.current) setDy(Math.max(0, e.clientY - drag.current.y)) }
   const onUp = (e: PointerEvent) => {
@@ -64,8 +68,9 @@ export function Sheet({ open, onClose, side, title, actions, snap = 'half', chil
     const v = dist / Math.max(1, performance.now() - d.t)
     const h = ref.current?.getBoundingClientRect().height ?? 1
     setDy(0)
-    if (dist > h * 0.3 || v > 0.5) onClose()
+    if (dist > h * 0.3 || (dist > 24 && v > 0.5)) onClose()
   }
+  const onCancelDrag = () => { drag.current = null; setDy(0) }
 
   const base = 'p-0 m-0 max-w-none max-h-none bg-[var(--surface-1)] text-[var(--fg)] backdrop:bg-black/50'
   const bySide = {
@@ -81,12 +86,17 @@ export function Sheet({ open, onClose, side, title, actions, snap = 'half', chil
       data-snap={effSnap}
       aria-labelledby={title ? titleId : undefined}
       onCancel={e => { e.preventDefault(); onClose() }}
-      onClick={e => { if (e.target === e.currentTarget) onClose() }}
+      onPointerDown={e => { downOnSelf.current = e.target === e.currentTarget }}
+      onClick={e => {
+        const self = downOnSelf.current && e.target === e.currentTarget
+        downOnSelf.current = false
+        if (self) onClose()
+      }}
       style={{ height, transform: dy ? `translateY(${dy}px)` : undefined, transition: dy ? 'none' : 'transform var(--dur-base) var(--ease-out)' }}
       className={`${base} ${bySide} flex flex-col`}
     >
       {side === 'bottom' && (
-        <div onPointerDown={onDown} onPointerMove={onMove} onPointerUp={onUp} className="flex justify-center py-2 touch-none cursor-grab" aria-hidden>
+        <div onPointerDown={onDown} onPointerMove={onMove} onPointerUp={onUp} onPointerCancel={onCancelDrag} className="flex justify-center py-2 touch-none cursor-grab" aria-hidden>
           <span className="h-1 w-10 rounded-full bg-[var(--border)]" />
         </div>
       )}

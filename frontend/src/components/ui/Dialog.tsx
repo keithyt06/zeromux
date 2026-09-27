@@ -1,4 +1,5 @@
 import { useEffect, useId, useRef, type ReactNode, type MouseEvent } from 'react'
+import { modalStack } from './modalStack'
 
 /** Native <dialog> modal. Lives in the browser top layer, so ancestors'
  *  `contain: paint` / overflow / z-index can't clip or reorder it (replaces
@@ -13,11 +14,13 @@ export function Dialog({ open, onClose, title, children, className = '', labelle
   useEffect(() => {
     const el = ref.current
     if (open) {
-      if (el && !el.open) {
+      if (!el) return
+      if (!el.open) {
         opener.current = document.activeElement
         el.showModal()
       }
-      return
+      modalStack.push(el)
+      return () => modalStack.pop(el)
     }
     // open=false renders null (the <dialog> is already gone, ref is null), so
     // restore focus here rather than gating on the element.
@@ -28,7 +31,14 @@ export function Dialog({ open, onClose, title, children, className = '', labelle
 
   useEffect(() => () => { (opener.current as HTMLElement | null)?.focus?.() }, [])
 
-  const onBackdrop = (e: MouseEvent<HTMLDialogElement>) => { if (e.target === e.currentTarget) onClose() }
+  // Only a press that both started and ended on the backdrop closes: a text
+  // selection dragged out of an input must not dismiss (and lose) the dialog.
+  const downOnSelf = useRef(false)
+  const onBackdrop = (e: MouseEvent<HTMLDialogElement>) => {
+    const self = downOnSelf.current && e.target === e.currentTarget
+    downOnSelf.current = false
+    if (self) onClose()
+  }
 
   if (!open) return null
   return (
@@ -36,6 +46,7 @@ export function Dialog({ open, onClose, title, children, className = '', labelle
       ref={ref}
       aria-labelledby={labelledBy ?? (title ? titleId : undefined)}
       onCancel={e => { e.preventDefault(); onClose() }}
+      onPointerDown={e => { downOnSelf.current = e.target === e.currentTarget }}
       onClick={onBackdrop}
       className={`bg-transparent p-0 m-auto backdrop:bg-black/50 ${className}`}
     >

@@ -1,4 +1,4 @@
-import { render, screen } from '@testing-library/react'
+import { render, screen, fireEvent } from '@testing-library/react'
 import { describe, it, expect, vi, afterEach } from 'vitest'
 import { Sheet } from '../Sheet'
 
@@ -18,6 +18,17 @@ describe('Sheet', () => {
     const d = screen.getByRole('dialog', { hidden: true }) as HTMLDialogElement
     expect(d.dataset.snap).toBe('full')
     expect(d.style.height).toBe('400px')
+  })
+  it('drag that ends on the backdrop does not close', () => {
+    const onClose = vi.fn()
+    render(<Sheet open side="right" onClose={onClose}><input /></Sheet>)
+    const d = screen.getByRole('dialog', { hidden: true })
+    fireEvent.pointerDown(d.querySelector('input')!)
+    fireEvent.click(d)
+    expect(onClose).not.toHaveBeenCalled()
+    fireEvent.pointerDown(d)
+    fireEvent.click(d)
+    expect(onClose).toHaveBeenCalledTimes(1)
   })
   it('warns on Sheet-in-Sheet', () => {
     const err = vi.spyOn(console, 'error').mockImplementation(() => {})

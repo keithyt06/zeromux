@@ -1,6 +1,7 @@
-import { render, screen, fireEvent } from '@testing-library/react'
+import { render, screen, fireEvent, waitFor } from '@testing-library/react'
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
 import PushSettings from '../PushSettings'
+import { Toaster } from '../ui'
 import * as pushLib from '../../lib/push'
 
 // Mock push.ts
@@ -26,7 +27,7 @@ describe('PushSettings', () => {
   })
 
   it('渲染主开关按钮', async () => {
-    render(<PushSettings onClose={() => {}} />)
+    render(<PushSettings open onClose={() => {}} />)
     // The toggle button or status label should be present
     expect(screen.getByRole('button', { name: /关闭|close/i })).toBeInTheDocument()
     // There should be some push-related text
@@ -45,7 +46,7 @@ describe('PushSettings', () => {
       value: vi.fn().mockReturnValue({ matches: false, addEventListener: vi.fn(), removeEventListener: vi.fn() }),
     })
 
-    render(<PushSettings onClose={() => {}} />)
+    render(<PushSettings open onClose={() => {}} />)
     // Should show iOS hint with share/add steps
     expect(screen.getAllByText(/分享|主屏幕|Safari/i).length).toBeGreaterThan(0)
   })
@@ -56,7 +57,7 @@ describe('PushSettings', () => {
       configurable: true,
     })
 
-    render(<PushSettings onClose={() => {}} />)
+    render(<PushSettings open onClose={() => {}} />)
     expect(screen.queryByText(/Safari/i)).toBeNull()
   })
 
@@ -64,9 +65,20 @@ describe('PushSettings', () => {
     const sendTestPushMock = vi.mocked(pushLib.sendTestPush)
     vi.mocked(pushLib.getPushState).mockResolvedValue('enabled')
 
-    render(<PushSettings onClose={() => {}} />)
+    render(<PushSettings open onClose={() => {}} />)
     const btn = await screen.findByRole('button', { name: /测试推送/ })
     fireEvent.click(btn)
     expect(sendTestPushMock).toHaveBeenCalled()
+  })
+
+  it('toggle failure shows a toast and keeps the switch off', async () => {
+    vi.mocked(pushLib.getPushState).mockResolvedValue('disabled')
+    vi.mocked(pushLib.enablePush).mockRejectedValue(new Error('subscribe failed'))
+    render(<><Toaster /><PushSettings open onClose={() => {}} /></>)
+    const sw = await screen.findByRole('switch')
+    await waitFor(() => expect(sw).not.toBeDisabled())
+    fireEvent.click(sw)
+    expect(await screen.findByText(/开启失败/)).toBeInTheDocument()
+    expect(screen.getByRole('switch')).toHaveAttribute('aria-checked', 'false')
   })
 })

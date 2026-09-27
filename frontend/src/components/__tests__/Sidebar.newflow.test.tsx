@@ -10,7 +10,7 @@ function setup(over: Partial<React.ComponentProps<typeof Sidebar>> = {}) {
     onDelete: vi.fn(), onRename: vi.fn(), hasUnread: () => false, onLogout: vi.fn(),
     theme: 'dark' as const, onToggleTheme: vi.fn(), themePref: 'dark' as const, onSetThemePref: vi.fn(),
     user: { id: 'u', login: 'u', avatar: null, role: 'admin', status: 'active' } as api.UserInfo,
-    open: true, onToggle: vi.fn(), mobile: false, hostTmux: [], ...over,
+    open: true, onToggle: vi.fn(), mobile: false, hostTmux: [], onOpenPanel: vi.fn(), ...over,
   }
   render(<Sidebar {...props} />)
   return { onCreate }
@@ -94,5 +94,27 @@ describe('Sidebar new terminal flow', () => {
     fireEvent.click(row)
     expect(onCreate).toHaveBeenCalledTimes(1)
     expect(await screen.findByText('创建中…')).toBeInTheDocument()
+  })
+})
+
+describe('Sidebar panel entries route to App (T11)', () => {
+  beforeEach(() => {
+    vi.restoreAllMocks()
+    vi.spyOn(api, 'getSchedulerHealth').mockResolvedValue({ heartbeat_ms: 1, healthy: true })
+    vi.spyOn(api, 'getVaultMeta').mockResolvedValue({ enabled: false, name: '' })
+    vi.spyOn(api, 'listQuickTargets').mockResolvedValue({ top: [] })
+    vi.spyOn(api, 'listPrompts').mockResolvedValue([])
+  })
+  it('Clock and Settings items call onOpenPanel instead of mounting panels inline', () => {
+    const onOpenPanel = vi.fn()
+    setup({ onOpenPanel })
+    fireEvent.click(screen.getByTitle('定时任务'))
+    expect(onOpenPanel).toHaveBeenLastCalledWith('scheduled')
+    for (const [label, p] of [['推送通知', 'push'], ['常用 prompt 管理', 'prompts'], ['用户管理', 'admin']] as const) {
+      fireEvent.click(screen.getByText('Settings'))
+      fireEvent.click(screen.getByText(label))
+      expect(onOpenPanel).toHaveBeenLastCalledWith(p)
+    }
+    expect(screen.queryByRole('dialog', { hidden: true })).toBeNull()
   })
 })

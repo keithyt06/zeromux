@@ -8,13 +8,18 @@ import { join } from 'node:path'
 
 const [base, outDir, ...rest] = process.argv.slice(2)
 if (!base || !outDir || /:8090\b/.test(base)) {
-  console.error('usage: node scripts/screens.mjs http://127.0.0.1:<port≠8090> <outDir> [--theme dark|light] [--sessions id,id] [--token T]')
+  console.error('usage: node scripts/screens.mjs http://127.0.0.1:<port≠8090> <outDir> [--theme dark|light] [--sessions id,id] [--token T] [--click SEL]... [--label L]')
   process.exit(2)
 }
 const arg = (k, d) => { const i = rest.indexOf(k); return i >= 0 ? rest[i + 1] : d }
 const theme = arg('--theme', 'dark')
 const sessions = (arg('--sessions', '') || '').split(',').filter(Boolean)
 const token = arg('--token', 'smoke')
+// --click SEL (repeatable): click in order from '/', then shoot one scene named
+// --label. SEL = text (exact) | title:T | css:C; an `m:` prefix runs the step on
+// the mobile viewport only (e.g. opening the collapsed sidebar).
+const clicks = rest.flatMap((v, i) => (rest[i - 1] === '--click' ? [v] : []))
+const label = arg('--label', 'click')
 
 const req = createRequire(process.env.PLAYWRIGHT_CORE_FROM || '/tmp/zmx-pw/package.json')
 const { chromium } = req('playwright-core')
@@ -36,8 +41,21 @@ for (const vp of VIEWPORTS) {
     await p.goto(base + url); await p.waitForTimeout(2500)
     await p.screenshot({ path: join(outDir, `${name}-${theme}-${label}.png`) })
   }
-  await shot('home', '/')
-  for (const id of sessions) await shot(`session-${id.slice(0, 6)}`, `/?session=${id}`)
+  if (clicks.length) {
+    await p.goto(base + '/'); await p.waitForTimeout(2500)
+    for (let sel of clicks) {
+      if (sel.startsWith('m:')) { if (name !== 'm') continue; sel = sel.slice(2) }
+      const loc = sel.startsWith('title:') ? p.getByTitle(sel.slice(6), { exact: true })
+        : sel.startsWith('css:') ? p.locator(sel.slice(4))
+        : p.getByText(sel, { exact: true })
+      await loc.first().click(); await p.waitForTimeout(600)
+    }
+    await p.waitForTimeout(1200)
+    await p.screenshot({ path: join(outDir, `${name}-${theme}-${label}.png`) })
+  } else {
+    await shot('home', '/')
+    for (const id of sessions) await shot(`session-${id.slice(0, 6)}`, `/?session=${id}`)
+  }
   await ctx.close()
 }
 await b.close()

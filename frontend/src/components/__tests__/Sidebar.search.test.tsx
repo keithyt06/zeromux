@@ -13,7 +13,7 @@ function setup(over: Partial<React.ComponentProps<typeof Sidebar>> = {}) {
     sessions: [], docTabs: [], activeId: null, onSelect: vi.fn(), onCreate, onOpenVault,
     onDelete: vi.fn(), onRename: vi.fn(), hasUnread: () => false, onLogout: vi.fn(),
     theme: 'dark' as const, onToggleTheme: vi.fn(), themePref: 'dark' as const, onSetThemePref: vi.fn(), user: { id: 'u', login: 'u', avatar: null, role: 'admin', status: 'active' } as api.UserInfo,
-    open: true, onToggle, mobile: false, ...over,
+    open: true, onToggle, mobile: false, onOpenPanel: vi.fn(), ...over,
   }
   render(<Sidebar {...props} />)
   return { onCreate, onOpenVault, onToggle }

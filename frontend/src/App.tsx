@@ -18,6 +18,10 @@ import GitViewer from './components/GitViewer'
 import AgentDashboard from './components/AgentDashboard'
 import VaultReader from './components/VaultReader'
 import MemoryPanel from './components/MemoryPanel'
+import AdminPanel from './components/AdminPanel'
+import ScheduledTasksPanel from './components/ScheduledTasksPanel'
+import PushSettings from './components/PushSettings'
+import PromptsSheet from './components/PromptsSheet'
 import { Toaster, DialogHost, toast, confirm } from './components/ui'
 import { undoCloseToast } from './lib/undoCloseToast'
 import { type DocTab, newDocTab, isDocTabId, loadDocTabs, saveDocTabs, resolveActivePane, DEFAULT_DOC_TITLE } from './lib/docTabs'
@@ -74,6 +78,7 @@ export default function App() {
   const isMobile = useIsNarrow()
   const [sidebarOpen, setSidebarOpen] = useState(!isMobile)
   const [confirmCount, setConfirmCount] = useState(0)
+  const [panel, setPanel] = useState<null | 'admin' | 'scheduled' | 'push' | 'prompts'>(null)
   // One-shot request from the sidebar's ⋯ menu (查看历史) → the active
   // TerminalView opens its history drawer. nonce so re-requesting the same
   // session (already open) still re-fires the effect.
@@ -398,6 +403,7 @@ export default function App() {
         onOpenVault={handleOpenVault}
         askAgentRequest={askAgentRequest}
         onOpenHistory={(id) => { setActiveId(id); setHistoryReq({ id, nonce: Date.now() }) }}
+        onOpenPanel={setPanel}
       />
       <main className="flex-1 min-w-0 flex flex-col">
         {/* Info bar for active session */}
@@ -479,6 +485,10 @@ export default function App() {
             </div>
           )}
         </div>
+        {panel === 'admin' && <AdminPanel open onClose={() => setPanel(null)} />}
+        {panel === 'scheduled' && <ScheduledTasksPanel open onClose={() => setPanel(null)} />}
+        {panel === 'push' && <PushSettings open onClose={() => setPanel(null)} />}
+        {panel === 'prompts' && <PromptsSheet open onClose={() => setPanel(null)} />}
         <Toaster /><DialogHost />
       </main>
     </div>

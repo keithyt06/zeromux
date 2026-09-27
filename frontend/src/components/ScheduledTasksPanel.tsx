@@ -1,5 +1,5 @@
 import { useState, useEffect, useCallback } from 'react'
-import { Clock, X, Play, Pencil, Trash2, Plus, History, ChevronLeft, Folder } from 'lucide-react'
+import { X, Play, Pencil, Trash2, Plus, History, ChevronLeft, Folder } from 'lucide-react'
 import DirectoryPicker from './DirectoryPicker'
 import type { ScheduledTask, TaskRun, ScheduleInput, ScheduledTaskReq } from '../lib/api'
 import {
@@ -13,8 +13,11 @@ import {
   confirmRunDone,
   replayRun,
 } from '../lib/api'
+import { useLatestRequest } from '../lib/useLatestRequest'
+import { Sheet, confirm } from './ui'
 
 interface Props {
+  open: boolean
   onClose: () => void
 }
 
@@ -41,38 +44,43 @@ const STATE_LABELS: Record<TaskRun['state'], string> = {
 }
 
 const STATE_COLORS: Record<TaskRun['state'], string> = {
-  claimed: 'text-[var(--text-secondary)]',
-  running: 'text-[var(--accent-blue)]',
-  succeeded: 'text-[var(--accent-green-text)]',
-  failed: 'text-[var(--accent-red)]',
-  skipped: 'text-[var(--text-muted)]',
-  aborted: 'text-[var(--accent-yellow)]',
+  claimed: 'text-[var(--fg-muted)]',
+  running: 'text-[var(--accent)]',
+  succeeded: 'text-[var(--success)]',
+  failed: 'text-[var(--danger)]',
+  skipped: 'text-[var(--fg-subtle)]',
+  aborted: 'text-[var(--attention)]',
 }
 
 // eslint-disable-next-line react-refresh/only-export-components -- pure helper exported for unit tests
 export function runReason(r: TaskRun): { label: string; color: string } {
   if (r.state === 'aborted') {
-    if (r.failure_kind === 'idle_timeout') return { label: '静默超时(无输出)', color: 'text-[var(--accent-red)]' }
-    if (r.failure_kind === 'watchdog_timeout') return { label: '超过最长运行时长', color: 'text-[var(--accent-red)]' }
-    if (r.failure_kind === 'orphaned_restart') return { label: '重启中断', color: 'text-[var(--accent-red)]' }
+    if (r.failure_kind === 'idle_timeout') return { label: '静默超时(无输出)', color: 'text-[var(--danger)]' }
+    if (r.failure_kind === 'watchdog_timeout') return { label: '超过最长运行时长', color: 'text-[var(--danger)]' }
+    if (r.failure_kind === 'orphaned_restart') return { label: '重启中断', color: 'text-[var(--danger)]' }
   }
   return { label: STATE_LABELS[r.state], color: STATE_COLORS[r.state] }
 }
 
-export default function ScheduledTasksPanel({ onClose }: Props) {
+export default function ScheduledTasksPanel({ open, onClose }: Props) {
   const [tasks, setTasks] = useState<ScheduledTask[]>([])
   const [loading, setLoading] = useState(true)
   const [view, setView] = useState<View>('list')
   const [editing, setEditing] = useState<ScheduledTask | null>(null)
   const [historyTask, setHistoryTask] = useState<ScheduledTask | null>(null)
   const [note, setNote] = useState<string | null>(null)
+  const req = useLatestRequest()
 
   const load = useCallback(async () => {
+    const t = req.begin()
     try {
-      setTasks(await listScheduledTasks())
+      const data = await listScheduledTasks()
+      if (!req.isCurrent(t)) return
+      setTasks(data)
     } catch { /* ignore */ }
+    if (!req.isCurrent(t)) return
     setLoading(false)
-  }, [])
+  }, [req])
 
   useEffect(() => { load() }, [load])
 
@@ -107,7 +115,7 @@ export default function ScheduledTasksPanel({ onClose }: Props) {
   }
 
   const handleDelete = async (t: ScheduledTask) => {
-    if (!confirm(`确定删除定时任务「${t.name}」？`)) return
+    if (!await confirm({ title: `删除定时任务「${t.name}」？`, confirmLabel: '删除', danger: true })) return
     try {
       await deleteScheduledTask(t.id)
       load()
@@ -118,53 +126,54 @@ export default function ScheduledTasksPanel({ onClose }: Props) {
   const openEdit = (t: ScheduledTask) => { setEditing(t); setView('form') }
   const openHistory = (t: ScheduledTask) => { setHistoryTask(t); setView('history') }
 
+  const title = view === 'list' ? '定时任务' : view === 'form' ? (editing ? '编辑任务' : '新建任务') : `运行历史 · ${historyTask?.name}`
+
   return (
-    <div className="absolute inset-0 bg-[var(--bg-primary)] z-50 flex flex-col">
-      {/* Header */}
-      <div className="flex items-center justify-between px-4 h-10 border-b border-[var(--border)] bg-[var(--bg-secondary)]">
-        <div className="flex items-center gap-2 text-xs font-bold text-[var(--text-primary)]">
-          {view !== 'list' ? (
+    <Sheet
+      open={open}
+      side="full"
+      onClose={onClose}
+      title={title}
+      actions={
+        <>
+          {view !== 'list' && (
             <button
               onClick={() => setView('list')}
-              className="p-0.5 text-[var(--text-secondary)] hover:text-[var(--text-primary)] rounded transition-colors"
+              aria-label="返回"
+              className="p-1 text-[var(--fg-muted)] hover:text-[var(--fg)] rounded transition-colors"
               title="返回"
             >
-              <ChevronLeft size={14} />
+              <ChevronLeft size={18} />
             </button>
-          ) : (
-            <Clock size={14} />
           )}
-          {view === 'list' ? '定时任务' : view === 'form' ? (editing ? '编辑任务' : '新建任务') : `运行历史 · ${historyTask?.name}`}
-        </div>
-        <button
-          onClick={onClose}
-          className="p-1 text-[var(--text-secondary)] hover:text-[var(--text-primary)] rounded transition-colors"
-        >
-          <X size={14} />
-        </button>
-      </div>
-
-      <div className="flex-1 overflow-y-auto p-4 space-y-3">
+          <button onClick={onClose} aria-label="关闭"
+            className="p-1 text-[var(--fg-muted)] hover:text-[var(--fg)] rounded transition-colors">
+            <X size={18} />
+          </button>
+        </>
+      }
+    >
+      <div className="p-4 space-y-3">
         {view === 'list' && (
           <>
             <ConfirmationQueue onResolved={load} />
             {note && (
-              <div className="text-xs text-[var(--text-secondary)] bg-[var(--bg-secondary)] border border-[var(--border)] rounded px-3 py-2">
+              <div className="text-ui-xs text-[var(--fg-muted)] bg-[var(--surface-2)] border border-[var(--border)] rounded px-3 py-2">
                 {note}
               </div>
             )}
             <button
               onClick={openCreate}
-              className="flex items-center gap-2 px-3 py-2 text-xs font-medium text-[var(--accent-blue)] hover:bg-[var(--bg-tertiary)] rounded-lg transition-colors"
+              className="flex items-center gap-2 px-3 py-2 text-ui-xs font-medium text-[var(--accent)] hover:bg-[var(--surface-3)] rounded-lg transition-colors"
             >
               <Plus size={14} />
               新建任务
             </button>
 
             {loading ? (
-              <div className="text-sm text-[var(--text-muted)]">加载中...</div>
+              <div className="text-ui-sm text-[var(--fg-subtle)]">加载中...</div>
             ) : tasks.length === 0 ? (
-              <div className="text-sm text-[var(--text-muted)]">还没有定时任务</div>
+              <div className="text-ui-sm text-[var(--fg-subtle)]">还没有定时任务</div>
             ) : (
               <div className="space-y-1">
                 {tasks.map(t => (
@@ -195,28 +204,31 @@ export default function ScheduledTasksPanel({ onClose }: Props) {
           <RunHistory task={historyTask} />
         )}
       </div>
-    </div>
+    </Sheet>
   )
 }
 
 function ConfirmationQueue({ onResolved }: { onResolved: () => void }) {
   const [runs, setRuns] = useState<TaskRun[]>([])
   const [busy, setBusy] = useState<string | null>(null)
+  const req = useLatestRequest()
 
   const reload = useCallback(async () => {
+    const t = req.begin()
     try {
       const r = await listConfirmations()
+      if (!req.isCurrent(t)) return
       setRuns(r.runs)
     } catch { /* ignore */ }
-  }, [])
+  }, [req])
 
   useEffect(() => {
-    let cancelled = false
+    const t = req.begin()
     listConfirmations()
-      .then(r => { if (!cancelled) setRuns(r.runs) })
+      .then(r => { if (req.isCurrent(t)) setRuns(r.runs) })
       .catch(() => { /* ignore */ })
-    return () => { cancelled = true }
-  }, [])
+    return () => { req.bump() }
+  }, [req])
 
   const onDone = async (run: TaskRun) => {
     setBusy(run.id)
@@ -240,30 +252,30 @@ function ConfirmationQueue({ onResolved }: { onResolved: () => void }) {
 
   return (
     <div className="space-y-1 mb-3">
-      <div className="flex items-center gap-2 text-[10px] font-semibold text-[var(--text-muted)] uppercase tracking-wider">
+      <div className="flex items-center gap-2 text-ui-2xs font-semibold text-[var(--fg-subtle)] uppercase tracking-wider">
         待确认
-        <span className="inline-flex items-center justify-center min-w-[16px] h-4 px-1 text-[10px] font-bold text-white bg-[var(--accent-red)] rounded-full">
+        <span className="inline-flex items-center justify-center min-w-[16px] h-4 px-1 text-ui-2xs font-bold text-white bg-[var(--danger)] rounded-full">
           {runs.length}
         </span>
       </div>
       {runs.map(run => {
         const reason = runReason(run)
         return (
-          <div key={run.id} className="px-3 py-2 bg-[var(--bg-secondary)] rounded-lg border border-[var(--border)]">
+          <div key={run.id} className="px-3 py-2 bg-[var(--surface-2)] rounded-lg border border-[var(--border)]">
             <div className="flex items-center justify-between gap-2">
-              <span className="text-xs font-medium text-[var(--text-primary)] truncate" title={run.task_name}>
+              <span className="text-ui-xs font-medium text-[var(--fg)] truncate" title={run.task_name}>
                 {run.task_name ?? run.task_id}
               </span>
               {run.ended_ms != null && (
-                <span className="text-[10px] text-[var(--text-muted)] shrink-0">{new Date(run.ended_ms).toLocaleString()}</span>
+                <span className="text-ui-2xs text-[var(--fg-subtle)] shrink-0">{new Date(run.ended_ms).toLocaleString()}</span>
               )}
             </div>
-            <div className={`text-[10px] font-medium mt-0.5 ${reason.color}`}>{reason.label}</div>
+            <div className={`text-ui-2xs font-medium mt-0.5 ${reason.color}`}>{reason.label}</div>
             {run.verdict && (
-              <div className="text-[10px] text-[var(--text-secondary)] mt-1 break-words">{run.verdict}</div>
+              <div className="text-ui-2xs text-[var(--fg-muted)] mt-1 break-words">{run.verdict}</div>
             )}
             {run.output_tail && run.output_tail.length > 0 && (
-              <div className="mt-1.5 max-h-24 overflow-y-auto bg-[var(--bg-tertiary)] rounded px-2 py-1 text-[10px] font-mono text-[var(--text-secondary)] whitespace-pre-wrap break-words">
+              <div className="mt-1.5 max-h-24 overflow-y-auto bg-[var(--surface-3)] rounded px-2 py-1 text-ui-2xs font-mono text-[var(--fg-muted)] whitespace-pre-wrap break-words">
                 {run.output_tail.join('\n')}
               </div>
             )}
@@ -271,14 +283,14 @@ function ConfirmationQueue({ onResolved }: { onResolved: () => void }) {
               <button
                 onClick={() => onDone(run)}
                 disabled={busy === run.id}
-                className="px-2 py-1 text-[11px] font-medium text-[var(--accent-green-text)] hover:bg-[var(--bg-tertiary)] rounded transition-colors disabled:opacity-50"
+                className="px-2 py-1 text-ui-xs font-medium text-[var(--success)] hover:bg-[var(--surface-3)] rounded transition-colors disabled:opacity-50"
               >
                 确认已完成
               </button>
               <button
                 onClick={() => onReplay(run)}
                 disabled={busy === run.id}
-                className="px-2 py-1 text-[11px] font-medium text-[var(--accent-blue)] hover:bg-[var(--bg-tertiary)] rounded transition-colors disabled:opacity-50"
+                className="px-2 py-1 text-ui-xs font-medium text-[var(--accent)] hover:bg-[var(--surface-3)] rounded transition-colors disabled:opacity-50"
               >
                 确认未完成 → 重放
               </button>
@@ -299,16 +311,16 @@ function TaskRow({ task, onToggle, onRun, onEdit, onDelete, onHistory }: {
   onHistory: (t: ScheduledTask) => void
 }) {
   return (
-    <div className="flex items-center gap-3 px-3 py-2 bg-[var(--bg-secondary)] rounded-lg border border-[var(--border)]">
+    <div className="flex items-center gap-3 px-3 py-2 bg-[var(--surface-2)] rounded-lg border border-[var(--border)]">
       <div className="flex-1 min-w-0">
-        <div className="text-xs font-medium text-[var(--text-primary)] truncate flex items-center gap-1.5">
+        <div className="text-ui-xs font-medium text-[var(--fg)] truncate flex items-center gap-1.5">
           {task.name}
           {!task.enabled && (
-            <span className="text-[10px] text-[var(--text-muted)] font-normal">已暂停</span>
+            <span className="text-ui-2xs text-[var(--fg-subtle)] font-normal">已暂停</span>
           )}
         </div>
-        <div className="text-[10px] text-[var(--text-muted)] truncate font-mono">{task.trigger_spec}</div>
-        <div className="text-[10px] text-[var(--text-muted)] truncate" title={task.work_dir}>{task.work_dir}</div>
+        <div className="text-ui-2xs text-[var(--fg-subtle)] truncate font-mono">{task.trigger_spec}</div>
+        <div className="text-ui-2xs text-[var(--fg-subtle)] truncate" title={task.work_dir}>{task.work_dir}</div>
       </div>
       <div className="flex items-center gap-1 shrink-0">
         <label className="flex items-center cursor-pointer" title={task.enabled ? '点击暂停' : '点击启用'}>
@@ -316,33 +328,33 @@ function TaskRow({ task, onToggle, onRun, onEdit, onDelete, onHistory }: {
             type="checkbox"
             checked={task.enabled}
             onChange={() => onToggle(task)}
-            className="accent-[var(--accent-blue)]"
+            className="accent-[var(--accent)]"
           />
         </label>
         <button
           onClick={() => onRun(task)}
-          className="p-1 text-[var(--accent-green-text)] hover:bg-[var(--bg-tertiary)] rounded transition-colors"
+          className="p-1 text-[var(--success)] hover:bg-[var(--surface-3)] rounded transition-colors"
           title="立即运行"
         >
           <Play size={13} />
         </button>
         <button
           onClick={() => onHistory(task)}
-          className="p-1 text-[var(--text-secondary)] hover:text-[var(--text-primary)] hover:bg-[var(--bg-tertiary)] rounded transition-colors"
+          className="p-1 text-[var(--fg-muted)] hover:text-[var(--fg)] hover:bg-[var(--surface-3)] rounded transition-colors"
           title="运行历史"
         >
           <History size={13} />
         </button>
         <button
           onClick={() => onEdit(task)}
-          className="p-1 text-[var(--text-secondary)] hover:text-[var(--text-primary)] hover:bg-[var(--bg-tertiary)] rounded transition-colors"
+          className="p-1 text-[var(--fg-muted)] hover:text-[var(--fg)] hover:bg-[var(--surface-3)] rounded transition-colors"
           title="编辑"
         >
           <Pencil size={13} />
         </button>
         <button
           onClick={() => onDelete(task)}
-          className="p-1 text-[var(--text-secondary)] hover:text-[var(--accent-red)] hover:bg-[var(--bg-tertiary)] rounded transition-colors"
+          className="p-1 text-[var(--fg-muted)] hover:text-[var(--danger)] hover:bg-[var(--surface-3)] rounded transition-colors"
           title="删除"
         >
           <Trash2 size={12} />
@@ -354,7 +366,21 @@ function TaskRow({ task, onToggle, onRun, onEdit, onDelete, onHistory }: {
 
 type Kind = ScheduleInput['kind']
 
-function TaskForm({ task, onCancel, onSaved }: {
+// eslint-disable-next-line react-refresh/only-export-components -- pure helper exported for unit tests
+export function parseCronToForm(spec: string): { kind: Kind; hour: number; minute: number; weekdays: number[] } | null {
+  // 6-field seconds-first cron as produced by the backend schedule_to_cron
+  // (src/scheduled_tasks.rs): "0 M H * * *" (daily) or "0 M H * * D,D" (weekly).
+  const f = spec.trim().split(/\s+/)
+  if (f.length !== 6 || f[0] !== '0' || f[3] !== '*' || f[4] !== '*') return null
+  const minute = Number(f[1]), hour = Number(f[2])
+  if (!Number.isInteger(minute) || !Number.isInteger(hour)) return null
+  if (f[5] === '*') return { kind: 'daily', hour, minute, weekdays: [1, 2, 3, 4, 5] }
+  const days = f[5].split(',').map(Number)
+  if (days.some(d => !Number.isInteger(d) || d < 0 || d > 7)) return null
+  return { kind: 'weekly', hour, minute, weekdays: days.map(d => (d === 7 ? 0 : d)) }
+}
+
+export function TaskForm({ task, onCancel, onSaved }: {
   task: ScheduledTask | null
   onCancel: () => void
   onSaved: () => void
@@ -363,10 +389,13 @@ function TaskForm({ task, onCancel, onSaved }: {
   const [workDir, setWorkDir] = useState(task?.work_dir ?? '')
   const [prompt, setPrompt] = useState(task?.prompt ?? '')
   const [enabled, setEnabled] = useState(task?.enabled ?? true)
-  const [kind, setKind] = useState<Kind>(task ? 'cron' : 'daily')
-  const [hour, setHour] = useState(9)
-  const [minute, setMinute] = useState(0)
-  const [weekdays, setWeekdays] = useState<number[]>([1, 2, 3, 4, 5])
+  // B2: re-derive the friendly schedule from the stored cron so editing a
+  // daily/weekly task doesn't silently reopen as a raw cron at the 09:00 default.
+  const [parsed] = useState(() => (task ? parseCronToForm(task.trigger_spec) : null))
+  const [kind, setKind] = useState<Kind>(parsed?.kind ?? (task ? 'cron' : 'daily'))
+  const [hour, setHour] = useState(parsed?.hour ?? 9)
+  const [minute, setMinute] = useState(parsed?.minute ?? 0)
+  const [weekdays, setWeekdays] = useState<number[]>(parsed?.weekdays ?? [1, 2, 3, 4, 5])
   const [cronExpr, setCronExpr] = useState(task?.trigger_spec ?? '')
   const [sideEffects, setSideEffects] = useState(task?.side_effects ?? false)
   const [maxRuntime, setMaxRuntime] = useState<number | null>(task?.max_runtime_min ?? null)
@@ -414,13 +443,13 @@ function TaskForm({ task, onCancel, onSaved }: {
     }
   }
 
-  const inputCls = 'w-full bg-[var(--bg-secondary)] border border-[var(--border)] rounded px-2 py-1.5 text-xs text-[var(--text-primary)] outline-none focus:border-[var(--accent-blue)]'
-  const labelCls = 'block text-[10px] font-semibold text-[var(--text-muted)] uppercase tracking-wider mb-1'
+  const inputCls = 'w-full bg-[var(--surface-2)] border border-[var(--border)] rounded px-2 py-1.5 text-ui-xs text-[var(--fg)] outline-none focus:border-[var(--accent)]'
+  const labelCls = 'block text-ui-2xs font-semibold text-[var(--fg-subtle)] uppercase tracking-wider mb-1'
 
   return (
     <div className="space-y-3 max-w-md">
       {error && (
-        <div className="text-xs text-[var(--accent-red)] bg-[var(--bg-secondary)] border border-[var(--border)] rounded px-3 py-2">
+        <div className="text-ui-xs text-[var(--danger)] bg-[var(--surface-2)] border border-[var(--border)] rounded px-3 py-2">
           {error}
         </div>
       )}
@@ -434,7 +463,7 @@ function TaskForm({ task, onCancel, onSaved }: {
         <label className={labelCls}>调度类型</label>
         <select value={kind} onChange={e => setKind(e.target.value as Kind)} className={inputCls}>
           <option value="daily">每天</option>
-          <option value="weekly">每工作日</option>
+          <option value="weekly">每周</option>
           <option value="cron">自定义 cron</option>
         </select>
       </div>
@@ -448,10 +477,10 @@ function TaskForm({ task, onCancel, onSaved }: {
                 key={d.value}
                 type="button"
                 onClick={() => toggleWeekday(d.value)}
-                className={`w-8 h-8 rounded text-xs transition-colors ${
+                className={`w-8 h-8 rounded text-ui-xs transition-colors ${
                   weekdays.includes(d.value)
-                    ? 'bg-[var(--accent-blue)] text-white'
-                    : 'bg-[var(--bg-secondary)] border border-[var(--border)] text-[var(--text-secondary)] hover:bg-[var(--bg-tertiary)]'
+                    ? 'bg-[var(--accent)] text-white'
+                    : 'bg-[var(--surface-2)] border border-[var(--border)] text-[var(--fg-muted)] hover:bg-[var(--surface-3)]'
                 }`}
               >
                 {d.label}
@@ -495,7 +524,7 @@ function TaskForm({ task, onCancel, onSaved }: {
             <button
               type="button"
               onClick={() => setPickingDir(true)}
-              className="shrink-0 flex items-center gap-1 px-2 py-1.5 text-xs text-[var(--text-secondary)] hover:text-[var(--text-primary)] bg-[var(--bg-secondary)] border border-[var(--border)] rounded hover:bg-[var(--bg-tertiary)] transition-colors"
+              className="shrink-0 flex items-center gap-1 px-2 py-1.5 text-ui-xs text-[var(--fg-muted)] hover:text-[var(--fg)] bg-[var(--surface-2)] border border-[var(--border)] rounded hover:bg-[var(--surface-3)] transition-colors"
               title="浏览选择目录"
             >
               <Folder size={13} />
@@ -538,13 +567,13 @@ function TaskForm({ task, onCancel, onSaved }: {
         />
       </div>
 
-      <label className="flex items-center gap-2 text-xs text-[var(--text-secondary)] cursor-pointer">
-        <input type="checkbox" checked={sideEffects} onChange={e => setSideEffects(e.target.checked)} className="accent-[var(--accent-blue)]" />
+      <label className="flex items-center gap-2 text-ui-xs text-[var(--fg-muted)] cursor-pointer">
+        <input type="checkbox" checked={sideEffects} onChange={e => setSideEffects(e.target.checked)} className="accent-[var(--accent)]" />
         有外部副作用(提 PR / push / 改文件)
       </label>
 
-      <label className="flex items-center gap-2 text-xs text-[var(--text-secondary)] cursor-pointer">
-        <input type="checkbox" checked={enabled} onChange={e => setEnabled(e.target.checked)} className="accent-[var(--accent-blue)]" />
+      <label className="flex items-center gap-2 text-ui-xs text-[var(--fg-muted)] cursor-pointer">
+        <input type="checkbox" checked={enabled} onChange={e => setEnabled(e.target.checked)} className="accent-[var(--accent)]" />
         启用
       </label>
 
@@ -552,13 +581,13 @@ function TaskForm({ task, onCancel, onSaved }: {
         <button
           onClick={submit}
           disabled={saving}
-          className="px-4 py-1.5 text-xs font-semibold bg-[var(--accent-blue)] hover:bg-[var(--accent-blue-hover)] text-white rounded transition-colors disabled:opacity-50"
+          className="px-4 py-1.5 text-ui-xs font-semibold bg-[var(--accent)] hover:bg-[var(--accent-hover)] text-white rounded transition-colors disabled:opacity-50"
         >
           {saving ? '保存中...' : '保存'}
         </button>
         <button
           onClick={onCancel}
-          className="px-4 py-1.5 text-xs text-[var(--text-secondary)] hover:text-[var(--text-primary)] rounded transition-colors"
+          className="px-4 py-1.5 text-ui-xs text-[var(--fg-muted)] hover:text-[var(--fg)] rounded transition-colors"
         >
           取消
         </button>
@@ -581,8 +610,8 @@ function RunHistory({ task }: { task: ScheduledTask }) {
     return () => { cancelled = true }
   }, [task.id])
 
-  if (loading) return <div className="text-sm text-[var(--text-muted)]">加载中...</div>
-  if (runs.length === 0) return <div className="text-sm text-[var(--text-muted)]">还没有运行记录</div>
+  if (loading) return <div className="text-ui-sm text-[var(--fg-subtle)]">加载中...</div>
+  if (runs.length === 0) return <div className="text-ui-sm text-[var(--fg-subtle)]">还没有运行记录</div>
 
   const onReplay = async (run: TaskRun) => {
     setBusy(run.id)
@@ -608,13 +637,13 @@ function RunHistory({ task }: { task: ScheduledTask }) {
             ? '请经待确认队列处理'
             : undefined
         return (
-          <div key={r.id} className="px-3 py-2 bg-[var(--bg-secondary)] rounded-lg border border-[var(--border)]">
+          <div key={r.id} className="px-3 py-2 bg-[var(--surface-2)] rounded-lg border border-[var(--border)]">
             <div className="flex items-center justify-between gap-2">
-              <span className={`text-xs font-medium ${reason.color}`}>{reason.label}</span>
-              <span className="text-[10px] text-[var(--text-muted)]">{new Date(r.scheduled_for_ms).toLocaleString()}</span>
+              <span className={`text-ui-xs font-medium ${reason.color}`}>{reason.label}</span>
+              <span className="text-ui-2xs text-[var(--fg-subtle)]">{new Date(r.scheduled_for_ms).toLocaleString()}</span>
             </div>
             {(r.verdict || r.failure_kind) && (
-              <div className="text-[10px] text-[var(--text-secondary)] mt-1 break-words">
+              <div className="text-ui-2xs text-[var(--fg-muted)] mt-1 break-words">
                 {r.verdict || r.failure_kind}
               </div>
             )}
@@ -623,7 +652,7 @@ function RunHistory({ task }: { task: ScheduledTask }) {
                 onClick={() => onReplay(r)}
                 disabled={disabled || busy === r.id}
                 title={title}
-                className="px-2 py-1 text-[11px] font-medium text-[var(--accent-blue)] hover:bg-[var(--bg-tertiary)] rounded transition-colors disabled:opacity-40 disabled:cursor-not-allowed"
+                className="px-2 py-1 text-ui-xs font-medium text-[var(--accent)] hover:bg-[var(--surface-3)] rounded transition-colors disabled:opacity-40 disabled:cursor-not-allowed"
               >
                 重放
               </button>

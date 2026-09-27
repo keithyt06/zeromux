@@ -1,5 +1,5 @@
-import { describe, it, expect } from 'vitest'
-import { vapidKeyToUint8Array, levelAllows, shouldSuppress, pickApplicationServerKey, shouldResyncNow } from '../push'
+import { describe, it, expect, vi } from 'vitest'
+import { vapidKeyToUint8Array, levelAllows, shouldSuppress, pickApplicationServerKey, shouldResyncNow, enablePush } from '../push'
 
 describe('push pure fns', () => {
   it('vapidKeyToUint8Array decodes base64url to 65-byte P-256 point', () => {
@@ -45,5 +45,21 @@ describe('pickApplicationServerKey', () => {
   it('falls back to fetched base64url when old key absent', () => {
     const out = pickApplicationServerKey(null, 'AQID') // base64url AQID = [1,2,3]
     expect(Array.from(out)).toEqual([1,2,3])
+  })
+})
+
+describe('enablePush', () => {
+  it('enablePush does not mark enabled when subscribe fails', async () => {
+    localStorage.removeItem('zmx_push_enabled')
+    vi.stubGlobal('Notification', { requestPermission: async () => 'granted', permission: 'granted' })
+    const sub = { toJSON: () => ({ endpoint: 'https://p.example/x', keys: { p256dh: 'a', auth: 'b' } }), unsubscribe: vi.fn(async () => true) }
+    Object.defineProperty(navigator, 'serviceWorker', { configurable: true, value: { ready: Promise.resolve({ pushManager: { subscribe: async () => sub } }) } })
+    vi.spyOn(globalThis, 'fetch')
+      .mockResolvedValueOnce(new Response('{"key":"AAAA"}', { status: 200 }))
+      .mockResolvedValueOnce(new Response('nope', { status: 500 }))
+    await expect(enablePush()).rejects.toMatchObject({ status: 500 })
+    expect(localStorage.getItem('zmx_push_enabled')).toBeNull()
+    expect(sub.unsubscribe).toHaveBeenCalled()
+    vi.unstubAllGlobals()
   })
 })

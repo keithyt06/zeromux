@@ -1,4 +1,5 @@
 import { api } from './api'
+import { request } from './http'
 
 export function vapidKeyToUint8Array(b64url: string): Uint8Array<ArrayBuffer> {
   const pad = '='.repeat((4 - (b64url.length % 4)) % 4)
@@ -45,18 +46,23 @@ export async function enablePush(): Promise<void> {
   const perm = await Notification.requestPermission()
   if (perm !== 'granted') return
   const reg = await navigator.serviceWorker.ready
-  const res = await api('/api/push/vapid-key')
-  const { key } = await res.json()
+  const { key } = await request<{ key: string }>('/api/push/vapid-key')
   const sub = await reg.pushManager.subscribe({
     userVisibleOnly: true,
     applicationServerKey: vapidKeyToUint8Array(key),
   })
   const j = sub.toJSON()
-  const levels = getLevels()
-  await api('/api/push/subscribe', {
-    method: 'POST',
-    body: JSON.stringify({ endpoint: j.endpoint, keys: j.keys, levels }),
-  })
+  try {
+    await request('/api/push/subscribe', {
+      method: 'POST', parse: 'none',
+      body: JSON.stringify({ endpoint: j.endpoint, keys: j.keys, levels: getLevels() }),
+    })
+  } catch (e) {
+    // Server never stored it: drop the browser subscription too, so local state
+    // and server agree (previously a 500 still marked push as enabled).
+    await sub.unsubscribe().catch(() => {})
+    throw e
+  }
   localStorage.setItem(ENABLED_KEY, '1')
 }
 
@@ -64,8 +70,8 @@ export async function disablePush(): Promise<void> {
   const reg = await navigator.serviceWorker.getRegistration()
   const sub = await reg?.pushManager.getSubscription()
   if (sub) {
-    await api('/api/push/unsubscribe', {
-      method: 'POST', body: JSON.stringify({ endpoint: sub.endpoint }),
+    await request('/api/push/unsubscribe', {
+      method: 'POST', parse: 'none', body: JSON.stringify({ endpoint: sub.endpoint }),
     })
     await sub.unsubscribe()
   }
@@ -97,7 +103,7 @@ export function shouldResyncNow(lastMs: number | null, nowMs: number): boolean {
 }
 
 export async function sendTestPush(): Promise<void> {
-  await api('/api/push/test', { method: 'POST' })
+  await request('/api/push/test', { method: 'POST', parse: 'none' })
 }
 
 export async function setLevels(levels: PushLevels): Promise<void> {

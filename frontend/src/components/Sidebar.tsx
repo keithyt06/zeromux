@@ -6,10 +6,8 @@ import { shouldShowVault } from '../lib/vault'
 import type { Theme, ThemePref } from '../lib/theme'
 import { Terminal, Plus, X, PanelLeftClose, PanelLeft, Sun, Moon, Folder, FolderGit2, ChevronLeft, Home, LogOut, Users, Clock, Bell, BookOpen, Settings, Pencil, Search } from 'lucide-react'
 import { type DocTab } from '../lib/docTabs'
-import AdminPanel from './AdminPanel'
-import ScheduledTasksPanel from './ScheduledTasksPanel'
 import PromptManager from './PromptManager'
-import PushSettings from './PushSettings'
+import { Sheet } from './ui'
 import { usePromptPresets } from '../lib/usePromptPresets'
 import { usePolling } from '../lib/usePolling'
 import { useDirBrowser } from '../lib/useDirBrowser'
@@ -47,6 +45,8 @@ interface Props {
   /** Untracked host tmux sessions (admin only; empty otherwise). Click = attach. */
   hostTmux?: HostTmux[]
   onOpenHistory?: (id: string) => void
+  /** Full-screen panels (and the prompt manager) are mounted at App level. */
+  onOpenPanel: (p: 'admin' | 'scheduled' | 'push' | 'prompts') => void
 }
 
 /** Relative "last activity" label. <60s 刚刚, <60m Xm, <24h Xh, else Xd. */
@@ -102,7 +102,7 @@ function SessionTypeIcon({ type, size = 14, className }: { type: SessionType; si
   }
 }
 
-export default function Sidebar({ sessions, docTabs, activeId, onSelect, onCreate, onDelete, onRename, hasUnread, onLogout, theme, onToggleTheme, themePref, onSetThemePref, user, open, onToggle, mobile, confirmCount = 0, onOpenVault, askAgentRequest, hostTmux = [], onOpenHistory }: Props) {
+export default function Sidebar({ sessions, docTabs, activeId, onSelect, onCreate, onDelete, onRename, hasUnread, onLogout, theme, onToggleTheme, themePref, onSetThemePref, user, open, onToggle, mobile, confirmCount = 0, onOpenVault, askAgentRequest, hostTmux = [], onOpenHistory, onOpenPanel }: Props) {
   const [step, setStep] = useState<NewSessionStep>('closed')
   const [pendingType, setPendingType] = useState<SessionType | null>(null)
   const [promptDraft, setPromptDraft] = useState('')
@@ -117,11 +117,7 @@ export default function Sidebar({ sessions, docTabs, activeId, onSelect, onCreat
   // initial_prompt) and prefill the prompt page.
   const [pendingAgentContext, setPendingAgentContext] = useState<AskAgentTarget | null>(null)
   const presetStore = usePromptPresets()
-  const [showAdmin, setShowAdmin] = useState(false)
-  const [showScheduled, setShowScheduled] = useState(false)
-  const [showPushSettings, setShowPushSettings] = useState(false)
   const [showSettings, setShowSettings] = useState(false)
-  const [showPromptManager, setShowPromptManager] = useState(false)
   const [vaultEnabled, setVaultEnabled] = useState(false)
   const [schedulerHealthy, setSchedulerHealthy] = useState(true)
   const [editingId, setEditingId] = useState<string | null>(null)
@@ -399,7 +395,7 @@ export default function Sidebar({ sessions, docTabs, activeId, onSelect, onCreat
         </div>
         <div className="flex items-center gap-0.5">
           <button
-            onClick={() => setShowScheduled(true)}
+            onClick={() => onOpenPanel('scheduled')}
             className="relative p-1 text-[var(--text-secondary)] hover:text-[var(--accent-blue)] rounded transition-colors"
             title={schedulerHealthy ? '定时任务' : '调度器异常'}
           >
@@ -432,15 +428,6 @@ export default function Sidebar({ sessions, docTabs, activeId, onSelect, onCreat
           </button>
         </div>
       </div>
-
-      {/* Admin Panel overlay */}
-      {showAdmin && <AdminPanel onClose={() => setShowAdmin(false)} />}
-
-      {/* Scheduled Tasks overlay */}
-      {showScheduled && <ScheduledTasksPanel onClose={() => setShowScheduled(false)} />}
-
-      {/* Push Settings overlay */}
-      {showPushSettings && <PushSettings onClose={() => setShowPushSettings(false)} />}
 
       {/* Sessions */}
       <div className="flex-1 overflow-y-auto py-1">
@@ -847,7 +834,8 @@ export default function Sidebar({ sessions, docTabs, activeId, onSelect, onCreat
                 </>
               )}
 
-              {step === 'pick-prompt' && (
+              {/* manage-prompts keeps the prompt page underneath its Sheet. */}
+              {(step === 'pick-prompt' || step === 'manage-prompts') && (
                 <>
                   <div className="flex items-center gap-1 px-2 py-1.5 border-b border-[var(--border)]">
                     <button
@@ -923,17 +911,8 @@ export default function Sidebar({ sessions, docTabs, activeId, onSelect, onCreat
               )}
 
               {step === 'manage-prompts' && (
-                <>
-                  <div className="flex items-center gap-1 px-2 py-1.5 border-b border-[var(--border)]">
-                    <button
-                      onClick={() => setStep('pick-prompt')}
-                      className="p-0.5 text-[var(--text-secondary)] hover:text-[var(--text-primary)] rounded transition-colors"
-                      title="Back"
-                    >
-                      <ChevronLeft size={14} />
-                    </button>
-                    <span className="text-[10px] font-semibold text-[var(--text-muted)] uppercase tracking-wider">管理常用 prompt</span>
-                  </div>
+                <Sheet open side="bottom" title="管理常用 prompt" onClose={() => setStep('pick-prompt')}
+                  actions={<button onClick={() => setStep('pick-prompt')} aria-label="关闭" className="p-1 text-[var(--fg-muted)] hover:text-[var(--fg)] rounded transition-colors"><X size={18} /></button>}>
                   <PromptManager
                     presets={presetStore.presets}
                     error={presetStore.error}
@@ -942,7 +921,7 @@ export default function Sidebar({ sessions, docTabs, activeId, onSelect, onCreat
                     onRemove={presetStore.remove}
                     onClose={() => setStep('pick-prompt')}
                   />
-                </>
+                </Sheet>
               )}
             </div>
           </>
@@ -971,14 +950,14 @@ export default function Sidebar({ sessions, docTabs, activeId, onSelect, onCreat
                 ))}
               </div>
               <button
-                onClick={() => { setShowSettings(false); setShowPushSettings(true) }}
+                onClick={() => { setShowSettings(false); onOpenPanel('push') }}
                 className="flex items-center gap-2.5 w-full px-3 py-2 text-xs text-[var(--text-primary)] hover:bg-[var(--bg-hover)] transition-colors"
               >
                 <Bell size={14} className="shrink-0" />
                 <span className="flex-1 text-left">推送通知</span>
               </button>
               <button
-                onClick={() => { setShowSettings(false); presetStore.reload(); setShowPromptManager(true) }}
+                onClick={() => { setShowSettings(false); onOpenPanel('prompts') }}
                 className="flex items-center gap-2.5 w-full px-3 py-2 text-xs text-[var(--text-primary)] hover:bg-[var(--bg-hover)] transition-colors"
               >
                 <Pencil size={14} className="shrink-0" />
@@ -986,7 +965,7 @@ export default function Sidebar({ sessions, docTabs, activeId, onSelect, onCreat
               </button>
               {isAdmin && (
                 <button
-                  onClick={() => { setShowSettings(false); setShowAdmin(true) }}
+                  onClick={() => { setShowSettings(false); onOpenPanel('admin') }}
                   className="flex items-center gap-2.5 w-full px-3 py-2 text-xs text-[var(--text-primary)] hover:bg-[var(--bg-hover)] transition-colors"
                 >
                   <Users size={14} className="shrink-0" />
@@ -997,24 +976,6 @@ export default function Sidebar({ sessions, docTabs, activeId, onSelect, onCreat
           </>
         )}
 
-        {showPromptManager && (
-          <>
-            <div className="fixed inset-0 z-10" onClick={() => setShowPromptManager(false)} />
-            <div className={`absolute bottom-full left-2 mb-1 bg-[var(--bg-tertiary)] border border-[var(--border)] rounded-lg py-1 ${mobile ? 'w-[calc(100vw-1rem)]' : 'w-56'} z-20 shadow-xl`}>
-              <div className="flex items-center gap-1 px-2 py-1.5 border-b border-[var(--border)]">
-                <span className="text-[10px] font-semibold text-[var(--text-muted)] uppercase tracking-wider flex-1">管理常用 prompt</span>
-              </div>
-              <PromptManager
-                presets={presetStore.presets}
-                error={presetStore.error}
-                onAdd={presetStore.add}
-                onEdit={presetStore.edit}
-                onRemove={presetStore.remove}
-                onClose={() => setShowPromptManager(false)}
-              />
-            </div>
-          </>
-        )}
       </div>
     </div>
   )

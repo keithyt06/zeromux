@@ -1,13 +1,15 @@
 import { useState, useEffect } from 'react'
-import { X, Bell, BellOff, BellRing } from 'lucide-react'
+import { X, BellOff, BellRing } from 'lucide-react'
 import { getPushState, enablePush, disablePush, getLevels, setLevels, sendTestPush } from '../lib/push'
 import type { PushState, PushLevels } from '../lib/push'
+import { Sheet, toast } from './ui'
 
 interface Props {
+  open: boolean
   onClose: () => void
 }
 
-export default function PushSettings({ onClose }: Props) {
+export default function PushSettings({ open, onClose }: Props) {
   const [state, setState] = useState<PushState | 'loading'>('loading')
   const [levels, setLevelsState] = useState<PushLevels>(getLevels())
   const [busy, setBusy] = useState(false)
@@ -25,13 +27,12 @@ export default function PushSettings({ onClose }: Props) {
     if (busy || state === 'loading' || state === 'unsupported' || state === 'denied') return
     setBusy(true)
     try {
-      if (state === 'enabled') {
-        await disablePush()
-      } else {
-        await enablePush()
-      }
-      setState(await getPushState())
+      if (state === 'enabled') await disablePush()
+      else await enablePush()
+    } catch (e) {
+      toast.push({ message: `${state === 'enabled' ? '关闭' : '开启'}失败:${e instanceof Error ? e.message : '未知错误'}` })
     } finally {
+      setState(await getPushState().catch(() => state))
       setBusy(false)
     }
   }
@@ -43,34 +44,29 @@ export default function PushSettings({ onClose }: Props) {
   }
 
   return (
-    <div className="absolute inset-0 z-30 bg-[var(--bg-secondary)] flex flex-col">
-      {/* Header */}
-      <div className="flex items-center justify-between px-3 h-10 border-b border-[var(--border)] shrink-0">
-        <div className="flex items-center gap-1.5">
-          <Bell size={14} className="text-[var(--text-secondary)]" />
-          <span className="text-xs font-semibold text-[var(--text-primary)]">推送通知</span>
-        </div>
-        <button
-          onClick={onClose}
-          aria-label="close"
-          className="p-1 text-[var(--text-secondary)] hover:text-[var(--text-primary)] rounded transition-colors"
-        >
-          <X size={14} />
+    <Sheet
+      open={open}
+      side="full"
+      onClose={onClose}
+      title="推送通知"
+      actions={
+        <button onClick={onClose} aria-label="关闭"
+          className="p-1 text-[var(--fg-muted)] hover:text-[var(--fg)] rounded transition-colors">
+          <X size={18} />
         </button>
-      </div>
-
-      {/* Content */}
-      <div className="flex-1 overflow-y-auto p-3 flex flex-col gap-4">
+      }
+    >
+      <div className="p-3 flex flex-col gap-4">
 
         {/* Main toggle */}
         <div className="flex flex-col gap-2">
           <div className="flex items-center justify-between">
             <div className="flex items-center gap-2">
               {state === 'enabled'
-                ? <BellRing size={14} className="text-[var(--accent-blue)]" />
-                : <BellOff size={14} className="text-[var(--text-muted)]" />
+                ? <BellRing size={14} className="text-[var(--accent)]" />
+                : <BellOff size={14} className="text-[var(--fg-subtle)]" />
               }
-              <span className="text-xs text-[var(--text-primary)]">
+              <span className="text-ui-xs text-[var(--fg)]">
                 {state === 'loading' ? '检测中…'
                   : state === 'unsupported' ? '不支持推送'
                   : state === 'denied' ? '通知已被拒绝'
@@ -79,11 +75,13 @@ export default function PushSettings({ onClose }: Props) {
               </span>
             </div>
             <button
+              role="switch"
+              aria-checked={state === 'enabled'}
               onClick={toggle}
               disabled={busy || state === 'loading' || state === 'unsupported' || state === 'denied'}
               className={`relative w-9 h-5 rounded-full transition-colors shrink-0 ${
                 state === 'enabled'
-                  ? 'bg-[var(--accent-blue)]'
+                  ? 'bg-[var(--accent)]'
                   : 'bg-[var(--border)]'
               } disabled:opacity-40 disabled:cursor-not-allowed`}
               aria-label={state === 'enabled' ? '关闭推送' : '开启推送'}
@@ -94,12 +92,12 @@ export default function PushSettings({ onClose }: Props) {
             </button>
           </div>
           {state === 'denied' && (
-            <p className="text-[10px] text-[var(--accent-red)]">
+            <p className="text-ui-xs text-[var(--danger)]">
               浏览器已拒绝通知权限，请在浏览器设置中手动开启。
             </p>
           )}
           {state === 'unsupported' && (
-            <p className="text-[10px] text-[var(--text-muted)]">
+            <p className="text-ui-xs text-[var(--fg-subtle)]">
               当前浏览器不支持 Web Push。
             </p>
           )}
@@ -108,7 +106,7 @@ export default function PushSettings({ onClose }: Props) {
         {/* Two-tier level toggles — only shown when enabled */}
         {state === 'enabled' && (
           <div className="flex flex-col gap-2 border-t border-[var(--border)] pt-3">
-            <p className="text-[10px] font-semibold text-[var(--text-muted)] uppercase tracking-wider">通知级别</p>
+            <p className="text-ui-2xs font-semibold text-[var(--fg-subtle)] uppercase tracking-wider">通知级别</p>
             <LevelRow
               label="重要通知"
               hint="任务失败、需确认"
@@ -133,23 +131,23 @@ export default function PushSettings({ onClose }: Props) {
 
         {/* iOS install hint */}
         {showIOSHint && (
-          <div className="border border-[var(--border)] rounded-lg p-3 flex flex-col gap-1.5 bg-[var(--bg-tertiary)]">
-            <p className="text-[10px] font-semibold text-[var(--text-primary)]">iOS 使用提示</p>
-            <p className="text-[10px] text-[var(--text-secondary)]">
+          <div className="border border-[var(--border)] rounded-lg p-3 flex flex-col gap-1.5 bg-[var(--surface-3)]">
+            <p className="text-ui-xs font-semibold text-[var(--fg)]">iOS 使用提示</p>
+            <p className="text-ui-xs text-[var(--fg-muted)]">
               Safari 推送需先将页面添加到主屏幕：
             </p>
             <ol className="flex flex-col gap-1">
-              <li className="text-[10px] text-[var(--text-secondary)]">
-                ① 点击 Safari 底栏<span className="font-medium text-[var(--text-primary)]">「分享」</span>按钮
+              <li className="text-ui-xs text-[var(--fg-muted)]">
+                ① 点击 Safari 底栏<span className="font-medium text-[var(--fg)]">「分享」</span>按钮
               </li>
-              <li className="text-[10px] text-[var(--text-secondary)]">
-                ② 选择<span className="font-medium text-[var(--text-primary)]">「添加到主屏幕」</span>，再从主屏幕打开
+              <li className="text-ui-xs text-[var(--fg-muted)]">
+                ② 选择<span className="font-medium text-[var(--fg)]">「添加到主屏幕」</span>，再从主屏幕打开
               </li>
             </ol>
           </div>
         )}
       </div>
-    </div>
+    </Sheet>
   )
 }
 
@@ -159,13 +157,13 @@ function LevelRow({ label, hint, checked, onChange }: {
   return (
     <div className="flex items-center justify-between">
       <div>
-        <div className="text-xs text-[var(--text-primary)]">{label}</div>
-        <div className="text-[10px] text-[var(--text-muted)]">{hint}</div>
+        <div className="text-ui-xs text-[var(--fg)]">{label}</div>
+        <div className="text-ui-2xs text-[var(--fg-subtle)]">{hint}</div>
       </div>
       <button
         onClick={() => onChange(!checked)}
         className={`relative w-9 h-5 rounded-full transition-colors shrink-0 ${
-          checked ? 'bg-[var(--accent-blue)]' : 'bg-[var(--border)]'
+          checked ? 'bg-[var(--accent)]' : 'bg-[var(--border)]'
         }`}
         aria-label={`${checked ? '关闭' : '开启'} ${label}`}
       >
@@ -182,7 +180,7 @@ function TestPushButton() {
   return (
     <button
       onClick={async () => { try { await sendTestPush(); setSent(true); setTimeout(() => setSent(false), 2000) } catch { /* noop */ } }}
-      className="text-xs px-2 py-1 rounded bg-[var(--bg-tertiary)] text-[var(--text-primary)] hover:opacity-80"
+      className="text-ui-xs px-2 py-1 rounded bg-[var(--surface-3)] text-[var(--fg)] hover:opacity-80"
     >
       {sent ? '已发送 ✓' : '发送测试推送'}
     </button>

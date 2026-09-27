@@ -14,7 +14,7 @@ describe('ScheduledTasksPanel toggle (B1)', () => {
     vi.spyOn(api, 'listScheduledTasks').mockResolvedValue([task])
     vi.spyOn(api, 'listConfirmations').mockResolvedValue({ count: 0, runs: [] })
     const upd = vi.spyOn(api, 'updateScheduledTask').mockResolvedValue({ ...task, enabled: false })
-    render(<ScheduledTasksPanel onClose={() => {}} />)
+    render(<ScheduledTasksPanel open onClose={() => {}} />)
     fireEvent.click(await screen.findByTitle('点击暂停'))
     await waitFor(() => expect(upd).toHaveBeenCalled())
     expect(upd).toHaveBeenCalledWith('t1', {

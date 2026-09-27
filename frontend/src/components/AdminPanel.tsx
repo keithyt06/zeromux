@@ -1,23 +1,30 @@
 import { useState, useEffect, useCallback } from 'react'
-import { Users, Check, Trash2, X, Shield, Clock } from 'lucide-react'
+import { Check, Trash2, X, Shield, Clock } from 'lucide-react'
 import type { AdminUser } from '../lib/api'
 import { listUsers, approveUser, removeUser } from '../lib/api'
+import { useLatestRequest } from '../lib/useLatestRequest'
+import { Sheet } from './ui'
 
 interface Props {
+  open: boolean
   onClose: () => void
 }
 
-export default function AdminPanel({ onClose }: Props) {
+export default function AdminPanel({ open, onClose }: Props) {
   const [users, setUsers] = useState<AdminUser[]>([])
   const [loading, setLoading] = useState(true)
+  const req = useLatestRequest()
 
   const load = useCallback(async () => {
+    const t = req.begin()
     try {
       const data = await listUsers()
+      if (!req.isCurrent(t)) return
       setUsers(data)
     } catch { /* ignore */ }
+    if (!req.isCurrent(t)) return
     setLoading(false)
-  }, [])
+  }, [req])
 
   useEffect(() => { load() }, [load])
 
@@ -39,30 +46,27 @@ export default function AdminPanel({ onClose }: Props) {
   const active = users.filter(u => u.status === 'active')
 
   return (
-    <div className="absolute inset-0 bg-[var(--bg-primary)] z-50 flex flex-col">
-      {/* Header */}
-      <div className="flex items-center justify-between px-4 h-10 border-b border-[var(--border)] bg-[var(--bg-secondary)]">
-        <div className="flex items-center gap-2 text-xs font-bold text-[var(--text-primary)]">
-          <Users size={14} />
-          User Management
-        </div>
-        <button
-          onClick={onClose}
-          className="p-1 text-[var(--text-secondary)] hover:text-[var(--text-primary)] rounded transition-colors"
-        >
-          <X size={14} />
+    <Sheet
+      open={open}
+      side="full"
+      onClose={onClose}
+      title="用户管理"
+      actions={
+        <button onClick={onClose} aria-label="关闭"
+          className="p-1 text-[var(--fg-muted)] hover:text-[var(--fg)] rounded transition-colors">
+          <X size={18} />
         </button>
-      </div>
-
-      <div className="flex-1 overflow-y-auto p-4 space-y-4">
+      }
+    >
+      <div className="p-4 space-y-4">
         {loading ? (
-          <div className="text-sm text-[var(--text-muted)]">Loading...</div>
+          <div className="text-ui-sm text-[var(--fg-subtle)]">Loading...</div>
         ) : (
           <>
             {/* Pending users */}
             {pending.length > 0 && (
               <div>
-                <h3 className="text-xs font-semibold text-[var(--accent-yellow)] uppercase tracking-wider mb-2 flex items-center gap-1.5">
+                <h3 className="text-ui-xs font-semibold text-[var(--attention)] uppercase tracking-wider mb-2 flex items-center gap-1.5">
                   <Clock size={12} />
                   Pending Approval ({pending.length})
                 </h3>
@@ -76,7 +80,7 @@ export default function AdminPanel({ onClose }: Props) {
 
             {/* Active users */}
             <div>
-              <h3 className="text-xs font-semibold text-[var(--accent-green-text)] uppercase tracking-wider mb-2 flex items-center gap-1.5">
+              <h3 className="text-ui-xs font-semibold text-[var(--success)] uppercase tracking-wider mb-2 flex items-center gap-1.5">
                 <Shield size={12} />
                 Active Users ({active.length})
               </h3>
@@ -89,7 +93,7 @@ export default function AdminPanel({ onClose }: Props) {
           </>
         )}
       </div>
-    </div>
+    </Sheet>
   )
 }
 
@@ -99,28 +103,28 @@ function UserRow({ user, onApprove, onRemove }: {
   onRemove: (id: string) => void
 }) {
   return (
-    <div className="flex items-center gap-3 px-3 py-2 bg-[var(--bg-secondary)] rounded-lg border border-[var(--border)]">
+    <div className="flex items-center gap-3 px-3 py-2 bg-[var(--surface-2)] rounded-lg border border-[var(--border)]">
       {user.avatar_url ? (
         <img src={user.avatar_url} alt="" className="w-7 h-7 rounded-full shrink-0" />
       ) : (
-        <div className="w-7 h-7 rounded-full bg-[var(--bg-tertiary)] shrink-0" />
+        <div className="w-7 h-7 rounded-full bg-[var(--surface-3)] shrink-0" />
       )}
       <div className="flex-1 min-w-0">
-        <div className="text-xs font-medium text-[var(--text-primary)] truncate">
+        <div className="text-ui-xs font-medium text-[var(--fg)] truncate">
           {user.github_login}
           {user.role === 'admin' && (
-            <span className="ml-1.5 text-[10px] text-[var(--accent-purple)] font-normal">admin</span>
+            <span className="ml-1.5 text-ui-2xs text-[var(--peer)] font-normal">admin</span>
           )}
         </div>
         {user.display_name && (
-          <div className="text-[10px] text-[var(--text-muted)] truncate">{user.display_name}</div>
+          <div className="text-ui-2xs text-[var(--fg-subtle)] truncate">{user.display_name}</div>
         )}
       </div>
       <div className="flex items-center gap-1 shrink-0">
         {onApprove && user.status === 'pending' && (
           <button
             onClick={() => onApprove(user.id)}
-            className="p-1 text-[var(--accent-green-text)] hover:bg-[var(--bg-tertiary)] rounded transition-colors"
+            className="p-1 text-[var(--success)] hover:bg-[var(--surface-3)] rounded transition-colors"
             title="Approve"
           >
             <Check size={14} />
@@ -129,7 +133,7 @@ function UserRow({ user, onApprove, onRemove }: {
         {user.role !== 'admin' && (
           <button
             onClick={() => onRemove(user.id)}
-            className="p-1 text-[var(--text-secondary)] hover:text-[var(--accent-red)] hover:bg-[var(--bg-tertiary)] rounded transition-colors"
+            className="p-1 text-[var(--fg-muted)] hover:text-[var(--danger)] hover:bg-[var(--surface-3)] rounded transition-colors"
             title="Remove"
           >
             <Trash2 size={12} />

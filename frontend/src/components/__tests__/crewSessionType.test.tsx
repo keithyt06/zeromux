@@ -32,7 +32,9 @@ describe('T13 crew 八处类型映射不漏', () => {
   const src = (rel: string) => readFileSync(resolve(__dirname, '../../', rel), 'utf8')
 
   it('① api.ts 的 SessionType 含 crew 且不再含 kiro', () => {
-    const t = src('lib/api.ts')
+    // Task 6 把 SessionType 的声明移到 lib/api/sessions.ts；lib/api.ts 现在只做
+    // `export * from './api/sessions'` 聚合，不再含这行文本。
+    const t = src('lib/api/sessions.ts')
     const line = t.split('\n').find(l => l.startsWith('export type SessionType'))!
     expect(line).toContain("'crew'")
     // Task 11 之后这条才该绿；Task 6 时它是本任务的「先验红」之一。

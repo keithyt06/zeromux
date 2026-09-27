@@ -29,4 +29,19 @@ describe('countViolations', () => {
   it('counts emoji icons from the deny-list', () => {
     expect(countViolations("<span>📜</span><b>👍 👎</b>{'⧉ x'}🖱").emojiIcon).toBe(5)
   })
+  it('does not count the sanctioned confirm() primitive when imported from components/ui', () => {
+    const src = [
+      "import { confirm } from '../components/ui'",
+      "await confirm({title:'x'})",
+    ].join('\n')
+    expect(countViolations(src).nativeDialog).toBe(0)
+  })
+  it('still counts window.confirm alongside an imported confirm() primitive', () => {
+    const src = [
+      "import { confirm } from '../components/ui'",
+      "await confirm({title:'x'})",
+      "window.confirm('y')",
+    ].join('\n')
+    expect(countViolations(src).nativeDialog).toBe(1)
+  })
 })

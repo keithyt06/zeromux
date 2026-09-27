@@ -1,6 +1,7 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest'
 import { render, screen, fireEvent, waitFor } from '@testing-library/react'
 import VaultReader from '../VaultReader'
+import { Toaster } from '../ui'
 import * as api from '../../lib/api'
 
 vi.mock('../../lib/api', () => ({
@@ -142,5 +143,49 @@ describe('VaultReader', () => {
   it('warms the notes index on mount', async () => {
     render(<VaultReader />)
     await waitFor(() => expect(api.warmSearchIndex).toHaveBeenCalledWith('notes'))
+  })
+
+  it('shows a Skeleton while the directory listing is in flight, then the real list', async () => {
+    let resolveList: (v: { entries: api.DirListEntry[]; truncated: boolean }) => void = () => {}
+    vi.mocked(api.listVault).mockReturnValue(new Promise(r => { resolveList = r }))
+    render(<VaultReader onClose={() => {}} />)
+    expect(screen.getByLabelText('加载中')).toBeInTheDocument()
+    resolveList({ entries: [{ name: 'note.md', type: 'file', size: 1, mtime: 0, writable: false }], truncated: false })
+    await waitFor(() => expect(screen.getByText('note.md')).toBeInTheDocument())
+    expect(screen.queryByLabelText('加载中')).toBeNull()
+  })
+
+  it('shows a retry button when the directory listing fails, and retry re-fetches', async () => {
+    vi.mocked(api.listVault).mockRejectedValueOnce(new Error('offline'))
+    render(<VaultReader onClose={() => {}} />)
+    expect(await screen.findByText('加载目录失败')).toBeInTheDocument()
+    vi.mocked(api.listVault).mockResolvedValueOnce({ entries: [{ name: 'note.md', type: 'file', size: 1, mtime: 0, writable: false }], truncated: false })
+    fireEvent.click(screen.getByText('重试'))
+    await waitFor(() => expect(screen.getByText('note.md')).toBeInTheDocument())
+  })
+
+  it('failing to open a note shows a toast instead of a native alert', async () => {
+    vi.mocked(api.getVaultFile).mockRejectedValueOnce(new Error('404'))
+    render(<><VaultReader onClose={() => {}} /><Toaster /></>)
+    fireEvent.click(await screen.findByText('note.md'))
+    expect(await screen.findByText(/无法打开笔记/)).toBeInTheDocument()
+  })
+
+  it('an unresolvable wikilink shows a toast (未找到对应笔记)', async () => {
+    vi.mocked(api.resolveWikiLink).mockResolvedValueOnce(null)
+    vi.mocked(api.getVaultFile).mockResolvedValueOnce({ content: 'see [[missing]] here', truncated: false })
+    render(<><VaultReader onClose={() => {}} /><Toaster /></>)
+    fireEvent.click(await screen.findByText('note.md'))
+    fireEvent.click(await screen.findByText('missing'))
+    expect(await screen.findByText(/未找到对应笔记/)).toBeInTheDocument()
+  })
+
+  it('resolveWikiLink rejecting shows a toast instead of an unhandled rejection (B9)', async () => {
+    vi.mocked(api.resolveWikiLink).mockRejectedValueOnce(new Error('network'))
+    vi.mocked(api.getVaultFile).mockResolvedValueOnce({ content: 'see [[missing]] here', truncated: false })
+    render(<><VaultReader onClose={() => {}} /><Toaster /></>)
+    fireEvent.click(await screen.findByText('note.md'))
+    fireEvent.click(await screen.findByText('missing'))
+    expect(await screen.findByText(/无法解析链接/)).toBeInTheDocument()
   })
 })

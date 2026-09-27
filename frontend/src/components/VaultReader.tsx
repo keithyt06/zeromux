@@ -1,5 +1,5 @@
 import { useState, useEffect, useCallback, useRef } from 'react'
-import { X, ChevronLeft, Search, FileText, Folder } from 'lucide-react'
+import { X, ChevronLeft, Search, FileText, Folder, BookOpen } from 'lucide-react'
 import { listVault, getVaultFile, warmSearchIndex, resolveWikiLink } from '../lib/api'
 import { filterVaultEntries, resolveVaultImageSrc } from '../lib/vault'
 import QuickTargets from './QuickTargets'
@@ -10,6 +10,7 @@ import type { DirListEntry, SearchResult, NoteHit } from '../lib/api'
 import { docTitleFromPath } from '../lib/docTabs'
 import { usePathSearch } from '../lib/usePathSearch'
 import type { AskAgentTarget } from '../lib/askAgent'
+import { toast, Skeleton } from './ui'
 
 // With the inotify watcher live, re-query only while indexing (building the
 // index). Once built, zero results during a refresh are real misses.
@@ -24,7 +25,21 @@ export default function VaultReader({ onClose, onTitleChange, target, onAskAgent
   const [mode, setMode] = useState<'list' | 'read'>('list')
   const [cwd, setCwd] = useState('')
   const [entries, setEntries] = useState<DirListEntry[]>([])
+  const [listLoading, setListLoading] = useState(true)
+  const [listError, setListError] = useState(false)
+  const [reloadToken, setReloadToken] = useState(0)
   const [query, setQuery] = useState('')
+  // Listing identity: reset loading/error DURING render (React's "reset state on
+  // prop change" pattern, matching FileBrowser.listKey) rather than synchronously
+  // inside the effect below, so a cwd change or retry never leaves the previous
+  // listing's loading/error state stale while the new fetch is in flight.
+  const listKey = `${cwd}\u0000${reloadToken}`
+  const [shownListKey, setShownListKey] = useState(listKey)
+  if (shownListKey !== listKey) {
+    setShownListKey(listKey)
+    setListLoading(true)
+    setListError(false)
+  }
   const { result: search, failed: searchFailed, retry: retrySearch } = usePathSearch(query, { scope: 'notes', limit: 50, debounceMs: 200, requeryWhile: vaultRequery })
   const [openPath, setOpenPath] = useState('')
   const [content, setContent] = useState('')
@@ -40,10 +55,10 @@ export default function VaultReader({ onClose, onTitleChange, target, onAskAgent
   useEffect(() => {
     let ignore = false
     listVault(cwd)
-      .then(r => { if (!ignore) setEntries(filterVaultEntries(r.entries)) })
-      .catch(() => { if (!ignore) setEntries([]) })
+      .then(r => { if (!ignore) { setEntries(filterVaultEntries(r.entries)); setListLoading(false) } })
+      .catch(() => { if (!ignore) { setEntries([]); setListError(true); setListLoading(false) } })
     return () => { ignore = true }
-  }, [cwd])
+  }, [cwd, reloadToken])
 
   useEffect(() => { warmSearchIndex('notes') }, [])
 
@@ -59,16 +74,16 @@ export default function VaultReader({ onClose, onTitleChange, target, onAskAgent
       // A stale entry (note deleted/moved in Obsidian) 404s here. The backend's
       // read-time guard prunes and deletes the row on the next listing, so all
       // that's left to do is tell the user.
-      alert('无法打开笔记(可能已被删除或移动):' + path)
+      toast.push({ message: '无法打开笔记(可能已被删除或移动):' + path })
     })
   }, [onTitleChange])
 
   const onWikiLink = useCallback((name: string) => {
     resolveWikiLink(name).then(r => {
       if (r && 'path' in r) openNote(r.path)
-      else if (r && 'indexing' in r) alert('笔记索引建立中，请稍候再试')
-      else alert('未找到对应笔记:' + name)
-    })
+      else if (r && 'indexing' in r) toast.push({ message: '笔记索引建立中，请稍候再试' })
+      else toast.push({ message: '未找到对应笔记:' + name })
+    }).catch(() => toast.push({ message: '无法解析链接' }))
   }, [openNote])
 
   // One-shot external navigation request (opened from search elsewhere, e.g.
@@ -96,7 +111,7 @@ export default function VaultReader({ onClose, onTitleChange, target, onAskAgent
       <div className="h-full bg-[var(--bg-primary)] flex flex-col">
         <div className="flex items-center gap-2 p-2 border-b border-[var(--border)]">
           <button onClick={() => { setMode('list'); onTitleChange?.(null) }} className="p-1.5 text-[var(--text-secondary)] hover:text-[var(--text-primary)]"><ChevronLeft size={18} /></button>
-          <span className="text-sm truncate flex-1">{openPath}</span>
+          <span className="text-ui-sm truncate flex-1">{openPath}</span>
           {onClose && <button onClick={onClose} className="p-1.5 text-[var(--text-secondary)] hover:text-[var(--accent-red)]"><X size={18} /></button>}
         </div>
         {/* vault-reading-surface keeps the app's dark theme (per user preference). The class is
@@ -105,8 +120,8 @@ export default function VaultReader({ onClose, onTitleChange, target, onAskAgent
             have low contrast on the dark page — an accepted trade-off for a dark reading surface. */}
         <div className="flex-1 overflow-auto">
           <div className="vault-reading-surface min-h-full">
-            <article className="mx-auto max-w-[72ch] px-4 py-6 leading-relaxed text-[15px]">
-              {truncated && <div className="mb-3 px-3 py-2 text-xs rounded bg-[var(--bg-tertiary)] text-[var(--accent-yellow)]">内容过长,仅显示前 1MB</div>}
+            <article className="mx-auto max-w-[72ch] px-4 py-6 leading-relaxed text-ui-base">
+              {truncated && <div className="mb-3 px-3 py-2 text-ui-xs rounded bg-[var(--bg-tertiary)] text-[var(--accent-yellow)]">内容过长,仅显示前 1MB</div>}
               <MarkdownContent text={content} isComplete enableRawHtml
                 resolveSrc={(s) => resolveVaultImageSrc(s, openPath)}
                 onWikiLink={onWikiLink} />
@@ -122,14 +137,14 @@ export default function VaultReader({ onClose, onTitleChange, target, onAskAgent
   return (
     <div className="h-full bg-[var(--bg-primary)] flex flex-col">
       <div className="flex items-center gap-2 p-2 border-b border-[var(--border)]">
-        <span className="text-sm font-bold flex-1">📓 Obsidian</span>
+        <span className="text-ui-sm font-bold flex-1 flex items-center gap-1.5"><BookOpen size={14} /> Obsidian</span>
         {onClose && <button onClick={onClose} className="p-1.5 text-[var(--text-secondary)] hover:text-[var(--accent-red)]"><X size={18} /></button>}
       </div>
       <div className="p-2 border-b border-[var(--border)]">
         <div className="flex items-center gap-2 px-2 py-1 rounded bg-[var(--bg-tertiary)]">
           <Search size={14} className="text-[var(--text-secondary)]" />
           <input value={query} onChange={e => setQuery(e.target.value)} placeholder="搜索笔记名…"
-            className="flex-1 bg-transparent text-base outline-none text-[var(--text-primary)]" />
+            className="flex-1 bg-transparent text-ui-input outline-none text-[var(--text-primary)]" />
         </div>
       </div>
       <div className="flex-1 overflow-auto">
@@ -143,14 +158,14 @@ export default function VaultReader({ onClose, onTitleChange, target, onAskAgent
                 onPickNote={pickHit}
                 onAskAgent={(h) => onAskAgent?.({ absDir: h.abs_dir, relPath: h.path, kind: h.kind })}
               />
-              {search.notes.items.length >= 50 && <div className="px-3 py-2 text-xs text-[var(--accent-yellow)]">仅显示前 50 条，请细化搜索</div>}
+              {search.notes.items.length >= 50 && <div className="px-3 py-2 text-ui-xs text-[var(--accent-yellow)]">仅显示前 50 条，请细化搜索</div>}
             </>
           ) : searchFailed ? (
-            <div className="px-3 py-2 flex items-center justify-between gap-2 text-xs text-[var(--text-secondary)]">
+            <div className="px-3 py-2 flex items-center justify-between gap-2 text-ui-xs text-[var(--text-secondary)]">
               <span>搜索暂时不可用</span>
               <button type="button" onClick={retrySearch} className="px-2 py-1 min-h-[44px] rounded bg-[var(--bg-tertiary)]">重试</button>
             </div>
-          ) : <div className="px-3 py-2 text-xs text-[var(--text-secondary)]">搜索中…</div>
+          ) : <div className="px-3 py-2 text-ui-xs text-[var(--text-secondary)]">搜索中…</div>
         ) : (
           <>
             {/* `hidden` rather than conditional rendering: VaultReader stays mounted in
@@ -161,17 +176,26 @@ export default function VaultReader({ onClose, onTitleChange, target, onAskAgent
               <QuickTargets kind="note" onPick={(path) => openNote(path)} />
             </div>
             {crumbs.length > 0 && (
-              <button onClick={() => setCwd(crumbs.slice(0, -1).join('/'))} className="flex items-center gap-1 px-3 py-2 text-sm text-[var(--text-secondary)]"><ChevronLeft size={14} />返回上级</button>
+              <button onClick={() => setCwd(crumbs.slice(0, -1).join('/'))} className="flex items-center gap-1 px-3 py-2 text-ui-sm text-[var(--text-secondary)]"><ChevronLeft size={14} />返回上级</button>
             )}
-            <ul>{entries.map(e => (
-              <li key={e.name}>
-                <button onClick={() => e.type === 'dir' ? setCwd(cwd ? `${cwd}/${e.name}` : e.name) : openNote(cwd ? `${cwd}/${e.name}` : e.name)}
-                  className="flex items-center gap-2 w-full px-3 py-2 text-sm text-left hover:bg-[var(--bg-tertiary)]">
-                  {e.type === 'dir' ? <Folder size={14} className="text-[var(--accent-blue)]" /> : <FileText size={14} className="text-[var(--text-secondary)]" />}
-                  {e.name}
-                </button>
-              </li>
-            ))}</ul>
+            {listLoading ? (
+              <Skeleton rows={4} />
+            ) : listError ? (
+              <div className="px-3 py-2 flex items-center justify-between gap-2 text-ui-xs text-[var(--danger)]">
+                <span>加载目录失败</span>
+                <button type="button" onClick={() => setReloadToken(t => t + 1)} className="px-2 py-1 min-h-[44px] rounded bg-[var(--bg-tertiary)]">重试</button>
+              </div>
+            ) : (
+              <ul>{entries.map(e => (
+                <li key={e.name}>
+                  <button onClick={() => e.type === 'dir' ? setCwd(cwd ? `${cwd}/${e.name}` : e.name) : openNote(cwd ? `${cwd}/${e.name}` : e.name)}
+                    className="flex items-center gap-2 w-full px-3 py-2 text-ui-sm text-left hover:bg-[var(--bg-tertiary)]">
+                    {e.type === 'dir' ? <Folder size={14} className="text-[var(--accent-blue)]" /> : <FileText size={14} className="text-[var(--text-secondary)]" />}
+                    {e.name}
+                  </button>
+                </li>
+              ))}</ul>
+            )}
           </>
         )}
       </div>

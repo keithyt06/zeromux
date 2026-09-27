@@ -389,6 +389,8 @@ export default function App() {
         onLogout={handleLogout}
         theme={themeCtx.theme}
         onToggleTheme={themeCtx.toggle}
+        themePref={themeCtx.pref}
+        onSetThemePref={themeCtx.setPref}
         user={user}
         open={sidebarOpen}
         onToggle={() => setSidebarOpen(v => !v)}

@@ -1,7 +1,7 @@
 {
   "name": "ZeroMux",
   "short_name": "ZeroMux",
-  "theme_color": "#f7b500",
+  "theme_color": "#11161d",
   "background_color": "#11161d",
   "display": "standalone",
   "start_url": "/",

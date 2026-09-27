@@ -8,6 +8,7 @@ import { SearchAddon } from '@xterm/addon-search'
 import { wsUrl, getSessionStatus, getTmuxHealth, reviveSession } from '../lib/api'
 import type { SessionStatus, TmuxHealth } from '../lib/api'
 import type { Theme } from '../lib/theme'
+import { readTerminalTheme } from '../lib/terminalTheme'
 import { b64encode, b64decode } from '../lib/base64'
 import { GitBranch, Folder, Circle, ArrowUpToLine, ArrowDownToLine } from 'lucide-react'
 import { attachCommand, copyText } from '../lib/attachCommand'
@@ -25,53 +26,6 @@ import { historyPrompt } from '../lib/historyToAgent'
 import { shouldSendResize } from '../lib/terminalSize'
 
 const FONT_SIZE = 14
-
-const THEMES = {
-  dark: {
-    background: '#0d1117',
-    foreground: '#c9d1d9',
-    cursor: '#58a6ff',
-    selectionBackground: '#264f78',
-    black: '#484f58',
-    red: '#ff7b72',
-    green: '#3fb950',
-    yellow: '#d29922',
-    blue: '#58a6ff',
-    magenta: '#bc8cff',
-    cyan: '#39c5cf',
-    white: '#b1bac4',
-    brightBlack: '#6e7681',
-    brightRed: '#ffa198',
-    brightGreen: '#56d364',
-    brightYellow: '#e3b341',
-    brightBlue: '#79c0ff',
-    brightMagenta: '#d2a8ff',
-    brightCyan: '#56d4dd',
-    brightWhite: '#f0f6fc',
-  },
-  light: {
-    background: '#ffffff',
-    foreground: '#1f2328',
-    cursor: '#0969da',
-    selectionBackground: '#b6d4fe',
-    black: '#24292f',
-    red: '#cf222e',
-    green: '#1a7f37',
-    yellow: '#9a6700',
-    blue: '#0969da',
-    magenta: '#8250df',
-    cyan: '#1b7c83',
-    white: '#6e7781',
-    brightBlack: '#57606a',
-    brightRed: '#a40e26',
-    brightGreen: '#116329',
-    brightYellow: '#7d4e00',
-    brightBlue: '#0550ae',
-    brightMagenta: '#6639ba',
-    brightCyan: '#136061',
-    brightWhite: '#8c959f',
-  },
-}
 
 const LANDSCAPE_MQ = '(orientation: landscape) and (max-height: 500px)'
 
@@ -303,7 +257,7 @@ export default function TerminalView({ sessionId, active, theme, tmuxName, tmuxO
       cursorBlink: true,
       fontSize: FONT_SIZE,
       fontFamily: getComputedStyle(document.documentElement).getPropertyValue('--font-mono').trim() || 'ui-monospace, Menlo, monospace',
-      theme: THEMES[theme],
+      theme: readTerminalTheme(),
       allowProposedApi: true,
       scrollback: 10000,
       macOptionClickForcesSelection: true,
@@ -456,7 +410,7 @@ export default function TerminalView({ sessionId, active, theme, tmuxName, tmuxO
   // Update terminal theme when it changes
   useEffect(() => {
     if (termRef.current) {
-      termRef.current.options.theme = THEMES[theme]
+      termRef.current.options.theme = readTerminalTheme()
     }
   }, [theme])
 

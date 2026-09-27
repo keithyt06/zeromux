@@ -10,7 +10,10 @@ type State =
   | { kind: 'error'; msg: string }
 
 export default function MermaidBlock({ code }: Props) {
-  const key = fnv1a(code)
+  // Theme is part of the key: a dark SVG must not be reused under the light theme.
+  // Dark keeps the legacy bare-hash key; light gets an `l` prefix.
+  const light = typeof document !== 'undefined' && document.documentElement.classList.contains('light')
+  const key = (light ? 'l' : '') + fnv1a(code)
   const cached = mermaidCache.get(key)
   const [state, setState] = useState<State>(
     cached ? { kind: 'svg', svg: cached } : { kind: 'pending' }
@@ -38,7 +41,7 @@ export default function MermaidBlock({ code }: Props) {
           return
         }
         const m = (await import('mermaid')).default
-        m.initialize({ startOnLoad: false, theme: 'dark', securityLevel: 'strict' })
+        m.initialize({ startOnLoad: false, theme: light ? 'default' : 'dark', securityLevel: 'strict' })
         await m.parse(code)
         const id = `mid-${key}`
         const { svg } = await m.render(id, code)
@@ -53,7 +56,7 @@ export default function MermaidBlock({ code }: Props) {
       }
     })()
     return () => { cancel = true }
-  }, [code, key, state.kind])
+  }, [code, key, light, state.kind])
 
   if (state.kind === 'svg') {
     return (

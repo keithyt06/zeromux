@@ -1,34 +1,62 @@
 import { useState, useEffect, useCallback } from 'react'
 
+export type ThemePref = 'system' | 'dark' | 'light'
+/** Resolved theme actually painted. Name kept for existing importers. */
 export type Theme = 'dark' | 'light'
 
 const STORAGE_KEY = 'zeromux_theme'
+const LIGHT_MQ = '(prefers-color-scheme: light)'
 
-function getInitial(): Theme {
-  const stored = localStorage.getItem(STORAGE_KEY)
-  if (stored === 'light' || stored === 'dark') return stored
-  return 'dark'
+function readPref(): ThemePref {
+  try {
+    const v = localStorage.getItem(STORAGE_KEY)
+    if (v === 'light' || v === 'dark' || v === 'system') return v
+  } catch { /* storage blocked */ }
+  return 'system'
 }
 
-function applyTheme(theme: Theme) {
-  document.documentElement.classList.toggle('light', theme === 'light')
+function systemLight(): boolean {
+  return typeof matchMedia !== 'undefined' && matchMedia(LIGHT_MQ).matches
+}
+
+export function resolveTheme(pref: ThemePref, sysLight: boolean): Theme {
+  return pref === 'system' ? (sysLight ? 'light' : 'dark') : pref
+}
+
+/** Synchronous DOM write. Must run BEFORE the React state update so child
+ *  effects (xterm, mermaid) that read CSS variables see the new theme. */
+export function applyResolvedTheme(t: Theme) {
+  const el = document.documentElement
+  el.classList.toggle('light', t === 'light')
+  el.style.colorScheme = t
 }
 
 export function useTheme() {
-  const [theme, setThemeState] = useState<Theme>(getInitial)
+  const [pref, setPrefState] = useState<ThemePref>(readPref)
+  const [theme, setTheme] = useState<Theme>(() => resolveTheme(readPref(), systemLight()))
 
   useEffect(() => {
-    applyTheme(theme)
-  }, [theme])
-
-  const setTheme = useCallback((t: Theme) => {
-    localStorage.setItem(STORAGE_KEY, t)
-    setThemeState(t)
+    if (typeof matchMedia === 'undefined') return
+    const mq = matchMedia(LIGHT_MQ)
+    const on = (e: { matches: boolean }) => {
+      if (readPref() !== 'system') return
+      const t: Theme = e.matches ? 'light' : 'dark'
+      applyResolvedTheme(t)
+      setTheme(t)
+    }
+    mq.addEventListener('change', on)
+    return () => mq.removeEventListener('change', on)
   }, [])
 
-  const toggle = useCallback(() => {
-    setTheme(theme === 'dark' ? 'light' : 'dark')
-  }, [theme, setTheme])
+  const setPref = useCallback((p: ThemePref) => {
+    try { localStorage.setItem(STORAGE_KEY, p) } catch { /* ignore */ }
+    const t = resolveTheme(p, systemLight())
+    applyResolvedTheme(t)
+    setPrefState(p)
+    setTheme(t)
+  }, [])
 
-  return { theme, setTheme, toggle }
+  const toggle = useCallback(() => setPref(theme === 'dark' ? 'light' : 'dark'), [theme, setPref])
+
+  return { pref, theme, setPref, toggle }
 }

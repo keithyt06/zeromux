@@ -8,7 +8,7 @@ function setup(over: Partial<React.ComponentProps<typeof Sidebar>> = {}) {
   const props = {
     sessions: [], docTabs: [], activeId: null, onSelect: vi.fn(), onCreate, onOpenVault: vi.fn(),
     onDelete: vi.fn(), onRename: vi.fn(), hasUnread: () => false, onLogout: vi.fn(),
-    theme: 'dark' as const, onToggleTheme: vi.fn(),
+    theme: 'dark' as const, onToggleTheme: vi.fn(), themePref: 'dark' as const, onSetThemePref: vi.fn(),
     user: { id: 'u', login: 'u', avatar: null, role: 'admin', status: 'active' } as api.UserInfo,
     open: true, onToggle: vi.fn(), mobile: false, hostTmux: [], ...over,
   }

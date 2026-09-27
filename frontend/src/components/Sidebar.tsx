@@ -3,7 +3,7 @@ import type { SessionInfo, SessionType, DirEntry, UserInfo, SearchResult, DirHit
 import { isOrphan, matchHostTmux } from '../lib/hostTmux'
 import { listDirectories, getSchedulerHealth, getVaultMeta, searchPaths, warmSearchIndex } from '../lib/api'
 import { shouldShowVault } from '../lib/vault'
-import type { Theme } from '../lib/theme'
+import type { Theme, ThemePref } from '../lib/theme'
 import { Terminal, Plus, X, PanelLeftClose, PanelLeft, Sun, Moon, Folder, FolderGit2, ChevronLeft, Home, LogOut, Users, Clock, Bell, BookOpen, Settings, Pencil, Search } from 'lucide-react'
 import { type DocTab } from '../lib/docTabs'
 import AdminPanel from './AdminPanel'
@@ -31,6 +31,8 @@ interface Props {
   onLogout: () => void
   theme: Theme
   onToggleTheme: () => void
+  themePref: ThemePref
+  onSetThemePref: (p: ThemePref) => void
   user: UserInfo | null
   open: boolean
   onToggle: () => void
@@ -86,7 +88,7 @@ function SessionTypeIcon({ type, size = 14, className }: { type: SessionType; si
   }
 }
 
-export default function Sidebar({ sessions, docTabs, activeId, onSelect, onCreate, onDelete, onRename, hasUnread, onLogout, theme, onToggleTheme, user, open, onToggle, mobile, confirmCount = 0, onOpenVault, askAgentRequest, hostTmux = [], onOpenHistory }: Props) {
+export default function Sidebar({ sessions, docTabs, activeId, onSelect, onCreate, onDelete, onRename, hasUnread, onLogout, theme, onToggleTheme, themePref, onSetThemePref, user, open, onToggle, mobile, confirmCount = 0, onOpenVault, askAgentRequest, hostTmux = [], onOpenHistory }: Props) {
   const [step, setStep] = useState<NewSessionStep>('closed')
   const [pendingType, setPendingType] = useState<SessionType | null>(null)
   const [promptDraft, setPromptDraft] = useState('')
@@ -1022,13 +1024,15 @@ export default function Sidebar({ sessions, docTabs, activeId, onSelect, onCreat
             <div className="fixed inset-0 z-10" onClick={() => setShowSettings(false)} />
             <div className={`absolute bottom-full left-2 mb-1 bg-[var(--bg-tertiary)] border border-[var(--border)] rounded-lg py-1 ${mobile ? 'w-[calc(100vw-1rem)]' : 'w-56'} z-20 shadow-xl`}>
               <div className="px-3 py-1.5 text-[10px] font-semibold text-[var(--text-muted)] uppercase tracking-wider">Settings</div>
-              <button
-                onClick={onToggleTheme}
-                className="flex items-center gap-2.5 w-full px-3 py-2 text-xs text-[var(--text-primary)] hover:bg-[var(--bg-hover)] transition-colors"
-              >
-                <ThemeIcon size={14} className="shrink-0" />
-                <span className="flex-1 text-left">{theme === 'dark' ? '浅色模式' : '深色模式'}</span>
-              </button>
+              <div className="flex items-center gap-1 px-3 py-2">
+                <ThemeIcon size={14} className="shrink-0 text-[var(--fg-muted)]" />
+                {(['system', 'light', 'dark'] as const).map(p => (
+                  <button key={p} onClick={() => onSetThemePref(p)} aria-pressed={themePref === p}
+                    className={`flex-1 px-1.5 py-1 rounded-md text-ui-xs whitespace-nowrap ${themePref === p ? 'bg-[var(--surface-hover)] text-[var(--fg-strong)]' : 'text-[var(--fg-muted)] hover:text-[var(--fg)]'}`}>
+                    {p === 'system' ? '跟随系统' : p === 'light' ? '浅色' : '深色'}
+                  </button>
+                ))}
+              </div>
               <button
                 onClick={() => { setShowSettings(false); setShowPushSettings(true) }}
                 className="flex items-center gap-2.5 w-full px-3 py-2 text-xs text-[var(--text-primary)] hover:bg-[var(--bg-hover)] transition-colors"

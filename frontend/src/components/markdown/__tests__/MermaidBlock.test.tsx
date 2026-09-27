@@ -119,4 +119,33 @@ describe('MermaidBlock', () => {
     expect(container.textContent).toContain('this is not mermaid')
     expect(container.textContent).toContain('Syntax error')
   })
+
+  it('initializes mermaid with the resolved app theme', async () => {
+    parseMock.mockResolvedValue(true)
+    renderMock.mockResolvedValue({ svg: '<svg id="themed"/>' })
+    const { default: MermaidBlock } = await import('../MermaidBlock')
+    document.documentElement.classList.add('light')
+    try {
+      render(<MermaidBlock code={'graph TD; A-->B'} />)
+      await waitFor(() => expect(initMock).toHaveBeenCalledWith(expect.objectContaining({ theme: 'default' })))
+    } finally {
+      document.documentElement.classList.remove('light')
+    }
+  })
+
+  it('keys the svg cache by theme (no dark svg reused in light)', async () => {
+    parseMock.mockResolvedValue(true)
+    renderMock.mockResolvedValue({ svg: '<svg id="light"/>' })
+    mermaidCache.set(fnv1a('graph TD; T-->U'), '<svg id="dark-cached"/>')
+    const { default: MermaidBlock } = await import('../MermaidBlock')
+    document.documentElement.classList.add('light')
+    try {
+      const { container } = render(<MermaidBlock code="graph TD; T-->U" />)
+      await waitFor(() => {
+        expect(container.querySelector('.mermaid-rendered')?.innerHTML).toContain('id="light"')
+      })
+    } finally {
+      document.documentElement.classList.remove('light')
+    }
+  })
 })

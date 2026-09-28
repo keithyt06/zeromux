@@ -2,12 +2,15 @@ import { useState, useEffect, useRef, useCallback, useMemo } from 'react'
 import { uploadSessionFile, getSessionRuns, getCrewMemory, putCrewSemantic, deleteCrewSemantic } from '../lib/api'
 import type { SemanticEntry } from '../lib/api'
 import { normalizeMemoryKey, parseSemanticValue } from '../lib/crewMemory'
-import { Brain, AlertCircle, Paperclip, ListPlus, X } from 'lucide-react'
+import { Brain, AlertCircle, Paperclip, Plus, X } from 'lucide-react'
 import Composer from './Composer'
 import ConnectionBar from './ConnectionBar'
-import PromptManager from './PromptManager'
 import { usePromptPresets } from '../lib/usePromptPresets'
-import { applyPreset } from '../lib/applyPreset'
+import { resolvePresetPick, splitSlash } from '../lib/presetPick'
+import type { PromptPreset } from '../lib/api'
+import { IconButton, Menu, Popover, type MenuItem } from './ui'
+import { QueueChip } from './composer/QueueChip'
+import { PresetPicker } from './composer/PresetPicker'
 import { SessionLifetimeBadge } from './SessionLifetimeBadge'
 import { foldTranscript, stabilizeGroups, type WireEvent, type TurnGroup } from '../lib/transcript'
 import { shouldStickToBottom, shouldAutoScrollOnAppend, shouldTrackScrollUp } from '../lib/scrollReplay'
@@ -29,6 +32,11 @@ interface Props {
   // App state so the visible control can't lie (observer tab / reconnect showing
   // 'Collect' while the backend is 'Interrupt' → an unintended interrupt on send).
   onQueueModeChange?: (sessionId: string, mode: string) => void
+  /** Backend-authoritative queue mode for this session (shell.queueModes, I-6). The
+   *  composer chip shows ONLY this; it changes once a flip is delivered. */
+  queueMode?: string
+  /** 「管理…」 at the bottom of the `/` preset list → the shell's prompts Sheet. */
+  onManagePresets?: () => void
   // 「全部 →」打开记忆面板 Sheet（由 AppShell 拥有）。未传时 popover 里
   // 那个入口仅关弹层，不报错 —— composer 的就地写入不依赖面板存在。
   onOpenMemory?: () => void
@@ -47,7 +55,7 @@ const EMPTY_PEERS: Record<string, string> = {}
 // `active` is accepted (App passes it for all session views) but no longer used:
 // the Composer owns its own textarea and we intentionally don't auto-focus it,
 // so switching to a chat session doesn't pop the mobile keyboard.
-export default function AcpChatView({ sessionId, agentType = 'claude', onRegisterControls, onQueueModeChange, onOpenMemory, peerNames = EMPTY_PEERS, onOpenChanges, onCtxUsage }: Props) {
+export default function AcpChatView({ sessionId, agentType = 'claude', onRegisterControls, onQueueModeChange, queueMode = 'collect', onManagePresets, onOpenMemory, peerNames = EMPTY_PEERS, onOpenChanges, onCtxUsage }: Props) {
   const scrollRef = useRef<HTMLDivElement>(null)
   const replayingRef = useRef(false)
   // True only while the post-replay_done follow ResizeObserver is armed (~2s).
@@ -142,9 +150,28 @@ export default function AcpChatView({ sessionId, agentType = 'claude', onRegiste
   const openChanges = useCallback(() => { onOpenChanges?.(sessionId) }, [onOpenChanges, sessionId])
   const [input, setInput] = useState('')
   const presetStore = usePromptPresets()
-  const [presetOpen, setPresetOpen] = useState(false)
-  const [presetManaging, setPresetManaging] = useState(false)
-  const closePreset = useCallback(() => { setPresetOpen(false); setPresetManaging(false) }, [])
+  const { reload: reloadPresets } = presetStore
+  // Line-start `/` → preset list (V7). null = not in slash mode; `slashDismissed`
+  // keeps an Esc/tap-outside/pick closed until the text changes again.
+  const [slashQuery, setSlashQuery] = useState<string | null>(null)
+  const [slashDismissed, setSlashDismissed] = useState(false)
+  const [composerBox, setComposerBox] = useState<HTMLDivElement | null>(null)
+  const slashOnRef = useRef(false)
+  const onSlash = useCallback((q: string | null) => {
+    // Entering slash mode re-lists presets (last-writer-wins, see usePromptPresets).
+    if (q !== null && !slashOnRef.current) reloadPresets()
+    slashOnRef.current = q !== null
+    setSlashQuery(q)
+    setSlashDismissed(false)
+  }, [reloadPresets])
+  const pickPreset = useCallback(async (p: PromptPreset) => {
+    // Close first: the overwrite confirm must not share the keyboard with the list.
+    setSlashDismissed(true)
+    const next = await resolvePresetPick(p.body, splitSlash(slashQuery ?? '').arg)
+    if (next !== null) setInput(next)
+  }, [slashQuery])
+  const [plusAnchor, setPlusAnchor] = useState<HTMLButtonElement | null>(null)
+  const [plusOpen, setPlusOpen] = useState(false)
   // ── 就地记忆写入（composer 第 3 个按钮）──
   // 人只在「被冒犯的那一刻」想纠正记忆（agent 刚用了 npm 而你说过 pnpm），那一刻
   // 拇指在输入框上。要求用户「打开设置去配置偏好」= 问卷 = 没人填。
@@ -279,22 +306,15 @@ export default function AcpChatView({ sessionId, agentType = 'claude', onRegiste
     return () => onRegisterControls?.(sessionId, null)
   }, [sessionId, setQueueMode, sendPrompt, interrupt, resolveApproval, pendingApprovals, onRegisterControls])
 
-  // Esc closes the preset popover (parity with the Sidebar pick-prompt step).
-  useEffect(() => {
-    if (!presetOpen) return
-    const onKey = (e: KeyboardEvent) => { if (e.key === 'Escape') closePreset() }
-    window.addEventListener('keydown', onKey)
-    return () => window.removeEventListener('keydown', onKey)
-  }, [presetOpen, closePreset])
-
-  // Esc 同样关记忆 popover（与 preset 一致，否则桌面端两个弹层行为不一致）。
-  useEffect(() => {
-    if (!memOpen) return
-    const onKey = (e: KeyboardEvent) => { if (e.key === 'Escape') closeMem() }
-    window.addEventListener('keydown', onKey)
-    return () => window.removeEventListener('keydown', onKey)
-  }, [memOpen, closeMem])
-
+  // 「＋」 menu (V8): 📎 upload, and ⌘ memory for Crew only.
+  const plusItems: MenuItem[] = [
+    { label: '附件', icon: Paperclip, onSelect: () => fileInputRef.current?.click() },
+    ...(agentType === 'crew' ? [{ label: '记忆', ariaLabel: 'memory', icon: Brain, onSelect: () => {
+      setMemConfirming(null)
+      setMemOpen(true)
+      loadMemRecent()
+    } }] : []),
+  ]
 
   // Disconnect the replay-follow ResizeObserver and its disarm timer on unmount.
   useEffect(() => () => {
@@ -369,62 +389,8 @@ export default function AcpChatView({ sessionId, agentType = 'claude', onRegiste
         )}
         <input ref={fileInputRef} type="file" accept="*/*" multiple className="hidden"
           onChange={e => { handleFiles(e.target.files); e.target.value = '' }} />
-        {presetOpen && (
-          // Tap-outside-to-close: transparent full-screen catcher behind the popover.
-          <div className="fixed inset-0 z-10" onClick={closePreset} aria-hidden="true" />
-        )}
-        {presetOpen && (
-          <div className="absolute bottom-full left-0 right-0 mb-2 mx-2 rounded-lg border border-[var(--border)] bg-[var(--bg-primary)] shadow-lg z-20">
-            {presetManaging ? (
-              <PromptManager
-                presets={presetStore.presets}
-                error={presetStore.error}
-                onAdd={presetStore.add}
-                onEdit={presetStore.edit}
-                onRemove={presetStore.remove}
-                onClose={() => setPresetManaging(false)}
-              />
-            ) : (
-              <div className="p-2 flex flex-col gap-2">
-                <div className="flex flex-wrap gap-1">
-                  {presetStore.presets.length === 0 && (
-                    <span className="text-[10px] text-[var(--text-muted)] px-1 py-1">还没有常用 prompt</span>
-                  )}
-                  {presetStore.presets.map(p => (
-                    <button
-                      key={p.id}
-                      onClick={() => { setInput(applyPreset(p.body, input)); setPresetOpen(false) }}
-                      title={p.body}
-                      className="px-2 py-0.5 text-[10px] rounded-full bg-[var(--bg-secondary)] border border-[var(--border)] text-[var(--text-secondary)] hover:text-[var(--text-primary)] hover:border-[var(--accent-blue)] transition-colors truncate max-w-[160px]"
-                    >
-                      {p.title}
-                    </button>
-                  ))}
-                </div>
-                <div className="flex justify-between">
-                  <button
-                    onClick={() => setPresetManaging(true)}
-                    className="flex items-center gap-1 px-2 py-1 text-[10px] font-semibold text-[var(--accent-blue)] hover:opacity-80"
-                  >
-                    ✎ 管理
-                  </button>
-                  <button
-                    onClick={closePreset}
-                    className="px-2 py-1 text-[10px] text-[var(--text-muted)] hover:text-[var(--text-primary)]"
-                  >
-                    关闭
-                  </button>
-                </div>
-              </div>
-            )}
-          </div>
-        )}
-        {memOpen && (
-          <div className="fixed inset-0 z-10" onClick={closeMem} aria-hidden="true" />
-        )}
-        {memOpen && (
-          <div className="absolute bottom-full left-0 right-0 mb-2 mx-2 rounded-lg border border-[var(--border)] bg-[var(--bg-primary)] shadow-lg z-20">
-            <div className="p-2 flex flex-col gap-2">
+        <Popover open={memOpen} onClose={closeMem} anchor={plusAnchor} placement="top" sheetTitle="记忆">
+            <div className="p-2 flex flex-col gap-2 md:w-[296px]">
               <div className="flex items-center gap-1.5">
                 <Brain size={12} className="text-[var(--accent-purple)] shrink-0" />
                 <span className="text-[10px] font-semibold text-[var(--text-muted)] uppercase tracking-wider flex-1">记忆</span>
@@ -493,53 +459,28 @@ export default function AcpChatView({ sessionId, agentType = 'claude', onRegiste
                 </button>
               </div>
             </div>
-          </div>
-        )}
+        </Popover>
+        <PresetPicker open={slashQuery !== null && !slashDismissed} query={slashQuery ?? ''} presets={presetStore.presets}
+          anchor={composerBox} onPick={pickPreset} onClose={() => setSlashDismissed(true)}
+          onManage={() => { setSlashDismissed(true); onManagePresets?.() }} />
+        <div ref={setComposerBox}>
         <Composer
           value={input}
           onChange={setInput}
           onSend={(t) => { const ok = sendPrompt(t); if (ok) setInput(''); return ok }}
           submitOnEnter={true}
           placeholder={`Send a message to ${agentName}...`}
-          rightSlot={
-            <div className="flex items-end gap-1">
-              <button
-                onClick={() => {
-                  setPresetManaging(false)
-                  // 两个 popover 都是 absolute bottom-full，同时开会重叠 —— 互斥。
-                  setMemOpen(false)
-                  setPresetOpen(o => { if (!o) presetStore.reload(); return !o })
-                }}
-                aria-label="prompt presets"
-                className="self-end p-2 text-[var(--text-muted)] hover:text-[var(--text-primary)] rounded-lg transition-colors"
-                title="常用 prompt"
-              >
-                <ListPlus size={16} />
-              </button>
-              <button onClick={() => fileInputRef.current?.click()} aria-label="attach"
-                className="self-end p-2 text-[var(--text-muted)] hover:text-[var(--text-primary)] rounded-lg transition-colors" title="附件">
-                <Paperclip size={16} />
-              </button>
-              {/* 仅 Crew 会话。宽度核算：现有 2 按钮各 p-2+size16 ≈ 32px 加发送键
-                  40px = 104px；375px 屏下 textarea 约 246px。加这个 → 136px，
-                  textarea 剩 ~214px。接近极限，故其它后端不渲染。 */}
-              {agentType === 'crew' && (
-                <button
-                  onClick={() => {
-                    setMemConfirming(null)
-                    closePreset()
-                    setMemOpen(o => { if (!o) loadMemRecent(); return !o })
-                  }}
-                  aria-label="memory"
-                  className="self-end p-2 text-[var(--text-muted)] hover:text-[var(--accent-purple)] rounded-lg transition-colors"
-                  title="记忆"
-                >
-                  <Brain size={16} />
-                </button>
-              )}
-            </div>
+          onSlash={onSlash}
+          leftSlot={
+            <>
+              <QueueChip mode={queueMode} busy={busy} onToggle={() => setQueueMode(queueMode === 'collect' ? 'interrupt' : 'collect')} />
+              <span className="flex-1" />
+              <IconButton ref={setPlusAnchor} label="更多" icon={Plus} onClick={() => { setSlashDismissed(true); setPlusOpen(o => !o) }} aria-haspopup="menu" aria-expanded={plusOpen} />
+              <Menu open={plusOpen} onClose={() => setPlusOpen(false)} anchor={plusAnchor} items={plusItems} title="更多" />
+            </>
           }
         />
+        </div>
       </div>
     </div>
   )

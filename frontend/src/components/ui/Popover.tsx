@@ -18,14 +18,16 @@ const layers: HTMLElement[] = []
  *  a bottom Sheet — anchored layers get pushed off-screen by the soft keyboard.
  *  Exception: when the anchor already lives inside a modal (a Sheet/Dialog) it
  *  stays anchored and portals into that dialog — outside it the page is
- *  inert, and a Sheet inside a Sheet is not allowed. */
-export function Popover({ open, onClose, anchor, placement = 'bottom', align = 'start', children, sheetTitle }: {
-  open: boolean; onClose: () => void; anchor: HTMLElement | null; placement?: 'top' | 'bottom'; align?: 'start' | 'end'; children: ReactNode; sheetTitle?: string
+ *  inert, and a Sheet inside a Sheet is not allowed. `anchored` also keeps it
+ *  anchored on phones: for typeaheads whose input must keep focus (a modal Sheet
+ *  would make the input inert and drop the keyboard mid-typing). */
+export function Popover({ open, onClose, anchor, placement = 'bottom', align = 'start', children, sheetTitle, anchored = false }: {
+  open: boolean; onClose: () => void; anchor: HTMLElement | null; placement?: 'top' | 'bottom'; align?: 'start' | 'end'; children: ReactNode; sheetTitle?: string; anchored?: boolean
 }) {
   const narrow = useIsNarrow()
   const hostDialog = anchor?.closest('dialog') ?? null
   const inModal = !!hostDialog
-  const asSheet = narrow && !inModal
+  const asSheet = narrow && !inModal && !anchored
   const ref = useRef<HTMLDivElement>(null)
   const [pos, setPos] = useState<{ top: number; left: number } | null>(null)
   // Callers pass inline closures; don't re-subscribe (and reorder `layers`) per render.

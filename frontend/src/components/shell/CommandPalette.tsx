@@ -9,6 +9,10 @@ import { matchHostTmux } from '../../lib/hostTmux'
 import { askAgentPrompt } from '../../lib/askAgent'
 import { triage, toneOf, labelOf } from '../../lib/triage'
 import { useIsNarrow } from '../../lib/useMediaQuery'
+import { usePromptPresets } from '../../lib/usePromptPresets'
+import { resolvePresetPick, splitSlash } from '../../lib/presetPick'
+import type { PromptPreset } from '../../lib/api'
+import { PresetPicker } from '../composer/PresetPicker'
 import { Dialog, Sheet, StatusDot } from '../ui'
 import QuickTargets from '../QuickTargets'
 import SearchResults from '../SearchResults'
@@ -39,6 +43,8 @@ export interface CommandPaletteProps {
   actions: PaletteAction[]
   vaultEnabled?: boolean
   now?: number
+  /** 「管理…」 under the new-mode `/` preset list. */
+  onManagePresets?(): void
 }
 
 export function CommandPalette(p: CommandPaletteProps) {
@@ -55,7 +61,14 @@ function stripNewPrefix(t: string): { forced: boolean; rest: string } {
   return { forced: false, rest: t }
 }
 
-function PaletteBody({ onClose, initial, shell, actions, vaultEnabled = false, now: nowProp }: CommandPaletteProps) {
+// New-mode text = [+|新建 ]<type?> <dir> <prompt>; split off the raw prompt part so a
+// line-start `/` there opens the preset list and a pick replaces only that part.
+function splitPrompt(text: string, rest: string, hasType: boolean): { head: string; prompt: string } | null {
+  const m = new RegExp(`^(\\s*(?:\\S+\\s+){${hasType ? 2 : 1}})([\\s\\S]*)$`).exec(rest)
+  return m ? { head: text.slice(0, text.length - rest.length) + m[1], prompt: m[2] } : null
+}
+
+function PaletteBody({ onClose, initial, shell, actions, vaultEnabled = false, now: nowProp, onManagePresets }: CommandPaletteProps) {
   const [openedAt] = useState(() => Date.now())
   const now = nowProp ?? openedAt
   const narrow = useIsNarrow()
@@ -79,6 +92,26 @@ function PaletteBody({ onClose, initial, shell, actions, vaultEnabled = false, n
   // A bare type word ("tmux") still searches; a type word followed by more text is new mode.
   const newMode = forcedNew || forced || (parsed.type !== null && /\s/.test(rest.trimStart()))
   const newType: NewType = parsed.type ?? loadLastType()
+
+  // ── new mode `/` presets (V7: same picker as the composer) ──
+  const presetStore = usePromptPresets()
+  const { reload: reloadPresets } = presetStore
+  const promptPart = newMode ? splitPrompt(text, rest, parsed.type !== null) : null
+  const slashQuery = promptPart?.prompt.startsWith('/') ? promptPart.prompt.slice(1) : null
+  const inSlash = slashQuery !== null
+  // Esc/tap-outside/pick keeps the list closed until the query text changes again.
+  const [slashDismissed, setSlashDismissed] = useState(false)
+  const [prevSlash, setPrevSlash] = useState(slashQuery)
+  if (prevSlash !== slashQuery) { setPrevSlash(slashQuery); setSlashDismissed(false) }
+  useEffect(() => { if (inSlash) reloadPresets() }, [inSlash, reloadPresets])
+  const [inputBox, setInputBox] = useState<HTMLDivElement | null>(null)
+  const pickPreset = async (p: PromptPreset) => {
+    if (!promptPart || slashQuery === null) return
+    setSlashDismissed(true)
+    const next = await resolvePresetPick(p.body, splitSlash(slashQuery).arg)
+    if (next !== null) setText(promptPart.head + next)
+    inputRef.current?.focus()
+  }
 
   // Await creation; only close on success. On failure keep the palette open with
   // a visible reason (audit B3) — never close silently.
@@ -218,7 +251,7 @@ function PaletteBody({ onClose, initial, shell, actions, vaultEnabled = false, n
   const body = (
     <div className="flex flex-col max-h-[min(70dvh,560px)] md:max-h-[min(70vh,560px)]">
       <h2 id={titleId} className="sr-only">命令面板</h2>
-      <div className="flex items-center gap-2 px-3 border-b border-[var(--border-subtle)]">
+      <div ref={setInputBox} className="flex items-center gap-2 px-3 border-b border-[var(--border-subtle)]">
         <Search size={16} className="shrink-0 text-[var(--fg-subtle)]" />
         <input ref={inputRef} autoFocus value={text} onKeyDown={onKey} maxLength={512}
           onChange={e => { setText(e.target.value); setDirPick(0); setCreateError(null); if (!e.target.value) setForcedNew(initial?.mode === 'new') }}
@@ -226,6 +259,9 @@ function PaletteBody({ onClose, initial, shell, actions, vaultEnabled = false, n
           aria-label="命令" role="combobox" aria-expanded aria-controls={`${titleId}-list`}
           className="flex-1 min-w-0 min-h-[48px] bg-transparent outline-none text-ui-input text-[var(--fg)] placeholder:text-[var(--fg-subtle)]" />
       </div>
+      <PresetPicker open={inSlash && !slashDismissed} query={slashQuery ?? ''} presets={presetStore.presets} anchor={inputBox}
+        onPick={p => { pickPreset(p) }} onClose={() => setSlashDismissed(true)}
+        onManage={() => { onClose(); onManagePresets?.() }} />
       {newMode ? (
         <div className="p-2 space-y-2">
           <div role="radiogroup" aria-label="会话类型" className="flex flex-wrap gap-1">

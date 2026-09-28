@@ -7,7 +7,6 @@ import * as api from '../../../lib/api'
 import type { SearchResult, SessionInfo } from '../../../lib/api'
 import { mkSession } from '../../../test/appHarness'
 import { LAST_TYPE_KEY } from '../../../lib/paletteParse'
-import type { SessionControls } from '../../../lib/sessionControls'
 
 const sec = <T,>(kind: 'dirs' | 'notes', items: T[]) => ({ kind, indexing: false, refreshing: false, truncated: false, items })
 const R = (dirs: SearchResult['dirs'], notes: SearchResult['notes']): SearchResult => ({ dirs, notes })
@@ -166,7 +165,7 @@ describe('CommandPalette', () => {
   // 9
   it('action section: 主题 / 笔记 / tmux attach', () => {
     const actions = buildPaletteActions({
-      isAdmin: false, vaultEnabled: true, active: null, activeActions: [], queueMode: undefined, setQueueMode: vi.fn(),
+      isAdmin: false, vaultEnabled: true, active: null, activeActions: [],
       next: vi.fn(), toggleTheme: vi.fn(), openPanel: vi.fn(), openVault: vi.fn(), openContext: vi.fn(), openMemory: vi.fn(), logout: vi.fn(),
     })
     const { type } = setup({ actions, sh: shell({ hostTmux: [{ name: 'vscode-dev', windows: 1, attached: 0, created: 0, path: '/w' }] }) })
@@ -292,33 +291,37 @@ describe('CommandPalette', () => {
     setup({ initial: { mode: 'new' }, vaultEnabled: true })
     expect(screen.getAllByRole('radio').map(r => r.textContent)).toEqual(['Claude Code' + 'Claude', 'Codex' + 'Codex', 'Kiro Crew' + 'Crew', '终端', '笔记库'])
   })
-
-  // Step 8.2 — temporary queue-mode action until the composer chip (Task 12).
-  it('queue-mode action shows the backend-authoritative mode and flips it through controls', () => {
-    const c = { setQueueMode: vi.fn() } as unknown as SessionControls
-    const active = mkSession('a1', { name: 'agent' })
+  // The temporary queue-mode action (Step 8.2) moved to the composer chip (Task 12,
+  // QueueChip.test). The palette no longer offers it.
+  it('the palette no longer offers a queue-mode action', () => {
     const actions = buildPaletteActions({
-      isAdmin: false, vaultEnabled: false, active, activeActions: [], queueMode: 'interrupt', setQueueMode: (id: string, m: string) => ({ a1: c } as Record<string, SessionControls>)[id]?.setQueueMode(m),
+      isAdmin: false, vaultEnabled: false, active: mkSession('a1', { name: 'agent' }), activeActions: [],
       next: vi.fn(), toggleTheme: vi.fn(), openPanel: vi.fn(), openVault: vi.fn(), openContext: vi.fn(), openMemory: vi.fn(), logout: vi.fn(),
     })
-    const { type, key } = setup({ actions })
-    type('队列')
-    expect(screen.getByText('切换队列模式(当前:Interrupt)')).toBeInTheDocument()
-    key('Enter')
-    expect(c.setQueueMode).toHaveBeenCalledWith('collect')
+    expect(actions.some(a => a.id === 'queue-mode' || a.label.includes('队列'))).toBe(false)
   })
-  it('queue-mode label is never overridden locally: it shows the prop until the backend reports a change (I-6)', () => {
-    const setQueueMode = vi.fn()
-    const active = mkSession('a1', { name: 'agent' })
-    const mk = (queueMode: string) => buildPaletteActions({
-      isAdmin: false, vaultEnabled: false, active, activeActions: [], queueMode, setQueueMode,
-      next: vi.fn(), toggleTheme: vi.fn(), openPanel: vi.fn(), openVault: vi.fn(), openContext: vi.fn(), openMemory: vi.fn(), logout: vi.fn(),
-    })
-    const { type, key } = setup({ actions: mk('interrupt') })
-    type('队列')
-    key('Enter')
-    expect(setQueueMode).toHaveBeenCalledWith('a1', 'collect')
-    // The flip is not delivered yet (prop unchanged) → the label still shows the backend value.
-    expect(screen.getByText('切换队列模式(当前:Interrupt)')).toBeInTheDocument()
+
+  // V7: the new-mode prompt reuses the composer's `/` PresetPicker.
+  it('new mode: `/` in the prompt part opens the preset picker; a pick fills only the prompt; 管理… opens the Sheet', async () => {
+    vi.spyOn(api, 'listPrompts').mockResolvedValue([
+      { id: '1', title: 'fix bug', body: '修复:{{input}}', created_at: '', updated_at: '', sort_order: 0 },
+      { id: '2', title: 'review', body: '请审查', created_at: '', updated_at: '', sort_order: 0 },
+    ])
+    const onManagePresets = vi.fn()
+    const { input, type, key, sh, onClose } = setup({ initial: { mode: 'new' }, onManagePresets })
+    type('codex /w/p /fix 登录页')
+    await screen.findByRole('option', { name: /fix bug/ })
+    expect(screen.queryByRole('option', { name: /review/ })).toBeNull()
+    key('Enter')   // picks — must not create the session
+    await waitFor(() => expect(input().value).toBe('codex /w/p 修复:登录页'))
+    expect(sh.create).not.toHaveBeenCalled()
+    expect(screen.queryByRole('listbox', { name: '常用 prompt' })).toBeNull()
+    // Directory part starting with / is a path, not a preset trigger.
+    type('claude /w/p')
+    expect(screen.queryByRole('listbox', { name: '常用 prompt' })).toBeNull()
+    type('claude /w/p /')
+    fireEvent.click(await screen.findByText('管理…'))
+    expect(onClose).toHaveBeenCalled()
+    expect(onManagePresets).toHaveBeenCalledTimes(1)
   })
 })

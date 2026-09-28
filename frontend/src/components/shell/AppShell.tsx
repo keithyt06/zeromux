@@ -117,15 +117,12 @@ export function AppShell({ user, theme, onLogout, onAuthLost }: {
     openPalette({ mode: 'new', text: askAgentPaletteText(loadLastType(), t.absDir, askAgentPrompt(t)) })
   }, [openPalette])
 
-  const { controls } = shell
-  const setQueueMode = useCallback((id: string, mode: string) => controls.current[id]?.setQueueMode(mode), [controls])
+  const openPrompts = useCallback(() => setPanel('prompts'), [])
   // The callbacks read refs only when an action runs (click / Enter), never during render.
   // eslint-disable-next-line react-hooks/refs
   const actions = buildPaletteActions({
     isAdmin: user?.role === 'admin', vaultEnabled, active,
     activeActions: active ? actionsFor(active) : [],
-    queueMode: active ? shell.queueModes[active.id] : undefined,
-    setQueueMode,
     next, toggleTheme: theme.toggle, openPanel: setPanel,
     openVault: () => { shell.create('vault') },
     openContext: tab => { if (active) openContext(active.id, tab) },
@@ -156,7 +153,7 @@ export function AppShell({ user, theme, onLogout, onAuthLost }: {
                 onAskAgent={(prompt) => { shell.create('claude', s.work_dir, undefined, prompt).catch(() => toast.push({ message: '创建会话失败' })) }} />
             ) : (
               <AcpChatView sessionId={s.id} active={isActive} agentType={s.type} onRegisterControls={shell.registerControls}
-                onQueueModeChange={shell.onQueueModeChange} onOpenMemory={s.type === 'crew' ? () => setMemoryOpen(true) : undefined}
+                onQueueModeChange={shell.onQueueModeChange} queueMode={shell.queueModes[s.id] ?? 'collect'} onManagePresets={openPrompts} onOpenMemory={s.type === 'crew' ? () => setMemoryOpen(true) : undefined}
                 peerNames={peerNames} onOpenChanges={openChanges}
                 onCtxUsage={shell.onCtxUsage} />
             )}
@@ -292,7 +289,7 @@ export function AppShell({ user, theme, onLogout, onAuthLost }: {
       </main>
       {fab}
       {contextSheet}
-      <CommandPalette open={!!palette} onClose={() => setPalette(null)} initial={palette ?? undefined} shell={shell} actions={actions} vaultEnabled={vaultEnabled} now={now} />
+      <CommandPalette open={!!palette} onClose={() => setPalette(null)} initial={palette ?? undefined} shell={shell} actions={actions} vaultEnabled={vaultEnabled} now={now} onManagePresets={openPrompts} />
       <RenameDialog session={sessions.find(s => s.id === renamingId) ?? null} onClose={() => setRenamingId(null)} onSave={shell.rename} />
       {panel === 'admin' && <Suspense fallback={null}><AdminPanel open onClose={() => setPanel(null)} /></Suspense>}
       {panel === 'scheduled' && <Suspense fallback={null}><ScheduledTasksPanel open onClose={() => setPanel(null)} /></Suspense>}

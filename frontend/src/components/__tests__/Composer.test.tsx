@@ -64,3 +64,26 @@ describe('Composer', () => {
     expect(onSend).toHaveBeenCalledWith('你好')
   })
 })
+
+describe('Composer onSlash (line-start / presets)', () => {
+  it('reports the query after / while the value starts with /, then null once it stops', () => {
+    const onSlash = vi.fn()
+    const el = (value: string) => <Composer value={value} onChange={() => {}} onSend={() => {}} submitOnEnter onSlash={onSlash} />
+    const { rerender } = render(el('hello'))
+    expect(onSlash).not.toHaveBeenCalled()
+    rerender(el('/'))
+    expect(onSlash).toHaveBeenLastCalledWith('')
+    rerender(el('/fix 登录页'))
+    expect(onSlash).toHaveBeenLastCalledWith('fix 登录页')
+    rerender(el('fix'))
+    expect(onSlash).toHaveBeenLastCalledWith(null)
+    const n = onSlash.mock.calls.length
+    rerender(el('fixed'))
+    expect(onSlash).toHaveBeenCalledTimes(n) // null is sent once, on the transition only
+  })
+
+  it('renders leftSlot inside the input box', () => {
+    render(<Composer value="" onChange={() => {}} onSend={() => {}} submitOnEnter placeholder="p" leftSlot={<span data-testid="ls" />} />)
+    expect(screen.getByPlaceholderText('p').parentElement).toContainElement(screen.getByTestId('ls'))
+  })
+})

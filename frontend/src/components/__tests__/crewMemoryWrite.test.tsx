@@ -41,6 +41,8 @@ describe('T15-c 走代理端点：路径不带 key，凭证不进前端', () => 
   it('composer 的「记住」PUT 到 /api/crew/memory/semantic —— 路径不带 key', async () => {
     const calls = captureFetch()
     render(<AcpChatView sessionId="s1" active agentType="crew" />)
+    // V8: ⌘ 记忆收进输入框内「＋」菜单 —— 先开菜单。
+    await act(async () => { screen.getByLabelText('更多').click() })
     await act(async () => { screen.getByLabelText('memory').click() })
     const input = await screen.findByLabelText('memory draft')
     // 受控 input:必须走 fireEvent.change(React 合成事件),直接 dispatch 原生
@@ -82,6 +84,8 @@ describe('T15-c 走代理端点：路径不带 key，凭证不进前端', () => 
     }) as unknown as typeof fetch
 
     render(<AcpChatView sessionId="s1" active agentType="crew" />)
+    // V8: ⌘ 记忆收进输入框内「＋」菜单 —— 先开菜单。
+    await act(async () => { screen.getByLabelText('更多').click() })
     await act(async () => { screen.getByLabelText('memory').click() })
     // 最近 5 条直接可见(0 tap),✕ 常驻(不用 group-hover:手机上会变隐形按钮)。
     const x = await screen.findByTestId('mem-forget')
@@ -97,6 +101,8 @@ describe('T15-c 走代理端点：路径不带 key，凭证不进前端', () => 
   it('写入成功后在对话流留一行回执（可见性靠回执，不靠面板）', async () => {
     captureFetch()
     render(<AcpChatView sessionId="s1" active agentType="crew" />)
+    // V8: ⌘ 记忆收进输入框内「＋」菜单 —— 先开菜单。
+    await act(async () => { screen.getByLabelText('更多').click() })
     await act(async () => { screen.getByLabelText('memory').click() })
     const input = await screen.findByLabelText('memory draft')
     fireEvent.change(input, { target: { value: '提交前必须先跑 npm test' } })

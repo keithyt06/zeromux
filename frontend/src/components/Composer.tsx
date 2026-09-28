@@ -1,4 +1,4 @@
-import { useRef, useEffect, type KeyboardEvent, type ReactNode } from 'react'
+import { useRef, useEffect, useEffectEvent, type KeyboardEvent, type ReactNode } from 'react'
 import { Send } from 'lucide-react'
 
 interface ComposerProps {
@@ -13,6 +13,11 @@ interface ComposerProps {
   placeholder?: string
   /** Optional extra control rendered between textarea and send (e.g. a future MicButton). */
   rightSlot?: ReactNode
+  /** Controls rendered inside the input box, bottom row (agent: queue chip + 「＋」). */
+  leftSlot?: ReactNode
+  /** Line-start `/` mode: called with the text after `/` on every change while the
+   *  value starts with `/`, and once with `null` when it stops doing so. */
+  onSlash?: (query: string | null) => void
 }
 
 function autoResize(t: HTMLTextAreaElement) {
@@ -21,9 +26,15 @@ function autoResize(t: HTMLTextAreaElement) {
 }
 
 export default function Composer({
-  value, onChange, onSend, submitOnEnter, placeholder, rightSlot,
+  value, onChange, onSend, submitOnEnter, placeholder, rightSlot, leftSlot, onSlash,
 }: ComposerProps) {
   const inputRef = useRef<HTMLTextAreaElement>(null)
+  const slash = useEffectEvent((q: string | null) => onSlash?.(q))
+  const inSlash = useRef(false)
+  useEffect(() => {
+    if (value.startsWith('/')) { inSlash.current = true; slash(value.slice(1)) }
+    else if (inSlash.current) { inSlash.current = false; slash(null) }
+  }, [value])
 
   // Re-fit height whenever value changes from the outside (e.g. voice transcript
   // appended, or cleared after send) — onInput only fires for user typing.
@@ -49,25 +60,28 @@ export default function Composer({
   }
 
   return (
-    <div className="flex gap-2">
-      <textarea
-        ref={inputRef}
-        value={value}
-        onChange={e => onChange(e.target.value)}
-        onKeyDown={handleKeyDown}
-        placeholder={placeholder}
-        rows={1}
-        /* text-base = 16px：低于 16px 时 iOS Safari 聚焦会自动放大整页，把右侧发送键挤出视口。 */
-        className="flex-1 px-3 py-2 bg-[var(--bg-primary)] border border-[var(--border)] rounded-lg text-base text-[var(--text-primary)] placeholder-[var(--text-muted)] outline-none focus:border-[var(--accent-blue)] resize-none min-h-[40px] max-h-[120px]"
-        style={{ height: 'auto', overflow: 'hidden' }}
-        onInput={e => autoResize(e.target as HTMLTextAreaElement)}
-      />
+    <div className="flex items-end gap-2">
+      <div className="flex-1 min-w-0 flex flex-col bg-[var(--bg-primary)] border border-[var(--border)] rounded-lg focus-within:border-[var(--accent-blue)]">
+        <textarea
+          ref={inputRef}
+          value={value}
+          onChange={e => onChange(e.target.value)}
+          onKeyDown={handleKeyDown}
+          placeholder={placeholder}
+          rows={1}
+          /* text-base = 16px：低于 16px 时 iOS Safari 聚焦会自动放大整页，把右侧发送键挤出视口。 */
+          className="w-full px-3 py-2 bg-transparent text-base text-[var(--text-primary)] placeholder-[var(--text-muted)] outline-none resize-none min-h-[40px] max-h-[120px]"
+          style={{ height: 'auto', overflow: 'hidden' }}
+          onInput={e => autoResize(e.target as HTMLTextAreaElement)}
+        />
+        {leftSlot && <div className="flex items-center gap-1 px-1">{leftSlot}</div>}
+      </div>
       {rightSlot}
       <button
         onClick={send}
         disabled={!value.trim()}
         aria-label="send"
-        className="self-end p-2 bg-[var(--accent-green)] hover:bg-[var(--accent-green-hover)] disabled:bg-[var(--btn-disabled-bg)] disabled:text-[var(--btn-disabled-text)] text-white rounded-lg transition-colors"
+        className="shrink-0 inline-flex items-center justify-center w-9 h-9 bg-[var(--accent-green)] hover:bg-[var(--accent-green-hover)] disabled:bg-[var(--btn-disabled-bg)] disabled:text-[var(--btn-disabled-text)] text-white rounded-lg transition-colors"
         title="Send"
       >
         <Send size={16} />

@@ -19,6 +19,7 @@ import { partitionBlocks, type Density } from '../lib/density'
 import { STUCK_SILENCE_MS, shouldSeedTurnClock } from '../lib/stuck'
 import { shouldStickToBottom, shouldAutoScrollOnAppend, shouldTrackScrollUp } from '../lib/scrollReplay'
 import { shouldClearQueuedHint, busyAfterReplay, replaySilenceBaseline } from '../lib/collectHint'
+import type { PendingApproval, RegisterControls } from '../lib/sessionControls'
 
 // ── Message types ──
 
@@ -74,7 +75,7 @@ interface Props {
   agentType?: 'claude' | 'crew' | 'codex'
   // Lets the parent (App→SessionInfoBar) drive WS-only controls that live in
   // this component. Registered on mount, cleared on unmount. (G2b queue mode.)
-  onRegisterControls?: (sessionId: string, api: { setQueueMode: (mode: string) => void; sendPrompt: (text: string) => boolean } | null) => void
+  onRegisterControls?: RegisterControls
   // Report the backend-authoritative queue mode UP to App so the sibling
   // SessionInfoBar dropdown reflects the real mode (review 2026-07-28). The
   // functional path uses queueModeRef; this only mirrors the same value into
@@ -314,11 +315,12 @@ export default function AcpChatView({ sessionId, agentType = 'claude', onRegiste
   // 审批上行。照 interrupt 的形状（同一条 /ws/acp socket，后端 fan-out 代理
   // POST /api/approvals/{id}/{action}）—— 不新开连接、不新增轮询。
   // resolve 后本地把该块标 resolved，按钮消失（不等服务端回帧，Gateway 不回执）。
-  const resolveApproval = useCallback((approvalId: string, action: 'approve' | 'reject') => {
-    if (wsRef.current?.readyState === WebSocket.OPEN) {
-      wsRef.current.send(JSON.stringify({ type: 'approval', approval_id: approvalId, action }))
-    }
+  // socket 未 OPEN → 返回 false、不标 resolved（否则按钮消失但决定从未送达）。
+  const resolveApproval = useCallback((approvalId: string, action: 'approve' | 'reject'): boolean => {
+    if (wsRef.current?.readyState !== WebSocket.OPEN) return false
+    wsRef.current.send(JSON.stringify({ type: 'approval', approval_id: approvalId, action }))
     setResolvedApprovals(prev => (prev[approvalId] ? prev : { ...prev, [approvalId]: action }))
+    return true
   }, [])
 
   // Mark the in-flight turn's group complete when a turn ends via error/exit rather
@@ -753,12 +755,14 @@ export default function AcpChatView({ sessionId, agentType = 'claude', onRegiste
   const stuck = busy && lastEventMs != null && (nowMs - lastEventMs) > STUCK_SILENCE_MS
   const silenceSecs = lastEventMs != null ? Math.floor((nowMs - lastEventMs) / 1000) : 0
 
-  const interrupt = useCallback(() => {
-    if (wsRef.current?.readyState === WebSocket.OPEN) {
-      wsRef.current.send(JSON.stringify({ type: 'interrupt' }))
-    }
+  // false = socket not OPEN: nothing sent, so the queued hint must stay (the
+  // backend never saw the interrupt and still holds the collect queue).
+  const interrupt = useCallback((): boolean => {
+    if (wsRef.current?.readyState !== WebSocket.OPEN) return false
+    wsRef.current.send(JSON.stringify({ type: 'interrupt' }))
     // Backend clears the pending collect queue on interrupt (E5); mirror locally.
     setQueuedCount(0)
+    return true
   }, [])
 
   const setQueueMode = useCallback((mode: string) => {
@@ -776,12 +780,25 @@ export default function AcpChatView({ sessionId, agentType = 'claude', onRegiste
     }
   }, [adoptQueueMode])
 
+  // Latest events / resolved map mirrored into refs so pendingApprovals stays a
+  // stable callback — otherwise the registration effect below would re-run on
+  // every streamed event.
+  const eventsRef = useRef<WireEvent[]>([])
+  useEffect(() => { eventsRef.current = events }, [events])
+  const resolvedRef = useRef(resolvedApprovals)
+  useEffect(() => { resolvedRef.current = resolvedApprovals }, [resolvedApprovals])
+  const pendingApprovals = useCallback((): PendingApproval[] =>
+    eventsRef.current
+      .filter(e => e.type === 'content_block' && e.block_type === 'approval' && e.approval_id && !resolvedRef.current[e.approval_id])
+      .map(e => ({ id: e.approval_id!, tool: e.name ?? '', ...(e.summary ? { purpose: e.summary } : {}) })),
+  [])
+
   // Register WS-only controls so SessionInfoBar (rendered by App, a sibling)
   // can drive them for the active session. Clear on unmount.
   useEffect(() => {
-    onRegisterControls?.(sessionId, { setQueueMode, sendPrompt })
+    onRegisterControls?.(sessionId, { setQueueMode, sendPrompt, interrupt, resolveApproval, pendingApprovals })
     return () => onRegisterControls?.(sessionId, null)
-  }, [sessionId, setQueueMode, sendPrompt, onRegisterControls])
+  }, [sessionId, setQueueMode, sendPrompt, interrupt, resolveApproval, pendingApprovals, onRegisterControls])
 
   // Esc closes the preset popover (parity with the Sidebar pick-prompt step).
   useEffect(() => {

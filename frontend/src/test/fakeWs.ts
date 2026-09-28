@@ -19,11 +19,13 @@ export interface FakeSocket {
 }
 
 /** 装上替身，返回「取最近一个实例」的句柄。调用方在 afterEach 里 restore。 */
-export function installFakeWebSocket(): { latest: () => FakeSocket; all: FakeSocket[] } {
+// startConnecting: 构造时 readyState=CONNECTING(0),close() 同步触发 onclose ——
+// 用于测 onopen 清空 / 退避重连这类依赖真实连接态的行为。默认关闭,旧测试行为不变。
+export function installFakeWebSocket(opts: { startConnecting?: boolean } = {}): { latest: () => FakeSocket; all: FakeSocket[] } {
   const all: FakeSocket[] = []
   class Fake implements FakeSocket {
     static OPEN = 1
-    readyState = 1              // OPEN：sendPrompt / interrupt / approval 的守卫要求
+    readyState = opts.startConnecting ? 0 : 1   // 默认 OPEN：sendPrompt / interrupt / approval 的守卫要求
     sent: string[] = []
     onopen: (() => void) | null = null
     onclose: (() => void) | null = null
@@ -34,7 +36,7 @@ export function installFakeWebSocket(): { latest: () => FakeSocket; all: FakeSoc
     url: string
     constructor(url: string) { this.url = url; all.push(this) }
     send(data: string) { this.sent.push(data) }
-    close() { this.readyState = 3 }
+    close() { const was = this.readyState; this.readyState = 3; if (opts.startConnecting && was !== 3) this.onclose?.() }
     emit(evt: unknown) { this.onmessage?.({ data: JSON.stringify(evt) }) }
     fireOpen() { this.readyState = 1; this.onopen?.() }
     fireClose() { this.readyState = 3; this.onclose?.() }

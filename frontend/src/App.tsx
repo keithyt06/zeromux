@@ -29,6 +29,7 @@ import { type DocTab, newDocTab, isDocTabId, loadDocTabs, saveDocTabs, resolveAc
 import { pickDocTabForTarget } from './lib/docTarget'
 import type { AskAgentTarget } from './lib/askAgent'
 import { peerNamesKey, peerNamesFromKey } from './lib/peer'
+import type { SessionControls, RegisterControls } from './lib/sessionControls'
 
 type AuthState = 'loading' | 'unauthenticated' | 'pending' | 'active'
 type OverlayView = 'none' | 'files' | 'git' | 'events' | 'memory'
@@ -59,8 +60,8 @@ export default function App() {
   const baselineInit = useRef(false)
   // WS-only controls each AcpChatView registers, keyed by session id, so the
   // sibling SessionInfoBar can drive them (G2b queue mode).
-  const sessionControls = useRef<Record<string, { setQueueMode: (mode: string) => void; sendPrompt: (text: string) => boolean }>>({})
-  const registerControls = useCallback((sid: string, api: { setQueueMode: (mode: string) => void; sendPrompt: (text: string) => boolean } | null) => {
+  const sessionControls = useRef<Record<string, SessionControls>>({})
+  const registerControls = useCallback<RegisterControls>((sid, api) => {
     if (api) sessionControls.current[sid] = api
     else delete sessionControls.current[sid]
   }, [])

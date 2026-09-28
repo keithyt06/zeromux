@@ -108,7 +108,10 @@ Worktree isolation is **opt-in** via `--worktree-isolation` (default OFF). `git 
 
 ### Frontend (`frontend/src/`)
 
-React 19 + Vite + Tailwind v4. `App.tsx` owns auth state, the session list, and active-session/overlay routing. Views: `TerminalView` (xterm.js + WebGL addon), `AcpChatView` (agent chat), `GitViewer`. Switching views uses CSS visibility toggling, not unmount, to preserve terminal/scroll state. Markdown rendering (`components/markdown/`) supports KaTeX math, mermaid diagrams, and syntax highlighting, with content hashing + caching to avoid re-render churn — agents are instructed (Codex via a developer-role preamble) to emit `$...$` math, ```` ```mermaid ```` blocks, and pipe tables to match these renderers.
+React 19 + Vite + Tailwind v4. `App.tsx` is auth gating only; the UI is `components/shell/AppShell` — triage queue (`lib/triage.ts`), ⌘K `CommandPalette`, `FocusHeader`, and `ContextPanel` (Git / 文件 / 运行 tabs) — one stable layout tree across breakpoints.
+Session panes (`TerminalView` xterm.js+WebGL, `AcpChatView`) are always mounted and toggled with `hidden` (`data-session-pane`), never unmounted, so terminal/WS/scroll state survives switching. Shell actions reach a session through `sessionControls` (`lib/sessionControls.ts`), never a new WS.
+`AcpChatView` uses `hooks/useAcpSocket` and `components/turn/TurnView` (timeline → summary card). `frontend/src/__tests__/App.characterization.test.tsx` is the invariant contract — keep it green unchanged.
+Markdown rendering (`components/markdown/`) supports KaTeX math, mermaid diagrams, and syntax highlighting, with content hashing + caching to avoid re-render churn — agents are instructed (Codex via a developer-role preamble) to emit `$...$` math, ```` ```mermaid ```` blocks, and pipe tables to match these renderers.
 
 设计系统:语义 token 在 `src/index.css`(旧 `--bg-*`/`--text-*` 为别名),primitives 在 `src/components/ui/`(原生 `<dialog>`,零依赖);`npm run lint` 含 token 棘轮与对比度校验,`npm run build` 含首屏 br ≤ 330KB 门禁。
 

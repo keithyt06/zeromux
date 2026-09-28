@@ -1,4 +1,4 @@
-import { useState, useEffect, useCallback, useMemo, useRef } from 'react'
+import { useState, useEffect, useCallback, useMemo, useRef, lazy, Suspense } from 'react'
 import type { SessionInfo, SessionType, UserInfo, HostTmux } from './lib/api'
 import { listSessions, listSessionsWithHost, createSession, deleteSession, closeCheck, checkAuth, legacyLogin, clearAuth, renameSession, listConfirmations, getSessionStatus, isAuthError } from './lib/api'
 import { deepLinkView } from './lib/deeplink'
@@ -13,16 +13,17 @@ import AcpChatView from './components/AcpChatView'
 import LoginPage from './components/LoginPage'
 import WaitingPage from './components/WaitingPage'
 import SessionInfoBar from './components/SessionInfoBar'
-import FileBrowser from './components/FileBrowser'
-import GitViewer from './components/GitViewer'
-import AgentDashboard from './components/AgentDashboard'
-import VaultReader from './components/VaultReader'
-import MemoryPanel from './components/MemoryPanel'
-import AdminPanel from './components/AdminPanel'
-import ScheduledTasksPanel from './components/ScheduledTasksPanel'
-import PushSettings from './components/PushSettings'
-import PromptsSheet from './components/PromptsSheet'
-import { Toaster, DialogHost, toast, confirm } from './components/ui'
+import { Toaster, DialogHost, Skeleton, toast, confirm } from './components/ui'
+// Off the first-screen graph (spec v3 M27): these are opened on demand.
+const FileBrowser = lazy(() => import('./components/FileBrowser'))
+const GitViewer = lazy(() => import('./components/GitViewer'))
+const AgentDashboard = lazy(() => import('./components/AgentDashboard'))
+const VaultReader = lazy(() => import('./components/VaultReader'))
+const MemoryPanel = lazy(() => import('./components/MemoryPanel'))
+const AdminPanel = lazy(() => import('./components/AdminPanel'))
+const ScheduledTasksPanel = lazy(() => import('./components/ScheduledTasksPanel'))
+const PushSettings = lazy(() => import('./components/PushSettings'))
+const PromptsSheet = lazy(() => import('./components/PromptsSheet'))
 import { undoCloseToast } from './lib/undoCloseToast'
 import { type DocTab, newDocTab, isDocTabId, loadDocTabs, saveDocTabs, resolveActivePane, DEFAULT_DOC_TITLE } from './lib/docTabs'
 import { pickDocTabForTarget } from './lib/docTarget'
@@ -463,11 +464,13 @@ export default function App() {
                     <AcpChatView sessionId={s.id} active={isActive && view === 'none'} agentType={s.type} onRegisterControls={registerControls} onQueueModeChange={handleQueueModeChange} showMetrics={!!metricsOpen[s.id]} onOpenMemory={s.type === 'crew' ? () => toggleOverlay(s.id, 'memory') : undefined} peerNames={peerNames} />
                   )}
                 </div>
-                {view === 'files' && <FileBrowser sessionId={s.id} />}
-                {view === 'git' && <GitViewer sessionId={s.id} onForward={s.type !== 'tmux' ? (t) => sessionControls.current[s.id]?.sendPrompt(t) ?? false : undefined} />}
-                {view === 'events' && <AgentDashboard sessionId={s.id} />}
-                {/* 记忆是 Crew 侧全局的（一份 Gateway 一份记忆），故不接 sessionId。 */}
-                {view === 'memory' && <MemoryPanel />}
+                <Suspense fallback={<Skeleton rows={4} />}>
+                  {view === 'files' && <FileBrowser sessionId={s.id} />}
+                  {view === 'git' && <GitViewer sessionId={s.id} onForward={s.type !== 'tmux' ? (t) => sessionControls.current[s.id]?.sendPrompt(t) ?? false : undefined} />}
+                  {view === 'events' && <AgentDashboard sessionId={s.id} />}
+                  {/* 记忆是 Crew 侧全局的（一份 Gateway 一份记忆），故不接 sessionId。 */}
+                  {view === 'memory' && <MemoryPanel />}
+                </Suspense>
               </div>
             )
           })}
@@ -475,7 +478,9 @@ export default function App() {
             const isActive = t.id === activeId
             return (
               <div key={t.id} className={`absolute inset-0 ${isActive ? '' : 'hidden'}`}>
-                <VaultReader onTitleChange={(title) => updateDocTabTitle(t.id, title)} target={docTargets[t.id] ?? null} onAskAgent={handleAskAgent} />
+                <Suspense fallback={null}>
+                  <VaultReader onTitleChange={(title) => updateDocTabTitle(t.id, title)} target={docTargets[t.id] ?? null} onAskAgent={handleAskAgent} />
+                </Suspense>
               </div>
             )
           })}
@@ -485,10 +490,10 @@ export default function App() {
             </div>
           )}
         </div>
-        {panel === 'admin' && <AdminPanel open onClose={() => setPanel(null)} />}
-        {panel === 'scheduled' && <ScheduledTasksPanel open onClose={() => setPanel(null)} />}
-        {panel === 'push' && <PushSettings open onClose={() => setPanel(null)} />}
-        {panel === 'prompts' && <PromptsSheet open onClose={() => setPanel(null)} />}
+        {panel === 'admin' && <Suspense fallback={null}><AdminPanel open onClose={() => setPanel(null)} /></Suspense>}
+        {panel === 'scheduled' && <Suspense fallback={null}><ScheduledTasksPanel open onClose={() => setPanel(null)} /></Suspense>}
+        {panel === 'push' && <Suspense fallback={null}><PushSettings open onClose={() => setPanel(null)} /></Suspense>}
+        {panel === 'prompts' && <Suspense fallback={null}><PromptsSheet open onClose={() => setPanel(null)} /></Suspense>}
         <Toaster /><DialogHost />
       </main>
     </div>

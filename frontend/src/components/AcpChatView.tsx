@@ -1,4 +1,4 @@
-import { useState, useEffect, useRef, useCallback, useMemo, memo, createElement } from 'react'
+import { useState, useEffect, useRef, useCallback, useMemo, memo, createElement, lazy, Suspense } from 'react'
 import { wsUrl, uploadSessionFile, getSessionRuns, getCrewMemory, putCrewSemantic, deleteCrewSemantic } from '../lib/api'
 import type { SemanticEntry } from '../lib/api'
 import { normalizeMemoryKey, parseSemanticValue } from '../lib/crewMemory'
@@ -12,7 +12,7 @@ import PromptManager from './PromptManager'
 import { usePromptPresets } from '../lib/usePromptPresets'
 import { applyPreset } from '../lib/applyPreset'
 import { buildPromptWithAttachments } from '../lib/attachments'
-import { RunMetricsPanel } from './RunMetricsPanel'
+const RunMetricsPanel = lazy(() => import('./RunMetricsPanel').then(m => ({ default: m.RunMetricsPanel })))
 import { SessionLifetimeBadge } from './SessionLifetimeBadge'
 import { foldTranscript, stabilizeGroups, type WireEvent, type Block, type TurnGroup } from '../lib/transcript'
 import { partitionBlocks, type Density } from '../lib/density'
@@ -822,12 +822,14 @@ export default function AcpChatView({ sessionId, agentType = 'claude', onRegiste
         </div>
       )}
       {showMetrics && (
-        <RunMetricsPanel
-          sessionId={sessionId}
-          turnStartedMs={turnStartedMs}
-          running={busy}
-          refreshKey={metricsRefresh}
-        />
+        <Suspense fallback={null}>
+          <RunMetricsPanel
+            sessionId={sessionId}
+            turnStartedMs={turnStartedMs}
+            running={busy}
+            refreshKey={metricsRefresh}
+          />
+        </Suspense>
       )}
       <div
         ref={scrollRef}

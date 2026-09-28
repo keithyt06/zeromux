@@ -7,6 +7,8 @@ import { defaultGitTab, COMMIT_PROMPT, DISCARD_PROMPT } from '../lib/gitviewer'
 interface Props {
   sessionId: string
   onForward?: (text: string) => boolean
+  /** Opening tab (push deep link → 'worktree'); the git_dirty status default still runs after mount. */
+  initialTab?: 'worktree' | 'history'
 }
 
 // Colors for graph lanes
@@ -25,7 +27,7 @@ function laneColor(index: number): string {
   return LANE_COLORS[index % LANE_COLORS.length]
 }
 
-export default function GitViewer({ sessionId, onForward }: Props) {
+export default function GitViewer({ sessionId, onForward, initialTab }: Props) {
   const [entries, setEntries] = useState<GitGraphEntry[]>([])
   const [total, setTotal] = useState(0)
   const [loading, setLoading] = useState(true)
@@ -43,7 +45,7 @@ export default function GitViewer({ sessionId, onForward }: Props) {
   const [commitMeta, setCommitMeta] = useState<GitCommit | null>(null)
   const [loadingDiff, setLoadingDiff] = useState(false)
 
-  const [tab, setTab] = useState<'worktree' | 'history'>('history')
+  const [tab, setTab] = useState<'worktree' | 'history'>(initialTab ?? 'history')
   const [wt, setWt] = useState<{ files: WorktreeFile[]; diff: string; truncated: boolean; is_git: boolean } | null>(null)
   const [wtSelected, setWtSelected] = useState<string | null>(null)
 
@@ -152,9 +154,9 @@ export default function GitViewer({ sessionId, onForward }: Props) {
           onForward={onForward}
         />
       ) : (
-    <div className="flex flex-1 min-h-0">
+    <div className="flex flex-col @[640px]:flex-row flex-1 min-h-0">
       {/* Commit list with graph */}
-      <div className="w-80 border-r border-[var(--border)] flex flex-col bg-[var(--bg-secondary)] shrink-0">
+      <div className="w-full @[640px]:w-80 max-h-[35%] @[640px]:max-h-none border-b @[640px]:border-b-0 @[640px]:border-r border-[var(--border)] flex flex-col bg-[var(--bg-secondary)] shrink-0">
         <div className="flex items-center justify-between px-3 h-9 border-b border-[var(--border)]">
           <span className="text-[10px] font-semibold text-[var(--text-muted)] uppercase tracking-wider">
             Commits {total > 0 && <span className="normal-case font-normal">({total})</span>}
@@ -289,9 +291,9 @@ function WorktreePanel({ wt, selected, onSelect, onRefresh, onForward }: {
   }
 
   return (
-    <div className="flex flex-1 min-h-0">
+    <div className="flex flex-col @[640px]:flex-row flex-1 min-h-0">
       {/* File list */}
-      <div className="w-80 border-r border-[var(--border)] flex flex-col bg-[var(--bg-secondary)] shrink-0">
+      <div className="w-full @[640px]:w-80 max-h-[35%] @[640px]:max-h-none border-b @[640px]:border-b-0 @[640px]:border-r border-[var(--border)] flex flex-col bg-[var(--bg-secondary)] shrink-0">
         <div className="flex items-center justify-between px-3 h-9 border-b border-[var(--border)]">
           <span className="text-[10px] font-semibold text-[var(--text-muted)] uppercase tracking-wider">
             Files {wt && wt.files.length > 0 && <span className="normal-case font-normal">({wt.files.length})</span>}

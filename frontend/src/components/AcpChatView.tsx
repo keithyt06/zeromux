@@ -1,4 +1,4 @@
-import { useState, useEffect, useRef, useCallback, useMemo, lazy, Suspense } from 'react'
+import { useState, useEffect, useRef, useCallback, useMemo } from 'react'
 import { uploadSessionFile, getSessionRuns, getCrewMemory, putCrewSemantic, deleteCrewSemantic } from '../lib/api'
 import type { SemanticEntry } from '../lib/api'
 import { normalizeMemoryKey, parseSemanticValue } from '../lib/crewMemory'
@@ -8,7 +8,6 @@ import ConnectionBar from './ConnectionBar'
 import PromptManager from './PromptManager'
 import { usePromptPresets } from '../lib/usePromptPresets'
 import { applyPreset } from '../lib/applyPreset'
-const RunMetricsPanel = lazy(() => import('./RunMetricsPanel').then(m => ({ default: m.RunMetricsPanel })))
 import { SessionLifetimeBadge } from './SessionLifetimeBadge'
 import { foldTranscript, stabilizeGroups, type WireEvent, type TurnGroup } from '../lib/transcript'
 import { shouldStickToBottom, shouldAutoScrollOnAppend, shouldTrackScrollUp } from '../lib/scrollReplay'
@@ -30,15 +29,17 @@ interface Props {
   // App state so the visible control can't lie (observer tab / reconnect showing
   // 'Collect' while the backend is 'Interrupt' → an unintended interrupt on send).
   onQueueModeChange?: (sessionId: string, mode: string) => void
-  // Inline run-metrics panel visibility, owned by App (toggled from SessionInfoBar).
-  showMetrics?: boolean
-  // 「全部 →」跳记忆面板（第 5 个 overlay view，由 App 拥有）。未传时 popover 里
+  // 「全部 →」打开记忆面板 Sheet（由 AppShell 拥有）。未传时 popover 里
   // 那个入口仅关弹层，不报错 —— composer 的就地写入不依赖面板存在。
   onOpenMemory?: () => void
   // Claude peer name → session title, for labeling cross-session messages.
   peerNames?: Record<string, string>
-  /** Clicking a turn's touched-file chip (Task 11 wires this to the Git「改动」view). */
-  onOpenChanges?: () => void
+  /** Clicking a turn's touched-file chip opens the ContextPanel Git「改动」view.
+   *  Takes the session id so the shell can pass ONE stable function to every view. */
+  onOpenChanges?: (sessionId: string) => void
+  /** Crew context usage, reported up so FocusHeader shows it. When absent (standalone
+   *  mount) the view renders it inline itself. */
+  onCtxUsage?: (sessionId: string, usage: { used: number; total: number } | null) => void
 }
 
 const EMPTY_PEERS: Record<string, string> = {}
@@ -46,7 +47,7 @@ const EMPTY_PEERS: Record<string, string> = {}
 // `active` is accepted (App passes it for all session views) but no longer used:
 // the Composer owns its own textarea and we intentionally don't auto-focus it,
 // so switching to a chat session doesn't pop the mobile keyboard.
-export default function AcpChatView({ sessionId, agentType = 'claude', onRegisterControls, onQueueModeChange, showMetrics, onOpenMemory, peerNames = EMPTY_PEERS, onOpenChanges }: Props) {
+export default function AcpChatView({ sessionId, agentType = 'claude', onRegisterControls, onQueueModeChange, onOpenMemory, peerNames = EMPTY_PEERS, onOpenChanges, onCtxUsage }: Props) {
   const scrollRef = useRef<HTMLDivElement>(null)
   const replayingRef = useRef(false)
   // True only while the post-replay_done follow ResizeObserver is armed (~2s).
@@ -105,7 +106,7 @@ export default function AcpChatView({ sessionId, agentType = 'claude', onRegiste
   const {
     events, notices, pushNotice,
     busy, turnStartedMs, lastEventMs,
-    queuedCount, wsStatus, ctxUsage, resolvedApprovals, metricsRefresh,
+    queuedCount, wsStatus, ctxUsage: ctxUsageRaw, resolvedApprovals, metricsRefresh,
     sendPrompt, setQueueMode, interrupt, resolveApproval,
   } = useAcpSocket({
     sessionId, onQueueModeChange,
@@ -132,10 +133,13 @@ export default function AcpChatView({ sessionId, agentType = 'claude', onRegiste
     prevGroupsRef.current = stable
     return stable
   }, [events])
+  useEffect(() => { onCtxUsage?.(sessionId, ctxUsageRaw) }, [onCtxUsage, sessionId, ctxUsageRaw])
+  const ctxUsage = onCtxUsage ? null : ctxUsageRaw
   const agentName = agentType === 'crew' ? 'Crew' : agentType === 'codex' ? 'Codex' : 'Claude'
   // Stable identities so TurnView's memo keeps skipping finished turns (I-9).
   const resolveApprovalVoid = useCallback((id: string, a: 'approve' | 'reject') => { resolveApproval(id, a) }, [resolveApproval])
   const onInterrupt = useCallback(() => { interrupt() }, [interrupt])
+  const openChanges = useCallback(() => { onOpenChanges?.(sessionId) }, [onOpenChanges, sessionId])
   const [input, setInput] = useState('')
   const presetStore = usePromptPresets()
   const [presetOpen, setPresetOpen] = useState(false)
@@ -156,8 +160,8 @@ export default function AcpChatView({ sessionId, agentType = 'claude', onRegiste
   const closeMem = useCallback(() => { setMemOpen(false); setMemConfirming(null); setMemErr(null) }, [])
   const [uploading, setUploading] = useState(0)           // 上传中计数
   const fileInputRef = useRef<HTMLInputElement>(null)
-  // Session lifetime (cumulative turns/duration/cost) — fetched from /runs
-  // independently of showMetrics so the header badge is always available.
+  // Session lifetime (cumulative turns/duration/cost) — fetched from /runs so the
+  // header badge is always available.
   const [lifetime, setLifetime] = useState({ turns: 0, duration_ms: 0, cost_usd: 0 })
   useEffect(() => {
     // Guard against out-of-order resolves: metricsRefresh bumps this on every turn
@@ -311,16 +315,6 @@ export default function AcpChatView({ sessionId, agentType = 'claude', onRegiste
           {lifetime.turns > 0 && <SessionLifetimeBadge agentType={agentType} lifetime={lifetime} />}
         </div>
       )}
-      {showMetrics && (
-        <Suspense fallback={null}>
-          <RunMetricsPanel
-            sessionId={sessionId}
-            turnStartedMs={turnStartedMs}
-            running={busy}
-            refreshKey={metricsRefresh}
-          />
-        </Suspense>
-      )}
       <div
         ref={scrollRef}
         onScroll={() => {
@@ -340,7 +334,7 @@ export default function AcpChatView({ sessionId, agentType = 'claude', onRegiste
       >
         {groups.map(g => (
           <TurnView key={g.turnId} group={g} agentName={agentName} resolvedApprovals={resolvedApprovals}
-            onResolveApproval={resolveApprovalVoid} peerNames={peerNames} onOpenChanges={onOpenChanges} />
+            onResolveApproval={resolveApprovalVoid} peerNames={peerNames} onOpenChanges={onOpenChanges ? openChanges : undefined} />
         ))}
         {notices.map(n => <NoticeBubble key={n.id} notice={n} />)}
       </div>

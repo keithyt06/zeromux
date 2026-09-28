@@ -17,7 +17,7 @@ import { installFakeWebSocket } from '../../test/fakeWs'
 //
 // 八处（文件:行号，改动前）：
 //   1. api.ts:1                 SessionType 联合类型
-//   2. Sidebar.tsx:69-77        SessionTypeIcon
+//   2. shell/TypeIcon.tsx        TypeIcon（原 Sidebar SessionTypeIcon，Task 11 迁移）
 //   3. QuickTargets.tsx:11-20   RowIcon
 //   4. AcpChatView.tsx:57       agentType
 //   5. MobileKeyBar.tsx:18-22   AGENT_KEYS
@@ -45,13 +45,12 @@ describe('T13 crew 八处类型映射不漏', () => {
     expect(coerceAgent('kiro')).toBeNull()
   })
 
-  it('② Sidebar 的 SessionTypeIcon 有 crew 分支，类型菜单仍是 4 项', () => {
-    const t = src('components/Sidebar.tsx')
-    expect(t).toMatch(/case 'crew':\s*return <CrewIcon/)
-    expect(t).toContain('Kiro Crew')
-    expect(t).toContain("selectType('crew')")
-    expect(t).not.toContain("selectType('kiro')")
-    expect(t.match(/selectType\('(tmux|claude|crew|codex)'\)/g)?.length).toBe(4)
+  it('② TypeIcon has a crew branch; the palette offers exactly 4 session types', () => {
+    const icon = src('components/shell/TypeIcon.tsx')
+    expect(icon).toMatch(/case 'crew':\s*return <CrewIcon/)
+    const pal = src('components/shell/CommandPalette.tsx')
+    expect(pal).toMatch(/TYPE_CHOICES = \['claude', 'codex', 'crew', 'tmux'\] as const/)
+    expect(pal).not.toContain("'kiro'")
   })
 
   it('③ QuickTargets 的 RowIcon 用 CrewIcon 渲染 crew 行', async () => {

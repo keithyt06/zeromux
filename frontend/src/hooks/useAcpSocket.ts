@@ -172,11 +172,11 @@ export function useAcpSocket(o: AcpSocketOptions) {
   // than a clean `result`. Injects an empty synthetic `result` for the last observed
   // turn_id (empty text → foldTranscript sets complete without appending). No-op if no
   // turn is active or one already settled. (review 2026-08-03, F4)
-  const settleActiveTurn = useCallback(() => {
+  const settleActiveTurn = useCallback((isError = false) => {
     const tid = activeTurnIdRef.current
     if (tid == null) return
     activeTurnIdRef.current = null
-    setEvents(prev => [...prev, { type: 'result', turn_id: tid, text: '' }])
+    setEvents(prev => [...prev, { type: 'result', turn_id: tid, text: '', ...(isError ? { is_error: true } : {}) }])
   }, [])
 
   useEffect(() => {
@@ -417,7 +417,7 @@ export function useAcpSocket(o: AcpSocketOptions) {
         // text means foldTranscript sets complete=true WITHOUT appending any block
         // (its `if (finalText)` guard), so the group's markdown stops streaming-
         // sanitizing (no phantom fence) and thinking blocks collapse. (review 2026-08-03, F4)
-        settleActiveTurn()
+        settleActiveTurn(true)
         pushNotice({ id: newId(), kind: 'error', text: evt.message || 'Unknown error' })
         setBusy(false)
         setTurnStartedMs(null)
@@ -430,7 +430,7 @@ export function useAcpSocket(o: AcpSocketOptions) {
 
       case 'exit': {
         // Same as error: settle the in-flight turn before the process-exit notice.
-        settleActiveTurn()
+        settleActiveTurn(true)
         pushNotice({ id: newId(), kind: 'system', text: `Process exited (code: ${evt.code || 0})` })
         setBusy(false)
         setTurnStartedMs(null)

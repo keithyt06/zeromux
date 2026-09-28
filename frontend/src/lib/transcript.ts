@@ -19,6 +19,8 @@ export interface WireEvent {
   approval_id?: string
   /** 仅 peer_message：发送方会话名（Claude Code 跨会话消息）。 */
   from_name?: string
+  /** 仅 result：前端为 error/exit 结束的 turn 合成的出错标记（不来自后端）。 */
+  is_error?: boolean
 }
 
 export interface Block {
@@ -43,6 +45,8 @@ export interface TurnGroup {
   blocks: Block[]
   complete: boolean
   cost?: number
+  /** Turn ended via a terminal error/exit rather than a clean result. */
+  errored?: boolean
   assistantText: () => string
 }
 
@@ -106,6 +110,7 @@ export function foldTranscript(
     } else if (e.type === 'result') {
       const g = group(tid)
       g.complete = true
+      if (e.is_error) g.errored = true
       if (typeof e.cost_usd === 'number') g.cost = e.cost_usd
       const finalText = (e.text ?? '').trim()
       // The `result` carries the authoritative full assistant text. Normally the
@@ -148,7 +153,7 @@ function groupSignature(g: TurnGroup): string {
     .map(b => `${b.type}:${(b.text ?? '').length}:${b.summary ?? ''}:${b.name ?? ''}`)
     .join('|')
   const prompts = g.userPrompts.map(p => `${p.fromName ?? ''}:${p.text}`).join('')
-  return `${g.complete ? 1 : 0}#${g.cost ?? ''}#${prompts}#${blocks}`
+  return `${g.complete ? 1 : 0}${g.errored ? 'E' : ''}#${g.cost ?? ''}#${prompts}#${blocks}`
 }
 
 /// Reconcile a freshly-folded group list against the previous render's list, REUSING

@@ -1,10 +1,8 @@
-import { useState, useEffect, useRef, useCallback, useMemo, memo, createElement, lazy, Suspense } from 'react'
+import { useState, useEffect, useRef, useCallback, useMemo, lazy, Suspense } from 'react'
 import { uploadSessionFile, getSessionRuns, getCrewMemory, putCrewSemantic, deleteCrewSemantic } from '../lib/api'
 import type { SemanticEntry } from '../lib/api'
 import { normalizeMemoryKey, parseSemanticValue } from '../lib/crewMemory'
-import { peerLabel } from '../lib/peer'
-import { ChevronDown, Wrench, Brain, AlertCircle, FileText, Terminal, Search, Bot, Paperclip, ListPlus, X, Ban, Check, type LucideIcon } from 'lucide-react'
-import MarkdownContent from './markdown/MarkdownContent'
+import { Brain, AlertCircle, Paperclip, ListPlus, X } from 'lucide-react'
 import Composer from './Composer'
 import ConnectionBar from './ConnectionBar'
 import PromptManager from './PromptManager'
@@ -12,16 +10,12 @@ import { usePromptPresets } from '../lib/usePromptPresets'
 import { applyPreset } from '../lib/applyPreset'
 const RunMetricsPanel = lazy(() => import('./RunMetricsPanel').then(m => ({ default: m.RunMetricsPanel })))
 import { SessionLifetimeBadge } from './SessionLifetimeBadge'
-import { foldTranscript, stabilizeGroups, type WireEvent, type Block, type TurnGroup } from '../lib/transcript'
-import { partitionBlocks, type Density } from '../lib/density'
-import { STUCK_SILENCE_MS } from '../lib/stuck'
+import { foldTranscript, stabilizeGroups, type WireEvent, type TurnGroup } from '../lib/transcript'
 import { shouldStickToBottom, shouldAutoScrollOnAppend, shouldTrackScrollUp } from '../lib/scrollReplay'
 import type { PendingApproval, RegisterControls } from '../lib/sessionControls'
 import { useAcpSocket, newId, type Notice } from '../hooks/useAcpSocket'
-
-// ── Message types ──
-
-type ContentBlock = Block
+import { TurnView } from './turn/TurnView'
+import { TurnStatusBar } from './turn/TurnStatusBar'
 
 interface Props {
   sessionId: string
@@ -43,6 +37,8 @@ interface Props {
   onOpenMemory?: () => void
   // Claude peer name → session title, for labeling cross-session messages.
   peerNames?: Record<string, string>
+  /** Clicking a turn's touched-file chip (Task 11 wires this to the Git「改动」view). */
+  onOpenChanges?: () => void
 }
 
 const EMPTY_PEERS: Record<string, string> = {}
@@ -50,7 +46,7 @@ const EMPTY_PEERS: Record<string, string> = {}
 // `active` is accepted (App passes it for all session views) but no longer used:
 // the Composer owns its own textarea and we intentionally don't auto-focus it,
 // so switching to a chat session doesn't pop the mobile keyboard.
-export default function AcpChatView({ sessionId, agentType = 'claude', onRegisterControls, onQueueModeChange, showMetrics, onOpenMemory, peerNames = EMPTY_PEERS }: Props) {
+export default function AcpChatView({ sessionId, agentType = 'claude', onRegisterControls, onQueueModeChange, showMetrics, onOpenMemory, peerNames = EMPTY_PEERS, onOpenChanges }: Props) {
   const scrollRef = useRef<HTMLDivElement>(null)
   const replayingRef = useRef(false)
   // True only while the post-replay_done follow ResizeObserver is armed (~2s).
@@ -108,7 +104,7 @@ export default function AcpChatView({ sessionId, agentType = 'claude', onRegiste
   useEffect(() => { pendingRef.current = pending }, [pending])
   const {
     events, notices, pushNotice,
-    busy, turnStartedMs, lastEventMs, nowMs,
+    busy, turnStartedMs, lastEventMs,
     queuedCount, wsStatus, ctxUsage, resolvedApprovals, metricsRefresh,
     sendPrompt, setQueueMode, interrupt, resolveApproval,
   } = useAcpSocket({
@@ -121,7 +117,7 @@ export default function AcpChatView({ sessionId, agentType = 'claude', onRegiste
     getPending: () => pendingRef.current, clearPending: () => setPending([]),
   })
   // Fold events → turn groups, then reconcile object identity against the previously
-  // rendered list so already-finished turns keep their identity and the TurnGroupView
+  // rendered list so already-finished turns keep their identity and the TurnView
   // React.memo actually skips them. Without this, foldTranscript allocates fresh group
   // objects every call, so every prior turn re-parsed its markdown on each streamed
   // delta of the current turn — O(N²), visible lag on a long session. Reading + writing
@@ -136,6 +132,10 @@ export default function AcpChatView({ sessionId, agentType = 'claude', onRegiste
     prevGroupsRef.current = stable
     return stable
   }, [events])
+  const agentName = agentType === 'crew' ? 'Crew' : agentType === 'codex' ? 'Codex' : 'Claude'
+  // Stable identities so TurnView's memo keeps skipping finished turns (I-9).
+  const resolveApprovalVoid = useCallback((id: string, a: 'approve' | 'reject') => { resolveApproval(id, a) }, [resolveApproval])
+  const onInterrupt = useCallback(() => { interrupt() }, [interrupt])
   const [input, setInput] = useState('')
   const presetStore = usePromptPresets()
   const [presetOpen, setPresetOpen] = useState(false)
@@ -169,19 +169,6 @@ export default function AcpChatView({ sessionId, agentType = 'claude', onRegiste
       .catch(() => { /* ignore — lifetime badge is non-critical */ })
     return () => { ignore = true }
   }, [sessionId, metricsRefresh])
-  // 输出密度(G2b/P2):concise(默认)折叠思考+原始工具输入;full 全显。
-  const [density, setDensity] = useState<Density>('concise')
-  // 首次精简提示:一次性、可关。localStorage 跨会话只显示一次。
-  const [showDensityHint, setShowDensityHint] = useState(
-    () => typeof localStorage !== 'undefined' && localStorage.getItem('zeromux:density-hint') == null
-  )
-  const dismissDensityHint = useCallback(() => {
-    setShowDensityHint(false)
-    try { localStorage.setItem('zeromux:density-hint', '1') } catch { /* ignore */ }
-  }, [])
-  const expandDensity = useCallback(() => setDensity('full'), [])
-
-
   // 记忆的读/写/删。**必须放在 pushNotice 之后** —— 它们依赖它，放前面会 TDZ 报错。
   const loadMemRecent = useCallback(async () => {
     const req = ++memReqRef.current
@@ -268,12 +255,6 @@ export default function AcpChatView({ sessionId, agentType = 'claude', onRegiste
     setPending(p => p.filter(x => x !== path))
   }, [])
 
-  const elapsed = turnStartedMs ? Math.floor((nowMs - turnStartedMs) / 1000) : 0
-  // Silence-based, not turn-total-duration: a long but actively-streaming turn
-  // is not stuck. Mirrors the sidebar amber dot / backend STUCK_SILENCE_MS.
-  const stuck = busy && lastEventMs != null && (nowMs - lastEventMs) > STUCK_SILENCE_MS
-  const silenceSecs = lastEventMs != null ? Math.floor((nowMs - lastEventMs) / 1000) : 0
-
   // Latest events / resolved map mirrored into refs so pendingApprovals stays a
   // stable callback — otherwise the registration effect below would re-run on
   // every streamed event.
@@ -357,59 +338,20 @@ export default function AcpChatView({ sessionId, agentType = 'claude', onRegiste
         }}
         className="flex-1 overflow-y-auto px-5 py-4 space-y-4"
       >
-        {showDensityHint && (
-          <div className="flex items-center gap-2 text-[11px] text-[var(--text-muted)] bg-[var(--bg-secondary)] border border-[var(--border)] rounded px-2 py-1">
-            <span className="flex-1">已为你精简显示，可切完整</span>
-            <button onClick={dismissDensityHint} aria-label="dismiss hint"
-              className="shrink-0 text-[var(--text-muted)] hover:text-[var(--text-primary)]">
-              <X size={12} />
-            </button>
-          </div>
-        )}
         {groups.map(g => (
-          <TurnGroupView
-            key={g.turnId}
-            group={g}
-            agentName={agentType === 'crew' ? 'Crew' : agentType === 'codex' ? 'Codex' : 'Claude'}
-            density={density}
-            onExpand={expandDensity}
-            resolvedApprovals={resolvedApprovals}
-            onResolveApproval={resolveApproval}
-            peerNames={peerNames}
-          />
+          <TurnView key={g.turnId} group={g} agentName={agentName} resolvedApprovals={resolvedApprovals}
+            onResolveApproval={resolveApprovalVoid} peerNames={peerNames} onOpenChanges={onOpenChanges} />
         ))}
         {notices.map(n => <NoticeBubble key={n.id} notice={n} />)}
       </div>
 
       <ConnectionBar status={wsStatus.status} sinceMs={wsStatus.since} />
       <div className="relative flex flex-col px-4 py-3 border-t border-[var(--border)] bg-[var(--bg-secondary)]">
-        {queuedCount > 0 && (
-          <div className="px-2 pb-1 text-xs text-[var(--text-muted)]">
-            已排队 {queuedCount} 条，本轮结束后合并发送
-          </div>
-        )}
-        {busy && (
-          <div className="flex items-center gap-2 px-2 pb-1 text-xs">
-            {stuck ? (
-              <span className="text-[var(--accent-red)]">已静默 {silenceSecs}s，可能卡住</span>
-            ) : (
-              <span className="text-[var(--text-muted)] italic">已运行 {elapsed}s…</span>
-            )}
-            {/* Always available while busy: a CLI-started (cross-session) turn is
-                autonomous work the user did not start and must be able to stop
-                from a phone (spec 2026-09-26 v2 §3e). */}
-            <button
-              onClick={interrupt}
-              className={`px-2 py-0.5 text-[10px] font-semibold border rounded transition-colors ${
-                stuck
-                  ? 'text-[var(--accent-red)] border-[var(--accent-red)] hover:bg-[var(--accent-red)] hover:text-white'
-                  : 'text-[var(--text-secondary)] border-[var(--border)] hover:text-[var(--text-primary)]'
-              }`}
-            >
-              中断
-            </button>
-          </div>
-        )}
+        {/* Interrupt is always available while busy: a CLI-started (cross-session)
+            turn is autonomous work the user did not start and must be able to stop
+            from a phone (spec 2026-09-26 v2 §3e). */}
+        <TurnStatusBar busy={busy} turnStartedMs={turnStartedMs} lastEventMs={lastEventMs}
+          queuedCount={queuedCount} onInterrupt={onInterrupt} />
         {(pending.length > 0 || uploading > 0) && (
           <div className="flex flex-wrap gap-1.5 px-1 pb-1.5">
             {pending.map(p => (
@@ -564,7 +506,7 @@ export default function AcpChatView({ sessionId, agentType = 'claude', onRegiste
           onChange={setInput}
           onSend={(t) => { const ok = sendPrompt(t); if (ok) setInput(''); return ok }}
           submitOnEnter={true}
-          placeholder={`Send a message to ${agentType === 'crew' ? 'Crew' : agentType === 'codex' ? 'Codex' : 'Claude'}...`}
+          placeholder={`Send a message to ${agentName}...`}
           rightSlot={
             <div className="flex items-end gap-1">
               <button
@@ -611,73 +553,6 @@ export default function AcpChatView({ sessionId, agentType = 'claude', onRegiste
 
 // ── Message rendering ──
 
-// A turn = its user prompt bubble(s) followed by the assistant's blocks. A
-// collect-merged turn has N userPrompts (P1) → N "You" bubbles, then one
-// assistant section. A turn with no blocks yet (prompt sent, nothing streamed)
-// renders just the user bubble(s).
-function TurnGroupViewImpl({ group, agentName = 'Claude', density = 'concise', onExpand, resolvedApprovals, onResolveApproval, peerNames }: {
-  group: TurnGroup; agentName?: string; density?: Density; onExpand?: () => void
-  /** approval id → 本端已作出的决定；有值则卡片收起按钮，显示结果。 */
-  resolvedApprovals?: Record<string, 'approve' | 'reject'>
-  onResolveApproval?: (approvalId: string, action: 'approve' | 'reject') => void
-  peerNames?: Record<string, string>
-}) {
-  const { visible, collapsedCount } = partitionBlocks(group.blocks, density)
-  return (
-    <div className="space-y-4">
-      {group.userPrompts.map((p, i) => (
-        <div key={p.clientId ?? i}>
-          <p className={`text-[11px] font-semibold mb-0.5 ${p.fromName ? 'text-[var(--accent-purple)]' : 'text-[var(--accent-blue)]'}`}>
-            {p.fromName ? `来自 @${peerLabel(p.fromName, peerNames ?? {})}` : 'You'}
-          </p>
-          <p className="text-sm text-[var(--text-primary)] whitespace-pre-wrap">{p.text}</p>
-        </div>
-      ))}
-      {group.blocks.length > 0 && (
-        <div className="space-y-2">
-          <p className="text-[11px] font-semibold text-[var(--accent-purple)] mb-0.5">{agentName}</p>
-          {visible.map((b, i) => (
-            <BlockView
-              key={i}
-              block={b}
-              isComplete={group.complete}
-              approvalDecision={b.approvalId ? resolvedApprovals?.[b.approvalId] : undefined}
-              onResolveApproval={onResolveApproval}
-            />
-          ))}
-          {collapsedCount > 0 && (
-            <button onClick={onExpand}
-              className="text-[11px] text-[var(--text-muted)] hover:text-[var(--accent-blue)] border border-[var(--border)] rounded px-2 py-0.5 transition-colors">
-              +{collapsedCount} 条思考/工具 · 展开
-            </button>
-          )}
-          {group.cost != null && (
-            <p className="text-[10px] text-[var(--text-muted)] border-t border-[var(--border-light)] pt-1 mt-1">
-              cost: ${group.cost.toFixed(4)}
-            </p>
-          )}
-        </div>
-      )}
-    </div>
-  )
-}
-
-const TurnGroupView = memo(
-  TurnGroupViewImpl,
-  (prev, next) =>
-    prev.group === next.group &&
-    prev.agentName === next.agentName &&
-    prev.density === next.density &&
-    prev.onExpand === next.onExpand &&
-    // Must be compared, or answering an approval would not re-render the card:
-    // stabilizeGroups (:92, 2026-08-03 F-perf) deliberately keeps a completed
-    // turn's object identity, so nothing else changes when the decision lands.
-    prev.resolvedApprovals === next.resolvedApprovals &&
-    prev.onResolveApproval === next.onResolveApproval &&
-    // Same reason: a renamed session must relabel already-finished peer bubbles.
-    prev.peerNames === next.peerNames
-)
-
 function NoticeBubble({ notice }: { notice: Notice }) {
   if (notice.kind === 'system') {
     return <p className="text-[11px] text-[var(--text-muted)] italic">{notice.text}</p>
@@ -688,156 +563,4 @@ function NoticeBubble({ notice }: { notice: Notice }) {
       <span>{notice.text}</span>
     </div>
   )
-}
-
-// 工具名 → lucide 图标。未知/MCP 工具回落 Wrench。
-const TOOL_ICONS: Record<string, LucideIcon> = {
-  Read: FileText, Edit: FileText, Write: FileText,
-  Bash: Terminal,
-  Grep: Search, Glob: Search,
-  Agent: Bot, Task: Bot,
-}
-const iconFor = (name?: string): LucideIcon =>
-  (name && TOOL_ICONS[name]) || Wrench
-
-function BlockView({ block, isComplete, approvalDecision, onResolveApproval }: {
-  block: ContentBlock
-  isComplete: boolean
-  approvalDecision?: 'approve' | 'reject'
-  onResolveApproval?: (approvalId: string, action: 'approve' | 'reject') => void
-}) {
-  switch (block.type) {
-    case 'text':
-      return (
-        <div className="text-sm text-[var(--text-primary)] leading-relaxed">
-          <MarkdownContent text={block.text || ''} isComplete={isComplete} />
-        </div>
-      )
-
-    case 'error':
-      // A non-terminal, mid-turn agent error (e.g. a transient Codex codex/event
-      // error while the turn keeps running). Rendered inline as a red note so the
-      // user sees it, but it does NOT end the turn (F-CODEX-1). Terminal errors
-      // still arrive as the top-level 'error' event → NoticeBubble.
-      return (
-        <div className="flex items-start gap-1.5 text-[var(--accent-red)] text-xs">
-          <AlertCircle size={13} className="shrink-0 mt-0.5" />
-          <span className="whitespace-pre-wrap break-words">{block.text || 'Error'}</span>
-        </div>
-      )
-
-    case 'thinking':
-      return (
-        <details open={!isComplete} className="border-l-2 border-[var(--accent-purple-dim)] pl-2.5 text-xs text-[var(--accent-purple-text)]">
-          <summary className="cursor-pointer text-[var(--accent-purple-dim)] font-medium flex items-center gap-1 select-none">
-            <Brain size={12} />
-            <span>thinking...</span>
-            <ChevronDown size={12} />
-          </summary>
-          <div className="mt-1 leading-relaxed">
-            <MarkdownContent text={block.text || ''} isComplete={isComplete} />
-          </div>
-        </details>
-      )
-
-    case 'tool_use': {
-      const inputStr = block.input ? JSON.stringify(block.input, null, 2) : null
-      const truncated = inputStr && inputStr.length > 2000
-        ? inputStr.substring(0, 2000) + '\n...(truncated)'
-        : inputStr
-      const hasRawInput = !!truncated && truncated !== '{}' && truncated !== 'null'
-      return (
-        <div className="border-l-2 border-[var(--accent-yellow)] pl-2.5 py-1 text-xs">
-          <div className="flex items-center gap-1 text-[var(--accent-yellow)] font-medium">
-            {createElement(iconFor(block.name), { size: 12 })}
-            <span>{block.name || 'tool'}</span>
-            {block.summary && (
-              <span className="text-[var(--text-secondary)] font-normal truncate min-w-0 flex-1">· {block.summary}</span>
-            )}
-          </div>
-          {hasRawInput && (
-            <details className="mt-1">
-              <summary className="cursor-pointer text-[10px] text-[var(--text-muted)] select-none">input</summary>
-              <pre className="mt-1 text-[11px] text-[var(--text-secondary)] whitespace-pre-wrap break-words bg-[var(--bg-secondary)] rounded p-2 border border-[var(--border)] overflow-x-auto">
-                {truncated}
-              </pre>
-            </details>
-          )}
-        </div>
-      )
-    }
-
-    case 'approval': {
-      // 内联而非图标位：审批天然属于某个 turn 的某个 tool_call，且 SessionInfoBar
-      // 的 5 图标已是硬上限。**必须有这个 case** —— BlockView 的 default 是
-      // `return null`，未知 block_type 渲染为空 = 什么都没发生。
-      const aid = block.approvalId
-      return (
-        <div className="border-l-2 border-[var(--accent-red)] pl-2.5 py-1.5 text-xs">
-          <div className="flex items-center gap-1 text-[var(--accent-red)] font-medium">
-            <AlertCircle size={12} className="shrink-0" />
-            <span>需要你批准</span>
-            {block.name && (
-              <span className="text-[var(--text-primary)] font-normal truncate min-w-0 flex-1">· {block.name}</span>
-            )}
-          </div>
-          {block.summary && (
-            <p className="mt-1 text-[11px] text-[var(--text-secondary)] break-words leading-snug">{block.summary}</p>
-          )}
-          {block.text && (
-            <pre className="mt-1 text-[11px] text-[var(--text-secondary)] whitespace-pre-wrap break-words bg-[var(--bg-secondary)] rounded p-2 border border-[var(--border)] overflow-x-auto max-h-40 overflow-y-auto">
-              {block.text.length > 2000 ? block.text.substring(0, 2000) + '\n...(truncated)' : block.text}
-            </pre>
-          )}
-          {approvalDecision ? (
-            <p className="mt-1.5 text-[11px] text-[var(--text-muted)] italic">
-              {approvalDecision === 'approve' ? '已批准' : '已拒绝'}
-            </p>
-          ) : aid ? (
-            /* min-h-[44px] 触控目标。 */
-            <div className="mt-2 flex gap-2">
-              <button
-                data-testid="approval-reject"
-                onClick={() => onResolveApproval?.(aid, 'reject')}
-                className="flex-1 min-h-[44px] rounded-lg border border-[var(--border)] text-[var(--text-secondary)] hover:text-[var(--accent-red)] hover:border-[var(--accent-red)] text-xs font-medium transition-colors inline-flex items-center justify-center gap-1"
-              >
-                <Ban size={13} />拒绝
-              </button>
-              <button
-                data-testid="approval-approve"
-                onClick={() => onResolveApproval?.(aid, 'approve')}
-                className="flex-1 min-h-[44px] rounded-lg bg-[var(--accent-green)] hover:bg-[var(--accent-green-hover)] text-white text-xs font-medium transition-colors inline-flex items-center justify-center gap-1"
-              >
-                <Check size={13} />批准
-              </button>
-            </div>
-          ) : (
-            /* approval_id 缺失 = 后端 bug。绝不渲染两个点了没反应的按钮。 */
-            <p className="mt-1.5 text-[11px] text-[var(--accent-yellow)]">审批 id 缺失，无法在此回答</p>
-          )}
-        </div>
-      )
-    }
-
-    case 'tool_result': {
-      const out = block.text || ''
-      return (
-        <div className="border-l-2 border-[var(--accent-green,#3fb950)] pl-2.5 py-1 text-xs">
-          <div className="flex items-center gap-1 text-[var(--accent-green,#3fb950)] font-medium">
-            {createElement(iconFor(block.name), { size: 12 })}
-            <span>{block.name || 'tool'}</span>
-            <span className="text-[var(--text-secondary)] font-normal">· result</span>
-          </div>
-          {out && (
-            <pre className="mt-1 text-[11px] text-[var(--text-secondary)] whitespace-pre-wrap break-words bg-[var(--bg-secondary)] rounded p-2 border border-[var(--border)] overflow-x-auto max-h-60 overflow-y-auto">
-              {out.length > 4000 ? out.substring(0, 4000) + '\n...(truncated)' : out}
-            </pre>
-          )}
-        </div>
-      )
-    }
-
-    default:
-      return null
-  }
 }

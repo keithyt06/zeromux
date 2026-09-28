@@ -256,3 +256,20 @@ describe('foldTranscript — cross-session peer message (spec 2026-09-26)', () =
     expect(out[0]).toBe(b[0]) // not reused: signature differs
   })
 })
+
+describe('foldTranscript — errored turn (M9d)', () => {
+  it('a synthetic is_error result marks the group errored without adding text', () => {
+    const g = foldTranscript([
+      { type: 'content_block', block_type: 'text', text: 'working', turn_id: 3 },
+      { type: 'result', turn_id: 3, text: '', is_error: true },
+    ])[0]
+    expect(g.complete).toBe(true)
+    expect(g.errored).toBe(true)
+    expect(g.blocks).toHaveLength(1)
+  })
+  it('stabilizeGroups sees the errored flip as a change', () => {
+    const a = foldTranscript([{ type: 'content_block', block_type: 'text', text: 'x', turn_id: 1 }])
+    const b = foldTranscript([{ type: 'content_block', block_type: 'text', text: 'x', turn_id: 1 }, { type: 'result', turn_id: 1, text: '', is_error: true }])
+    expect(stabilizeGroups(a, b)[0]).not.toBe(a[0])
+  })
+})

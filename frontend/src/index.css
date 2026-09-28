@@ -223,3 +223,7 @@ html { font-family: var(--font-sans); -webkit-font-smoothing: antialiased; }
   touch-action: none;
   overscroll-behavior: contain;
 }
+
+@keyframes dot-breathe { 0%, 100% { opacity: 1 } 50% { opacity: .5 } }
+.dot-breathe { animation: dot-breathe 1.6s ease-in-out infinite; }
+@media (prefers-reduced-motion: reduce) { .dot-breathe { animation: none; } }

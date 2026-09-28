@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## What this is
 
-ZeroMux — a single-binary, web-based terminal multiplexer and AI-agent orchestration platform. A Rust/Axum backend serves a React/Vite frontend (embedded into the binary via `rust-embed`) and brokers WebSocket connections to PTY shells and three AI agent CLIs (Claude Code, Kiro, Codex). READMEs exist in both English (`README.md`) and Chinese (`README_ZH.md`); design docs under `docs/` are largely in Chinese.
+ZeroMux — a single-binary, web-based terminal multiplexer and AI-agent orchestration platform. A Rust/Axum backend serves a React/Vite frontend (embedded into the binary via `rust-embed`) and brokers WebSocket connections to PTY shells and three AI agent backends (Claude Code, Codex, Crew). READMEs exist in both English (`README.md`) and Chinese (`README_ZH.md`); design docs under `docs/` are largely in Chinese.
 
 ## Build & run
 
@@ -59,7 +59,7 @@ Recovery if found 502 / `inactive`: if the installed binary is already the inten
 
 ### Session lifecycle & the broadcast fan-out model (core abstraction)
 
-`src/session_manager.rs` is the heart of the system. Every session — `Tmux`, `Claude`, `Kiro`, or `Codex` (the `SessionType` enum) — follows the **same** pattern:
+`src/session_manager.rs` is the heart of the system. Every session — `Tmux`, `Claude`, `Codex`, or `Crew` (the `SessionType` enum) — follows the **same** pattern:
 
 - On creation, a dedicated **fan-out task** is spawned that *exclusively owns* the underlying process (PTY handle or agent process). No other code touches the process directly.
 - The task `select!`s between two channels:
@@ -79,7 +79,7 @@ Each session keeps a `VecDeque` scrollback capped at `SCROLLBACK_MAX_BYTES` (2MB
 All three normalize to a common `AcpEvent` enum (`src/acp/process.rs`) that the frontend renders. **They speak three different wire protocols** — this is the main source of per-backend complexity:
 
 - **Claude** (`process.rs`): `claude -p --output-format stream-json --input-format stream-json`. Reads NDJSON from stdout; `translate_event` flattens `assistant.message.content[]` blocks into individual `ContentBlock` events. Note thinking blocks carry prose in a `thinking` field, not `text`.
-- **Kiro** (`kiro_process.rs`): `kiro-cli acp --trust-all-tools` over JSON-RPC 2.0 with an `initialize` → `session/new` handshake.
+- **Crew** (`crew_process.rs`): Gateway WebSocket; approvals via `SessionInput::Approval` → `POST /api/approvals/{id}/{action}`.
 - **Codex** (`codex_process.rs`): `codex mcp-server` driven via the `rmcp` MCP client. The agent turn is a `tools/call("codex")`; streaming text/reasoning arrive as **notifications**, not as the call response. Critical constraint: notification callbacks use **non-blocking `try_send`** into the event loop — awaiting there would deadlock rmcp's transport reader (the same task carrying the in-flight `tools/call` response). The `--codex-reasoning` flag injects `model_reasoning_effort` into the call config and only has effect if the model/provider propagates `thinking`.
 
 `AcpEvent` tag fields use `Cow<'static, str>` (`StaticOrOwnedStr`): emit static literals as `Borrowed` to avoid per-event allocation; only pass-through of arbitrary upstream block types uses `Owned`.
@@ -96,7 +96,7 @@ Two modes, chosen at startup by whether `--github-client-id`/`--github-client-se
 
 ### Git worktree isolation
 
-Worktree isolation is **opt-in** via `--worktree-isolation` (default OFF). `git worktree add` checks out the whole tree, which is ~24s on the JuiceFS/S3-backed production filesystem and dominates New Session latency, so the default is to run agent sessions directly in the work dir — the same as tmux sessions, which already share the tree. With the flag ON, agent sessions (Claude/Kiro/Codex) created inside a git repo get an isolated detached worktree under `.zeromux-worktrees/<short-id>/` (`resolve_work_dir`), removed on session delete; if worktree creation fails, it falls back to the base dir with a warning. Trade-off when OFF: concurrent agents on the same repo share one working tree and git index — fine for the single-user deployment, but enable the flag if you run simultaneous agents that must not collide.
+Worktree isolation is **opt-in** via `--worktree-isolation` (default OFF). `git worktree add` checks out the whole tree, which is ~24s on the JuiceFS/S3-backed production filesystem and dominates New Session latency, so the default is to run agent sessions directly in the work dir — the same as tmux sessions, which already share the tree. With the flag ON, agent sessions (Claude/Codex/Crew) created inside a git repo get an isolated detached worktree under `.zeromux-worktrees/<short-id>/` (`resolve_work_dir`), removed on session delete; if worktree creation fails, it falls back to the base dir with a warning. Trade-off when OFF: concurrent agents on the same repo share one working tree and git index — fine for the single-user deployment, but enable the flag if you run simultaneous agents that must not collide.
 
 ### Notes (peripheral feature)
 

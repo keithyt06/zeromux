@@ -329,6 +329,8 @@ pub struct Session {
     lifetime_turns: u64,
     lifetime_duration_ms: i64,
     lifetime_cost_usd: f64,
+    /// Triage "at a glance" fields (spec v3 M2). In-memory, lock-only.
+    posture: Posture,
     /// 运行态；None = 未运行（可按 resume_token 重生）。
     running: Option<RunningProcess>,
     /// Output history for replay on reconnect (base64 for PTY, JSON for ACP agents)
@@ -403,6 +405,12 @@ pub struct SessionInfo {
     pub tmux_origin: Option<TmuxOrigin>,
     pub other_clients: u32,
     pub peer_name: Option<String>,
+    pub last_outcome: Option<&'static str>,
+    pub last_outcome_ms: Option<i64>,
+    pub last_snippet: Option<String>,
+    pub current_step: Option<String>,
+    pub pending_approvals: u32,
+    pub lifetime_cost_usd: f64,
 }
 
 // ── Git worktree helpers ──
@@ -679,6 +687,17 @@ fn session_info_of(s: &Session) -> SessionInfo {
         tmux_origin: s.tmux_origin,
         other_clients: 0,
         peer_name: (s.session_type == SessionType::Claude).then(|| peer_name_for(&s.id)),
+        last_outcome: s.posture.last_outcome.map(|o| match o {
+            crate::run_metrics::RunOutcome::Completed => "completed",
+            crate::run_metrics::RunOutcome::Errored => "errored",
+            crate::run_metrics::RunOutcome::Timeout => "timeout",
+            crate::run_metrics::RunOutcome::Cancelled => "cancelled",
+        }),
+        last_outcome_ms: s.posture.last_outcome_ms,
+        last_snippet: s.posture.last_snippet.clone(),
+        current_step: s.posture.current_step.clone(),
+        pending_approvals: s.posture.approval_ids.len() as u32,
+        lifetime_cost_usd: s.lifetime_cost_usd,
     }
 }
 
@@ -1031,7 +1050,7 @@ impl SessionManager {
                                 // the real history and repaints via refresh-client on connect.
                                 if let Some(m) = mgr_weak.upgrade() {
                                     if is_tmux { m.broadcast_pty(&sid, b64); }
-                                    else { m.record_and_broadcast(&sid, b64, true); }
+                                    else { m.record_and_broadcast(&sid, b64, true, None); }
                                 } else {
                                     let _ = event_tx_clone.send(b64); // manager gone: best-effort
                                 }
@@ -1164,6 +1183,7 @@ impl SessionManager {
             lifetime_turns: 0,
             lifetime_duration_ms: 0,
             lifetime_cost_usd: 0.0,
+            posture: Posture::default(),
             running: Some(running),
             scrollback: VecDeque::new(),
             scrollback_bytes: 0,
@@ -1282,6 +1302,7 @@ impl SessionManager {
             lifetime_turns: 0,
             lifetime_duration_ms: 0,
             lifetime_cost_usd: 0.0,
+            posture: Posture::default(),
             running: Some(running),
             scrollback: VecDeque::new(),
             scrollback_bytes: 0,
@@ -1627,6 +1648,7 @@ impl SessionManager {
             lifetime_turns: 0,
             lifetime_duration_ms: 0,
             lifetime_cost_usd: 0.0,
+            posture: Posture::default(),
             running: Some(running),
             scrollback: VecDeque::new(),
             scrollback_bytes: 0,
@@ -1730,6 +1752,7 @@ impl SessionManager {
             lifetime_turns: 0,
             lifetime_duration_ms: 0,
             lifetime_cost_usd: 0.0,
+            posture: Posture::default(),
             running: Some(running),
             scrollback: VecDeque::new(),
             scrollback_bytes: 0,
@@ -2022,7 +2045,7 @@ impl SessionManager {
     /// synchronous, so holding the std mutex across it does not block on I/O.
     /// Returns the broadcast result (Err == zero live subscribers; persistence
     /// still happened — that is the whole point, see T2).
-    fn record_and_broadcast(&self, id: &str, data: String, bump_activity: bool) {
+    fn record_and_broadcast(&self, id: &str, data: String, bump_activity: bool, delta: Option<PostureDelta>) {
         let mut map = self.sessions.lock().unwrap();
         if let Some(s) = map.get_mut(id) {
             // Most persisted events (ContentBlock/Result/…) are real forward
@@ -2040,6 +2063,9 @@ impl SessionManager {
             // just doesn't pretend the agent is making progress.
             if bump_activity {
                 s.last_activity_ms = now_millis();
+            }
+            if let Some(d) = delta {
+                apply_posture_delta(&mut s.posture, d);
             }
             let data_len = data.len();
             s.scrollback.push_back(data.clone());
@@ -2090,6 +2116,26 @@ impl SessionManager {
         let mut map = self.sessions.lock().unwrap();
         if let Some(s) = map.get_mut(sid) {
             apply_turn(s, state, seq);
+        }
+    }
+
+    /// A turn truly settled (not a Claude SkipBoundary): record its outcome and
+    /// clear per-turn posture. Called beside `record_run_metric` in each fan-out.
+    fn settle_posture(&self, sid: &str, outcome: crate::run_metrics::RunOutcome) {
+        let mut map = self.sessions.lock().unwrap();
+        if let Some(s) = map.get_mut(sid) {
+            s.posture.last_outcome = Some(outcome);
+            s.posture.last_outcome_ms = Some(now_millis());
+            s.posture.current_step = None;
+            s.posture.approval_ids.clear();
+        }
+    }
+
+    /// The browser answered one Crew approval (the Gateway sends no receipt).
+    fn approval_resolved(&self, sid: &str, approval_id: &str) {
+        let mut map = self.sessions.lock().unwrap();
+        if let Some(s) = map.get_mut(sid) {
+            s.posture.approval_ids.retain(|x| x != approval_id);
         }
     }
 
@@ -2279,6 +2325,7 @@ impl SessionManager {
                     lifetime_turns: 0,
                     lifetime_duration_ms: 0,
                     lifetime_cost_usd: 0.0,
+                    posture: Posture::default(),
                     running: None,
                     scrollback: VecDeque::new(),
                     scrollback_bytes: 0,
@@ -2634,6 +2681,8 @@ fn mark_fanout_ended(mgr: &Weak<SessionManager>, sid: &str) {
         if let Some(s) = mgr.sessions.lock().unwrap().get_mut(sid) {
             s.running = None;
             s.status = SessionMeta::Idle;
+            s.posture.current_step = None;
+            s.posture.approval_ids.clear();
         }
     }
 }
@@ -3035,6 +3084,15 @@ fn spawn_acp_fanout(
                                         if matches!(evt, AcpEvent::Exit { .. }) { "cli_exited" } else { "cli_error" }.to_string()),
                                     _ => None,
                                 };
+                                // Only the boundary that settles the LIVE turn updates posture;
+                                // a stale boundary of a superseded interrupt-resend turn
+                                // (boundary_count < turn_seq, clamped above) must not clear the
+                                // new turn's current_step or stamp its outcome.
+                                if boundary_count >= turn_seq {
+                                    if let Some(m) = mgr.upgrade() {
+                                        m.settle_posture(&sid, outcome);
+                                    }
+                                }
                                 if let Some((started, _)) = settled {
                                     if let Some(m) = mgr.upgrade() {
                                         let rid = crate::run_metrics::new_run_id();
@@ -3534,6 +3592,67 @@ fn emit_queue_mode(event_tx: &broadcast::Sender<String>, mode: QueueMode) {
     let _ = event_tx.send(json.to_string()); // Err == zero subscribers; ignore (T2)
 }
 
+/// Precomputed "at a glance" state for the triage list (spec v3 §0.5.1 M2/M3/M5).
+/// Maintained only under the sessions lock from `record_and_broadcast` /
+/// `settle_posture` / `approval_resolved`; `session_info_of` just copies it.
+/// In-memory only: a restart resets it (accepted, M8).
+#[derive(Default, Clone, Debug, PartialEq)]
+struct Posture {
+    last_outcome: Option<crate::run_metrics::RunOutcome>,
+    last_outcome_ms: Option<i64>,
+    last_snippet: Option<String>,
+    current_step: Option<String>,
+    /// Unresolved Crew approval ids, deduped (M9b). Exported as `len()`.
+    approval_ids: Vec<String>,
+}
+
+/// What one event changes in `Posture`. Computed in `emit` from the typed event,
+/// BEFORE serialization, so `record_and_broadcast` never re-parses JSON.
+enum PostureDelta {
+    Step(String),
+    Snippet(String),
+    ApprovalAdded(String),
+}
+
+fn cap_chars(s: &str, n: usize) -> String {
+    s.chars().take(n).collect()
+}
+
+/// Last non-empty line of an agent's final text, with light markdown stripped.
+/// Only `Result.text` feeds this: streamed text blocks are deltas (M3).
+fn snippet_of(text: &str) -> Option<String> {
+    let line = text.lines().rev().map(str::trim).find(|l| !l.is_empty())?;
+    let line = line.trim_start_matches(|c| c == '#' || c == '-' || c == '*' || c == '>' || c == ' ');
+    let cleaned: String = line.chars().filter(|c| *c != '*' && *c != '`' && *c != '_').collect();
+    let cleaned = cleaned.trim();
+    if cleaned.is_empty() { return None; }
+    Some(cap_chars(cleaned, 120))
+}
+
+fn posture_delta_of(evt: &AcpEvent) -> Option<PostureDelta> {
+    match evt {
+        AcpEvent::ContentBlock { block_type, name, summary, .. } if block_type.as_ref() == "tool_use" => {
+            let name = name.as_deref().unwrap_or("tool");
+            let step = match summary.as_deref() {
+                Some(s) if !s.is_empty() => format!("{} · {}", name, s),
+                _ => name.to_string(),
+            };
+            Some(PostureDelta::Step(cap_chars(&step, 80)))
+        }
+        AcpEvent::Result { text, .. } => snippet_of(text).map(PostureDelta::Snippet),
+        AcpEvent::Approval { id, .. } => Some(PostureDelta::ApprovalAdded(id.clone())),
+        _ => None,
+    }
+}
+
+fn apply_posture_delta(p: &mut Posture, d: PostureDelta) {
+    match d {
+        PostureDelta::Step(s) => p.current_step = Some(s),
+        PostureDelta::Snippet(s) => p.last_snippet = Some(s),
+        PostureDelta::ApprovalAdded(id) => { if !p.approval_ids.contains(&id) { p.approval_ids.push(id) } }
+    }
+}
+
 /// True for events that are forwarded live but NOT persisted to scrollback.
 /// Currently only `System{subtype:"queued"}` (the collect enqueue hint): a
 /// reconnect must not replay a phantom "已排队 N 条" for a batch already flushed.
@@ -3615,7 +3734,7 @@ fn emit(
         // Persist + broadcast atomically under one lock so a reconnecting
         // client never sees this event in BOTH replay and live stream
         // (review 2026-06-11; pairs with subscribe_with_history).
-        m.record_and_broadcast(sid, json, bump_activity);
+        m.record_and_broadcast(sid, json, bump_activity, posture_delta_of(evt));
     } else {
         // SessionManager gone (shutting down): best-effort live broadcast.
         let _ = event_tx.send(json);
@@ -3855,6 +3974,15 @@ fn spawn_crew_fanout(
                                         if matches!(evt, AcpEvent::Exit { .. }) { "cli_exited" } else { "cli_error" }.to_string()),
                                     _ => None,
                                 };
+                                // Only the boundary that settles the LIVE turn updates posture;
+                                // a stale boundary of a superseded interrupt-resend turn
+                                // (boundary_count < turn_seq, clamped above) must not clear the
+                                // new turn's current_step or stamp its outcome.
+                                if boundary_count >= turn_seq {
+                                    if let Some(m) = mgr.upgrade() {
+                                        m.settle_posture(&sid, outcome);
+                                    }
+                                }
                                 if let Some((started, _)) = settled {
                                     if let Some(m) = mgr.upgrade() {
                                         let rid = crate::run_metrics::new_run_id();
@@ -4014,6 +4142,9 @@ fn spawn_crew_fanout(
                             // set_live_intent: answering an approval CONTINUES the
                             // turn — it is neither a cancel nor a completion, so it
                             // must not touch the turn_starts FIFO intent.
+                            if let Some(m) = mgr.upgrade() {
+                                m.approval_resolved(&sid, &approval_id);
+                            }
                             if let Err(e) = process.resolve_approval(&approval_id, &action).await {
                                 tracing::warn!("crew approval failed for {}: {}", sid, e);
                             }
@@ -4151,6 +4282,15 @@ fn spawn_codex_fanout(
                                         if matches!(evt, AcpEvent::Exit { .. }) { "cli_exited" } else { "cli_error" }.to_string()),
                                     _ => None,
                                 };
+                                // Only the boundary that settles the LIVE turn updates posture;
+                                // a stale boundary of a superseded interrupt-resend turn
+                                // (boundary_count < turn_seq, clamped above) must not clear the
+                                // new turn's current_step or stamp its outcome.
+                                if boundary_count >= turn_seq {
+                                    if let Some(m) = mgr.upgrade() {
+                                        m.settle_posture(&sid, outcome);
+                                    }
+                                }
                                 if let Some((started, _)) = settled {
                                     if let Some(m) = mgr.upgrade() {
                                         let rid = crate::run_metrics::new_run_id();
@@ -4532,6 +4672,7 @@ mod decide_spawn_tests {
             lifetime_turns: 0,
             lifetime_duration_ms: 0,
             lifetime_cost_usd: 0.0,
+            posture: Posture::default(),
             running: None,
             scrollback: VecDeque::new(),
             scrollback_bytes: 0,
@@ -4721,6 +4862,7 @@ mod turn_state_tests {
             lifetime_turns: 0,
             lifetime_duration_ms: 0,
             lifetime_cost_usd: 0.0,
+            posture: Posture::default(),
             running: Some(RunningProcess {
                 event_tx, input_tx, pty_pid: None,
                 turn_state: TurnState::Idle,
@@ -5437,6 +5579,7 @@ mod running_summary_tests {
             lifetime_turns: 0,
             lifetime_duration_ms: 0,
             lifetime_cost_usd: 0.0,
+            posture: Posture::default(),
             running: Some(RunningProcess {
                 event_tx,
                 input_tx,
@@ -5843,7 +5986,7 @@ mod running_summary_tests {
         ]);
 
         // "streaming" receives a fresh event; "silent" does not.
-        m.record_and_broadcast("streaming", "some output".to_string(), true);
+        m.record_and_broadcast("streaming", "some output".to_string(), true, None);
 
         let killed = m.running_idle_too_long(now_millis(), idle);
         assert_eq!(killed, vec!["silent".to_string()],
@@ -5866,7 +6009,7 @@ mod running_summary_tests {
         ]);
 
         // An error frame arrives (persisted for the user to see) but is not progress.
-        m.record_and_broadcast("erroring", "Codex: transient".to_string(), false);
+        m.record_and_broadcast("erroring", "Codex: transient".to_string(), false, None);
 
         let killed = m.running_idle_too_long(now_millis(), idle);
         assert_eq!(killed, vec!["erroring".to_string()],
@@ -5887,7 +6030,7 @@ mod running_summary_tests {
             "p", SessionType::Tmux, None, TurnState::Idle,
         )]);
         // A pre-existing scrollback frame (already persisted before reconnect).
-        m.record_and_broadcast("p", "old".to_string(), true);
+        m.record_and_broadcast("p", "old".to_string(), true, None);
 
         // Reconnect: snapshot history AND subscribe under one lock.
         let (history, mut rx) = m.subscribe_with_history("p").expect("session exists");
@@ -5895,7 +6038,7 @@ mod running_summary_tests {
 
         // A frame emitted AFTER the atomic subscribe: goes to the live receiver,
         // and (being appended after the snapshot) is NOT in `history`.
-        m.record_and_broadcast("p", "live".to_string(), true);
+        m.record_and_broadcast("p", "live".to_string(), true, None);
         assert_eq!(rx.try_recv().unwrap(), "live", "post-subscribe frame delivered live");
         assert!(rx.try_recv().is_err(), "no second copy of any frame on the live channel");
         assert!(!history.contains(&"live".to_string()), "live frame is not also in the replay snapshot");
@@ -6267,6 +6410,7 @@ mod lifetime_tests {
             lifetime_turns: 0,
             lifetime_duration_ms: 0,
             lifetime_cost_usd: 0.0,
+            posture: Posture::default(),
             running: None,
             scrollback: VecDeque::new(),
             scrollback_bytes: 0,
@@ -6865,6 +7009,7 @@ mod tmux_session_tests {
             worktree_path: None, created_ms: 0, source_task_id: None, spawning: false,
             last_activity_ms: 0, turns_completed: 0, run_metrics: VecDeque::new(),
             lifetime_turns: 0, lifetime_duration_ms: 0, lifetime_cost_usd: 0.0,
+            posture: Posture::default(),
             running: None, scrollback: VecDeque::new(), scrollback_bytes: 0,
         }
     }
@@ -6912,5 +7057,160 @@ mod terminal_size_tests {
         assert_eq!(size("tiny"), (DEFAULT_COLS, DEFAULT_ROWS));
         assert_eq!(size("short"), (DEFAULT_COLS, DEFAULT_ROWS));
         assert_eq!(size("ok"), (53, 20), "sane sizes are kept");
+    }
+}
+
+#[cfg(test)]
+mod posture_tests {
+    use super::*;
+    use std::borrow::Cow;
+
+    fn block(bt: &'static str, text: Option<&str>, name: Option<&str>, summary: Option<&str>) -> AcpEvent {
+        AcpEvent::ContentBlock {
+            block_type: Cow::Borrowed(bt), turn_id: 0,
+            text: text.map(String::from), name: name.map(String::from),
+            input: None, streaming: None, summary: summary.map(String::from),
+        }
+    }
+
+    #[test]
+    fn snippet_takes_last_nonempty_line_strips_markdown_and_caps_chars() {
+        assert_eq!(snippet_of("first\n\n**Done**: fixed `x`\n\n").as_deref(), Some("Done: fixed x"));
+        assert_eq!(snippet_of("   \n  ").as_deref(), None);
+        let long: String = "中".repeat(300);
+        let s = snippet_of(&long).unwrap();
+        assert_eq!(s.chars().count(), 120, "cap by chars, never bytes (multi-byte safe)");
+        assert_eq!(snippet_of("# Title\n- item one").as_deref(), Some("item one"));
+    }
+
+    #[test]
+    fn delta_tool_use_is_step_with_name_and_summary_capped_80() {
+        let d = posture_delta_of(&block("tool_use", None, Some("Bash"), Some("npx vitest run")));
+        assert!(matches!(d, Some(PostureDelta::Step(ref s)) if s == "Bash · npx vitest run"));
+        let d = posture_delta_of(&block("tool_use", None, Some("Read"), None));
+        assert!(matches!(d, Some(PostureDelta::Step(ref s)) if s == "Read"));
+        let long = "x".repeat(200);
+        match posture_delta_of(&block("tool_use", None, Some("Bash"), Some(&long))) {
+            Some(PostureDelta::Step(s)) => assert_eq!(s.chars().count(), 80),
+            _ => panic!("expected Step"),
+        }
+    }
+
+    #[test]
+    fn delta_ignores_streaming_text_and_thinking_takes_result_text() {
+        // Codex/Crew stream deltas: taking their "last line" would yield fragments (M3).
+        assert!(posture_delta_of(&block("text", Some("partial wo"), None, None)).is_none());
+        assert!(posture_delta_of(&block("thinking", Some("hmm"), None, None)).is_none());
+        let r = AcpEvent::Result { text: "All green.\nShipped".into(), turn_id: 0, session_id: String::new(),
+            cost_usd: None, tokens_in: None, tokens_out: None };
+        assert!(matches!(posture_delta_of(&r), Some(PostureDelta::Snippet(ref s)) if s == "Shipped"));
+        let empty = AcpEvent::Result { text: "  ".into(), turn_id: 0, session_id: String::new(),
+            cost_usd: None, tokens_in: None, tokens_out: None };
+        assert!(posture_delta_of(&empty).is_none());
+    }
+
+    #[test]
+    fn delta_approval_increments() {
+        let a = AcpEvent::Approval { id: "a1".into(), tool: "rm".into(), tool_input: None, tool_purpose: None, slot: "s".into() };
+        assert!(matches!(posture_delta_of(&a), Some(PostureDelta::ApprovalAdded(ref id)) if id == "a1"));
+        let mut p = Posture::default();
+        apply_posture_delta(&mut p, PostureDelta::ApprovalAdded("a1".into()));
+        apply_posture_delta(&mut p, PostureDelta::ApprovalAdded("a1".into()));   // replayed / duplicate frame
+        apply_posture_delta(&mut p, PostureDelta::ApprovalAdded("a2".into()));
+        assert_eq!(p.approval_ids, vec!["a1".to_string(), "a2".to_string()], "dedupe by id (M9b)");
+    }
+
+    #[test]
+    fn user_prompt_and_system_have_no_delta() {
+        let u = AcpEvent::UserPrompt { text: "hi".into(), turn_id: 1, client_id: None };
+        assert!(posture_delta_of(&u).is_none());
+        let s = AcpEvent::System { subtype: Cow::Borrowed("status"), session_id: None, count: None };
+        assert!(posture_delta_of(&s).is_none());
+    }
+
+    fn base_session(id: &str, stype: SessionType) -> Session {
+        Session {
+            id: id.into(), name: "n".into(), session_type: stype, cols: 80, rows: 24,
+            work_dir: "/tmp".into(), owner_id: "o".into(), description: String::new(),
+            name_is_auto: true, status: SessionMeta::Idle, resume_token: None, tmux_origin: None,
+            pending_kill_until: None, worktree_path: None, created_ms: 0, source_task_id: None,
+            spawning: false, last_activity_ms: 0, turns_completed: 0, run_metrics: VecDeque::new(),
+            lifetime_turns: 0, lifetime_duration_ms: 0, lifetime_cost_usd: 0.0, posture: Posture::default(),
+            running: None, scrollback: VecDeque::new(), scrollback_bytes: 0,
+        }
+    }
+
+    fn mgr_one(stype: SessionType) -> (Arc<SessionManager>, tempfile::TempDir) {
+        let dir = tempfile::tempdir().unwrap();
+        let events = Arc::new(crate::events::EventStore::open(dir.path()).unwrap());
+        let store = Arc::new(crate::session_store::SessionStore::open(dir.path()).unwrap());
+        let m = SessionManager::new(events, store, "claude".into(), "codex".into(), "off".into(),
+            5476, "/tmp/crew".into(), "bash".into(), false,
+            crate::tmux::TmuxCtl::new(Some("zmx-test-unused".into())));
+        let (event_tx, _) = broadcast::channel(BROADCAST_CAPACITY);
+        let (input_tx, _rx) = mpsc::channel::<SessionInput>(64);
+        let mut s = base_session("p", stype);
+        s.running = Some(RunningProcess { event_tx, input_tx, pty_pid: None, turn_state: TurnState::Running,
+            turn_started_ms: None, turn_seq: 1, queue_mode: QueueMode::Collect });
+        m.sessions.lock().unwrap().insert("p".into(), s);
+        (m, dir)
+    }
+
+    fn info(m: &SessionManager) -> SessionInfo {
+        session_info_of(m.sessions.lock().unwrap().get("p").unwrap())
+    }
+
+    #[test]
+    fn record_applies_delta_under_lock_and_info_exports_it() {
+        for stype in [SessionType::Claude, SessionType::Codex, SessionType::Crew] {
+            let (m, _d) = mgr_one(stype);
+            m.record_and_broadcast("p", "{}".into(), true,
+                posture_delta_of(&block("tool_use", None, Some("Edit"), Some("src/a.rs"))));
+            assert_eq!(info(&m).current_step.as_deref(), Some("Edit · src/a.rs"), "{:?}", stype);
+            m.record_and_broadcast("p", "{}".into(), true, None);
+            assert_eq!(info(&m).current_step.as_deref(), Some("Edit · src/a.rs"), "None delta leaves posture");
+        }
+    }
+
+    #[test]
+    fn settle_records_outcome_clears_step_and_approvals() {
+        let (m, _d) = mgr_one(SessionType::Crew);
+        let a = AcpEvent::Approval { id: "a".into(), tool: "t".into(), tool_input: None, tool_purpose: None, slot: "s".into() };
+        m.record_and_broadcast("p", "{}".into(), true, posture_delta_of(&a));
+        m.record_and_broadcast("p", "{}".into(), true, posture_delta_of(&block("tool_use", None, Some("Bash"), None)));
+        assert_eq!(info(&m).pending_approvals, 1);
+        let before = now_millis();
+        m.settle_posture("p", crate::run_metrics::RunOutcome::Errored);
+        let i = info(&m);
+        assert_eq!(i.last_outcome, Some("errored"));
+        assert!(i.last_outcome_ms.unwrap() >= before);
+        assert_eq!(i.current_step, None, "settled boundary clears the running step");
+        assert_eq!(i.pending_approvals, 0, "turn boundary zeroes approvals (Gateway has no receipt, M5)");
+    }
+
+    #[test]
+    fn approval_resolved_removes_by_id() {
+        let (m, _d) = mgr_one(SessionType::Crew);
+        for id in ["a", "b"] {
+            let ev = AcpEvent::Approval { id: id.into(), tool: "t".into(), tool_input: None, tool_purpose: None, slot: "s".into() };
+            m.record_and_broadcast("p", "{}".into(), true, posture_delta_of(&ev));
+        }
+        m.approval_resolved("p", "a");
+        m.approval_resolved("p", "a");      // double click / unknown id is a no-op
+        m.approval_resolved("p", "zzz");
+        assert_eq!(info(&m).pending_approvals, 1);
+    }
+
+    #[test]
+    fn info_exports_lifetime_cost_and_defaults() {
+        let (m, _d) = mgr_one(SessionType::Claude);
+        m.sessions.lock().unwrap().get_mut("p").unwrap().lifetime_cost_usd = 0.42;
+        let i = info(&m);
+        assert_eq!(i.lifetime_cost_usd, 0.42);
+        assert_eq!(i.last_outcome, None);
+        assert_eq!(i.last_snippet, None);
+        let json = serde_json::to_value(&i).unwrap();
+        assert_eq!(json["pending_approvals"], 0);
+        assert!(json["last_outcome"].is_null());
     }
 }

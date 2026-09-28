@@ -23,6 +23,13 @@ export interface SessionInfo {
   tmux_origin: 'own' | 'external' | null
   other_clients: number
   peer_name?: string | null
+  // Triage posture (spec v3 M8). All reset to null/0 on a backend restart.
+  last_outcome?: RunOutcome | null
+  last_outcome_ms?: number | null
+  last_snippet?: string | null
+  current_step?: string | null
+  pending_approvals?: number
+  lifetime_cost_usd?: number
 }
 
 export interface SessionStatus {

@@ -741,4 +741,18 @@ mod tests {
         assert!(n.contains("\"type\":\"notice\""));
         assert!(n.contains("\"level\":\"info\""));
     }
+
+    #[test]
+    fn approval_serializes_id_not_approval_id() {
+        // The frontend contract (AcpChatView approval case) depends on this exact
+        // shape. rename_all on the enum does NOT rename variant fields. (review 2026-09-28, M9)
+        let v: serde_json::Value = serde_json::to_value(&AcpEvent::Approval {
+            id: "ap-1".into(), tool: "rm -rf /tmp/b".into(),
+            tool_input: None, tool_purpose: Some("cleanup".into()), slot: "s1".into(),
+        }).unwrap();
+        assert_eq!(v["type"], "approval");
+        assert_eq!(v["id"], "ap-1");
+        assert!(v.get("approval_id").is_none());
+        assert_eq!(v["tool_purpose"], "cleanup");
+    }
 }

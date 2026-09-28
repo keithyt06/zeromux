@@ -57,6 +57,8 @@ interface ServerEvent {
   // Crew: approval 请求 / 上下文用量。后端加变体与前端加 case 必须同一 commit ——
   // handleEvent 的 switch 没有 default 分支，未知 type 是**静默丢弃**。
   approval_id?: string
+  // backend's Approval variant serializes its id as `id` (process.rs)
+  id?: string
   tool?: string
   tool_purpose?: string
   tool_input?: string
@@ -437,7 +439,7 @@ export default function AcpChatView({ sessionId, agentType = 'claude', onRegiste
       case 'approval': {
         // **必须有这个 case** —— handleEvent 的 switch 没有 default 分支，未知顶层
         // type 是静默忽略：后端发了、前端没接 = 「什么都没发生」。
-        const aid = evt.approval_id
+        const aid = evt.approval_id ?? evt.id
         if (!aid) break
         // 作为一个 content_block 折进它所属的 turn，与那次 tool_use 相邻渲染。
         appendEvent({

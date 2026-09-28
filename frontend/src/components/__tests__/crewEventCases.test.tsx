@@ -80,4 +80,15 @@ describe('T14 Crew 新事件变体在前端有 case（防静默丢弃）', () =>
     await act(async () => { ws().emit({ type: 'context_usage', used: 5, total: 0 }) })
     await waitFor(() => expect(screen.queryByText(/^ctx /)).not.toBeInTheDocument())
   })
+
+  it('real wire shape: backend sends `id`, not `approval_id` (M9)', async () => {
+    mount()
+    await act(async () => {
+      ws().emit({ type: 'approval', id: 'ap9', tool: 'rm -rf /tmp/x', tool_purpose: 'wire', slot: 's1', turn_id: 1 })
+    })
+    expect(await screen.findByText('需要你批准')).toBeInTheDocument()
+    await act(async () => { screen.getByTestId('approval-approve').click() })
+    expect(ws().sent.map(s => JSON.parse(s)))
+      .toContainEqual({ type: 'approval', approval_id: 'ap9', action: 'approve' })
+  })
 })

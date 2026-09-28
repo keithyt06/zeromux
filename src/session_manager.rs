@@ -3084,11 +3084,9 @@ fn spawn_acp_fanout(
                                         if matches!(evt, AcpEvent::Exit { .. }) { "cli_exited" } else { "cli_error" }.to_string()),
                                     _ => None,
                                 };
-                                // Only the boundary that settles the LIVE turn updates posture;
-                                // a stale boundary of a superseded interrupt-resend turn
-                                // (boundary_count < turn_seq, clamped above) must not clear the
-                                // new turn's current_step or stamp its outcome.
-                                if boundary_count >= turn_seq {
+                                // Only the boundary that settles the LIVE turn updates posture
+                                // (see posture_settles).
+                                if posture_settles(boundary_count, turn_seq, settled.is_some()) {
                                     if let Some(m) = mgr.upgrade() {
                                         m.settle_posture(&sid, outcome);
                                     }
@@ -3645,6 +3643,17 @@ fn posture_delta_of(evt: &AcpEvent) -> Option<PostureDelta> {
     }
 }
 
+/// Whether a turn boundary settles the LIVE turn and so may update posture.
+/// Requires BOTH: caught up with the live turn (`boundary_count` is clamped to
+/// `turn_seq`, so a stale boundary of a superseded interrupt-resend turn has
+/// count < seq), AND it consumed a turn-start from the FIFO — an idle spurious
+/// boundary (e.g. Crew Gateway reconnect `Error`) or the second boundary of an
+/// already-settled turn has count == seq but nothing to settle, and would
+/// otherwise stamp a false `Errored`.
+fn posture_settles(boundary_count: u64, turn_seq: u64, settled: bool) -> bool {
+    boundary_count >= turn_seq && settled
+}
+
 fn apply_posture_delta(p: &mut Posture, d: PostureDelta) {
     match d {
         PostureDelta::Step(s) => p.current_step = Some(s),
@@ -3974,11 +3983,9 @@ fn spawn_crew_fanout(
                                         if matches!(evt, AcpEvent::Exit { .. }) { "cli_exited" } else { "cli_error" }.to_string()),
                                     _ => None,
                                 };
-                                // Only the boundary that settles the LIVE turn updates posture;
-                                // a stale boundary of a superseded interrupt-resend turn
-                                // (boundary_count < turn_seq, clamped above) must not clear the
-                                // new turn's current_step or stamp its outcome.
-                                if boundary_count >= turn_seq {
+                                // Only the boundary that settles the LIVE turn updates posture
+                                // (see posture_settles).
+                                if posture_settles(boundary_count, turn_seq, settled.is_some()) {
                                     if let Some(m) = mgr.upgrade() {
                                         m.settle_posture(&sid, outcome);
                                     }
@@ -4282,11 +4289,9 @@ fn spawn_codex_fanout(
                                         if matches!(evt, AcpEvent::Exit { .. }) { "cli_exited" } else { "cli_error" }.to_string()),
                                     _ => None,
                                 };
-                                // Only the boundary that settles the LIVE turn updates posture;
-                                // a stale boundary of a superseded interrupt-resend turn
-                                // (boundary_count < turn_seq, clamped above) must not clear the
-                                // new turn's current_step or stamp its outcome.
-                                if boundary_count >= turn_seq {
+                                // Only the boundary that settles the LIVE turn updates posture
+                                // (see posture_settles).
+                                if posture_settles(boundary_count, turn_seq, settled.is_some()) {
                                     if let Some(m) = mgr.upgrade() {
                                         m.settle_posture(&sid, outcome);
                                     }
@@ -7118,6 +7123,14 @@ mod posture_tests {
         apply_posture_delta(&mut p, PostureDelta::ApprovalAdded("a1".into()));   // replayed / duplicate frame
         apply_posture_delta(&mut p, PostureDelta::ApprovalAdded("a2".into()));
         assert_eq!(p.approval_ids, vec!["a1".to_string(), "a2".to_string()], "dedupe by id (M9b)");
+    }
+
+    #[test]
+    fn posture_settles_only_on_live_turn_that_consumed_a_start() {
+        assert!(posture_settles(3, 3, true), "live settle");
+        assert!(!posture_settles(2, 3, true), "stale interrupt-resend boundary");
+        assert!(!posture_settles(3, 3, false), "idle spurious boundary (e.g. Gateway reconnect Error)");
+        assert!(!posture_settles(3, 3, false), "second boundary of an already-settled turn");
     }
 
     #[test]

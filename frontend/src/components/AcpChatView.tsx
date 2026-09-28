@@ -52,10 +52,10 @@ interface Props {
 
 const EMPTY_PEERS: Record<string, string> = {}
 
-// `active` is accepted (App passes it for all session views) but no longer used:
-// the Composer owns its own textarea and we intentionally don't auto-focus it,
+// `active` only gates the `/` preset list (a hidden pane must not show or keep it).
+// The Composer owns its own textarea and we intentionally don't auto-focus it,
 // so switching to a chat session doesn't pop the mobile keyboard.
-export default function AcpChatView({ sessionId, agentType = 'claude', onRegisterControls, onQueueModeChange, queueMode = 'collect', onManagePresets, onOpenMemory, peerNames = EMPTY_PEERS, onOpenChanges, onCtxUsage }: Props) {
+export default function AcpChatView({ sessionId, active, agentType = 'claude', onRegisterControls, onQueueModeChange, queueMode = 'collect', onManagePresets, onOpenMemory, peerNames = EMPTY_PEERS, onOpenChanges, onCtxUsage }: Props) {
   const scrollRef = useRef<HTMLDivElement>(null)
   const replayingRef = useRef(false)
   // True only while the post-replay_done follow ResizeObserver is armed (~2s).
@@ -152,7 +152,8 @@ export default function AcpChatView({ sessionId, agentType = 'claude', onRegiste
   const presetStore = usePromptPresets()
   const { reload: reloadPresets } = presetStore
   // Line-start `/` → preset list (V7). null = not in slash mode; `slashDismissed`
-  // keeps an Esc/tap-outside/pick closed until the text changes again.
+  // keeps an Esc/tap-outside/pick/leave closed until the user types again (a pick's
+  // own setInput must not reopen it, even if the preset body starts with `/`).
   const [slashQuery, setSlashQuery] = useState<string | null>(null)
   const [slashDismissed, setSlashDismissed] = useState(false)
   const [composerBox, setComposerBox] = useState<HTMLDivElement | null>(null)
@@ -162,8 +163,11 @@ export default function AcpChatView({ sessionId, agentType = 'claude', onRegiste
     if (q !== null && !slashOnRef.current) reloadPresets()
     slashOnRef.current = q !== null
     setSlashQuery(q)
-    setSlashDismissed(false)
   }, [reloadPresets])
+  const onType = useCallback((v: string) => { setInput(v); setSlashDismissed(false) }, [])
+  // Leaving the session closes the list; coming back does not reopen it until typing.
+  const [prevActive, setPrevActive] = useState(active)
+  if (prevActive !== active) { setPrevActive(active); if (!active) setSlashDismissed(true) }
   const pickPreset = useCallback(async (p: PromptPreset) => {
     // Close first: the overwrite confirm must not share the keyboard with the list.
     setSlashDismissed(true)
@@ -460,13 +464,13 @@ export default function AcpChatView({ sessionId, agentType = 'claude', onRegiste
               </div>
             </div>
         </Popover>
-        <PresetPicker open={slashQuery !== null && !slashDismissed} query={slashQuery ?? ''} presets={presetStore.presets}
+        <PresetPicker open={active && slashQuery !== null && !slashDismissed} query={slashQuery ?? ''} presets={presetStore.presets}
           anchor={composerBox} onPick={pickPreset} onClose={() => setSlashDismissed(true)}
           onManage={() => { setSlashDismissed(true); onManagePresets?.() }} />
         <div ref={setComposerBox}>
         <Composer
           value={input}
-          onChange={setInput}
+          onChange={onType}
           onSend={(t) => { const ok = sendPrompt(t); if (ok) setInput(''); return ok }}
           submitOnEnter={true}
           placeholder={`Send a message to ${agentName}...`}
@@ -475,7 +479,7 @@ export default function AcpChatView({ sessionId, agentType = 'claude', onRegiste
             <>
               <QueueChip mode={queueMode} busy={busy} onToggle={() => setQueueMode(queueMode === 'collect' ? 'interrupt' : 'collect')} />
               <span className="flex-1" />
-              <IconButton ref={setPlusAnchor} label="更多" icon={Plus} onClick={() => { setSlashDismissed(true); setPlusOpen(o => !o) }} aria-haspopup="menu" aria-expanded={plusOpen} />
+              <IconButton ref={setPlusAnchor} label="更多" icon={Plus} onClick={() => { setSlashDismissed(true); closeMem(); setPlusOpen(o => !o) }} aria-haspopup="menu" aria-expanded={plusOpen} />
               <Menu open={plusOpen} onClose={() => setPlusOpen(false)} anchor={plusAnchor} items={plusItems} title="更多" />
             </>
           }

@@ -2,9 +2,8 @@ import { useEffect, useEffectEvent, useLayoutEffect, useRef, useState, type Reac
 import { createPortal } from 'react-dom'
 import { Sheet } from './Sheet'
 import { useIsNarrow } from '../../lib/useMediaQuery'
+import { placeLayer } from './placeLayer'
 
-const GAP = 6
-const MARGIN = 12
 
 // Open anchored layers, innermost last. A Menu opened from inside a Popover
 // (QuickTargets row menu inside New session) portals as a sibling, so the outer
@@ -37,24 +36,27 @@ export function Popover({ open, onClose, anchor, placement = 'bottom', align = '
     const el = ref.current
     if (!open || asSheet || !anchor || !el) return
     const place = () => {
-      const a = anchor.getBoundingClientRect()
       const p = el.getBoundingClientRect()
-      const vh = window.visualViewport?.height ?? window.innerHeight
-      const vw = window.innerWidth
-      const fitsBelow = a.bottom + GAP + p.height <= vh - MARGIN
-      const fitsAbove = a.top - GAP - p.height >= MARGIN
-      const below = placement === 'bottom' ? fitsBelow || !fitsAbove : !fitsAbove && fitsBelow
-      const top = below ? a.bottom + GAP : a.top - GAP - p.height
-      let left = align === 'start' ? a.left : a.right - p.width
-      left = Math.min(Math.max(MARGIN, left), vw - MARGIN - p.width)
-      setPos({ top: Math.max(MARGIN, top), left })
+      const vv = window.visualViewport
+      setPos(placeLayer({
+        a: anchor.getBoundingClientRect(), w: p.width, h: p.height,
+        vvTop: vv?.offsetTop ?? 0, vvHeight: vv?.height ?? window.innerHeight, vw: window.innerWidth,
+        placement, align,
+      }))
     }
     place()
     // Content changes size (New session steps, async lists) → re-anchor.
     const ro = typeof ResizeObserver !== 'undefined' ? new ResizeObserver(place) : null
     ro?.observe(el)
     window.addEventListener('resize', place)
-    return () => { ro?.disconnect(); window.removeEventListener('resize', place) }
+    // Soft keyboard: iOS resizes/pans the visual viewport without a window resize.
+    const vv = window.visualViewport
+    vv?.addEventListener('resize', place)
+    vv?.addEventListener('scroll', place)
+    return () => {
+      ro?.disconnect(); window.removeEventListener('resize', place)
+      vv?.removeEventListener('resize', place); vv?.removeEventListener('scroll', place)
+    }
   }, [open, asSheet, anchor, placement, align])
 
   useEffect(() => {

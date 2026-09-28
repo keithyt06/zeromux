@@ -99,10 +99,9 @@ function PaletteBody({ onClose, initial, shell, actions, vaultEnabled = false, n
   const promptPart = newMode ? splitPrompt(text, rest, parsed.type !== null) : null
   const slashQuery = promptPart?.prompt.startsWith('/') ? promptPart.prompt.slice(1) : null
   const inSlash = slashQuery !== null
-  // Esc/tap-outside/pick keeps the list closed until the query text changes again.
+  // Esc/tap-outside/pick keeps the list closed until the user types again (a pick's
+  // own setText must not reopen it, even if the preset body starts with `/`).
   const [slashDismissed, setSlashDismissed] = useState(false)
-  const [prevSlash, setPrevSlash] = useState(slashQuery)
-  if (prevSlash !== slashQuery) { setPrevSlash(slashQuery); setSlashDismissed(false) }
   useEffect(() => { if (inSlash) reloadPresets() }, [inSlash, reloadPresets])
   const [inputBox, setInputBox] = useState<HTMLDivElement | null>(null)
   const pickPreset = async (p: PromptPreset) => {
@@ -254,7 +253,7 @@ function PaletteBody({ onClose, initial, shell, actions, vaultEnabled = false, n
       <div ref={setInputBox} className="flex items-center gap-2 px-3 border-b border-[var(--border-subtle)]">
         <Search size={16} className="shrink-0 text-[var(--fg-subtle)]" />
         <input ref={inputRef} autoFocus value={text} onKeyDown={onKey} maxLength={512}
-          onChange={e => { setText(e.target.value); setDirPick(0); setCreateError(null); if (!e.target.value) setForcedNew(initial?.mode === 'new') }}
+          onChange={e => { setText(e.target.value); setDirPick(0); setCreateError(null); setSlashDismissed(false); if (!e.target.value) setForcedNew(initial?.mode === 'new') }}
           placeholder={forcedNew ? '类型 目录 prompt,如 codex zeromux 修 bug' : '搜索会话、动作、目录…  以 + 开头新建'}
           aria-label="命令" role="combobox" aria-expanded aria-controls={`${titleId}-list`}
           className="flex-1 min-w-0 min-h-[48px] bg-transparent outline-none text-ui-input text-[var(--fg)] placeholder:text-[var(--fg-subtle)]" />

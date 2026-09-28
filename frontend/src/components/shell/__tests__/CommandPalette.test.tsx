@@ -301,6 +301,17 @@ describe('CommandPalette', () => {
     expect(actions.some(a => a.id === 'queue-mode' || a.label.includes('队列'))).toBe(false)
   })
 
+  it('new mode: a picked preset whose body starts with / does not reopen the list', async () => {
+    vi.spyOn(api, 'listPrompts').mockResolvedValue([{ id: '9', title: 'compact', body: '/compact now', created_at: '', updated_at: '', sort_order: 0 }])
+    const { input, type, key } = setup({ initial: { mode: 'new' } })
+    type('codex /w/p /com')
+    await screen.findByRole('option', { name: /compact/ })
+    key('Enter')
+    await waitFor(() => expect(input().value).toBe('codex /w/p /compact now'))
+    await act(async () => {})
+    expect(screen.queryByRole('listbox', { name: '常用 prompt' })).toBeNull()
+  })
+
   // V7: the new-mode prompt reuses the composer's `/` PresetPicker.
   it('new mode: `/` in the prompt part opens the preset picker; a pick fills only the prompt; 管理… opens the Sheet', async () => {
     vi.spyOn(api, 'listPrompts').mockResolvedValue([

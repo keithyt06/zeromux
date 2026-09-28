@@ -17,13 +17,19 @@ const PRESETS = [
 
 describe('PresetPicker', () => {
   const setup = (query: string, over: Partial<React.ComponentProps<typeof PresetPicker>> = {}) => {
+    // Keys only count when typed inside the anchor (the caller's input box).
     const anchor = document.createElement('div')
+    const field = document.createElement('textarea')
+    anchor.appendChild(field)
     document.body.appendChild(anchor)
     const onPick = vi.fn(), onManage = vi.fn(), onClose = vi.fn()
     const el = (q: string) => <PresetPicker open query={q} presets={PRESETS} anchor={anchor} onPick={onPick} onManage={onManage} onClose={onClose} {...over} />
     const u = render(el(query))
+    fieldEl = field
     return { onPick, onManage, onClose, rerender: (q: string) => u.rerender(el(q)) }
   }
+  let fieldEl: HTMLTextAreaElement
+  const field = () => fieldEl
   const titles = () => screen.getAllByRole('option').map(o => o.querySelector('span')!.textContent)
 
   it('filters by title (rankBy), ↑↓ + Enter picks, 「管理…」 calls onManage', () => {
@@ -34,12 +40,12 @@ describe('PresetPicker', () => {
     rerender('e')
     expect(titles()).toEqual(['explain', 'review'])
     rerender('')
-    fireEvent.keyDown(document.activeElement ?? document.body, { key: 'ArrowDown' })
+    fireEvent.keyDown(field(), { key: 'ArrowDown' })
     expect(screen.getAllByRole('option')[1]).toHaveAttribute('aria-selected', 'true')
-    fireEvent.keyDown(document.body, { key: 'ArrowUp' })
-    fireEvent.keyDown(document.body, { key: 'ArrowUp' })
+    fireEvent.keyDown(field(), { key: 'ArrowUp' })
+    fireEvent.keyDown(field(), { key: 'ArrowUp' })
     expect(screen.getAllByRole('option')[2]).toHaveAttribute('aria-selected', 'true')
-    fireEvent.keyDown(document.body, { key: 'Enter' })
+    fireEvent.keyDown(field(), { key: 'Enter' })
     expect(onPick).toHaveBeenCalledWith(PRESETS[2])
     fireEvent.click(screen.getByText('管理…'))
     expect(onManage).toHaveBeenCalledTimes(1)
@@ -47,11 +53,20 @@ describe('PresetPicker', () => {
 
   it('Enter during IME composition does not pick', () => {
     const { onPick } = setup('')
-    fireEvent.keyDown(document.body, { key: 'Enter', isComposing: true })
-    fireEvent.keyDown(document.body, { key: 'Enter', keyCode: 229 })
+    fireEvent.keyDown(field(), { key: 'Enter', isComposing: true })
+    fireEvent.keyDown(field(), { key: 'Enter', keyCode: 229 })
     expect(onPick).not.toHaveBeenCalled()
-    fireEvent.keyDown(document.body, { key: 'Enter' })
+    fireEvent.keyDown(field(), { key: 'Enter' })
     expect(onPick).toHaveBeenCalledTimes(1)
+  })
+
+  it('ignores keys typed outside its anchor (another input keeps its Enter)', () => {
+    const { onPick } = setup('')
+    const other = document.createElement('input')
+    document.body.appendChild(other)
+    const ev = fireEvent.keyDown(other, { key: 'Enter' })
+    expect(ev).toBe(true) // not preventDefault-ed
+    expect(onPick).not.toHaveBeenCalled()
   })
 
   it('a / that matches no title (e.g. a path) shows nothing', () => {
@@ -140,6 +155,57 @@ describe('/ presets in the AcpChatView composer', () => {
     fireEvent.click(await screen.findByText('管理…'))
     expect(onManagePresets).toHaveBeenCalledTimes(1)
     expect(screen.queryByRole('listbox')).toBeNull()
+  })
+
+  it('a picked preset whose body starts with / does not reopen the list', async () => {
+    vi.spyOn(api, 'listPrompts').mockResolvedValue([P('9', 'compact', '/compact 请压缩上下文')])
+    const { box, type } = mount()
+    type('/com')
+    const opt = await screen.findByRole('option', { name: /compact/ })
+    await act(async () => { fireEvent.click(opt) })
+    expect(box.value).toBe('/compact 请压缩上下文')
+    await act(async () => {})
+    expect(screen.queryByRole('listbox')).toBeNull()
+    // Typing again re-arms it.
+    type('/c')
+    expect(await screen.findByRole('option', { name: /compact/ })).toBeInTheDocument()
+  })
+
+  it('a picker left open in a hidden pane does not eat Enter in another pane, and closes when inactive', async () => {
+    const ws = installFakeWebSocket()
+    const { rerender } = render(<>
+      <AcpChatView sessionId="a" active agentType="claude" />
+      <AcpChatView sessionId="b" active={false} agentType="claude" />
+    </>)
+    const [boxA, boxB] = screen.getAllByPlaceholderText(/Send a message/) as HTMLTextAreaElement[]
+    fireEvent.change(boxA, { target: { value: '/fix' } })
+    await screen.findByRole('option', { name: /fix bug/ })
+    // User leaves A for B (⌘K / J / ⌘] — no pointerdown).
+    rerender(<>
+      <AcpChatView sessionId="a" active={false} agentType="claude" />
+      <AcpChatView sessionId="b" active agentType="claude" />
+    </>)
+    expect(screen.queryByRole('listbox')).toBeNull()
+    const sockB = ws.all.find(s => /\/ws\/acp\/b(\?|$)/.test((s as unknown as { url: string }).url))!
+    fireEvent.change(boxB, { target: { value: 'hello' } })
+    fireEvent.keyDown(boxB, { key: 'Enter', keyCode: 13 })
+    expect(sockB.sent.some(s => s.includes('"prompt"') && s.includes('hello'))).toBe(true)
+    expect(boxA.value).toBe('/fix')
+  })
+
+  it('an open picker in the active pane still ignores Enter typed in another pane', async () => {
+    const ws = installFakeWebSocket()
+    render(<>
+      <AcpChatView sessionId="a" active agentType="claude" />
+      <AcpChatView sessionId="b" active agentType="claude" />
+    </>)
+    const [boxA, boxB] = screen.getAllByPlaceholderText(/Send a message/) as HTMLTextAreaElement[]
+    fireEvent.change(boxA, { target: { value: '/fix' } })
+    await screen.findByRole('option', { name: /fix bug/ })
+    fireEvent.change(boxB, { target: { value: 'hi' } })
+    fireEvent.keyDown(boxB, { key: 'Enter', keyCode: 13 })
+    expect(ws.all.find(s => /\/ws\/acp\/b(\?|$)/.test((s as unknown as { url: string }).url))!.sent.some(s => s.includes('"prompt"'))).toBe(true)
+    expect(boxA.value).toBe('/fix')
   })
 
   it('the old ListPlus presets button is gone (V7: / is the only entry)', () => {

@@ -20,6 +20,9 @@ export function PresetPicker({ open, query, presets, anchor, onPick, onManage, o
   const cur = Math.min(hi, Math.max(0, items.length - 1))
 
   const onKey = useEffectEvent((e: KeyboardEvent) => {
+    // Only keys typed into OUR input: agent panes stay mounted while hidden, so a
+    // picker left open in another session must never eat ⌘K's or another pane's Enter.
+    if (!anchor?.contains(e.target as Node)) return
     // IME: Enter/arrows confirm or move the candidate, never the list.
     if (e.isComposing || e.keyCode === 229) return
     if (e.key === 'ArrowDown' || e.key === 'ArrowUp') {

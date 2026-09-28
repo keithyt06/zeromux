@@ -35,4 +35,15 @@ describe('⌘ memory popover — stale cold GET does not clobber a fresh write',
     expect(screen.getByText(/= pnpm/)).toBeInTheDocument()
     expect(screen.queryByText('还没有记住任何偏好')).toBeNull()
   })
+
+  it('opening the 「＋」 menu closes the memory popover (no stacked layers on the same anchor)', async () => {
+    vi.spyOn(api, 'getCrewMemory').mockResolvedValue({ preferences: '', projects: '', semantic: [], lessons: [], gateway_ok: true })
+    render(<AcpChatView sessionId="s1" active agentType="crew" />)
+    await act(async () => { screen.getByLabelText('更多').click() })
+    await act(async () => { screen.getByLabelText('memory').click() })
+    expect(await screen.findByLabelText('memory draft')).toBeInTheDocument()
+    await act(async () => { screen.getByLabelText('更多').click() })
+    expect(screen.queryByLabelText('memory draft')).toBeNull()
+    expect(screen.getByRole('menu')).toBeInTheDocument()
+  })
 })

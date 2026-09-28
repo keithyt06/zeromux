@@ -232,7 +232,7 @@ export function AppShell({ user, theme, onLogout, onAuthLost }: {
         return (
           <ContextPanel key={s.id} session={s} open={cc.open} tab={cc.tab} active={s.id === activeId} gitNonce={cc.nonce}
             onTab={t => setContext(s.id, { tab: t })} onClose={() => setContext(s.id, { open: false })} asSheet={false}
-            sendTo={sendTo(s.work_dir)} />
+            sendTo={sendTo(s.work_dir)} onNotGit={shell.onNotGit} />
         )
       })}
     </aside>
@@ -240,7 +240,7 @@ export function AppShell({ user, theme, onLogout, onAuthLost }: {
   const contextSheet = !wide && active && activeCtx && (
     <ContextPanel key={active.id} session={active} open={activeCtx.open} tab={activeCtx.tab} gitNonce={activeCtx.nonce}
       onTab={t => setContext(active.id, { tab: t })} onClose={() => setContext(active.id, { open: false })} asSheet
-      sendTo={sendTo(active.work_dir)} />
+      sendTo={sendTo(active.work_dir)} onNotGit={shell.onNotGit} />
   )
 
   const rail = !narrow && !lg && !railExpanded

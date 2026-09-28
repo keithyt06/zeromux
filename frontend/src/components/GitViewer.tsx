@@ -1,7 +1,7 @@
 import React, { useState, useEffect, useCallback, useRef } from 'react'
 import { getGitLog, getGitShow, getGitWorktree, getSessionStatus } from '../lib/api'
 import type { GitCommit, GitFileChange, GitGraphEntry, WorktreeFile } from '../lib/api'
-import { GitCommit as GitCommitIcon, RefreshCw, FileText, User, Calendar } from 'lucide-react'
+import { GitCommit as GitCommitIcon, RefreshCw, FileText, User, Calendar, FolderX } from 'lucide-react'
 import { defaultGitTab, COMMIT_PROMPT, DISCARD_PROMPT } from '../lib/gitviewer'
 import { SendToMenu } from './SendToMenu'
 import { confirm } from './ui'
@@ -17,6 +17,20 @@ interface Props {
   sendTo?: GitSendTo
   /** Opening tab (push deep link → 'worktree'); the git_dirty status default still runs after mount. */
   initialTab?: 'worktree' | 'history'
+  /** Fired once the session's dir is known not to be a git repo (ContextPanel then defaults to 文件). */
+  onNotGit?: () => void
+}
+
+const isNotRepoError = (msg: string) => /not a git repository/i.test(msg)
+
+/** Shared empty state for a work dir that is not a git repo — never the raw git stderr. */
+function NotGitEmpty() {
+  return (
+    <div className="flex flex-1 flex-col items-center justify-center gap-2 text-ui-sm text-[var(--fg-subtle)]">
+      <FolderX size={20} aria-hidden />
+      当前目录不是 git 仓库
+    </div>
+  )
 }
 
 // Colors for graph lanes
@@ -35,11 +49,12 @@ function laneColor(index: number): string {
   return LANE_COLORS[index % LANE_COLORS.length]
 }
 
-export default function GitViewer({ sessionId, onForward, sendTo, initialTab }: Props) {
+export default function GitViewer({ sessionId, onForward, sendTo, initialTab, onNotGit }: Props) {
   const [entries, setEntries] = useState<GitGraphEntry[]>([])
   const [total, setTotal] = useState(0)
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState<string | null>(null)
+  const [notGit, setNotGit] = useState(false)
 
   const [selectedHash, setSelectedHash] = useState<string | null>(null)
   // Mirror of selectedHash for loadLog to read WITHOUT taking it as a dep — adding it
@@ -71,7 +86,8 @@ export default function GitViewer({ sessionId, onForward, sendTo, initialTab }: 
         selectCommit(firstCommit.hash)
       }
     } catch (e: any) {
-      setError(e.message)
+      if (isNotRepoError(String(e?.message ?? ''))) setNotGit(true)
+      else setError(e.message)
     }
     setLoading(false)
   }, [sessionId])
@@ -104,7 +120,9 @@ export default function GitViewer({ sessionId, onForward, sendTo, initialTab }: 
   useEffect(() => {
     let alive = true
     getSessionStatus(sessionId).then(st => {
-      if (alive) setTab(defaultGitTab(st.git_dirty))
+      if (!alive) return
+      if (st.is_git === false) setNotGit(true)
+      else setTab(defaultGitTab(st.git_dirty))
     }).catch(() => {})
     return () => { alive = false }
   }, [sessionId])
@@ -126,6 +144,7 @@ export default function GitViewer({ sessionId, onForward, sendTo, initialTab }: 
       .catch(() => { if (wtReqRef.current === req) setWt(null) })
   }, [sessionId])
   useEffect(() => { if (tab === 'worktree') loadWorktree() }, [tab, loadWorktree])
+  useEffect(() => { if (notGit) onNotGit?.() }, [notGit, onNotGit])
 
   return (
     <div className="flex flex-col h-full">
@@ -153,7 +172,9 @@ export default function GitViewer({ sessionId, onForward, sendTo, initialTab }: 
         </button>
       </div>
 
-      {tab === 'worktree' ? (
+      {notGit ? (
+        <NotGitEmpty />
+      ) : tab === 'worktree' ? (
         <WorktreePanel
           wt={wt}
           selected={wtSelected}
@@ -185,7 +206,7 @@ export default function GitViewer({ sessionId, onForward, sendTo, initialTab }: 
           ) : error ? (
             <div className="px-3 py-4 text-center">
               <GitCommitIcon size={20} className="mx-auto text-[var(--text-muted)] mb-2" />
-              <p className="text-[10px] text-[var(--text-muted)]">{error}</p>
+              <p className="text-ui-xs text-[var(--fg-subtle)]">{error}</p>
             </div>
           ) : entries.length === 0 ? (
             <div className="px-3 py-4 text-center">
@@ -297,11 +318,7 @@ function WorktreePanel({ wt, selected, onSelect, onRefresh, onForward, sendTo }:
   }, [onForward])
 
   if (wt && !wt.is_git) {
-    return (
-      <div className="flex flex-1 items-center justify-center text-sm text-[var(--text-muted)]">
-        非 git 仓库
-      </div>
-    )
+    return <NotGitEmpty />
   }
 
   return (

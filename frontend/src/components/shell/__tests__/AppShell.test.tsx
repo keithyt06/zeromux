@@ -14,10 +14,17 @@ vi.mock('../../turn/TurnSummaryCard', async () => {
   const actual = await vi.importActual<typeof import('../../turn/TurnSummaryCard')>('../../turn/TurnSummaryCard')
   return { TurnSummaryCard: (p: Parameters<typeof actual.TurnSummaryCard>[0]) => { cardRenders.n++; return actual.TurnSummaryCard(p) } }
 })
+const notGitIds = new Set<string>()
 vi.mock('../lazyPanels', async () => {
   const actual = await vi.importActual<typeof import('../lazyPanels')>('../lazyPanels')
+  const { useEffect } = await import('react')
   const Stub = (name: string) => () => <div>{name}</div>
-  return { ...actual, GitViewer: Stub('GIT'), FileBrowser: Stub('FILES'), RunMetricsPanel: Stub('RUNS'), AgentDashboard: Stub('EVENTS') }
+  // Mirrors the real GitViewer: reports once when its session's dir is not a repo.
+  const Git = ({ sessionId, onNotGit }: { sessionId: string; onNotGit?: () => void }) => {
+    useEffect(() => { if (notGitIds.has(sessionId)) onNotGit?.() }, [sessionId, onNotGit])
+    return <div>GIT</div>
+  }
+  return { ...actual, GitViewer: Git, FileBrowser: Stub('FILES'), RunMetricsPanel: Stub('RUNS'), AgentDashboard: Stub('EVENTS') }
 })
 
 const pane = (id: string) => document.querySelector(`[data-session-pane="${id}"]`)
@@ -50,6 +57,7 @@ describe('AppShell', () => {
     xtermInstances.length = 0
     history.replaceState(null, '', '/')
     localStorage.clear()
+    notGitIds.clear()
   })
   afterEach(() => { vi.useRealTimers(); vi.unstubAllGlobals() })
 
@@ -209,6 +217,19 @@ describe('AppShell', () => {
     fireEvent.click(screen.getByText('alpha'))
     await waitFor(() => expect(activePane()).toBe('a'))
     expect(document.querySelector('[data-context-panel="a"] [role="radio"][aria-checked="true"]')?.textContent).toBe('文件')
+  })
+
+  it('a non-git session defaults its ContextPanel to 文件; an explicit Git pick sticks', async () => {
+    desktop()
+    notGitIds.add('a')
+    await boot()
+    await waitFor(() => expect(activePane()).toBe('a'))
+    const checked = () => document.querySelector('[data-context-panel="a"] [role="radio"][aria-checked="true"]')?.textContent
+    await waitFor(() => expect(checked()).toBe('文件'))
+    fireEvent.click(screen.getByRole('radio', { name: 'Git' }))
+    await waitFor(() => expect(checked()).toBe('Git'))
+    await act(async () => { await vi.advanceTimersByTimeAsync(10) })
+    expect(checked()).toBe('Git')
   })
 
   it('1024–1279: the ContextPanel is a bottom sheet, closed by default', async () => {

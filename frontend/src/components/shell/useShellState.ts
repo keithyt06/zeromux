@@ -12,7 +12,8 @@ import { toast, confirm } from '../ui'
 import { useSessionsPoll } from './useSessionsPoll'
 
 export type ContextTab = 'git' | 'files' | 'runs'
-export interface ContextState { open: boolean; tab: ContextTab; nonce?: number }
+/** tabChosen: the tab was set explicitly (user pick / deep link), so defaults must not override it. */
+export interface ContextState { open: boolean; tab: ContextTab; nonce?: number; tabChosen?: boolean }
 type VaultTarget = { path: string; kind: 'note' | 'folder' }
 
 export interface ShellState {
@@ -32,6 +33,8 @@ export interface ShellState {
   historyReq: { id: string; nonce: number } | null; openHistory(id: string): void
   context: Record<string, ContextState>; contextOf(s: SessionInfo): ContextState
   setContext(sid: string, patch: Partial<ContextState>): void
+  /** The session's dir is not a git repo: default its panel to 文件 unless a tab was chosen. */
+  onNotGit(sid: string): void
 }
 
 /** Everything App.tsx used to own, minus auth (spec v3 M1). */
@@ -107,7 +110,16 @@ export function useShellState(authActive: boolean, onAuthLost: () => void, { nar
       const cur = prev[sid]
       const s = sessionsRef.current.find(x => x.id === sid)
       const base = cur ?? { open: !!s && s.type !== 'tmux' && wideRef.current, tab: 'git' as ContextTab }
-      return { ...prev, [sid]: { ...base, ...patch } }
+      return { ...prev, [sid]: { ...base, ...patch, ...(patch.tab ? { tabChosen: true } : {}) } }
+    })
+  }, [])
+  const onNotGit = useCallback((sid: string) => {
+    setContextState(prev => {
+      const cur = prev[sid]
+      if (cur?.tabChosen || cur?.tab === 'files') return prev
+      const s = sessionsRef.current.find(x => x.id === sid)
+      const base = cur ?? { open: !!s && s.type !== 'tmux' && wideRef.current, tab: 'git' as ContextTab }
+      return { ...prev, [sid]: { ...base, tab: 'files' } }
     })
   }, [])
   const contextOf = useCallback((s: SessionInfo): ContextState =>
@@ -232,6 +244,6 @@ export function useShellState(authActive: boolean, onAuthLost: () => void, { nar
     confirmRuns, confirmsBySession, orphanConfirms, schedulerHealthy,
     controls, registerControls, create, close, rename,
     openVault, docTargets, closeDocTab, updateDocTabTitle,
-    historyReq, openHistory, context, contextOf, setContext,
+    historyReq, openHistory, context, contextOf, setContext, onNotGit,
   }
 }

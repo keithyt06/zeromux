@@ -1,4 +1,4 @@
-import { Suspense, useState } from 'react'
+import { Suspense, useCallback, useState } from 'react'
 import { X } from 'lucide-react'
 import type { SessionInfo } from '../../lib/api'
 import { IconButton, SegmentedControl, Sheet, Skeleton } from '../ui'
@@ -22,14 +22,18 @@ export interface ContextPanelProps {
   active?: boolean
   /** Bumped by a push deep link / summary-card file chip: reopen Git on 改动. */
   gitNonce?: number
+  /** GitViewer found the work dir is not a git repo (shell may switch the default tab). */
+  onNotGit?(sid: string): void
 }
 
 /** Session side panel (S3 V1/V3): Git / 文件 / 运行. Tabs mount on first visit and
  *  then stay mounted (hidden) so GitViewer's commit / FileBrowser's cwd survive. */
-export function ContextPanel({ session, open, tab: wanted, onTab, onClose, asSheet, sendTo, active = true, gitNonce }: ContextPanelProps) {
+export function ContextPanel({ session, open, tab: wanted, onTab, onClose, asSheet, sendTo, active = true, gitNonce, onNotGit }: ContextPanelProps) {
   const agent = session.type !== 'tmux'
   const tabs: ContextTab[] = agent ? ['git', 'files', 'runs'] : ['git', 'files']
   const tab: ContextTab = tabs.includes(wanted) ? wanted : 'git'
+  const sid = session.id
+  const notGit = useCallback(() => onNotGit?.(sid), [onNotGit, sid])
   const [visited, setVisited] = useState<ReadonlySet<ContextTab>>(() => new Set())
   const showing = open && active
   if (showing && !visited.has(tab)) setVisited(new Set([...visited, tab]))
@@ -50,7 +54,7 @@ export function ContextPanel({ session, open, tab: wanted, onTab, onClose, asShe
         {!asSheet && <IconButton label="关闭面板" icon={X} onClick={onClose} />}
       </div>
       <div className="flex-1 min-h-0 overflow-hidden">
-        {pane('git', <GitViewer key={gitNonce ?? 0} sessionId={session.id} sendTo={sendTo} initialTab={gitNonce ? 'worktree' : undefined} />)}
+        {pane('git', <GitViewer key={gitNonce ?? 0} sessionId={session.id} sendTo={sendTo} initialTab={gitNonce ? 'worktree' : undefined} onNotGit={notGit} />)}
         {pane('files', <FileBrowser sessionId={session.id} />)}
         {agent && pane('runs', (
           <div className="h-full overflow-y-auto">

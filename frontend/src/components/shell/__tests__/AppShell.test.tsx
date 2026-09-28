@@ -132,6 +132,38 @@ describe('AppShell', () => {
     expect(pane('a')).not.toBeNull()   // still mounted (I-1)
   })
 
+  it('phone: a focused session that vanished (closed elsewhere) offers 返回分诊, not a dead end', async () => {
+    phone()
+    const h = await boot()
+    fireEvent.click(screen.getByText('alpha'))
+    await waitFor(() => expect(activePane()).toBe('a'))
+    h.setSessions(sessions().filter(s => s.id !== 'a'))
+    await act(async () => { await vi.advanceTimersByTimeAsync(3100) })
+    await waitFor(() => expect(pane('a')).toBeNull())
+    expect(screen.getByText('该会话已不存在')).toBeInTheDocument()
+    fireEvent.click(screen.getByRole('button', { name: '返回分诊' }))
+    await waitFor(() => expect(screen.getByText('broken').closest('.hidden')).toBeNull())   // triage shown
+    expect(screen.queryByText('该会话已不存在')).toBeNull()
+  })
+
+  it('phone: a ?session= deep link shows no 该会话已不存在 before the first list load; a gone id then lands on triage', async () => {
+    phone()
+    history.replaceState(null, '', '/?session=x')
+    setupApp({ sessions: sessions() })
+    const api = await import('../../../lib/api')
+    let release!: () => void
+    const gate = new Promise<void>(r => { release = r })
+    vi.spyOn(api, 'listSessionsWithHost').mockImplementation(async () => { await gate; return { sessions: sessions(), host_tmux: [] } })
+    render(<App />)
+    await act(async () => { await vi.advanceTimersByTimeAsync(50) })
+    expect(api.listSessionsWithHost).toHaveBeenCalled()
+    expect(screen.queryByText('该会话已不存在')).toBeNull()
+    await act(async () => { release() })
+    // The initial reload() drops an id that doesn't resolve (phone), so triage is home — no dead end, no false message.
+    await waitFor(() => expect(screen.getByText('broken').closest('.hidden')).toBeNull())
+    expect(screen.queryByText('该会话已不存在')).toBeNull()
+  })
+
   it('phone: opening ⌘K closes the ContextPanel sheet — never two modals (R13)', async () => {
     phone()
     await boot()

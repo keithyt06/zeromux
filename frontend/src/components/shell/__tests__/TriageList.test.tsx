@@ -39,6 +39,17 @@ describe('TriageList', () => {
     expect(screen.getByText('cargo test 失败')).toBeInTheDocument()
     expect(screen.getByText('Edit · Sidebar.tsx')).toBeInTheDocument()
   })
+  it('row second line: a running turn shows its live step over a stale snippet; idle shows the snippet', () => {
+    setup([
+      mkSession('r2', { name: 'live', turn_state: 'running', turn_started_ms: NOW - 1000, last_activity_ms: NOW,
+        last_snippet: 'previous turn done', current_step: 'Bash · cargo test' }),
+      mkSession('i2', { name: 'resting', last_snippet: 'all green', current_step: 'Read · old.rs' }),
+    ])
+    expect(screen.getByText('Bash · cargo test')).toBeInTheDocument()
+    expect(screen.queryByText('previous turn done')).toBeNull()
+    expect(screen.getByText('all green')).toBeInTheDocument()
+    expect(screen.queryByText('Read · old.rs')).toBeNull()
+  })
   it('clicking a row selects it', () => {
     const { onSelect } = setup()
     fireEvent.click(screen.getByText('zeromux-fe'))

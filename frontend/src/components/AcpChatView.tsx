@@ -12,7 +12,7 @@ import { IconButton, Menu, Popover, type MenuItem } from './ui'
 import { QueueChip } from './composer/QueueChip'
 import { PresetPicker } from './composer/PresetPicker'
 import { SessionLifetimeBadge } from './SessionLifetimeBadge'
-import { foldTranscript, stabilizeGroups, type WireEvent, type TurnGroup } from '../lib/transcript'
+import { foldTranscript, stabilizeGroups, type TurnGroup } from '../lib/transcript'
 import { shouldStickToBottom, shouldAutoScrollOnAppend, shouldTrackScrollUp } from '../lib/scrollReplay'
 import type { PendingApproval, RegisterControls } from '../lib/sessionControls'
 import { useAcpSocket, newId, type Notice } from '../hooks/useAcpSocket'
@@ -290,17 +290,18 @@ export default function AcpChatView({ sessionId, active, agentType = 'claude', o
     setPending(p => p.filter(x => x !== path))
   }, [])
 
-  // Latest events / resolved map mirrored into refs so pendingApprovals stays a
+  // Latest folded groups / resolved map mirrored into refs so pendingApprovals stays a
   // stable callback — otherwise the registration effect below would re-run on
-  // every streamed event.
-  const eventsRef = useRef<WireEvent[]>([])
-  useEffect(() => { eventsRef.current = events }, [events])
+  // every streamed event. Only turns still in progress: an unanswered card in a
+  // completed turn can no longer be resolved.
+  const groupsRef = useRef<TurnGroup[]>([])
+  useEffect(() => { groupsRef.current = groups }, [groups])
   const resolvedRef = useRef(resolvedApprovals)
   useEffect(() => { resolvedRef.current = resolvedApprovals }, [resolvedApprovals])
   const pendingApprovals = useCallback((): PendingApproval[] =>
-    eventsRef.current
-      .filter(e => e.type === 'content_block' && e.block_type === 'approval' && e.approval_id && !resolvedRef.current[e.approval_id])
-      .map(e => ({ id: e.approval_id!, tool: e.name ?? '', ...(e.summary ? { purpose: e.summary } : {}) })),
+    groupsRef.current.filter(g => !g.complete).flatMap(g => g.blocks)
+      .filter(b => b.type === 'approval' && b.approvalId && !resolvedRef.current[b.approvalId])
+      .map(b => ({ id: b.approvalId!, tool: b.name ?? '', ...(b.summary ? { purpose: b.summary } : {}) })),
   [])
 
   // Register WS-only controls so SessionInfoBar (rendered by App, a sibling)

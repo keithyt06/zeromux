@@ -17,6 +17,8 @@ type VaultTarget = { path: string; kind: 'note' | 'folder' }
 
 export interface ShellState {
   sessions: SessionInfo[]; hostTmux: HostTmux[]; docTabs: DocTab[]
+  /** True once a session list has loaded from the server (a deep-linked id can't be judged gone before that). */
+  sessionsLoaded: boolean
   activeId: string | null; select(id: string | null): void
   lastViewedMs: Record<string, number>
   queueModes: Record<string, string>; onQueueModeChange(sid: string, mode: string): void
@@ -37,6 +39,8 @@ export interface ShellState {
  *  where the ContextPanel is an inline column and so may default open (S3 V3). */
 export function useShellState(authActive: boolean, onAuthLost: () => void, { narrow = false, wide = true }: { narrow?: boolean; wide?: boolean } = {}): ShellState {
   const [sessions, setSessions] = useState<SessionInfo[]>([])
+  const [sessionsLoaded, setSessionsLoaded] = useState(false)
+  const setLoadedSessions = useCallback((list: SessionInfo[]) => { setSessions(list); setSessionsLoaded(true) }, [])
   const [hostTmux, setHostTmux] = useState<HostTmux[]>([])
   const [docTabs, setDocTabs] = useState<DocTab[]>(() => loadDocTabs())
   // Ref mirror so loadSessions (captures a stale docTabs closure) can resolve the
@@ -116,7 +120,7 @@ export function useShellState(authActive: boolean, onAuthLost: () => void, { nar
   }, [select, setContext])
 
   const { reload } = useSessionsPoll({
-    enabled: authActive, onAuthLost, setSessions, setHostTmux, setActiveId,
+    enabled: authActive, onAuthLost, setSessions: setLoadedSessions, setHostTmux, setActiveId,
     docTabIds: () => docTabsRef.current.map(t => t.id),
     setConfirmRuns, setSchedulerHealthy, onOpenFromPush, activeId, autoSelect: !narrow,
   })
@@ -223,7 +227,7 @@ export function useShellState(authActive: boolean, onAuthLost: () => void, { nar
   }, [select])
 
   return {
-    sessions, hostTmux, docTabs, activeId, select, lastViewedMs,
+    sessions, sessionsLoaded, hostTmux, docTabs, activeId, select, lastViewedMs,
     queueModes, onQueueModeChange, ctxUsage, onCtxUsage,
     confirmRuns, confirmsBySession, orphanConfirms, schedulerHealthy,
     controls, registerControls, create, close, rename,

@@ -22,6 +22,19 @@ describe('useNextKeys', () => {
     fireEvent.keyDown(getByTestId('x'), { key: 'j' })
     expect(onNext).not.toHaveBeenCalled()
   })
+  it('J inside a menu / listbox / dialog does not fire (typeahead owns it)', () => {
+    const onNext = vi.fn()
+    const { getByTestId } = render(<>
+      <H onNext={onNext} onPalette={vi.fn()} />
+      <div role="menu"><button data-testid="m">m</button></div>
+      <div role="listbox"><div role="option" tabIndex={0} data-testid="l">l</div></div>
+      <dialog open><button data-testid="d">d</button></dialog>
+    </>)
+    fireEvent.keyDown(getByTestId('m'), { key: 'j' })
+    fireEvent.keyDown(getByTestId('l'), { key: 'j' })
+    fireEvent.keyDown(getByTestId('d'), { key: 'j' })
+    expect(onNext).not.toHaveBeenCalled()
+  })
   it('⌘K / Ctrl+K from any focus opens the palette and prevents default', () => {
     const onPalette = vi.fn()
     const { getByLabelText } = render(<H onNext={vi.fn()} onPalette={onPalette} />)

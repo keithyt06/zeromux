@@ -185,11 +185,20 @@ export function AppShell({ user, theme, onLogout, onAuthLost }: {
       })}
       {!active && !activeDoc && (
         <div className="absolute inset-0 flex flex-col items-center justify-center gap-3 text-[var(--fg-subtle)]">
+          {narrow && activeId ? (shell.sessionsLoaded && <>
+            {/* Focused id vanished (closed elsewhere / push to a gone session): no FocusHeader, so give a way back. */}
+            <p className="text-ui-sm">该会话已不存在</p>
+            <button type="button" onClick={() => select(null)}
+              className="ctl inline-flex items-center gap-1.5 px-3 rounded-[var(--r-md)] border border-[var(--border)] text-ui-sm text-[var(--fg)] hover:bg-[var(--surface-hover)]">
+              <ChevronLeft size={14} />返回分诊
+            </button>
+          </>) : (<>
           <p className="text-ui-sm">{sessions.length === 0 && docTabs.length === 0 ? '创建一个会话开始' : '从左侧选择一个会话'}</p>
           <button type="button" onClick={() => openPalette({ mode: 'new' })}
             className="ctl inline-flex items-center gap-1.5 px-3 rounded-[var(--r-md)] border border-[var(--border)] text-ui-sm text-[var(--fg)] hover:bg-[var(--surface-hover)]">
             <Plus size={14} />新建…
           </button>
+          </>)}
         </div>
       )}
     </div>

@@ -2136,6 +2136,8 @@ impl SessionManager {
         let mut map = self.sessions.lock().unwrap();
         if let Some(s) = map.get_mut(sid) {
             s.posture.approval_ids.retain(|x| x != approval_id);
+            // The human's answer is forward progress (else triage shows 可能卡住 right after approving an old request).
+            s.last_activity_ms = now_millis();
         }
     }
 
@@ -3621,8 +3623,9 @@ fn cap_chars(s: &str, n: usize) -> String {
 fn snippet_of(text: &str) -> Option<String> {
     let line = text.lines().rev().map(str::trim).find(|l| !l.is_empty())?;
     let line = line.trim_start_matches(|c| c == '#' || c == '-' || c == '*' || c == '>' || c == ' ');
-    let cleaned: String = line.chars().filter(|c| *c != '*' && *c != '`' && *c != '_').collect();
-    let cleaned = cleaned.trim();
+    // `_` only as whole-line emphasis: inside words it is part of identifiers (`session_manager.rs`).
+    let cleaned: String = line.chars().filter(|c| *c != '*' && *c != '`').collect();
+    let cleaned = cleaned.trim().trim_matches('_').trim();
     if cleaned.is_empty() { return None; }
     Some(cap_chars(cleaned, 120))
 }
@@ -7086,6 +7089,9 @@ mod posture_tests {
         let s = snippet_of(&long).unwrap();
         assert_eq!(s.chars().count(), 120, "cap by chars, never bytes (multi-byte safe)");
         assert_eq!(snippet_of("# Title\n- item one").as_deref(), Some("item one"));
+        // `_` inside identifiers survives; only whole-line `_emphasis_` is stripped.
+        assert_eq!(snippet_of("fixed `session_manager.rs`").as_deref(), Some("fixed session_manager.rs"));
+        assert_eq!(snippet_of("_all green_").as_deref(), Some("all green"));
     }
 
     #[test]
@@ -7212,6 +7218,18 @@ mod posture_tests {
         m.approval_resolved("p", "a");      // double click / unknown id is a no-op
         m.approval_resolved("p", "zzz");
         assert_eq!(info(&m).pending_approvals, 1);
+    }
+
+    #[test]
+    fn approval_resolved_advances_last_activity() {
+        // The human's answer is forward progress: an old request must not flip the
+        // session to 可能卡住 the moment it is approved.
+        let (m, _d) = mgr_one(SessionType::Crew);
+        let ev = AcpEvent::Approval { id: "a".into(), tool: "t".into(), tool_input: None, tool_purpose: None, slot: "s".into() };
+        m.record_and_broadcast("p", "{}".into(), true, posture_delta_of(&ev));
+        m.sessions.lock().unwrap().get_mut("p").unwrap().last_activity_ms = 0;
+        m.approval_resolved("p", "a");
+        assert!(m.last_activity_ms("p").unwrap() > 0, "approval_resolved must bump last_activity_ms");
     }
 
     #[test]

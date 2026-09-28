@@ -35,7 +35,8 @@ function TriageRowImpl({ item, active, onSelect, controls, actions, now, onOpenC
   const [expanded, setExpanded] = useState(false)
   const agent = s.type !== 'tmux'
   const time = timeLabel(s, now)
-  const second = s.last_snippet ?? s.current_step ?? s.description
+  // A running turn shows its live step; last_snippet is the previous turn's result.
+  const second = (s.turn_state === 'running' ? (s.current_step ?? s.last_snippet) : s.last_snippet) ?? s.description
   const cost = s.lifetime_cost_usd ? formatCost(s.lifetime_cost_usd, 'short') : ''
   const showApproval = agent && attention === 'approval' && (s.pending_approvals ?? 0) > 0
   // Only while the backend still counts pending approvals: pendingApprovals()

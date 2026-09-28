@@ -145,4 +145,14 @@ describe('AcpChatView WS characterization (spec S3 §3.1)', () => {
     expect(r).toBe(true)
     expect(s.sent.some(x => x.includes('"interrupt"'))).toBe(true)
   })
+
+  it('9. pendingApprovals excludes approvals of a completed turn', () => {
+    mount({ agentType: 'crew' })
+    const s = ws.latest()
+    act(() => { s.fireOpen() })
+    act(() => { s.emit({ type: 'approval', approval_id: 'old', tool: 'rm', turn_id: 1 }) })
+    act(() => { s.emit({ type: 'result', text: 'done', turn_id: 1 }) })
+    act(() => { s.emit({ type: 'approval', approval_id: 'live', tool: 'ls', turn_id: 2 }) })
+    expect(controls!.pendingApprovals()).toEqual([{ id: 'live', tool: 'ls' }])
+  })
 })

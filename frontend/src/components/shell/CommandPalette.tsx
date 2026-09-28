@@ -17,6 +17,7 @@ import { Dialog, Sheet, StatusDot } from '../ui'
 import QuickTargets from '../QuickTargets'
 import SearchResults from '../SearchResults'
 import { TypeIcon } from './TypeIcon'
+import { SendToMenu } from '../SendToMenu'
 import { askAgentPaletteText, type PaletteAction } from './paletteActions'
 import type { ShellState } from './useShellState'
 
@@ -191,7 +192,13 @@ function PaletteBody({ onClose, initial, shell, actions, vaultEnabled = false, n
     goNew(`${lastAgent()} ${h.path} `)
   }
   const pickNoteHit = (h: NoteHit) => { shell.openVault({ path: h.path, kind: h.kind }); onClose() }
-  const askAgent = (h: NoteHit) => goNew(`${askAgentPaletteText(lastAgent(), h.abs_dir, askAgentPrompt({ absDir: h.abs_dir, relPath: h.path, kind: h.kind }))}`)
+  // ⚡ → SendToMenu (M24/V6); its「＋ 新开…」prefills new mode right here. SearchResults
+  // reports only the hit, so the ⚡ button is captured on the click's way down.
+  const askAnchorRef = useRef<HTMLElement | null>(null)
+  const [noteSend, setNoteSend] = useState<{ anchor: HTMLElement | null; text: string; workDir: string } | null>(null)
+  const askAgent = (h: NoteHit) => setNoteSend({
+    anchor: askAnchorRef.current, workDir: h.abs_dir, text: askAgentPrompt({ absDir: h.abs_dir, relPath: h.path, kind: h.kind }),
+  })
 
   const submitNew = () => {
     if (resolvedDir === null) return
@@ -309,10 +316,17 @@ function PaletteBody({ onClose, initial, shell, actions, vaultEnabled = false, n
             </ul>
           )}
           {q && (search.result || search.failed) && (
+            <div className="contents" onClickCapture={e => { askAnchorRef.current = (e.target as Element).closest('button') }}>
             <SearchResults result={search.result ?? { dirs: null, notes: null }} failed={search.failed} onRetry={search.retry}
               showNotes={vaultEnabled} onPickDir={pickDirHit}
               onDirMenu={{ changeAgent: h => goNew(`${lastAgent()} ${h.path} `), withPrompt: h => goNew(`${h.agent ?? lastAgent()} ${h.path} `) }}
               onPickNote={pickNoteHit} onAskAgent={askAgent} onOpenHere={h => goNew(`${lastAgent()} ${h.abs_dir} `)} />
+            </div>
+          )}
+          {noteSend && (
+            <SendToMenu open anchor={noteSend.anchor} onClose={() => setNoteSend(null)} text={noteSend.text} workDir={noteSend.workDir}
+              sessions={shell.sessions} controls={shell.controls} queueModes={shell.queueModes} onSelectSession={selectSession}
+              onNew={({ workDir, prompt }) => goNew(askAgentPaletteText(lastAgent(), workDir ?? '', prompt))} />
           )}
           {!q && (
             <button type="button" onClick={() => goNew('')} className={`${row} text-ui-sm text-[var(--fg-muted)] hover:bg-[var(--surface-hover)]`}>

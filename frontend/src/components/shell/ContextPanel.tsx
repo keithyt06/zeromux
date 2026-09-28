@@ -4,6 +4,7 @@ import type { SessionInfo } from '../../lib/api'
 import { IconButton, SegmentedControl, Sheet, Skeleton } from '../ui'
 import { GitViewer, FileBrowser, RunMetricsPanel, AgentDashboard } from './lazyPanels'
 import type { ContextTab } from './useShellState'
+import type { GitSendTo } from '../GitViewer'
 
 const TAB_LABEL: Record<ContextTab, string> = { git: 'Git', files: '文件', runs: '运行' }
 
@@ -14,7 +15,8 @@ export interface ContextPanelProps {
   onTab(t: ContextTab): void
   onClose(): void
   asSheet: boolean
-  onForward?: (t: string) => boolean
+  /** GitViewer 「让 agent 处理」 → SendToMenu. */
+  sendTo?: GitSendTo
   /** false while this session is not the focused one (the inline column keeps every
    *  session's panel mounted, hidden, so tab state survives switching — I-1). */
   active?: boolean
@@ -24,7 +26,7 @@ export interface ContextPanelProps {
 
 /** Session side panel (S3 V1/V3): Git / 文件 / 运行. Tabs mount on first visit and
  *  then stay mounted (hidden) so GitViewer's commit / FileBrowser's cwd survive. */
-export function ContextPanel({ session, open, tab: wanted, onTab, onClose, asSheet, onForward, active = true, gitNonce }: ContextPanelProps) {
+export function ContextPanel({ session, open, tab: wanted, onTab, onClose, asSheet, sendTo, active = true, gitNonce }: ContextPanelProps) {
   const agent = session.type !== 'tmux'
   const tabs: ContextTab[] = agent ? ['git', 'files', 'runs'] : ['git', 'files']
   const tab: ContextTab = tabs.includes(wanted) ? wanted : 'git'
@@ -48,7 +50,7 @@ export function ContextPanel({ session, open, tab: wanted, onTab, onClose, asShe
         {!asSheet && <IconButton label="关闭面板" icon={X} onClick={onClose} />}
       </div>
       <div className="flex-1 min-h-0 overflow-hidden">
-        {pane('git', <GitViewer key={gitNonce ?? 0} sessionId={session.id} onForward={onForward} initialTab={gitNonce ? 'worktree' : undefined} />)}
+        {pane('git', <GitViewer key={gitNonce ?? 0} sessionId={session.id} sendTo={sendTo} initialTab={gitNonce ? 'worktree' : undefined} />)}
         {pane('files', <FileBrowser sessionId={session.id} />)}
         {agent && pane('runs', (
           <div className="h-full overflow-y-auto">

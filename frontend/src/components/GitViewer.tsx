@@ -3,10 +3,18 @@ import { getGitLog, getGitShow, getGitWorktree, getSessionStatus } from '../lib/
 import type { GitCommit, GitFileChange, GitGraphEntry, WorktreeFile } from '../lib/api'
 import { GitCommit as GitCommitIcon, RefreshCw, FileText, User, Calendar } from 'lucide-react'
 import { defaultGitTab, COMMIT_PROMPT, DISCARD_PROMPT } from '../lib/gitviewer'
+import { SendToMenu } from './SendToMenu'
+import { confirm } from './ui'
+
+/** Everything SendToMenu needs besides the text (ContextPanel passes it down from the shell). */
+export type GitSendTo = Omit<React.ComponentProps<typeof SendToMenu>, 'open' | 'anchor' | 'onClose' | 'text'>
 
 interface Props {
   sessionId: string
+  /** Compat path when no `sendTo` is given: forward straight to the current session. */
   onForward?: (text: string) => boolean
+  /** 「让 agent 处理」 opens SendToMenu (S3 §2.4) instead of forwarding directly. */
+  sendTo?: GitSendTo
   /** Opening tab (push deep link → 'worktree'); the git_dirty status default still runs after mount. */
   initialTab?: 'worktree' | 'history'
 }
@@ -27,7 +35,7 @@ function laneColor(index: number): string {
   return LANE_COLORS[index % LANE_COLORS.length]
 }
 
-export default function GitViewer({ sessionId, onForward, initialTab }: Props) {
+export default function GitViewer({ sessionId, onForward, sendTo, initialTab }: Props) {
   const [entries, setEntries] = useState<GitGraphEntry[]>([])
   const [total, setTotal] = useState(0)
   const [loading, setLoading] = useState(true)
@@ -152,6 +160,7 @@ export default function GitViewer({ sessionId, onForward, initialTab }: Props) {
           onSelect={setWtSelected}
           onRefresh={loadWorktree}
           onForward={onForward}
+          sendTo={sendTo}
         />
       ) : (
     <div className="flex flex-col @[640px]:flex-row flex-1 min-h-0">
@@ -261,21 +270,24 @@ export default function GitViewer({ sessionId, onForward, initialTab }: Props) {
 
 // ── Worktree panel ──
 
-function WorktreePanel({ wt, selected, onSelect, onRefresh, onForward }: {
+function WorktreePanel({ wt, selected, onSelect, onRefresh, onForward, sendTo }: {
   wt: { files: WorktreeFile[]; diff: string; truncated: boolean; is_git: boolean } | null
   selected: string | null
   onSelect: (path: string) => void
   onRefresh: () => void
   onForward?: (text: string) => boolean
+  sendTo?: GitSendTo
 }) {
+  // SendToMenu path: picking the target is the explicit confirmation step (no native confirm).
+  const [menu, setMenu] = useState<{ anchor: HTMLElement; text: string } | null>(null)
   // After a forward, show a brief "已发送给 agent" line and disable both buttons so
   // a second tap can't queue a duplicate prompt (the chat where it lands is hidden
   // behind this overlay, so the panel itself must give the only feedback).
   const [sent, setSent] = useState(false)
   const [failed, setFailed] = useState(false)
-  const forward = useCallback((text: string, confirmMsg?: string) => {
+  const forward = useCallback(async (text: string, confirmMsg?: string) => {
     if (!onForward) return
-    if (confirmMsg && !window.confirm(confirmMsg)) return
+    if (confirmMsg && !(await confirm({ title: confirmMsg, confirmLabel: '撤销改动', danger: true }))) return
     if (!onForward(text)) { setFailed(true); setTimeout(() => setFailed(false), 4000); return }
     setFailed(false)
     setSent(true)
@@ -334,7 +346,7 @@ function WorktreePanel({ wt, selected, onSelect, onRefresh, onForward }: {
             })
           )}
         </div>
-        {wt?.is_git && wt.files.length > 0 && onForward && (
+        {wt?.is_git && wt.files.length > 0 && (sendTo || onForward) && (
           <div className="border-t border-[var(--border)]">
             {sent && (
               <div className="px-2 pt-2 text-[10px] text-[var(--accent-green)]">
@@ -343,11 +355,13 @@ function WorktreePanel({ wt, selected, onSelect, onRefresh, onForward }: {
             )}
             {failed && <div className="px-2 pt-2"><span className="text-xs text-[var(--accent-red)]">未连接,未发送</span></div>}
             <div className="flex gap-2 p-2">
-              <button onClick={() => forward(COMMIT_PROMPT)} disabled={sent}
+              <button onClick={e => (sendTo ? setMenu({ anchor: e.currentTarget, text: COMMIT_PROMPT }) : forward(COMMIT_PROMPT))} disabled={sent}
                 className="px-2 py-1 text-xs rounded bg-[var(--bg-tertiary)] text-[var(--text-primary)] hover:bg-[var(--bg-hover)] disabled:opacity-40 disabled:cursor-not-allowed">让 agent 提交</button>
-              <button onClick={() => forward(DISCARD_PROMPT, '确认让 agent 撤销当前工作区的全部未提交改动?此操作不可恢复。')} disabled={sent}
+              {/* With SendToMenu, choosing the target is the confirmation step. */}
+              <button onClick={e => (sendTo ? setMenu({ anchor: e.currentTarget, text: DISCARD_PROMPT }) : forward(DISCARD_PROMPT, '确认让 agent 撤销当前工作区的全部未提交改动?此操作不可恢复。'))} disabled={sent}
                 className="px-2 py-1 text-xs rounded bg-[var(--bg-tertiary)] text-[var(--accent-red)] hover:bg-[var(--bg-hover)] disabled:opacity-40 disabled:cursor-not-allowed">让 agent 撤销改动</button>
             </div>
+            {sendTo && <SendToMenu {...sendTo} open={!!menu} anchor={menu?.anchor ?? null} onClose={() => setMenu(null)} text={menu?.text ?? ''} />}
           </div>
         )}
       </div>

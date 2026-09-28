@@ -1,12 +1,18 @@
-import { useEffect, useRef, type KeyboardEvent } from 'react'
-import type { LucideIcon } from 'lucide-react'
+import { useEffect, useRef, type ComponentType, type KeyboardEvent, type ReactNode } from 'react'
 import { Popover } from './Popover'
 import { Kbd } from './Kbd'
 import { restoreFocus } from './modalStack'
 
-export type MenuItem = { label: string; ariaLabel?: string; icon?: LucideIcon; danger?: boolean; kbd?: string; disabled?: boolean; onSelect(): void }
+export type MenuItem = {
+  label: string; ariaLabel?: string; icon?: ComponentType<{ size?: number; className?: string }>; danger?: boolean; kbd?: string; disabled?: boolean; onSelect(): void
+  /** React key when labels can repeat (e.g. two sessions with the same name). */
+  key?: string
+  /** Secondary text after the label (muted). */
+  hint?: ReactNode
+  separatorBefore?: boolean
+}
 
-export function Menu({ open, onClose, anchor, items, title }: { open: boolean; onClose(): void; anchor: HTMLElement | null; items: MenuItem[]; title?: string }) {
+export function Menu({ open, onClose, anchor, items, title, footer }: { open: boolean; onClose(): void; anchor: HTMLElement | null; items: MenuItem[]; title?: string; footer?: ReactNode }) {
   const refs = useRef<(HTMLButtonElement | null)[]>([])
   useEffect(() => {
     if (!open) return
@@ -52,15 +58,17 @@ export function Menu({ open, onClose, anchor, items, title }: { open: boolean; o
     <Popover open={open} onClose={onClose} anchor={anchor} align="end" sheetTitle={title}>
       <div role="menu" aria-label={title}>
         {items.map((it, i) => (
-          <button key={it.label} type="button" role="menuitem" aria-label={it.ariaLabel} ref={el => { refs.current[i] = el }} disabled={it.disabled}
+          <button key={it.key ?? it.label} type="button" role="menuitem" aria-label={it.ariaLabel} ref={el => { refs.current[i] = el }} disabled={it.disabled}
             onKeyDown={onKey(i)} onClick={() => select(i)}
-            className={`row w-full flex items-center gap-2.5 px-3 text-left text-ui-sm outline-none focus-visible:bg-[var(--surface-hover)] hover:bg-[var(--surface-hover)] disabled:opacity-50 ${it.danger ? 'text-[var(--danger)] danger' : 'text-[var(--fg)]'}`}>
+            className={`row w-full flex items-center ${it.separatorBefore ? 'border-t border-[var(--border-subtle)]' : ''} gap-2.5 px-3 text-left text-ui-sm outline-none focus-visible:bg-[var(--surface-hover)] hover:bg-[var(--surface-hover)] disabled:opacity-50 ${it.danger ? 'text-[var(--danger)] danger' : 'text-[var(--fg)]'}`}>
             {it.icon && <it.icon size={16} className="shrink-0" />}
-            <span className="flex-1">{it.label}</span>
+            <span className="flex-1 min-w-0 truncate">{it.label}</span>
+            {it.hint && <span className="shrink-0 flex items-center gap-1 text-ui-2xs text-[var(--fg-subtle)]">{it.hint}</span>}
             {it.kbd && <Kbd>{it.kbd}</Kbd>}
           </button>
         ))}
       </div>
+      {footer}
     </Popover>
   )
 }

@@ -212,6 +212,8 @@ describe('CommandPalette', () => {
     expect(sh.openVault).toHaveBeenCalledWith({ path: hit.path, kind: 'note' })
     expect(onClose).toHaveBeenCalled()
     fireEvent.click(await screen.findByTestId('sr-ask'))
+    // ⚡ opens SendToMenu (Task 13, M24); 「＋ 新开…」 is the old prefill path.
+    fireEvent.click(screen.getByText('＋ 新开…'))
     expect(input().value.startsWith(`claude ${hit.abs_dir} 当前笔记：`)).toBe(true)
     // tmux would drop the note context, so ⚡ never pre-selects it.
     unmount()
@@ -220,7 +222,22 @@ describe('CommandPalette', () => {
     again.type('19t3')
     await flush()
     fireEvent.click(await screen.findByTestId('sr-ask'))
+    fireEvent.click(screen.getByText('＋ 新开…'))
     expect(again.input().value.startsWith('claude ')).toBe(true)
+  })
+  it('⚡ → SendToMenu sends the note context to an existing agent without switching (Task 13)', async () => {
+    const hit = { path: 'a/n.md', kind: 'note' as const, display: 'n', hint: 'a', abs_dir: '/v/a', score: 9 }
+    vi.spyOn(api, 'searchPaths').mockResolvedValue(R(sec('dirs', []), sec('notes', [hit])))
+    const sendPrompt = vi.fn(() => true)
+    const sh = shell({ controls: { current: { b: { sendPrompt } as never } } })
+    const { type } = setup({ sh, vaultEnabled: true })
+    type('n')
+    await flush()
+    fireEvent.click(await screen.findByTestId('sr-ask'))
+    expect(screen.getAllByRole('menuitem')[0]).toHaveTextContent('★ zeromux-fe')   // most recent agent
+    fireEvent.click(screen.getByRole('menuitem', { name: '发给 zeromux-fe' }))
+    expect(sendPrompt).toHaveBeenCalledWith('当前笔记：/v/a/n.md\n\n')
+    expect(sh.select).not.toHaveBeenCalled()
   })
   it('folder ⋯ 在此开 agent → new mode in that folder (Sidebar.search:130)', async () => {
     const f = { path: 'p/x', kind: 'folder' as const, display: 'x', hint: 'p', abs_dir: '/v/p/x', score: 5 }

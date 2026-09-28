@@ -11,6 +11,7 @@ import { peerNamesKey, peerNamesFromKey } from '../../lib/peer'
 import { loadLastType } from '../../lib/paletteParse'
 import { askAgentPrompt, type AskAgentTarget } from '../../lib/askAgent'
 import TerminalView from '../TerminalView'
+import { SendToMenu } from '../SendToMenu'
 import AcpChatView from '../AcpChatView'
 import { Toaster, DialogHost, Sheet, IconButton, StatusDot, toast } from '../ui'
 import { useShellState, type ContextTab } from './useShellState'
@@ -113,9 +114,20 @@ export function AppShell({ user, theme, onLogout, onAuthLost }: {
     return () => clearTimeout(t)
   }, [ctxOpen, railExpanded, narrow, active?.type])
 
-  const askAgentFromNote = useCallback((t: AskAgentTarget) => {
-    openPalette({ mode: 'new', text: askAgentPaletteText(loadLastType(), t.absDir, askAgentPrompt(t)) })
+  // SendToMenu「＋ 新开…」= ⌘K new mode prefilled (M24).
+  const openNewPrefilled = useCallback(({ workDir, prompt }: { workDir: string | null; prompt: string }) => {
+    openPalette({ mode: 'new', text: askAgentPaletteText(loadLastType(), workDir ?? '', prompt) })
   }, [openPalette])
+  // VaultReader ⚡ → SendToMenu (M24/V6). VaultReader reports only the note, so the
+  // ⚡ button is captured from the click on its way down (onClickCapture below).
+  const askAnchorRef = useRef<HTMLElement | null>(null)
+  const [noteSend, setNoteSend] = useState<{ anchor: HTMLElement | null; text: string; workDir: string } | null>(null)
+  const askAgentFromNote = (t: AskAgentTarget) => {
+    setNoteSend({ anchor: askAnchorRef.current, text: askAgentPrompt(t), workDir: t.absDir })
+  }
+  const sendTo = (workDir: string) => ({
+    workDir, sessions, controls: shell.controls, queueModes: shell.queueModes, onSelectSession: select, onNew: openNewPrefilled,
+  })
 
   const openPrompts = useCallback(() => setPanel('prompts'), [])
   // The callbacks read refs only when an action runs (click / Enter), never during render.
@@ -163,7 +175,8 @@ export function AppShell({ user, theme, onLogout, onAuthLost }: {
       {docTabs.map(t => {
         const isActive = t.id === activeId
         return (
-          <div key={t.id} className={`absolute inset-0 ${isActive ? '' : 'hidden'}`}>
+          <div key={t.id} className={`absolute inset-0 ${isActive ? '' : 'hidden'}`}
+            onClickCapture={e => { askAnchorRef.current = (e.target as Element).closest('button') }}>
             <Suspense fallback={null}>
               <VaultReader onTitleChange={(title) => shell.updateDocTabTitle(t.id, title)} target={shell.docTargets[t.id] ?? null} onAskAgent={askAgentFromNote} />
             </Suspense>
@@ -210,7 +223,7 @@ export function AppShell({ user, theme, onLogout, onAuthLost }: {
         return (
           <ContextPanel key={s.id} session={s} open={cc.open} tab={cc.tab} active={s.id === activeId} gitNonce={cc.nonce}
             onTab={t => setContext(s.id, { tab: t })} onClose={() => setContext(s.id, { open: false })} asSheet={false}
-            onForward={s.type !== 'tmux' ? (t) => shell.controls.current[s.id]?.sendPrompt(t) ?? false : undefined} />
+            sendTo={sendTo(s.work_dir)} />
         )
       })}
     </aside>
@@ -218,7 +231,7 @@ export function AppShell({ user, theme, onLogout, onAuthLost }: {
   const contextSheet = !wide && active && activeCtx && (
     <ContextPanel key={active.id} session={active} open={activeCtx.open} tab={activeCtx.tab} gitNonce={activeCtx.nonce}
       onTab={t => setContext(active.id, { tab: t })} onClose={() => setContext(active.id, { open: false })} asSheet
-      onForward={active.type !== 'tmux' ? (t) => shell.controls.current[active.id]?.sendPrompt(t) ?? false : undefined} />
+      sendTo={sendTo(active.work_dir)} />
   )
 
   const rail = !narrow && !lg && !railExpanded
@@ -290,6 +303,9 @@ export function AppShell({ user, theme, onLogout, onAuthLost }: {
       {fab}
       {contextSheet}
       <CommandPalette open={!!palette} onClose={() => setPalette(null)} initial={palette ?? undefined} shell={shell} actions={actions} vaultEnabled={vaultEnabled} now={now} onManagePresets={openPrompts} />
+      {noteSend && (
+        <SendToMenu open anchor={noteSend.anchor} onClose={() => setNoteSend(null)} text={noteSend.text} {...sendTo(noteSend.workDir)} />
+      )}
       <RenameDialog session={sessions.find(s => s.id === renamingId) ?? null} onClose={() => setRenamingId(null)} onSave={shell.rename} />
       {panel === 'admin' && <Suspense fallback={null}><AdminPanel open onClose={() => setPanel(null)} /></Suspense>}
       {panel === 'scheduled' && <Suspense fallback={null}><ScheduledTasksPanel open onClose={() => setPanel(null)} /></Suspense>}

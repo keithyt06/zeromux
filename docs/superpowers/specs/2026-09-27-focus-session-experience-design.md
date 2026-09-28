@@ -1,7 +1,7 @@
 # S3+S4 会话内体验(Focus 区)—— 设计
 
 日期:2026-09-27
-状态:v2(2026-09-27 CTO + PM + 高级 UI/UX 三方交叉评审后修订,见 §0.3;**§0.3 与正文冲突时以 §0.3 为准**,plan 阶段按 §0.3 落实)
+状态:v3(2026-09-28:**Plan A 与总 spec S2 合并为一期、无新旧开关**,决议见总 spec §0.5,优先级 总 spec §0.5 > 本文 §0.3 > 正文)。v2:2026-09-27 三方评审(§0.3)
 基线:`main` @ `3601fb4`(P0 止血已上线)
 上游:
 - 总体设计 `docs/superpowers/specs/2026-09-26-frontend-triage-focus-redesign-design.md`(下称「总 spec」)—— 本文取代其 §5(S3)与 §6(S4)纲要。
@@ -351,8 +351,8 @@ export function conclusion(group: TurnGroup): string
 | Plan | 内容 | 可独立上线 | 回退 |
 |---|---|---|---|
 | **A1** | useAcpSocket characterization + 搬迁(无 UI 变化) | ✅ | revert PR |
-| **A2** | steps.ts + TurnTimeline + TurnSummaryCard + TurnStatusBar;移除全局 density | ✅ | `zmx_turn_ui=v1` 开关回旧 TurnGroupView,保留两周 |
-| **A3** | ContextPanel(5 tab,收编 overlay + SessionInfoBar)+ FocusHeader + FocusComposer(chip、`/` 预设、记忆统一) | ✅ | 依赖 S2 壳开关 `zmx_shell` |
+| **A2** | steps.ts + TurnTimeline + TurnSummaryCard + TurnStatusBar;移除全局 density | ✅ | **v3:无开关**,直接替换 TurnGroupView;git revert 回退 |
+| **A3** | ContextPanel(**3 tab**,V1)+ FocusHeader 随 S2 壳切换同提交上线;FocusComposer(chip、`/` 预设、记忆统一)在壳稳定后 | ✅ | **v3:无开关**,git revert |
 | **A4** | SendToMenu + GitViewer「让 agent 处理」接入 | ✅ | — |
 | **B1** | useTerminalSocket characterization + B14 验证/修 + 搬迁 | ✅ | revert PR |
 | **B2** | TerminalKeyTray(收起 + 自定义键)+ 选中文本 → SendToMenu + 删 `onAskAgent` 写死 claude | ✅ | — |

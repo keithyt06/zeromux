@@ -1,7 +1,7 @@
 # 前端重设计「Triage + Focus」—— 设计
 
 日期:2026-09-26
-状态:v2(2026-09-27 CTO + PM + 高级 UI/UX 三方交叉评审后修订 §3 S1 与若干 S2 条目,见 §0.4;P0 已上线 3601fb4)
+状态:v3(2026-09-28 用户决定 S2 与 S3 Plan A 合并为一期、不留新旧开关;CTO + PM 双评审后修订,见 **§0.5,与正文/§0.4/S3 spec §0.3 冲突时以 §0.5 为准**)。v2:2026-09-27 三方评审(§0.4)。P0 已上线 3601fb4,S1 已完成 025364f
 基线:`main` @ `acb3ea3`
 输入:
 - 前端审计 `docs/superpowers/audits/2026-09-26-frontend-ux-audit.md`(以下简称「审计」,§/I-/B- 编号均指它)
@@ -77,6 +77,107 @@ happy-dom 15 有 `<dialog>.showModal` 但**无 Popover API**;`text-[8-11px]` 现
 
 **对 S3+S4 spec(2026-09-27-focus-session-experience-design.md)的修订**由该文件 v2 记录(ContextPanel 3 tab、删 Esc Esc/⌘⇧Enter/⌘1-5/自定义键编辑器/可拖宽/每会话记忆等)。
 
+### 0.5 v3 合并期决议(2026-09-28,**最高优先级**)
+
+**用户决定**:① S2(本文 §4)与 S3 Plan A(`2026-09-27-focus-session-experience-design.md` 的 A1–A4)**合并为一期**交付;② **不保留新旧 UI 开关**——删除 `zmx_shell`、`zmx_turn_ui`,新 UI 为默认且唯一;旧 Sidebar / SessionInfoBar / overlay / TurnGroupView 在切换当日删除,回退手段只有 `git revert` + `./deploy.sh --build`。Plan B(终端 S4)仍另起一期。
+
+CTO + PM 双评审关键断言,主会话已复核:`SessionType` 只有 Tmux/Claude/Codex/Crew(`session_manager.rs:61-66`,**Kiro 已删**);`turns_completed` 仅内存、重启 hydrate 归零(`:2277`);`record_and_broadcast` 收已序列化 `String`(`:2025`)且 PTY 也走它;fan-out 为三个(`spawn_acp_fanout :2764`、`spawn_crew_fanout :3759`、`spawn_codex_fanout :4057`);crew fanout 有 `SessionInput::Approval` 臂(`:4007`);`sessionControls` 只有 `setQueueMode/sendPrompt`(`App.tsx:61`);`TaskRun` 自带 `session_id`(`lib/api/scheduler.ts:32`);zustand 未安装;**首屏 br 实测 320.0KB / 330KB**(余量 10KB);全仓无 App 级测试。
+
+#### 0.5.1 架构与后端
+
+| # | 决议 | 来源 | 取代 |
+|---|---|---|---|
+| M1 | **不引 zustand、不做「纯搬迁 PR」**。App state 按职责抽成 hooks,由 `AppShell` 持有:`useSessionsPoll`(I-2/I-3,原 `App.tsx:113-159`)、`useReadState`、`useSessionControls`、`useContextPanelState`;3s 整表替换的重渲染由 §4.3 签名 memo + 行级 `memo` 挡住 | CTO | §4.7-1、§0.2「引 zustand」 |
+| M2 | **态势字段在 `emit`(`:3555`)维护**:序列化前从 `&AcpEvent` 算出 `PostureDelta`,作为 `record_and_broadcast` 的新参数在**同一把锁内**写入(PTY 路径传 `None`)。锁内零 I/O 不变 | CTO | §4.2「record_and_broadcast 锁内」 |
+| M3 | **`last_snippet` 只取 `Result.text`**(末个非空行,去 markdown,`chars().take(120)`);Codex/Crew 正文是流式增量(`streaming:Some(true)`),取末行会得碎片。运行中由 `current_step` 表达。`current_step` 在**真正 settle 的 boundary** 清空——Claude `SkipBoundary`(`:2867`)不清 | CTO | §4.2 `last_snippet` 行 |
+| M4 | **parity = 三个 fan-out**(Claude / Crew / Codex);Rust 测试按三组写。项目 CLAUDE.md 中 Kiro 描述过时,本期顺手更正 | CTO | §4.2「四 backend」 |
+| M5 | **`pending_approvals` 后端实现**:`emit` 见 `AcpEvent::Approval` +1;crew fanout `SessionInput::Approval` 臂(`:4007`)短锁 −1(饱和到 0);turn boundary 与 Exit 归零。Gateway 不回执 → 在别处(微信)批准的要等 boundary 才清零,**接受**。**删除前端派生降级方案**(`resolvedApprovals` 为本地 state,刷新即丢) | CTO | §4.2 最后一条 |
+| M6 | **行内审批摘要**(tool + purpose)由已挂载的会话视图经 `sessionControls[sid].pendingApprovals()` 提供(所有会话常驻挂载,I-1);后端只给计数 | PM + CTO | §4.4 批准 |
+| M7 | **`sessionControls` 扩展**:`{ setQueueMode, sendPrompt, interrupt(): boolean, resolveApproval(id, action): boolean, pendingApprovals(): Approval[] }`。现 `interrupt`(`AcpChatView.tsx:754`)未 OPEN 静默不发却清 `queuedCount` → 改为先判 OPEN,未 OPEN 返回 `false` 且不改 state | CTO | §4.4「cancel()」 |
+| M8 | **导出 `lifetime_cost_usd`**,并新增 `last_outcome`/`last_outcome_ms`/`last_snippet`/`current_step`/`pending_approvals`(均 `#[serde(default)]` 可选,纯新增)。重启/部署后全部归零属预期,只丢「上一轮出错」类提示 | CTO | §4.2 |
+
+| M9 | **Crew 审批 wire 契约先修**(zmx-ai-0d6f3a 代码分析 D1,主会话复核):`AcpEvent::Approval` 序列化字段是 `id`(`process.rs:108-110`,`rename_all` 不作用于变体字段),前端读 `evt.approval_id`(`AcpChatView.tsx:440`)→ 审批卡在线上从不渲染;`crewEventCases.test` 手造了 `approval_id` 所以两侧都绿。修法:前端读 `evt.approval_id ?? evt.id`(兼容已持久化 scrollback),后端加序列化形状锁定测试。**本期第一个 task**,可独立上线 | 代码分析 | M6 的前提 |
+| M9b | **`pending_approvals` 按 id 去重**:`Posture` 存 `approval_ids: Vec<String>`,导出 `len()`;`SessionInput::Approval{approval_id}` 臂按 id 移除 | 代码分析 | M5 |
+| M9c | **Crew Gateway 断线重连的 `Error{"…连接中断,正在重连"}`**(`crew_process.rs:532`)是 boundary,会让当前 turn 记为 errored → 分诊显示「出错」。**接受**:该 turn 确实被中断,提示用户查看是对的;不改 boundary 语义 | 代码分析 D12 | — |
+| M9d | **出错 turn 的数据通道**:顶层 `error`/`exit` 不进 transcript(`settleActiveTurn` 只注入空 result)→ TurnGroup 不知道「本轮出错」。`settleActiveTurn` 注入的合成 result 加 `is_error: true`,`foldTranscript` 置 `g.errored = true`,`groupSignature` 纳入该位 | 代码分析 D9 | S3 §3.4 出错卡 |
+| M9e | **RunMetricsPanel 挪入「运行」tab 不新开向上通道**:`running`/`turnStartedMs` 取轮询的 `SessionInfo.turn_state/turn_started_ms`(3s 滞后可接受),`refreshKey` = `last_outcome_ms` | 主会话 | 代码分析 §6.2-2 |
+| M9f | **体积先腾后加**:在任何新壳组件之前,先单独一个 task 做 M27 懒载并记录新基线 | 代码分析 §6.3 | M27 |
+
+#### 0.5.2 分诊与已读
+
+| # | 决议 | 来源 | 取代 |
+|---|---|---|---|
+| M10 | **已读只用时间,不用计数**:localStorage `zmx_read` 只存 `lastViewedMs[sid]`;`done_unread` = `turn_state !== 'running'` 且 `last_outcome === 'completed'` 且 `last_outcome_ms > lastViewedMs[sid]`;`error` 同理用 `last_outcome ∈ {errored, timeout}`。首次见到的 sid 以当前时间 baseline(不把历史完成标未读);列表中消失的 sid 写回时 GC。**废弃 `readCounts`/`turns_completed` 对比**(部署后 `turns_completed` 归零会让计数法永久失效) | CTO | §4.3 已读、判定 1/5 |
+| M11 | **`confirm` 按 `TaskRun.session_id` 分组**;`session_id` 为空或指向已不存在会话的待确认项,在分诊页头部显示一条全局「定时待确认 (N)」行(点开定时确认 Sheet)。调度器异常红点同放分诊页头部 | CTO + PM | §4.3 判定 4 |
+| M12 | 判定顺序改为:`error` > **`approval` > `stuck`** > `confirm` > `done_unread` > `running` > `idle` > `ended`;1、5 用 M10 的时间判定。**approval 提到 stuck 之前**:等审批时 agent 不再产出,180s 后必然满足 stuck,若 stuck 在前会把「点批准」误导成「点中断」(与 `AcpChatView` approval 刷静默基线同理)。**当前会话**(`activeId`)不产生 error/done_unread | 主会话 | §4.3 判定顺序 |
+
+#### 0.5.3 信息架构与入口(清理正文残留)
+
+| # | 决议 | 取代 |
+|---|---|---|
+| M20 | **FocusHeader = 唯一会话顶栏**(S3 spec §2.1):手机 `‹ 分诊 (N) · 会话名 · ● 状态 · ⋯`;桌面有左栏时无「←」。`⋯` 全部从 `lib/sessionActions.ts` 渲染 | §4.1 顶栏草图 |
+| M21 | **无手机底部 Tab、无顶栏横滑、无 `K`/`⌘[`、无 ⌘N、无置顶/`zmx_pins`**(R20/R24 落实到正文)。快捷键只保留 `⌘K`/`Ctrl+K`、`J`(非输入焦点)、`⌘]`(plan 阶段实测 `preventDefault` 能否压住浏览器「前进」,压不住则只留 `J` + FAB) | §4.1、§4.3、§4.4、§4.5、§4.7 |
+| M22 | **⌘K 用 `components/ui/Dialog`**(R1),不用 Radix;⌘K **不提供** `/` 预设发送(V7:预设唯一入口是 composer `/`;⌘K 新建模式的 prompt 框复用同一补全组件) | §4.6 |
+| M23 | **不做 overlay 过渡态**:ContextPanel(3 tab,S3 V1)与新壳**同一次切换**上线,SessionInfoBar/overlay/`metricsOpen` 同时删除 | §4.7-4 |
+| M24 | **⚡ 问 agent(笔记/VaultReader)走 SendToMenu**;SendToMenu「＋新开…」= 预填 ⌘K 新建模式。VaultReader 的 `askAgentRequest` 路径(`Sidebar.tsx:272-284`)在壳切换同一提交内改接 | R22 与 V6 冲突 |
+| M25 | 终端 `onAskAgent`(`App.tsx:461`)**保留到 Plan B**,本期不删(仅从 Sidebar 路由挪到 AppShell) | S3 §4.3 末条 |
+| M26 | **推送深链 `&turn=` 砍掉**(SW 只发 `id`,`sw.js:45,47`;push payload 无 turn)。`git_dirty` 深链(`App.tsx:209-211`)改为打开 ContextPanel Git「改动」tab | §4.5、S3 §3.5 |
+| M27 | **首屏体积**:门禁维持 330KB(§7.1 的 400KB 作废);本期增量靠 `React.lazy` 腾出——ContextPanel 各 tab(GitViewer/FileBrowser/AgentDashboard/RunMetricsPanel/MemoryPanel)与 Admin/Scheduled/Push/Prompts Sheet、VaultReader 全部懒载;**每个 task 都跑 `check-size`** | §7.1-4 |
+| M28 | `SessionInfoBar.tsx:43` 的同名 `StatusDot` 随 SessionInfoBar 删除;新 `components/ui/StatusDot` 按 §3.1 状态表实现 | — |
+
+#### 0.5.4 功能对位(旧 UI 删除前必须全部有家)
+
+| 现有功能(位置) | 新家 |
+|---|---|
+| 会话列表 / 未读 / 相对时间(`Sidebar.tsx:419-465`) | TriageRow |
+| 行 ⋯:复制接续命令 / 重命名 / 查看历史 / 关闭(`SessionRowMenu.tsx`) | `sessionActions`(**含「查看历史」**,仅 tmux) |
+| 双击重命名 | TriageRow 名称双击(桌面)+ `sessionActions` |
+| **会话描述**(`SessionInfoBar.tsx:50-61`,`Sidebar.tsx:463` 第二行) | `sessionActions`「重命名 / 描述…」(一个 Dialog 两字段);TriageRow 第二行在无 snippet/step 时显示描述 |
+| 桌面折叠图标栏(`Sidebar.tsx:291-358`) | md–lg 56px 图标栏 |
+| 新建六步流程 / QuickTargets / 搜索 / 换类型 | ⌘K 新建模式(空状态列 quick targets + 最近会话,R21) |
+| 设置:推送 / 预设 / 用户管理 / 主题 / **退出登录**(`Sidebar.tsx:931-954,350,401`) | ⌘K 动作 + 分诊页头部 ⚙ `<Menu>`(手机唯一可见入口) |
+| 定时任务入口 + 待确认徽标 + 调度器红点(`Sidebar.tsx:383-396`) | 分诊页头部(M11)+ ⌘K 动作 |
+| **本机 tmux 接入列表 / 「zeromux 遗留」标记**(admin,`Sidebar.tsx:496-520,557`) | ⌘K 会话区「接入本机 tmux」分组 + 分诊页「空闲」组底部可折叠「本机 tmux (N)」 |
+| **Obsidian 笔记库入口 / 关闭文档页签**(`Sidebar.tsx:614-621,486-491`,hover-only) | ⌘K 动作「打开笔记库」;分诊「文档」组行 ⋯(关闭) |
+| 队列模式下拉(`SessionInfoBar.tsx:213-228`) | composer chip 一击切换(V8) |
+| Files / Git / Events / Metrics / Memory 图标(`SessionInfoBar.tsx:111-165`) | ContextPanel 3 tab(Git / 文件 / 运行)+ composer ⌘ 记忆 |
+| 复制 peer 名、peer「休眠」提示(`SessionInfoBar.tsx:176-188`) | `sessionActions`;休眠提示放 FocusHeader 次要信息 |
+| 手动 Blocked/Done(`SessionInfoBar.tsx:196-210`) | **删除**(R24);后端 `status` 字段保留不动,仅前端不再展示/写入 |
+| 精简/完整密度切换(`AcpChatView.tsx:191-200,847`) | 删除,由 Timeline/SummaryCard 取代 |
+| 会话成本、Crew `ctx %`(`AcpChatView.tsx:815-819`) | FocusHeader($ 与次要信息) |
+| 其他终端也在看 `🖥+N`(`Sidebar.tsx:460`) | TriageRow 右侧小 Badge(lucide `Monitor`) |
+| 中断按钮 / 已排队 N 条(`AcpChatView.tsx:880-896`) | TurnStatusBar + 分诊行内中断 |
+| 终端状态栏 路径/分支/dirty、接续 chip、历史、鼠标开关(`TerminalView.tsx:727-777`) | **本期不动**(Plan B 负责);FocusHeader 对 tmux 会话只加 `⋯`(sessionActions) |
+| Git「让 agent 处理」(`App.tsx:467`) | SendToMenu(A4) |
+| 推送深链 git_dirty → worktree diff(`App.tsx:209-211`) | ContextPanel Git「改动」tab(M26) |
+| `?session=` / SW `open_session` 深链(I-17) | AppShell 原样保留 |
+
+#### 0.5.5 砍掉 / 推迟(本期不做)
+
+推送 `&turn=` 深链;notices 按时间穿插;步骤 `arrivals` 耗时打点与每行 1s ticker(Timeline 只显示状态,turn 总耗时由 `turn_started_ms` 给出);tool result「看全文」Sheet(用 `<details>` + 截断);摘要卡文件 chip 精确定位 diff(本期点击只打开 Git「改动」tab);AgentDashboard 重做(原样放在「运行」tab 下半段的折叠区,不改代码——保住 `AgentDashboard.stale.test`);GitViewer 内部改造 B5/B6 与窄屏两级导航(本期 GitViewer 原样嵌入 Git tab,仅加 `initialView` prop);记忆完整编辑迁入 composer 弹层(本期 ⌘ 弹层底部「全部…」打开 MemoryPanel Sheet);`setAppBadge` 与分诊行「忽略」(保留 `document.title` 计数);`content-visibility` 优化;`⌘.` 等附加快捷键;Plan B 全部。
+
+**不可砍**:后端 `last_outcome`/`last_snippet`/`current_step`/`pending_approvals`;已读持久化(M10);行内中断/批准;下一个(J/FAB,⌘] 视实测);⌘K 新建模式 + quick targets 空状态;ContextPanel 3 tab;队列 chip(I-6);useAcpSocket characterization 先行;SendToMenu;I-1~I-19。
+
+#### 0.5.6 没有开关后的替代护栏
+
+1. **App 级 characterization 测试先对旧 App 写**(I-1 切会话 xterm/WS 实例不变、I-2 轮询重排焦点不动、I-3 401 登出 / 5xx 不登出、I-17 深链、I-18 撤销 toast 时长),切换后原样通过。
+2. **将被删组件的测试移植到新接口**,不随组件删除:`Sidebar.newflow`(B3 失败不关、`creatingRef` 防双击)→ ⌘K 新建;`Sidebar.search` → ⌘K / `usePathSearch`;`SessionInfoBar.queuemode`(I-6)→ composer chip;`SessionRowMenu.test` → `sessionActions`;**`crewSessionType.test` ② 直接读 `Sidebar.tsx` 源码**(`:48-55`)→ 改指 `CommandPalette.tsx` / `TypeIcon`(断言语义不变:crew 分支 + 恰好 4 种类型)。**显式清单原样通过**:`AgentDashboard.stale`、`DirectoryPicker.stale`、`GitViewer.stale`、`MemoryPanel.stale`、`RunMetricsPanel.stale`、`GitViewer.worktreeStale`、`FileBrowser`、`QuickTargets`、`VaultReader`、`crewEventCases`、`crewMemoryWrite`、`acpConnection`、`acpHeaderLifetime`、`transcript`(原「7 个 stale」实为 5 个 + 1 个驼峰命名);`density.test` 的 thinking 折叠规则转写进 `steps.test`。
+3. **壳切换 = 一个可整体 revert 的合并提交**(AppShell + Triage + ⌘K + FocusHeader + ContextPanel + 删除旧路径)。其后的 composer/SendToMenu 改动**等壳切换上线稳定 ≥ 2 天**再合并,避免 revert 连坐。
+4. **上线前**在隔离实例(`--data-dir` 线上数据**副本**、`--tmux-socket` 专用、端口 ≥ 18090)上手机 + Mac 真机走通 §0.5.4 对位表每一行 + 390×844 / 1440×900 暗亮截图回归;**回滚演练**实测 `git revert` + `./deploy.sh --build` 耗时并写入 plan。
+
+#### 0.5.7 合并期验收
+
+1. §0.5.4 对位表每行有组件测试或截图证明可达。
+2. 击数以组件测试断言:手机分诊 → 下一个需要你 ≤ 1 击;分诊行内中断 / 批准 ≤ 2 击且不改 `activeId`;quick target 新建并发 prompt = ⌘K + 1 击 + 打字;队列模式切换 1 击;笔记 ⚡ → 发给 ★ ≤ 2 击。
+3. `triage()` 8 态全覆盖;刷新页面后离开期间完成的会话仍在「需要你」;3s 轮询不改 `activeId`(I-2)、未变行不重渲染(render 计数,I-9)。
+4. 切会话往返:xterm 实例、WS、ContextPanel 当前 tab、turn 展开态不丢(I-1)。
+5. useAcpSocket 抽离:characterization 六项 + 既有测试不改断言即绿。
+6. 首屏 br ≤ 330KB;token 棘轮与对比度不增;lint 不新增 error。
+7. 终端可视高度(390×844,键盘收起)不低于现状(≥ 75%)。
+8. 隔离实例真机试用无 P1;回滚演练耗时已记录。
+
+**对 S3 spec 的影响**:A1–A4 按本节执行;S3 spec §6 的 `zmx_turn_ui=v1` 回退与「依赖 S2 壳开关 `zmx_shell`」作废。
+
 ---
 
 ## 1. 路线图
@@ -85,8 +186,7 @@ happy-dom 15 有 `<dialog>.showModal` 但**无 Popover API**;`text-[8-11px]` 现
 |---|---|---|---|
 | **P0 止血** | 修高频缺陷、压缩、手机终端底部 | 详细(§2) | ✅ |
 | **S1 地基** | 设计 token、响应式、primitives、数据层收敛 | 详细(§3) | ✅(视觉统一,IA 不变) |
-| **S2 分诊与导航** ⭐ | 态势字段 + 分诊队列 + 下一个 + ⌘K + 新壳 | **完整**(§4) | ✅(新旧壳开关) |
-| S3 对话体验 | turn 摘要卡、tool 配对、Context 面板 | 纲要(§5),另起 spec | — |
+| **S2+S3 合并期** ⭐ | 态势字段 + 分诊队列 + 下一个 + ⌘K + 新壳 + turn 摘要卡/时间线 + Context 面板 + composer + SendToMenu | 完整(§4 + S3 spec Plan A,**以 §0.5 为准**) | ✅(无开关,git revert 回退) |
 | S4 移动终端 | 键栏收起、选中转发、WebGL 策略 | 纲要(§6),另起 spec | — |
 
 每阶段单独出 implementation plan;每步部署走 `./deploy.sh --build`,**先 commit + push 再 deploy**。
@@ -306,7 +406,7 @@ happy-dom 15 有 `<dialog>.showModal` 但**无 Popover API**;`text-[8-11px]` 现
 - 截图回归:390×844 与 1440×900 × 暗/亮 × {登录、侧栏、定时任务 Sheet、推送 Sheet、Admin Sheet、tmux 终端、Claude 会话} 前后对比,存 `docs/superpowers/screens/s1/`。
 - 既有测试全绿;新增 primitives / hooks / 脚本测试全绿;`npm run lint` 含棘轮通过。
 
-## 4. S2 分诊与导航(本期核心)
+## 4. S2 分诊与导航(本期核心;**v3:与 S3 Plan A 合并实施,冲突以 §0.5 为准**)
 
 ### 4.1 信息架构
 
@@ -439,8 +539,8 @@ triage(s: SessionInfo, ctx: { now: number; readCount: number; confirmsBySession:
 1. **zustand store**(`lib/store.ts`):`sessions`、`hostTmux`、`queueModes`、`readCounts`、`lastViewedMs`、`activeId`、`overlay`、`pins`、`confirmsBySession`。App 的 3s 轮询写 store;组件用 selector 订阅。行为与现 App state 一一对应,**先做纯搬迁**(一个 PR,不改 UI),App 级 characterization 测试托底:
    - 轮询不改 activeId(I-2);401 登出、5xx 不登出(I-3);切换会话 xterm 实例不重建、WS 不重连(I-1);撤销关闭 toast 时长(I-18);`?session=` 深链(I-17)。
 2. **`AppShell`**:桌面三栏 / 手机单栏 + 底部 Tab;**会话层 DOM 原样搬入**(`App.tsx:446-474` 的 sessions.map + docTabs.map,常驻 + hidden)。分诊队列、⌘K、下一个、FAB 挂在壳上。
-3. **开关**:`localStorage.zmx_shell = 'v2' | 'v1'`;设置里可切换;S2 上线默认 `v2`,v1 保留至 v2 稳定两周后删除(另起清理 PR)。
-4. S2 期间 overlay(files/git/events/memory)**保持现状**:仍由顶栏图标打开、条件挂载;S3 收编进 Context 面板。
+3. ~~**开关**:`localStorage.zmx_shell`~~ —— **v3 作废(§0.5)**:无开关,新壳默认且唯一,旧壳在切换提交中删除。
+4. ~~S2 期间 overlay 保持现状~~ —— **v3 作废(M23)**:ContextPanel 与新壳同一次切换上线。
 
 ### 4.8 S2 非目标
 
@@ -505,5 +605,5 @@ triage(s: SessionInfo, ctx: { now: number; readCount: number; confirmsBySession:
 | `pending_approvals` 回执不可观测 | §4.2 降级方案(前端派生) |
 | CompressionLayer 影响 WS 升级 / 流式 | P0 实测 `/ws/*` 101 与流式端点 |
 | Radix + React 19 StrictMode 细节 | S1 首个 primitive 落地即跑 StrictMode 组件测(未验证项) |
-| 新壳回归无法快速回退 | `zmx_shell` 开关一键回 v1 |
+| 新壳回归无法快速回退 | **v3**:无开关;壳切换为单个可 revert 提交 + App 级 characterization + 隔离实例真机试用 + 回滚演练(§0.5.6) |
 | 分诊「error」误报(上一轮出错但用户已处理) | `lastViewedMs` 判定;看过即降级为 idle |

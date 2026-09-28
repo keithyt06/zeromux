@@ -270,6 +270,8 @@ export default function GitViewer({ sessionId, onForward, sendTo, initialTab }: 
 
 // ── Worktree panel ──
 
+const DISCARD_CONFIRM = '让 agent 撤销当前工作区的全部未提交改动?此操作不可恢复。'
+
 function WorktreePanel({ wt, selected, onSelect, onRefresh, onForward, sendTo }: {
   wt: { files: WorktreeFile[]; diff: string; truncated: boolean; is_git: boolean } | null
   selected: string | null
@@ -278,8 +280,8 @@ function WorktreePanel({ wt, selected, onSelect, onRefresh, onForward, sendTo }:
   onForward?: (text: string) => boolean
   sendTo?: GitSendTo
 }) {
-  // SendToMenu path: picking the target is the explicit confirmation step (no native confirm).
-  const [menu, setMenu] = useState<{ anchor: HTMLElement; text: string } | null>(null)
+  // SendToMenu path; discard still asks (irreversible) after the target is picked.
+  const [menu, setMenu] = useState<{ anchor: HTMLElement; text: string; discard?: boolean } | null>(null)
   // After a forward, show a brief "已发送给 agent" line and disable both buttons so
   // a second tap can't queue a duplicate prompt (the chat where it lands is hidden
   // behind this overlay, so the panel itself must give the only feedback).
@@ -357,11 +359,11 @@ function WorktreePanel({ wt, selected, onSelect, onRefresh, onForward, sendTo }:
             <div className="flex gap-2 p-2">
               <button onClick={e => (sendTo ? setMenu({ anchor: e.currentTarget, text: COMMIT_PROMPT }) : forward(COMMIT_PROMPT))} disabled={sent}
                 className="px-2 py-1 text-xs rounded bg-[var(--bg-tertiary)] text-[var(--text-primary)] hover:bg-[var(--bg-hover)] disabled:opacity-40 disabled:cursor-not-allowed">让 agent 提交</button>
-              {/* With SendToMenu, choosing the target is the confirmation step. */}
-              <button onClick={e => (sendTo ? setMenu({ anchor: e.currentTarget, text: DISCARD_PROMPT }) : forward(DISCARD_PROMPT, '确认让 agent 撤销当前工作区的全部未提交改动?此操作不可恢复。'))} disabled={sent}
+              <button onClick={e => (sendTo ? setMenu({ anchor: e.currentTarget, text: DISCARD_PROMPT, discard: true }) : forward(DISCARD_PROMPT, '确认让 agent 撤销当前工作区的全部未提交改动?此操作不可恢复。'))} disabled={sent}
                 className="px-2 py-1 text-xs rounded bg-[var(--bg-tertiary)] text-[var(--accent-red)] hover:bg-[var(--bg-hover)] disabled:opacity-40 disabled:cursor-not-allowed">让 agent 撤销改动</button>
             </div>
-            {sendTo && <SendToMenu {...sendTo} open={!!menu} anchor={menu?.anchor ?? null} onClose={() => setMenu(null)} text={menu?.text ?? ''} />}
+            {sendTo && <SendToMenu {...sendTo} open={!!menu} anchor={menu?.anchor ?? null} onClose={() => setMenu(null)} text={menu?.text ?? ''}
+              title={menu?.discard ? '撤销改动 → 发给…' : undefined} confirmDanger={menu?.discard ? { title: DISCARD_CONFIRM } : undefined} />}
           </div>
         )}
       </div>

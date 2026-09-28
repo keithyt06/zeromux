@@ -1,9 +1,10 @@
-import { render, screen, fireEvent } from '@testing-library/react'
+import { render, screen, fireEvent, act } from '@testing-library/react'
 import { describe, it, expect, vi, beforeEach } from 'vitest'
 import GitViewer from '../GitViewer'
 import * as api from '../../lib/api'
 import type { SessionStatus } from '../../lib/api'
 import { mkSession } from '../../test/appHarness'
+import { DialogHost } from '../ui'
 import { COMMIT_PROMPT, DISCARD_PROMPT } from '../../lib/gitviewer'
 
 describe('GitViewer forward feedback', () => {
@@ -40,7 +41,7 @@ describe('GitViewer forward feedback', () => {
       workDir: '/w', sessions: [mkSession('me', { name: 'this-agent', work_dir: '/w' }), mkSession('o', { name: 'other', work_dir: '/x', last_activity_ms: 50 })],
       controls: { current: { me: { sendPrompt } as never } }, queueModes: {}, onSelectSession: vi.fn(), onNew: vi.fn(),
     }
-    render(<GitViewer sessionId="me" sendTo={sendTo} />)
+    render(<><GitViewer sessionId="me" sendTo={sendTo} /><DialogHost /></>)
     return { sendPrompt, confirmSpy, sendTo }
   }
   it('让 agent 提交 → SendToMenu; the current session is ★ first; picking it sends COMMIT_PROMPT', async () => {
@@ -60,5 +61,19 @@ describe('GitViewer forward feedback', () => {
     fireEvent.click(screen.getByText('＋ 新开…'))
     expect(sendTo.onNew).toHaveBeenCalledWith({ workDir: '/w', prompt: DISCARD_PROMPT })
     expect(sendPrompt).not.toHaveBeenCalled()
+  })
+  it('让 agent 撤销改动 → pick ★ → irreversibility confirm; cancel sends nothing, 发送 sends DISCARD_PROMPT', async () => {
+    const { sendPrompt, confirmSpy } = mount()
+    fireEvent.click(await screen.findByText('让 agent 撤销改动'))
+    expect(screen.getByRole('menu', { name: '撤销改动 → 发给…' })).toBeInTheDocument()
+    fireEvent.click(screen.getAllByRole('menuitem')[0])
+    expect(await screen.findByText('让 agent 撤销当前工作区的全部未提交改动?此操作不可恢复。')).toBeInTheDocument()
+    await act(async () => { fireEvent.click(screen.getByText('取消')) })
+    expect(sendPrompt).not.toHaveBeenCalled()
+    fireEvent.click(screen.getByText('让 agent 撤销改动'))
+    fireEvent.click(screen.getAllByRole('menuitem')[0])
+    await act(async () => { fireEvent.click(await screen.findByText('发送')) })
+    expect(sendPrompt).toHaveBeenCalledWith(DISCARD_PROMPT)
+    expect(confirmSpy).not.toHaveBeenCalled()
   })
 })

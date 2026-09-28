@@ -1,4 +1,4 @@
-import { useEffect, useRef, type ComponentType, type KeyboardEvent, type ReactNode } from 'react'
+import { Fragment, useEffect, useRef, type ComponentType, type KeyboardEvent, type ReactNode } from 'react'
 import { Popover } from './Popover'
 import { Kbd } from './Kbd'
 import { restoreFocus } from './modalStack'
@@ -48,7 +48,8 @@ export function Menu({ open, onClose, anchor, items, title, footer }: { open: bo
     else if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); select(i, true) }
     else if (e.key.length === 1) {
       const k = e.key.toLowerCase()
-      const hit = (it: MenuItem) => !it.disabled && it.label.toLowerCase().startsWith(k)
+      // A leading ★ (SendToMenu's default target) is decoration, not the first letter.
+      const hit = (it: MenuItem) => !it.disabled && it.label.replace(/^★\s*/, '').toLowerCase().startsWith(k)
       const j = items.findIndex((it, idx) => idx > i && hit(it))
       const j2 = j >= 0 ? j : items.findIndex(hit)
       if (j2 >= 0) focusAt(j2)
@@ -58,14 +59,17 @@ export function Menu({ open, onClose, anchor, items, title, footer }: { open: bo
     <Popover open={open} onClose={onClose} anchor={anchor} align="end" sheetTitle={title}>
       <div role="menu" aria-label={title}>
         {items.map((it, i) => (
-          <button key={it.key ?? it.label} type="button" role="menuitem" aria-label={it.ariaLabel} ref={el => { refs.current[i] = el }} disabled={it.disabled}
+          <Fragment key={it.key ?? it.label}>
+          {it.separatorBefore && <div role="separator" className="border-t border-[var(--border-subtle)]" />}
+          <button type="button" role="menuitem" aria-label={it.ariaLabel} ref={el => { refs.current[i] = el }} disabled={it.disabled}
             onKeyDown={onKey(i)} onClick={() => select(i)}
-            className={`row w-full flex items-center ${it.separatorBefore ? 'border-t border-[var(--border-subtle)]' : ''} gap-2.5 px-3 text-left text-ui-sm outline-none focus-visible:bg-[var(--surface-hover)] hover:bg-[var(--surface-hover)] disabled:opacity-50 ${it.danger ? 'text-[var(--danger)] danger' : 'text-[var(--fg)]'}`}>
+            className={`row w-full flex items-center gap-2.5 px-3 text-left text-ui-sm outline-none focus-visible:bg-[var(--surface-hover)] hover:bg-[var(--surface-hover)] disabled:opacity-50 ${it.danger ? 'text-[var(--danger)] danger' : 'text-[var(--fg)]'}`}>
             {it.icon && <it.icon size={16} className="shrink-0" />}
-            <span className="flex-1 min-w-0 truncate">{it.label}</span>
+            <span className={it.hint ? 'flex-1 min-w-0 truncate' : 'flex-1'}>{it.label}</span>
             {it.hint && <span className="shrink-0 flex items-center gap-1 text-ui-2xs text-[var(--fg-subtle)]">{it.hint}</span>}
             {it.kbd && <Kbd>{it.kbd}</Kbd>}
           </button>
+          </Fragment>
         ))}
       </div>
       {footer}

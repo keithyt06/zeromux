@@ -1,7 +1,7 @@
 import { render, screen, fireEvent, act } from '@testing-library/react'
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
 import { SendToMenu } from '../SendToMenu'
-import { Toaster, toast } from '../ui'
+import { Toaster, DialogHost, toast } from '../ui'
 import { mkSession } from '../../test/appHarness'
 import type { SessionControls } from '../../lib/sessionControls'
 import * as attach from '../../lib/attachCommand'
@@ -11,7 +11,7 @@ const ctl = (ok: boolean): SessionControls => ({
   resolveApproval: vi.fn(() => ok), pendingApprovals: () => [],
 })
 
-function setup(o: { sessions?: ReturnType<typeof mkSession>[]; controls?: Record<string, SessionControls>; queueModes?: Record<string, string>; workDir?: string | null } = {}) {
+function setup(o: { sessions?: ReturnType<typeof mkSession>[]; controls?: Record<string, SessionControls>; queueModes?: Record<string, string>; workDir?: string | null; confirmDanger?: { title: string }; title?: string } = {}) {
   const anchor = document.createElement('button'); document.body.appendChild(anchor)
   const onSelectSession = vi.fn(), onNew = vi.fn(), onClose = vi.fn()
   const sessions = o.sessions ?? [
@@ -22,8 +22,9 @@ function setup(o: { sessions?: ReturnType<typeof mkSession>[]; controls?: Record
   const controls = { current: o.controls ?? { near: ctl(true), far: ctl(false) } }
   render(<>
     <SendToMenu open anchor={anchor} onClose={onClose} text="PROMPT" workDir={o.workDir === undefined ? '/w/repo' : o.workDir}
-      sessions={sessions} controls={controls} queueModes={o.queueModes ?? {}} onSelectSession={onSelectSession} onNew={onNew} />
-    <Toaster />
+      sessions={sessions} controls={controls} queueModes={o.queueModes ?? {}} onSelectSession={onSelectSession} onNew={onNew}
+      confirmDanger={o.confirmDanger} title={o.title} />
+    <Toaster /><DialogHost />
   </>)
   return { onSelectSession, onNew, onClose, controls }
 }
@@ -104,5 +105,46 @@ describe('SendToMenu', () => {
     const items = screen.getAllByRole('menuitem')
     expect(items).toHaveLength(1)
     expect(items[0]).toHaveTextContent('＋ 新开…')
+  })
+
+  it('复制 that fails → toast 复制失败', async () => {
+    vi.spyOn(attach, 'copyText').mockResolvedValue(false)
+    setup()
+    fireEvent.click(screen.getByRole('menuitem', { name: '发给 docs-sync' }))
+    await act(async () => { fireEvent.click(screen.getByText('复制')) })
+    expect(screen.getByText('复制失败')).toBeInTheDocument()
+  })
+
+  it('typeahead ignores the leading ★', () => {
+    setup({ sessions: [mkSession('a', { name: 'alpha', work_dir: '/w/repo' }), mkSession('b', { name: 'beta' })] })
+    const items = screen.getAllByRole('menuitem')
+    fireEvent.keyDown(items[1], { key: 'a' })
+    expect(document.activeElement).toBe(items[0])
+  })
+
+  it('a separator precedes ＋ 新开… (only when there are candidates)', () => {
+    setup()
+    expect(screen.getAllByRole('separator')).toHaveLength(1)
+  })
+
+  describe('confirmDanger', () => {
+    const danger = { title: '让 agent 撤销当前工作区的全部未提交改动?此操作不可恢复。' }
+    it('picking ★ asks first; 取消 sends nothing and shows no toast', async () => {
+      const { controls } = setup({ confirmDanger: danger, title: '撤销改动 → 发给…' })
+      expect(screen.getByRole('menu', { name: '撤销改动 → 发给…' })).toBeInTheDocument()
+      fireEvent.keyDown(screen.getAllByRole('menuitem')[0], { key: 'Enter' })
+      expect(await screen.findByText(danger.title)).toBeInTheDocument()
+      await act(async () => { fireEvent.click(screen.getByText('取消')) })
+      expect(controls.current.near.sendPrompt).not.toHaveBeenCalled()
+      expect(screen.queryByText(/已发给|未连接/)).toBeNull()
+    })
+    it('发送 in the dialog sends to the picked target', async () => {
+      const { controls } = setup({ confirmDanger: danger })
+      fireEvent.click(screen.getByRole('menuitem', { name: '发给 zeromux-fe' }))
+      expect(controls.current.near.sendPrompt).not.toHaveBeenCalled()
+      await act(async () => { fireEvent.click(await screen.findByText('发送')) })
+      expect(controls.current.near.sendPrompt).toHaveBeenCalledWith('PROMPT')
+      expect(screen.getByText('已发给 zeromux-fe')).toBeInTheDocument()
+    })
   })
 })

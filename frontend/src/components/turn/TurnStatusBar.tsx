@@ -10,14 +10,17 @@ export function TurnStatusBar({ busy, turnStartedMs, lastEventMs, queuedCount, o
   const [now, setNow] = useState(() => Date.now())
   useEffect(() => {
     if (!busy) return
-    // No synchronous setNow here (react-hooks/set-state-in-effect): a stale `now`
-    // only understates — elapsed/silence are clamped at 0 — until the first tick.
+    // Deps are [busy] ONLY: re-arming on every lastEventMs bump (each streamed
+    // block) would reset the interval before it ever fires and freeze the clock.
     const t = setInterval(() => setNow(Date.now()), 1000)
     return () => clearInterval(t)
-  }, [busy, turnStartedMs, lastEventMs])
+  }, [busy])
   if (!busy && queuedCount === 0) return null
-  const elapsed = turnStartedMs ? Math.max(0, now - turnStartedMs) : 0
-  const silence = lastEventMs != null ? Math.max(0, now - lastEventMs) : 0
+  // `now` may lag a fresh turnStartedMs/lastEventMs by <1s (no setState in the
+  // effect); never let it read earlier than the timestamps it is compared to.
+  const t = Math.max(now, turnStartedMs ?? 0, lastEventMs ?? 0)
+  const elapsed = turnStartedMs ? t - turnStartedMs : 0
+  const silence = lastEventMs != null ? t - lastEventMs : 0
   const stuck = busy && lastEventMs != null && silence > STUCK_SILENCE_MS
   return (
     <div className="px-2 pb-1 flex flex-col gap-0.5 text-ui-xs">

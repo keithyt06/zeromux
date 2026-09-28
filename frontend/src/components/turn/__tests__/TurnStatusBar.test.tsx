@@ -28,4 +28,15 @@ describe('TurnStatusBar', () => {
     render(<TurnStatusBar busy turnStartedMs={Date.now()} lastEventMs={Date.now()} queuedCount={2} onInterrupt={() => {}} />)
     expect(screen.getByText('已排队 2 条，本轮结束后合并发送')).toBeInTheDocument()
   })
+  it('keeps ticking while output streams (lastEventMs bumps do not reset the clock)', () => {
+    const start = Date.now()
+    const props = { busy: true, turnStartedMs: start, queuedCount: 0, onInterrupt: () => {} }
+    const { rerender } = render(<TurnStatusBar {...props} lastEventMs={start} />)
+    for (let i = 0; i < 10; i++) {
+      act(() => { vi.advanceTimersByTime(500) })
+      rerender(<TurnStatusBar {...props} lastEventMs={Date.now()} />)
+    }
+    const m = screen.getByText(/运行中 /).textContent!.match(/运行中 ([\d.]+)s/)
+    expect(Number(m?.[1])).toBeGreaterThanOrEqual(4)
+  })
 })

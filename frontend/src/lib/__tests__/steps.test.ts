@@ -61,8 +61,11 @@ describe('touchedFiles', () => {
     const st = toSteps([tu('apply_patch', 'src/x.rs, docs/my notes.md')], true)
     expect(touchedFiles(st).map(f => f.path)).toEqual(['src/x.rs', 'docs/my notes.md'])
   })
-  it('orphan tool_result (Codex try_send dropped the use) is ignored, not crashed on', () => {
-    expect(toSteps([tr('shell', 'out'), tx('ok')], true).map(s => s.kind)).toEqual(['text'])
+  it('orphan tool_result (Codex try_send dropped the use) becomes its own done tool step', () => {
+    const st = toSteps([tr('shell', 'out'), tx('ok')], true)
+    expect(st.map(s => s.kind)).toEqual(['tool', 'text'])
+    expect(st[0].result).toBe('out')
+    expect(st[0].status).toBe('done')
   })
   it('other write-ish tools only when summary looks like a path', () => {
     const st = toSteps([tu('create_file', 'docs/a.md'), tu('str_replace', 'not a path here'), tu('Read', 'src/r.ts')], true)

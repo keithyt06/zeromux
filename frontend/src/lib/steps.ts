@@ -27,10 +27,13 @@ export function toSteps(blocks: Block[], complete: boolean): Step[] {
         out.push({ kind: 'tool', name: b.name, summary: b.summary, input: b.input, status: 'running' })
         break
       case 'tool_result': {
+        let paired = false
         for (let i = out.length - 1; i >= 0; i--) {
           const s = out[i]
-          if (s.kind === 'tool' && s.name === b.name && s.result === undefined) { s.result = b.text ?? ''; s.status = 'done'; break }
+          if (s.kind === 'tool' && s.name === b.name && s.result === undefined) { s.result = b.text ?? ''; s.status = 'done'; paired = true; break }
         }
+        // Orphan (use dropped, or a backend that only sends results): keep it visible.
+        if (!paired) { closeOpenTools(); out.push({ kind: 'tool', name: b.name, result: b.text ?? '', status: 'done' }) }
         break
       }
       case 'thinking':

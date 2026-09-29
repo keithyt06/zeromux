@@ -231,6 +231,21 @@ describe('AppShell', () => {
     expect(document.title).toBe('ZeroMux')
   })
 
+  it('first run: zmx_read is not written before the first list load (a reload then is still a first run, A3)', async () => {
+    desktop()
+    setupApp({ sessions: offline() })
+    const api = await import('../../../lib/api')
+    let release!: () => void
+    const gate = new Promise<void>(r => { release = r })
+    vi.spyOn(api, 'listSessionsWithHost').mockImplementation(async () => { await gate; return { sessions: offline(), host_tmux: [] } })
+    render(<App />)
+    await act(async () => { await vi.advanceTimersByTimeAsync(50) })
+    expect(localStorage.getItem('zmx_read')).toBeNull()
+    await act(async () => { release() })
+    await waitFor(() => expect(localStorage.getItem('zmx_read')).not.toBeNull())
+    expect(Object.keys(JSON.parse(localStorage.getItem('zmx_read')!)).sort()).toEqual(['a', 'n'])
+  })
+
   it('desktop ≥1280: agent sessions open with the ContextPanel column; tmux starts closed; state is per session', async () => {
     desktop()
     await boot()

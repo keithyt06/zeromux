@@ -80,14 +80,18 @@ export function useShellState(authActive: boolean, onAuthLost: () => void, { nar
   const [lastViewedMs, setLastViewedMs] = useState(loadLastViewed)
   // Decided once at load: no zmx_read yet = first run on this device (A3).
   const [firstRun] = useState(() => !hasReadState())
+  // Nothing is persisted until the first reconcile ran: writing zmx_read earlier (even
+  // `{}`) would turn a reload-before-first-poll into a non-first run (A3).
+  const [reconciled, setReconciled] = useState(false)
   useEffect(() => {
     // Baseline new sids (at "now" only on first run, else 0 — A3) and GC vanished ones (M10).
     // Only once the list has loaded: an empty pre-load list would GC every entry.
     if (sessions.length === 0) return
     // eslint-disable-next-line react-hooks/set-state-in-effect -- derived bookkeeping on each poll; returns prev when unchanged
     setLastViewedMs(prev => reconcileLastViewed(prev, sessions.map(s => s.id), Date.now(), firstRun))
+    setReconciled(true)
   }, [sessions, firstRun])
-  useEffect(() => { saveLastViewed(lastViewedMs) }, [lastViewedMs])
+  useEffect(() => { if (reconciled) saveLastViewed(lastViewedMs) }, [lastViewedMs, reconciled])
   const select = useCallback((id: string | null) => {
     setActiveId(id)
     if (id) setLastViewedMs(prev => markViewed(prev, id, Date.now()))

@@ -240,6 +240,20 @@ fn serve_embedded(path: &str, accept: &str) -> Response {
     try_serve_embedded_enc(path, accept).unwrap_or_else(|| StatusCode::NOT_FOUND.into_response())
 }
 
+/// Entry HTML must revalidate so a deploy never leaves a page pointing at
+/// chunk hashes the new binary no longer embeds; Vite's `assets/` are
+/// content-hashed and safe to cache forever. Everything else (sw.js,
+/// manifest, icons) keeps the previous 1h policy.
+fn cache_control_for(path: &str) -> &'static str {
+    if path == "index.html" {
+        "no-cache"
+    } else if path.starts_with("assets/") {
+        "public, max-age=31536000, immutable"
+    } else {
+        "public, max-age=3600"
+    }
+}
+
 /// Serve an embedded dist file, preferring the build-time `.br` sibling
 /// (frontend/scripts/precompress.mjs, brotli q11) when the client accepts it.
 /// No `.gz` is emitted any more, so a gzip-only client gets identity here and
@@ -262,7 +276,7 @@ fn try_serve_embedded_enc(path: &str, accept: &str) -> Option<Response> {
     };
     let mut b = Response::builder()
         .header("Content-Type", mime.as_ref())
-        .header("Cache-Control", "public, max-age=3600")
+        .header("Cache-Control", cache_control_for(path))
         .header("Vary", "Accept-Encoding")
         // Global CSP backstop (defense-in-depth): even if a raw endpoint were
         // misconfigured, agent-generated content can't execute in the app origin.
@@ -6934,6 +6948,23 @@ mod precompressed_tests {
         let res = try_serve_embedded_enc("index.html", "").expect("index.html embedded");
         assert!(res.headers().get("content-encoding").is_none());
         assert_eq!(res.headers().get("vary").unwrap(), "Accept-Encoding");
+    }
+
+    #[tokio::test]
+    async fn entry_html_is_no_cache_and_hashed_assets_are_immutable() {
+        let res = try_serve_embedded_enc("index.html", "").expect("index.html embedded");
+        assert_eq!(res.headers().get("cache-control").unwrap(), "no-cache");
+        // SPA fallback (deep link) also hands back index.html -> must revalidate.
+        let res = spa_fallback("/some/route?session=x".parse().unwrap(), axum::http::HeaderMap::new()).await;
+        assert_eq!(res.headers().get("cache-control").unwrap(), "no-cache");
+        let asset = FrontendAssets::iter()
+            .find(|p| p.starts_with("assets/") && p.ends_with(".js"))
+            .expect("a hashed js asset in dist");
+        let res = try_serve_embedded_enc(&asset, "").unwrap();
+        assert_eq!(res.headers().get("cache-control").unwrap(), "public, max-age=31536000, immutable");
+        // sw.js / manifest keep the previous policy.
+        let res = try_serve_embedded_enc("sw.js", "").unwrap();
+        assert_eq!(res.headers().get("cache-control").unwrap(), "public, max-age=3600");
     }
 
     #[test]

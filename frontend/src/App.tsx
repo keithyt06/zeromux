@@ -5,6 +5,7 @@ import { useTheme } from './lib/theme'
 import LoginPage from './components/LoginPage'
 import WaitingPage from './components/WaitingPage'
 import { AppShell } from './components/shell/AppShell'
+import { ErrorBoundary } from './components/ui/ErrorBoundary'
 
 type AuthState = 'loading' | 'unauthenticated' | 'pending' | 'active'
 
@@ -72,5 +73,5 @@ export default function App() {
   }
 
   // A 401/403 from the session poll: the credentials are gone (D-F1) — same as logout.
-  return <AppShell user={user} theme={themeCtx} onLogout={handleLogout} onAuthLost={handleLogout} />
+  return <ErrorBoundary><AppShell user={user} theme={themeCtx} onLogout={handleLogout} onAuthLost={handleLogout} /></ErrorBoundary>
 }

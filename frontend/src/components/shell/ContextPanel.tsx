@@ -1,7 +1,7 @@
 import { Suspense, useCallback, useState } from 'react'
 import { X } from 'lucide-react'
 import type { SessionInfo } from '../../lib/api'
-import { IconButton, SegmentedControl, Sheet, Skeleton } from '../ui'
+import { ErrorBoundary, IconButton, SegmentedControl, Sheet, Skeleton } from '../ui'
 import { GitViewer, FileBrowser, RunMetricsPanel, AgentDashboard } from './lazyPanels'
 import type { ContextTab } from './useShellState'
 import type { GitSendTo } from '../GitViewer'
@@ -42,7 +42,7 @@ export function ContextPanel({ session, open, tab: wanted, onTab, onClose, asShe
 
   const pane = (t: ContextTab, node: React.ReactNode) => (visited.has(t) || (showing && t === tab)) && (
     <div key={t} className={`@container h-full ${t === tab ? '' : 'hidden'}`}>
-      <Suspense fallback={<Skeleton rows={4} />}>{node}</Suspense>
+      <ErrorBoundary><Suspense fallback={<Skeleton rows={4} />}>{node}</Suspense></ErrorBoundary>
     </div>
   )
 

@@ -13,7 +13,7 @@ import { askAgentPrompt, type AskAgentTarget } from '../../lib/askAgent'
 import TerminalView from '../TerminalView'
 import { SendToMenu } from '../SendToMenu'
 import AcpChatView from '../AcpChatView'
-import { Toaster, DialogHost, Sheet, IconButton, StatusDot, toast } from '../ui'
+import { Toaster, DialogHost, Sheet, IconButton, StatusDot, toast, ErrorBoundary } from '../ui'
 import { useShellState, type ContextTab } from './useShellState'
 import { TriageHeader, type ShellPanel } from './TriageHeader'
 import { TriageList } from './TriageList'
@@ -177,9 +177,9 @@ export function AppShell({ user, theme, onLogout, onAuthLost }: {
         return (
           <div key={t.id} className={`absolute inset-0 ${isActive ? '' : 'hidden'}`}
             onClickCapture={e => { askAnchorRef.current = (e.target as Element).closest('button') }}>
-            <Suspense fallback={null}>
+            <ErrorBoundary><Suspense fallback={null}>
               <VaultReader onTitleChange={(title) => shell.updateDocTabTitle(t.id, title)} target={shell.docTargets[t.id] ?? null} onAskAgent={askAgentFromNote} />
-            </Suspense>
+            </Suspense></ErrorBoundary>
           </div>
         )
       })}
@@ -316,13 +316,13 @@ export function AppShell({ user, theme, onLogout, onAuthLost }: {
         <SendToMenu open anchor={noteSend.anchor} onClose={() => setNoteSend(null)} text={noteSend.text} {...sendTo(noteSend.workDir)} />
       )}
       <RenameDialog session={sessions.find(s => s.id === renamingId) ?? null} onClose={() => setRenamingId(null)} onSave={shell.rename} />
-      {panel === 'admin' && <Suspense fallback={null}><AdminPanel open onClose={() => setPanel(null)} /></Suspense>}
-      {panel === 'scheduled' && <Suspense fallback={null}><ScheduledTasksPanel open onClose={() => setPanel(null)} /></Suspense>}
-      {panel === 'push' && <Suspense fallback={null}><PushSettings open onClose={() => setPanel(null)} /></Suspense>}
-      {panel === 'prompts' && <Suspense fallback={null}><PromptsSheet open onClose={() => setPanel(null)} /></Suspense>}
+      {panel === 'admin' && <ErrorBoundary><Suspense fallback={null}><AdminPanel open onClose={() => setPanel(null)} /></Suspense></ErrorBoundary>}
+      {panel === 'scheduled' && <ErrorBoundary><Suspense fallback={null}><ScheduledTasksPanel open onClose={() => setPanel(null)} /></Suspense></ErrorBoundary>}
+      {panel === 'push' && <ErrorBoundary><Suspense fallback={null}><PushSettings open onClose={() => setPanel(null)} /></Suspense></ErrorBoundary>}
+      {panel === 'prompts' && <ErrorBoundary><Suspense fallback={null}><PromptsSheet open onClose={() => setPanel(null)} /></Suspense></ErrorBoundary>}
       {memoryOpen && (
         <Sheet open side="bottom" snap="full" onClose={() => setMemoryOpen(false)} title="记忆">
-          <div className="h-[75dvh]"><Suspense fallback={null}><MemoryPanel /></Suspense></div>
+          <div className="h-[75dvh]"><ErrorBoundary><Suspense fallback={null}><MemoryPanel /></Suspense></ErrorBoundary></div>
         </Sheet>
       )}
       <Toaster /><DialogHost />

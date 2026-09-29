@@ -3,6 +3,10 @@ import { ChevronDown } from 'lucide-react'
 import MarkdownContent from '../markdown/MarkdownContent'
 import { formatCost } from '../../lib/format'
 
+// conclusion() re-joins paragraphs with one blank line; compare modulo whitespace so
+// a reformatted-but-complete conclusion doesn't offer 展开全文 with nothing hidden.
+const squash = (t: string) => t.replace(/\s+/g, ' ').trim()
+
 export function TurnSummaryCard({ conclusionText, fullText, files, steps, cost, errored, expanded, onExpand, onOpenChanges }: {
   conclusionText: string
   /** The last text step in full, shown by 「展开全文」 (A5). Defaults to the conclusion. */
@@ -14,7 +18,7 @@ export function TurnSummaryCard({ conclusionText, fullText, files, steps, cost, 
   // Text heuristic for "exceeds 6 lines" (spec §3.4): jsdom can't measure layout,
   // and a measured overflow would need setState-in-effect.
   const long = conclusionText.length > 280 || conclusionText.split('\n').length > 6
-    || (!!fullText && fullText !== conclusionText)
+    || (!!fullText && squash(fullText) !== squash(conclusionText))
   const [full, setFull] = useState(false)
   return (
     <div data-testid="turn-summary" data-errored={errored ? '1' : '0'}

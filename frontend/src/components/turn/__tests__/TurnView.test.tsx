@@ -96,6 +96,11 @@ describe('TurnView', () => {
     fireEvent.click(screen.getByRole('button', { name: '展开全文' }))
     expect(screen.getByText(/Long tail paragraph/)).toBeInTheDocument()
   })
+  it('whitespace-only differences from the full text do not count as hidden (no 展开全文)', () => {
+    const g = fold([{ type: 'content_block', block_type: 'tool_use', name: 'Read', summary: 'a', turn_id: 9 }, { type: 'content_block', block_type: 'text', text: '## 总结\n   \n- 修了侧栏会话列表的双击重复触发问题', turn_id: 9 }, { type: 'result', turn_id: 9, text: '' }])
+    render(<TurnView group={g} agentName="Claude" />)
+    expect(screen.queryByRole('button', { name: '展开全文' })).toBeNull()
+  })
   it('short conclusion has no 展开全文 (nothing hidden)', () => {
     const g = fold([{ type: 'content_block', block_type: 'tool_use', name: 'Read', summary: 'a', turn_id: 8 }, { type: 'content_block', block_type: 'text', text: 'Fixed the double tap on the session list.', turn_id: 8 }, { type: 'result', turn_id: 8, text: '' }])
     render(<TurnView group={g} agentName="Claude" />)

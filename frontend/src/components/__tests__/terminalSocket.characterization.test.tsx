@@ -166,4 +166,54 @@ describe('TerminalView WS characterization', () => {
     await act(async () => { vi.advanceTimersByTime(1600) })
     expect(screen.getByText('连接断开,正在重连…')).toBeInTheDocument()
   })
+
+  // S4 Task 1b: copy-mode / pill state machine across onBinary and reconnect.
+  const scrollFrames = (s: { sent: string[] }) => msgs(s).filter(m => m.type === 'scroll' || m.type === 'input')
+
+  it('onBinary while the copy-mode pill is shown sends scroll cancel before the input', () => {
+    mount()
+    const s = ws.latest()
+    act(() => { s.fireOpen() })
+    act(() => { s.emit({ type: 'scroll_state', in_mode: true }) })
+    expect(screen.getByLabelText('scroll-bottom')).toBeInTheDocument()
+    act(() => { lastTerminal().binaryHandlers.forEach(h => h('\x1b[M ')) })
+    const f = scrollFrames(s)
+    expect(f.map(m => m.type)).toEqual(['scroll', 'input'])
+    expect(f[0]).toEqual({ type: 'scroll', op: 'cancel', n: 1 })
+    expect(screen.queryByLabelText('scroll-bottom')).toBeNull()
+  })
+
+  it('reconnect while the pill is shown clears the pill and cancels copy-mode on the new socket', async () => {
+    mount()
+    const s1 = ws.latest()
+    act(() => { s1.fireOpen() })
+    act(() => { s1.emit({ type: 'scroll_state', in_mode: true, new_lines: 3 }) })
+    expect(screen.getByLabelText('scroll-bottom')).toHaveTextContent('3 行新输出')
+    act(() => { s1.fireClose() })
+    await act(async () => { vi.advanceTimersByTime(1010) })
+    const s2 = ws.latest()
+    expect(s2).not.toBe(s1)
+    act(() => { s2.fireOpen() })
+    expect(screen.queryByLabelText('scroll-top')).toBeNull()
+    expect(screen.queryByLabelText('scroll-bottom')).toBeNull()
+    const m2 = msgs(s2)
+    expect(m2.filter(m => m.type === 'scroll')).toEqual([{ type: 'scroll', op: 'cancel', n: 1 }])
+    // The cancel follows the first resize on the new socket.
+    expect(m2.findIndex(m => m.type === 'scroll')).toBeGreaterThan(m2.findIndex(m => m.type === 'resize'))
+    expect(m2.filter(m => m.type === 'scroll_watch')).toEqual([{ type: 'scroll_watch', on: false }])
+    // Next keystroke goes straight to input: no second cancel.
+    act(() => { lastTerminal().dataHandlers.forEach(h => h('a')) })
+    expect(scrollFrames(s2).map(m => m.type)).toEqual(['scroll', 'input'])
+  })
+
+  it('reconnect while not scrolling sends no scroll cancel', async () => {
+    mount()
+    const s1 = ws.latest()
+    act(() => { s1.fireOpen() })
+    act(() => { s1.fireClose() })
+    await act(async () => { vi.advanceTimersByTime(1010) })
+    const s2 = ws.latest()
+    act(() => { s2.fireOpen() })
+    expect(msgs(s2).filter(m => m.type === 'scroll' || m.type === 'scroll_watch')).toEqual([])
+  })
 })

@@ -475,6 +475,17 @@ export default function TerminalView({ sessionId, active, theme, tmuxName, tmuxO
         // 否则每次新建/重连的会话又会回到 tmux 接管鼠标。
         // Own sessions only: External ones (e.g. VSCode's) keep their own option.
         if (shouldSendMouseOffOnConnect(!!tmuxRef.current, tmuxOriginRef.current, localStorage)) ws.send(JSON.stringify({ type: 'mouse', on: false }))
+        // A new socket starts outside copy-mode as far as the UI knows: clear the
+        // pill. If we were reading history, the pane may still be in copy-mode
+        // server-side, so cancel it (a no-op outside copy-mode). scroll_watch
+        // is per-connection server-side; the [scrolling] effect disarms it.
+        const wasScrolling = scrollingRef.current || appScrollRef.current
+        scrollingRef.current = false
+        appScrollRef.current = false
+        lastScrollOpRef.current = 'cancel'
+        setScrolling(false)
+        setNewLines(0)
+        if (wasScrolling && tmuxRef.current) ws.send(JSON.stringify({ type: 'scroll', op: 'cancel', n: 1 }))
       }
 
       ws.onmessage = (evt) => {

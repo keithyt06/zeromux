@@ -18,6 +18,7 @@ export const xtermModule = {
     calls = { reset: 0, write: 0, focus: 0 }
     dataHandlers: ((d: string) => void)[] = []
     selectionHandlers: (() => void)[] = []
+    binaryHandlers: ((d: string) => void)[] = []
     constructor() { xtermInstances.push(this) }
     open() {} blur() {} dispose() {} clear() {} scrollToBottom() {} scrollLines() {} refresh() {} resize() {}
     reset() { this.calls.reset++ }
@@ -26,11 +27,12 @@ export const xtermModule = {
     loadAddon() {} attachCustomKeyEventHandler() {}
     onData(h: (d: string) => void) { this.dataHandlers.push(h); return disp }
     onSelectionChange(h: () => void) { this.selectionHandlers.push(h); return disp }
-    onBinary() { return disp } onResize() { return disp } onScroll() { return disp } onRender() { return disp }
+    onBinary(h: (d: string) => void) { this.binaryHandlers.push(h); return disp }
+    onResize() { return disp } onScroll() { return disp } onRender() { return disp }
     hasSelection() { return selection.has } getSelection() { return selection.text }
   },
 }
-type MockTerminal = { calls: { reset: number; write: number; focus: number }; dataHandlers: ((d: string) => void)[]; selectionHandlers: (() => void)[]; cols: number; rows: number }
+type MockTerminal = { calls: { reset: number; write: number; focus: number }; dataHandlers: ((d: string) => void)[]; binaryHandlers: ((d: string) => void)[]; selectionHandlers: (() => void)[]; cols: number; rows: number }
 export const lastTerminal = () => xtermInstances[xtermInstances.length - 1] as MockTerminal
 export const fitModule = { FitAddon: class {
   fit() { const t = xtermInstances.length ? lastTerminal() : undefined; if (t) { t.cols = fitDims.cols; t.rows = fitDims.rows } }

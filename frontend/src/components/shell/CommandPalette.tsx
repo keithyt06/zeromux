@@ -56,6 +56,11 @@ export function CommandPalette(p: CommandPaletteProps) {
 type Act = { t: 'session'; id: string } | { t: 'action'; a: PaletteAction } | { t: 'tmux'; name: string }
 type Item = { id: string; act: Act; node: ReactNode }
 
+/** Last `n` path segments ("…/workshop/eks" → "workshop/eks"). */
+function lastSegments(p: string, n: number): string {
+  return p.split('/').filter(Boolean).slice(-n).join('/')
+}
+
 function stripNewPrefix(t: string): { forced: boolean; rest: string } {
   if (t.startsWith('+')) return { forced: true, rest: t.slice(1) }
   if (t.startsWith('新建 ')) return { forced: true, rest: t.slice(3) }
@@ -165,13 +170,21 @@ function PaletteBody({ onClose, initial, shell, actions, vaultEnabled = false, n
   const selectSession = (id: string) => { shell.select(id); onClose() }
   const q = text.trim()
   const items: Item[] = []
+  // Sessions matched only via their dir (last 2 segments — a full path shares a long
+  // prefix with every other session, A4). Listed after the dir results and never the
+  // default pick unless nothing else matched.
+  const pathItems: Item[] = []
   if (!newMode) {
     const out = items
     const sess = q
-      ? rankBy(q, shell.sessions, s => [s.name, s.work_dir, s.peer_name ?? '']).slice(0, 8)
+      ? rankBy(q, shell.sessions, s => [s.name, s.peer_name ?? '']).slice(0, 8)
       : [...shell.sessions].sort((a, b) => b.last_activity_ms - a.last_activity_ms).slice(0, 5)
     for (const s of sess) out.push({ id: `s:${s.id}`, act: { t: 'session', id: s.id }, node: sessionRow(s) })
     if (q) {
+      const byName = new Set(sess.map(s => s.id))
+      for (const s of rankBy(q, shell.sessions.filter(s => !byName.has(s.id)), s => [lastSegments(s.work_dir, 2)]).slice(0, Math.max(0, 8 - sess.length))) {
+        pathItems.push({ id: `s:${s.id}`, act: { t: 'session', id: s.id }, node: sessionRow(s) })
+      }
       for (const a of rankBy(q, actions, x => [x.label])) out.push({ id: `a:${a.id}`, act: { t: 'action', a }, node: <span className="flex-1 truncate text-ui-sm">{a.label}</span> })
       for (const h of matchHostTmux(shell.hostTmux, q)) out.push({
         id: `t:${h.name}`, act: { t: 'tmux', name: h.name },
@@ -185,7 +198,13 @@ function PaletteBody({ onClose, initial, shell, actions, vaultEnabled = false, n
     else if (a.t === 'action') { a.a.run(); onClose() }
     else runCreate(() => shell.create('tmux', undefined, a.name))
   }
-  const hiId = items.some(i => i.id === hi) ? hi : items[0]?.id ?? null
+  // Default highlight: name/action match > (Enter falls back to) the first dir/note hit
+  // > a path-only session, the last only once this query's search came back empty.
+  const searchCurrent = !!search.result && search.resultQuery === text
+  const searchHits = searchCurrent && ((search.result!.dirs?.items.length ?? 0) + (vaultEnabled ? search.result!.notes?.items.length ?? 0 : 0)) > 0
+  const allItems = [...items, ...pathItems]
+  const hiId = allItems.some(i => i.id === hi) ? hi
+    : items[0]?.id ?? ((searchCurrent || search.failed) && !searchHits ? pathItems[0]?.id ?? null : null)
 
   const pickDirHit = (h: DirHit) => {
     if (h.agent) { runCreate(() => shell.create(h.agent!, h.path)); return }
@@ -213,18 +232,19 @@ function PaletteBody({ onClose, initial, shell, actions, vaultEnabled = false, n
   const onKey = (e: KeyboardEvent<HTMLInputElement>) => {
     if (e.nativeEvent.isComposing) return
     if (e.key === 'ArrowDown' || e.key === 'ArrowUp') {
-      if (!items.length) return
+      if (!allItems.length) return
       e.preventDefault()
-      const i = Math.max(0, items.findIndex(x => x.id === hiId))
-      const j = e.key === 'ArrowDown' ? (i + 1) % items.length : (i - 1 + items.length) % items.length
-      setHi(items[j].id)
+      const i = allItems.findIndex(x => x.id === hiId)
+      const j = i < 0 ? (e.key === 'ArrowDown' ? 0 : allItems.length - 1)
+        : e.key === 'ArrowDown' ? (i + 1) % allItems.length : (i - 1 + allItems.length) % allItems.length
+      setHi(allItems[j].id)
     } else if (e.key === 'Tab' && newMode && dirCandidates.length > 1) {
       e.preventDefault()
       setDirPick(n => (n + (e.shiftKey ? dirCandidates.length - 1 : 1)) % dirCandidates.length)
     } else if (e.key === 'Enter') {
       e.preventDefault()
       if (newMode) { submitNew(); return }
-      const it = items.find(x => x.id === hiId)
+      const it = allItems.find(x => x.id === hiId)
       if (it) { runItem(it); return }
       // Nothing in memory matched: fall back to the best dir/note hit — only if the
       // shown results belong to this query (debounce not yet fired otherwise).
@@ -322,6 +342,17 @@ function PaletteBody({ onClose, initial, shell, actions, vaultEnabled = false, n
               onDirMenu={{ changeAgent: h => goNew(`${lastAgent()} ${h.path} `), withPrompt: h => goNew(`${h.agent ?? lastAgent()} ${h.path} `) }}
               onPickNote={pickNoteHit} onAskAgent={askAgent} onOpenHere={h => goNew(`${lastAgent()} ${h.abs_dir} `)} />
             </div>
+          )}
+          {pathItems.length > 0 && (
+            <ul role="listbox" aria-label="目录匹配的会话" className="py-1">
+              {pathItems.map(it => (
+                <li key={it.id} role="option" aria-selected={it.id === hiId} data-palette-item={it.id}
+                  onClick={() => runItem(it)} onMouseMove={() => { if (hi !== it.id) setHi(it.id) }}
+                  className={`${row} cursor-pointer ${it.id === hiId ? 'bg-[var(--surface-hover)]' : ''}`}>
+                  {it.node}
+                </li>
+              ))}
+            </ul>
           )}
           {noteSend && (
             <SendToMenu open anchor={noteSend.anchor} onClose={() => setNoteSend(null)} text={noteSend.text} workDir={noteSend.workDir}

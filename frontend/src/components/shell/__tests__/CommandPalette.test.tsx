@@ -352,4 +352,49 @@ describe('CommandPalette', () => {
     expect(onClose).toHaveBeenCalled()
     expect(onManagePresets).toHaveBeenCalledTimes(1)
   })
+
+  // A4: long shared path prefixes must not make every session match a dir query.
+  describe('path-only session matches (A4)', () => {
+    const P = '/home/ubuntu/s3-workspace/keith-space'
+    const deep = () => shell({ sessions: [
+      mkSession('z', { name: 'zeromux-fe', work_dir: `${P}/github-search/ai/zeromux`, last_activity_ms: 30 }),
+      mkSession('d', { name: 'docs-sync', work_dir: `${P}/drafts/notes`, last_activity_ms: 20 }),
+      mkSession('k', { name: 'infra', work_dir: `${P}/workshop/eks`, last_activity_ms: 10 }),
+    ] })
+    const eksDir = R(sec('dirs', [{ path: `${P}/workshop/eks/2026-05-karpenter`, display: '2026-05-karpenter', hint: 'eks', agent: 'claude', score: 90 }]), null)
+    it('typing eks + Enter → the first directory result, not a session', async () => {
+      vi.spyOn(api, 'searchPaths').mockResolvedValue(eksDir)
+      const { sh, type, key } = setup({ sh: deep() })
+      type('eks')
+      await flush()
+      await screen.findByText('2026-05-karpenter')
+      // Only the session whose last two segments match is listed, and it is not highlighted.
+      const listed = [...document.querySelectorAll('[data-palette-item]')].map(e => e.getAttribute('data-palette-item'))
+      expect(listed).toEqual(['s:k'])
+      expect(document.querySelector('[aria-selected="true"]')).toBeNull()
+      // …and it renders after the directory results.
+      const dirRow = screen.getByText('2026-05-karpenter')
+      const pathRow = document.querySelector('[data-palette-item="s:k"]')!
+      expect(dirRow.compareDocumentPosition(pathRow) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy()
+      key('Enter')
+      await waitFor(() => expect(sh.create).toHaveBeenCalledWith('claude', `${P}/workshop/eks/2026-05-karpenter`))
+      expect(sh.select).not.toHaveBeenCalled()
+    })
+    it('a session-name prefix still wins the default highlight', async () => {
+      vi.spyOn(api, 'searchPaths').mockResolvedValue(eksDir)
+      const { sh, type, key } = setup({ sh: deep() })
+      type('zero')
+      await flush()
+      key('Enter')
+      expect(sh.select).toHaveBeenCalledWith('z')
+    })
+    it('no directory hits → a path-only session is the default', async () => {
+      const { sh, type, key } = setup({ sh: deep() })
+      type('eks')
+      await flush()
+      await waitFor(() => expect(document.querySelector('[aria-selected="true"]')?.getAttribute('data-palette-item')).toBe('s:k'))
+      key('Enter')
+      expect(sh.select).toHaveBeenCalledWith('k')
+    })
+  })
 })

@@ -166,6 +166,33 @@ describe('HistoryView', () => {
     act(() => { vi.advanceTimersByTime(UNDO_MS) })
     expect(sendPrompt).toHaveBeenCalledWith(`W[${text.split('\n').slice(-200).join('\n')}]`, { withAttachments: false })
   })
+  it('a rapid double tap sends once (the second tap replaces the pending send)', async () => {
+    vi.spyOn(api, 'getHistory').mockResolvedValue({ text: 'x', truncated: false })
+    const { sendPrompt } = renderSend()
+    await waitFor(() => expect(screen.getByText('x')).toBeInTheDocument())
+    vi.useFakeTimers()
+    const btn = screen.getByRole('button', { name: '发给 s-a' })
+    fireEvent.click(btn, { detail: 1 })
+    act(() => { vi.advanceTimersByTime(200) })
+    fireEvent.click(btn, { detail: 2 })
+    expect(screen.getAllByText('已发给 s-a · 1 行')).toHaveLength(1)
+    act(() => { vi.advanceTimersByTime(UNDO_MS * 2) })
+    expect(sendPrompt).toHaveBeenCalledTimes(1)
+  })
+  it('an aborted press leaves no stale payload: a later keyboard Enter sends the current selection', async () => {
+    vi.spyOn(api, 'getHistory').mockResolvedValue({ text: 'x', truncated: false })
+    const { sendPrompt } = renderSend()
+    await waitFor(() => expect(screen.getByText('x')).toBeInTheDocument())
+    const sel = vi.spyOn(window, 'getSelection').mockReturnValue({ toString: () => 'old' } as Selection)
+    vi.useFakeTimers()
+    const btn = screen.getByRole('button', { name: '发给 s-a' })
+    fireEvent.pointerDown(btn)
+    fireEvent.pointerLeave(btn)          // finger slid off: no click
+    sel.mockReturnValue({ toString: () => 'new' } as Selection)
+    fireEvent.click(btn, { detail: 0 })  // keyboard Enter/Space activation
+    act(() => { vi.advanceTimersByTime(UNDO_MS) })
+    expect(sendPrompt).toHaveBeenCalledWith('W[new]', { withAttachments: false })
+  })
   it('long press (500ms) opens SendToMenu and sends nothing by itself', async () => {
     vi.spyOn(api, 'getHistory').mockResolvedValue({ text: 'x', truncated: false })
     const { sendPrompt } = renderSend()

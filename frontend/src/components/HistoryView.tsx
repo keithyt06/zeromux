@@ -1,4 +1,4 @@
-import { useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react'
+import { useEffect, useId, useLayoutEffect, useMemo, useRef, useState, type MouseEvent } from 'react'
 import { ArrowUpToLine, ArrowDownToLine, ChevronUp, ChevronDown, X } from 'lucide-react'
 import { getHistory } from '../lib/api'
 import { parseAnsiLine, stripAnsi, type Span } from '../lib/ansi'
@@ -44,6 +44,8 @@ export default function HistoryView({ sessionId, title, onClose, split, sendTo, 
   const pendingPayload = useRef<string | null>(null)
   const pressTimer = useRef<ReturnType<typeof setTimeout> | undefined>(undefined)
   const longPressed = useRef(false)
+  // One pending undo-send per drawer: a double tap replaces (not queues) the first.
+  const undoKey = `history-send-${useId()}`
   useEffect(() => () => clearTimeout(pressTimer.current), [])
 
   useEffect(() => {
@@ -100,18 +102,23 @@ export default function HistoryView({ sessionId, title, onClose, split, sendTo, 
   const target = sendTo ? defaultTarget(sendTo.sessions, sendTo.workDir, sendTo.excludeId, sendTo.sameDirOnly) : null
   const openMenu = (anchor: HTMLElement | null) => setMenu({ anchor, text: wrap(takePayload()) })
   const cancelPress = () => clearTimeout(pressTimer.current)
+  // An aborted press (finger slid off / cancelled) must not leave a stale payload for a later click.
+  const abortPress = () => { cancelPress(); if (!longPressed.current) pendingPayload.current = null }
+  // Keyboard activation (detail 0) has no pointerdown of its own: read the current payload.
+  const freshIfKeyboard = (e: MouseEvent) => { if (e.detail === 0) pendingPayload.current = null }
   const onSendDown = () => {
     pendingPayload.current = readPayload()
     longPressed.current = false
     cancelPress()
     pressTimer.current = setTimeout(() => { longPressed.current = true; openMenu(sendBtnRef.current) }, LONG_PRESS_MS)
   }
-  const onSendClick = () => {
+  const onSendClick = (e: MouseEvent) => {
     cancelPress()
+    freshIfKeyboard(e)
     if (longPressed.current) { longPressed.current = false; return }   // the long press already opened the menu
     if (!sendTo || !target) { openMenu(sendBtnRef.current); return }
     const payload = takePayload()
-    sendWithUndo(target, wrap(payload), payload.replace(/\s+$/, '').split('\n').length, sendTo)
+    sendWithUndo(target, wrap(payload), payload.replace(/\s+$/, '').split('\n').length, sendTo, undoKey)
   }
   const alternate = !!loaded?.alternate
   const sendLabel = target ? `发给 ${target.name}` : '发给 agent…'
@@ -173,12 +180,12 @@ export default function HistoryView({ sessionId, title, onClose, split, sendTo, 
                 {/* touch-callout / select-none only on the button: the history text must stay long-press-copyable. */}
                 <button ref={sendBtnRef} aria-label={alternate ? `${sendLabel},仅当前屏` : sendLabel}
                   className={`${btn} min-h-[var(--hit)] max-w-[40vw] truncate select-none [-webkit-touch-callout:none]`}
-                  onPointerDown={onSendDown} onPointerUp={cancelPress} onPointerLeave={cancelPress} onPointerCancel={cancelPress}
+                  onPointerDown={onSendDown} onPointerUp={cancelPress} onPointerLeave={abortPress} onPointerCancel={abortPress}
                   onContextMenu={e => e.preventDefault()} onClick={onSendClick}>
                   {target ? `发给 ★ ${target.name}` : '发给 agent…'}
                 </button>
                 {target && <IconButton label="选择发送目标" icon={ChevronDown} size="sm"
-                  onPointerDown={() => { pendingPayload.current = readPayload() }} onClick={e => openMenu(e.currentTarget)} />}
+                  onPointerDown={() => { pendingPayload.current = readPayload() }} onClick={e => { freshIfKeyboard(e); openMenu(e.currentTarget) }} />}
               </div>
             </div>
           )}

@@ -105,6 +105,19 @@ describe('TerminalView → SendToMenu', () => {
     expect(sendTo.onNew).toHaveBeenCalledWith({ workDir: '/w/repo', prompt: historyPrompt({ name: 'zmx-t1', workDir: '/w/repo', text: 'h1' }) })
   })
 
+  it('touch devices never get the floating selection button (phones use the history drawer)', async () => {
+    const mt = Object.getOwnPropertyDescriptor(Navigator.prototype, 'maxTouchPoints') ?? Object.getOwnPropertyDescriptor(navigator, 'maxTouchPoints')
+    Object.defineProperty(navigator, 'maxTouchPoints', { configurable: true, get: () => 5 })
+    try {
+      const { select } = await setup()
+      select(true, 'err line')
+      expect(floatBtn()).toBeNull()
+    } finally {
+      if (mt) Object.defineProperty(navigator, 'maxTouchPoints', mt)
+      else delete (navigator as unknown as Record<string, unknown>).maxTouchPoints
+    }
+  })
+
   it('without sendTo there is no floating button', async () => {
     render(<TerminalView sessionId="t1" active theme="dark" tmuxName="zmx-t1" tmuxOrigin="own" />)
     await act(async () => {})

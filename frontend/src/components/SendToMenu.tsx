@@ -46,16 +46,19 @@ export function sendToSession(target: SessionInfo, text: string, { controls, onS
 
 export const UNDO_MS = 3000
 let undoSeq = 0
+const pendingUndo = new Map<string, ReturnType<typeof setTimeout>>()
 
 /** One-tap send with a 3s undo (replaces the old confirm): toast 「已发给 〈名〉 · N 行」+「撤回」;
  *  the prompt is only sent once the window elapses without 撤回. Module-level so it
- *  survives the caller unmounting (e.g. the history drawer closing). */
+ *  survives the caller unmounting (e.g. the history drawer closing). A repeat call with
+ *  the same `key` (e.g. a double tap) cancels the pending send and replaces its toast. */
 // eslint-disable-next-line react-refresh/only-export-components -- shared with HistoryView's one-tap send
-export function sendWithUndo(target: SessionInfo, text: string, lines: number, deps: SendDeps): void {
-  const key = `sendto-undo-${++undoSeq}`
-  const timer = setTimeout(() => { sendToSession(target, text, deps, key) }, UNDO_MS)
+export function sendWithUndo(target: SessionInfo, text: string, lines: number, deps: SendDeps, key = `sendto-undo-${++undoSeq}`): void {
+  clearTimeout(pendingUndo.get(key))
+  const timer = setTimeout(() => { pendingUndo.delete(key); sendToSession(target, text, deps, key) }, UNDO_MS)
+  pendingUndo.set(key, timer)
   toast.push({ key, durationMs: UNDO_MS, message: `已发给 ${target.name} · ${lines} 行`, action: { label: '撤回', onClick: () => {
-    clearTimeout(timer)
+    clearTimeout(timer); pendingUndo.delete(key)
     toast.push({ message: '已撤回' })
   } } })
 }

@@ -172,6 +172,15 @@ describe('AppShell', () => {
     expect(screen.queryByText('该会话已不存在')).toBeNull()
   })
 
+  it('?session= is consumed once: selected, then stripped from the URL (A11)', async () => {
+    desktop()
+    history.replaceState(null, '', '/?session=e')
+    await boot()
+    await waitFor(() => expect(activePane()).toBe('e'))
+    expect(location.search).toBe('')
+    expect(location.pathname).toBe('/')
+  })
+
   it('phone: opening ⌘K closes the ContextPanel sheet — never two modals (R13)', async () => {
     phone()
     await boot()

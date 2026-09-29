@@ -139,7 +139,12 @@ export function useSessionsPoll(o: {
   // Deep-link: parse ?session= query param on startup
   useEffect(() => {
     const sid = new URLSearchParams(location.search).get('session')
-    if (sid) ref.current.setActiveId(() => sid)
+    if (sid) {
+      ref.current.setActiveId(() => sid)
+      // Consume it: a lingering ?session= re-opened that session on every refresh,
+      // or 该会话已不存在 once it was gone (A11).
+      history.replaceState(null, '', location.pathname)
+    }
   }, [])
 
   return { reload }

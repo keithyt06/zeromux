@@ -511,6 +511,10 @@ export default function TerminalView({ sessionId, active, theme, tmuxName, tmuxO
       }
 
       ws.onclose = () => {
+        // Identity guard: a late close from a superseded socket must not null
+        // (orphan) the live one. Unreachable under browser semantics today (one
+        // close per socket; see the effect cleanup below) — defensive (B14).
+        if (wsRef.current !== ws && wsRef.current !== null) return
         wsRef.current = null
         // Keep `since` while already reconnecting: resetting it on every failed
         // retry would re-arm ConnectionBar's delay and blink the bar off each
@@ -537,6 +541,10 @@ export default function TerminalView({ sessionId, active, theme, tmuxName, tmuxO
       if (retryTimer) clearTimeout(retryTimer)
       if (stableTimer) clearTimeout(stableTimer)
       wsRef.current?.close()
+      // close() is async in browsers: clear the ref now so a re-run of this
+      // effect (wsEpoch bump / StrictMode) isn't stopped by `if (wsRef.current)`.
+      // Safe only together with the onclose identity guard above.
+      wsRef.current = null
     }
   }, [sessionId, wsEpoch])
 

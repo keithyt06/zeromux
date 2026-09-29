@@ -13,15 +13,22 @@ export function loadLastViewed(): Record<string, number> {
   } catch { return {} }
 }
 
-/** Baseline unseen sids at `now`, GC sids no longer listed. Returns the same
- *  object when nothing changed. */
-export function reconcileLastViewed(prev: Record<string, number>, sids: string[], now: number): Record<string, number> {
+/** True once read state was ever persisted on this device (false = first run). */
+export function hasReadState(): boolean {
+  try { return localStorage.getItem(READ_KEY) != null } catch { return false }
+}
+
+/** Baseline unseen sids, GC sids no longer listed. Returns the same object when
+ *  nothing changed. On a first run (no stored read state) unseen sids baseline at
+ *  `now` so history isn't all unread; afterwards at 0, so a session created and
+ *  finished while the app was closed (a scheduled run) still counts as unread (A3). */
+export function reconcileLastViewed(prev: Record<string, number>, sids: string[], now: number, firstRun: boolean): Record<string, number> {
   const keep = new Set(sids)
   let changed = Object.keys(prev).some(k => !keep.has(k))
   const next: Record<string, number> = {}
   for (const id of sids) {
     if (id in prev) next[id] = prev[id]
-    else { next[id] = now; changed = true }
+    else { next[id] = firstRun ? now : 0; changed = true }
   }
   return changed ? next : prev
 }

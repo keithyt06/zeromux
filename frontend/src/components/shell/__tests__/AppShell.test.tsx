@@ -205,6 +205,23 @@ describe('AppShell', () => {
     expect(await screen.findByText('都处理完了')).toBeInTheDocument()
   })
 
+  // A3: a scheduled run created + errored while the app was closed (its sid was never
+  // baselined) must count as needs-you; on a first run history is not all unread.
+  const offline = () => [mkSession('a', { name: 'alpha' }),
+    mkSession('n', { name: 'nightly', last_outcome: 'errored', last_outcome_ms: NOW - 3_600_000 })]
+  it('an unseen session that errored while the app was closed is needs-you (A3)', async () => {
+    desktop()
+    localStorage.setItem('zmx_read', JSON.stringify({ a: 1 }))
+    await boot(offline())
+    await waitFor(() => expect(document.title).toBe('(1) ZeroMux'))
+  })
+  it('first run (no zmx_read): past outcomes are baselined as seen (A3)', async () => {
+    desktop()
+    await boot(offline())
+    await act(async () => { await vi.advanceTimersByTimeAsync(50) })
+    expect(document.title).toBe('ZeroMux')
+  })
+
   it('desktop ≥1280: agent sessions open with the ContextPanel column; tmux starts closed; state is per session', async () => {
     desktop()
     await boot()

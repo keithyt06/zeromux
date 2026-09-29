@@ -6,7 +6,7 @@ import { notifyQuickTargetsChanged } from '../../lib/quickTargetsBus'
 import { undoCloseToast } from '../../lib/undoCloseToast'
 import { type DocTab, newDocTab, loadDocTabs, saveDocTabs, DEFAULT_DOC_TITLE } from '../../lib/docTabs'
 import { pickDocTabForTarget } from '../../lib/docTarget'
-import { loadLastViewed, reconcileLastViewed, markViewed, saveLastViewed } from '../../lib/readState'
+import { loadLastViewed, reconcileLastViewed, markViewed, saveLastViewed, hasReadState } from '../../lib/readState'
 import { useControlsRegistry, type SessionControls, type RegisterControls } from '../../lib/sessionControls'
 import { toast, confirm } from '../ui'
 import { useSessionsPoll } from './useSessionsPoll'
@@ -78,13 +78,15 @@ export function useShellState(authActive: boolean, onAuthLost: () => void, { nar
 
   // ── read state (M10) ──
   const [lastViewedMs, setLastViewedMs] = useState(loadLastViewed)
+  // Decided once at load: no zmx_read yet = first run on this device (A3).
+  const [firstRun] = useState(() => !hasReadState())
   useEffect(() => {
-    // Baseline new sids at "now" (never mark history unread) and GC vanished ones (M10).
+    // Baseline new sids (at "now" only on first run, else 0 — A3) and GC vanished ones (M10).
     // Only once the list has loaded: an empty pre-load list would GC every entry.
     if (sessions.length === 0) return
     // eslint-disable-next-line react-hooks/set-state-in-effect -- derived bookkeeping on each poll; returns prev when unchanged
-    setLastViewedMs(prev => reconcileLastViewed(prev, sessions.map(s => s.id), Date.now()))
-  }, [sessions])
+    setLastViewedMs(prev => reconcileLastViewed(prev, sessions.map(s => s.id), Date.now(), firstRun))
+  }, [sessions, firstRun])
   useEffect(() => { saveLastViewed(lastViewedMs) }, [lastViewedMs])
   const select = useCallback((id: string | null) => {
     setActiveId(id)

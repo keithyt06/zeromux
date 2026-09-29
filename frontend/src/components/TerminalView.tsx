@@ -192,7 +192,7 @@ export default function TerminalView({ sessionId, active, theme, tmuxName, tmuxO
     }
     sendScroll({ op: 'cancel', n: 1 })
   }, [sendScroll, isTouch])
-  // ⤓ pill button: copy-mode → cancel (exitScroll); fullscreen app → wheel to bottom.
+  // "回到底部" pill button: copy-mode → cancel (exitScroll); fullscreen app → wheel to bottom.
   const scrollToBottom = useCallback(() => {
     if (!appScrollRef.current) { exitScroll(); return }
     cancelInertiaRef.current()

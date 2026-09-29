@@ -1,9 +1,9 @@
 import { useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react'
-import { ArrowUpToLine, ArrowDownToLine } from 'lucide-react'
+import { ArrowUpToLine, ArrowDownToLine, ChevronUp, ChevronDown, X } from 'lucide-react'
 import { getHistory } from '../lib/api'
 import { parseAnsiLine, stripAnsi, type Span } from '../lib/ansi'
 import { chunkLines, findMatches } from '../lib/historySearch'
-import { confirm } from './ui'
+import { confirm, IconButton } from './ui'
 
 const CHUNK = 500
 
@@ -110,9 +110,9 @@ export default function HistoryView({ sessionId, title, onClose, split, onSendTo
           onKeyDown={e => { if (e.key === 'Enter') step(e.shiftKey ? -1 : 1) }}
           className="flex-1 min-w-0 px-2 py-1 rounded border border-[var(--border)] bg-[var(--bg-primary)] text-[var(--text-primary)] text-ui-input outline-none" />
         <span className="shrink-0 tabular-nums text-[var(--text-muted)]">{matches.length ? `${cur + 1}/${matches.length}` : q ? '0/0' : ''}</span>
-        <button aria-label="上一个" onClick={() => step(-1)} className="px-1 text-[var(--text-secondary)]">▲</button>
-        <button aria-label="下一个" onClick={() => step(1)} className="px-1 text-[var(--text-secondary)]">▼</button>
-        <button aria-label="关闭历史" onClick={onClose} className="px-2 text-[var(--text-muted)] hover:text-[var(--text-primary)]">✕</button>
+        <IconButton label="上一个" icon={ChevronUp} size="sm" onClick={() => step(-1)} />
+        <IconButton label="下一个" icon={ChevronDown} size="sm" onClick={() => step(1)} />
+        <IconButton label="关闭历史" icon={X} size="sm" onClick={onClose} />
       </div>
       <div ref={scrollRef} className="flex-1 min-h-0 overflow-y-auto overscroll-contain select-text" style={{ touchAction: 'pan-y', WebkitUserSelect: 'text' }}>
         {loaded?.alternate && <div className="px-3 py-1.5 text-ui-2xs text-[var(--accent-yellow)] border-b border-[var(--border)]">当前程序处于全屏模式（如 Claude Code/vim），历史只含当前屏；请在终端中直接滑动查看。新开的终端已默认关闭 Claude Code 全屏模式。</div>}

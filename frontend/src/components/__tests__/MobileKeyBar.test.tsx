@@ -50,4 +50,14 @@ describe('MobileKeyBar', () => {
     fireEvent.pointerDown(screen.getByLabelText('more-keys'))
     expect(screen.getByLabelText('claude')).toBeInTheDocument()
   })
+
+  it('more-keys toggle is an icon, not an emoji glyph (V16)', () => {
+    render(<MobileKeyBar onKey={() => {}} />)
+    const btn = screen.getByLabelText('more-keys')
+    expect(btn.textContent).toBe('')
+    expect(btn.querySelector('svg')).not.toBeNull()
+    fireEvent.pointerDown(btn)
+    expect(btn.textContent).toBe('')
+    expect(btn.querySelector('svg')).not.toBeNull()
+  })
 })

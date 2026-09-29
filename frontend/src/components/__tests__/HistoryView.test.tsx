@@ -60,6 +60,16 @@ describe('HistoryView', () => {
     fireEvent.click(screen.getByLabelText('下一个'))
     expect(screen.getByText('2/2')).toBeInTheDocument()
   })
+  it('nav/close buttons are icons, not emoji glyphs (V16)', async () => {
+    vi.spyOn(api, 'getHistory').mockResolvedValue({ text: 'a', truncated: false })
+    render(<HistoryView sessionId="s" title="t" onClose={() => {}} />)
+    await waitFor(() => expect(screen.getByText(/a/)).toBeInTheDocument())
+    for (const label of ['上一个', '下一个', '关闭历史']) {
+      const btn = screen.getByLabelText(label)
+      expect(btn.textContent).toBe('')
+      expect(btn.querySelector('svg')).not.toBeNull()
+    }
+  })
   it('color toggle refetches with ansi=1', async () => {
     const spy = vi.spyOn(api, 'getHistory').mockResolvedValue({ text: 'x', truncated: false })
     render(<HistoryView sessionId="s" title="t" onClose={() => {}} />)

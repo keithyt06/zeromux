@@ -311,7 +311,7 @@ export default function AcpChatView({ sessionId, active, agentType = 'claude', o
     return () => onRegisterControls?.(sessionId, null)
   }, [sessionId, setQueueMode, sendPrompt, interrupt, resolveApproval, pendingApprovals, onRegisterControls])
 
-  // 「＋」 menu (V8): 📎 upload, and ⌘ memory for Crew only.
+  // 「＋」 menu (V8): 附件 upload, and ⌘ memory for Crew only.
   const plusItems: MenuItem[] = [
     { label: '附件', icon: Paperclip, onSelect: () => fileInputRef.current?.click() },
     ...(agentType === 'crew' ? [{ label: '记忆', ariaLabel: 'memory', icon: Brain, onSelect: () => {

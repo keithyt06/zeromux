@@ -1,5 +1,5 @@
 import { useState } from 'react'
-import { ArrowUp, ArrowDown, CornerDownLeft, History, type LucideIcon } from 'lucide-react'
+import { ArrowUp, ArrowDown, CornerDownLeft, History, MoreHorizontal, Undo2, type LucideIcon } from 'lucide-react'
 import type { AgentKey, ControlKey } from '../lib/terminalInput'
 
 export type BarKey = 'up' | 'down' | 'left' | 'right' | 'enter' | ControlKey | AgentKey
@@ -80,7 +80,9 @@ export default function MobileKeyBar({ onKey, onHistory }: { onKey: (key: BarKey
         ))
       )}
       <button aria-label="more-keys" onPointerDown={(e) => { e.preventDefault(); setPage(p => 1 - p) }}
-        style={{ touchAction: 'manipulation' }} className={`${btnCls} text-ui-xs`}>{page === 0 ? '⋯' : '↩︎'}</button>
+        style={{ touchAction: 'manipulation' }} className={btnCls}>
+        {page === 0 ? <MoreHorizontal size={18} /> : <Undo2 size={18} />}
+      </button>
     </div>
   )
 }

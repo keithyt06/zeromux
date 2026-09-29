@@ -1,7 +1,10 @@
-import { render, screen, fireEvent, waitFor } from '@testing-library/react'
-import { describe, it, expect, vi, beforeEach } from 'vitest'
+import { render, screen, fireEvent, waitFor, act } from '@testing-library/react'
+import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
 import HistoryView from '../HistoryView'
-import { DialogHost } from '../ui'
+import { DialogHost, Toaster, toast } from '../ui'
+import { UNDO_MS } from '../SendToMenu'
+import { mkSession } from '../../test/appHarness'
+import type { SessionControls } from '../../lib/sessionControls'
 import { chunkLines } from '../../lib/historySearch'
 import * as api from '../../lib/api'
 
@@ -16,8 +19,25 @@ describe('chunkLines', () => {
   })
 })
 
+function renderSend(o: { ok?: boolean; sessions?: ReturnType<typeof mkSession>[]; queueModes?: Record<string, string> } = {}) {
+  const sendPrompt = vi.fn(() => o.ok ?? true)
+  const ctl = { setQueueMode: vi.fn(), sendPrompt, interrupt: vi.fn(), resolveApproval: vi.fn(), pendingApprovals: () => [] } as unknown as SessionControls
+  const onNew = vi.fn(), onSelectSession = vi.fn()
+  const sessions = o.sessions ?? [mkSession('a', { work_dir: '/w/a' }), mkSession('t', { type: 'tmux', work_dir: '/w/a' })]
+  render(<>
+    <HistoryView sessionId="s" title="t" onClose={() => {}} wrap={t => `W[${t}]`}
+      sendTo={{ workDir: '/w/a', excludeId: 't', sessions, controls: { current: { a: ctl } }, queueModes: o.queueModes ?? {}, onSelectSession, onNew }} />
+    <Toaster /><DialogHost />
+  </>)
+  return { sendPrompt, onNew, onSelectSession }
+}
+
 describe('HistoryView', () => {
   beforeEach(() => { vi.restoreAllMocks() })
+  afterEach(() => {
+    vi.useRealTimers()
+    act(() => { document.querySelectorAll('[data-toast-id]').forEach(el => toast.dismiss(el.getAttribute('data-toast-id')!)) })
+  })
   it('loads history, shows truncation note, copy-all and close', async () => {
     vi.spyOn(api, 'getHistory').mockResolvedValue({ text: 'line-1\nline-2', truncated: true })
     const writeText = vi.fn().mockResolvedValue(undefined)
@@ -60,6 +80,16 @@ describe('HistoryView', () => {
     fireEvent.click(screen.getByLabelText('下一个'))
     expect(screen.getByText('2/2')).toBeInTheDocument()
   })
+  it('nav/close buttons are icons, not emoji glyphs (V16)', async () => {
+    vi.spyOn(api, 'getHistory').mockResolvedValue({ text: 'a', truncated: false })
+    render(<HistoryView sessionId="s" title="t" onClose={() => {}} />)
+    await waitFor(() => expect(screen.getByText(/a/)).toBeInTheDocument())
+    for (const label of ['上一个', '下一个', '关闭历史']) {
+      const btn = screen.getByLabelText(label)
+      expect(btn.textContent).toBe('')
+      expect(btn.querySelector('svg')).not.toBeNull()
+    }
+  })
   it('color toggle refetches with ansi=1', async () => {
     const spy = vi.spyOn(api, 'getHistory').mockResolvedValue({ text: 'x', truncated: false })
     render(<HistoryView sessionId="s" title="t" onClose={() => {}} />)
@@ -67,25 +97,202 @@ describe('HistoryView', () => {
     fireEvent.click(screen.getByText('颜色'))
     await waitFor(() => expect(spy).toHaveBeenCalledWith('s', true))
   })
-  it('send to agent asks for confirmation and sends the tail', async () => {
+  // Task 5 (V5/§1.3 E): the old confirm() is replaced by a one-tap send to ★ with a
+  // 3s undo; these two cases were rewritten to the new interaction (same payload).
+  it('send to agent: one tap to ★, no confirmation, sends the tail after the 3s undo window', async () => {
     vi.spyOn(api, 'getHistory').mockResolvedValue({ text: 'a\nb', truncated: false })
-    const onSend = vi.fn()
-    render(<><HistoryView sessionId="s" title="t" onClose={() => {}} onSendToAgent={onSend} /><DialogHost /></>)
+    const { sendPrompt } = renderSend()
     await waitFor(() => expect(screen.getByText(/b/)).toBeInTheDocument())
-    fireEvent.click(screen.getByText('发给 agent'))
-    fireEvent.click(await screen.findByText('发送'))
-    await waitFor(() => expect(onSend).toHaveBeenCalledWith('a\nb'))
+    const btn = screen.getByRole('button', { name: '发给 s-a' })
+    expect(btn).toHaveTextContent('发给 ★ s-a')
+    vi.useFakeTimers()
+    fireEvent.click(btn)
+    expect(document.querySelector('dialog[open]')).toBeNull()
+    expect(screen.getByText('已发给 s-a · 2 行')).toBeInTheDocument()
+    expect(sendPrompt).not.toHaveBeenCalled()
+    act(() => { vi.advanceTimersByTime(UNDO_MS) })
+    expect(sendPrompt).toHaveBeenCalledWith('W[a\nb]', { withAttachments: false })
+    expect(screen.getByText('已发给 s-a')).toBeInTheDocument()
   })
   it('send to agent strips ANSI escapes in color mode', async () => {
     const spy = vi.spyOn(api, 'getHistory').mockResolvedValue({ text: 'a\x1b[31mb\x1b[0mc', truncated: false })
-    const onSend = vi.fn()
-    render(<><HistoryView sessionId="s" title="t" onClose={() => {}} onSendToAgent={onSend} /><DialogHost /></>)
+    const { sendPrompt } = renderSend()
     await waitFor(() => expect(spy).toHaveBeenCalledWith('s', false))
     fireEvent.click(screen.getByText('颜色'))
     await waitFor(() => expect(spy).toHaveBeenCalledWith('s', true))
-    fireEvent.click(screen.getByText('发给 agent'))
-    fireEvent.click(await screen.findByText('发送'))
-    await waitFor(() => expect(onSend).toHaveBeenCalledWith('abc'))
-    expect(onSend.mock.calls[0][0].includes('\x1b')).toBe(false)
+    vi.useFakeTimers()
+    fireEvent.click(screen.getByRole('button', { name: '发给 s-a' }))
+    act(() => { vi.advanceTimersByTime(UNDO_MS) })
+    expect(sendPrompt).toHaveBeenCalledWith('W[abc]', { withAttachments: false })
+    expect((sendPrompt.mock.calls[0] as unknown[])[0]).not.toContain('\x1b')
+  })
+  it('撤回 within 3s: nothing is sent', async () => {
+    vi.spyOn(api, 'getHistory').mockResolvedValue({ text: 'x', truncated: false })
+    const { sendPrompt } = renderSend()
+    await waitFor(() => expect(screen.getByText('x')).toBeInTheDocument())
+    vi.useFakeTimers()
+    fireEvent.click(screen.getByRole('button', { name: '发给 s-a' }))
+    act(() => { vi.advanceTimersByTime(1000) })
+    act(() => { fireEvent.click(screen.getByText('撤回')) })
+    act(() => { vi.advanceTimersByTime(UNDO_MS * 2) })
+    expect(sendPrompt).not.toHaveBeenCalled()
+  })
+  it('target socket not open when the window elapses → 未连接,未发送', async () => {
+    vi.spyOn(api, 'getHistory').mockResolvedValue({ text: 'x', truncated: false })
+    renderSend({ ok: false })
+    await waitFor(() => expect(screen.getByText('x')).toBeInTheDocument())
+    vi.useFakeTimers()
+    fireEvent.click(screen.getByRole('button', { name: '发给 s-a' }))
+    act(() => { vi.advanceTimersByTime(UNDO_MS) })
+    expect(screen.getByText('未连接,未发送')).toBeInTheDocument()
+  })
+  it('a text selection is sent instead of the tail', async () => {
+    vi.spyOn(api, 'getHistory').mockResolvedValue({ text: 'a\nb', truncated: false })
+    const { sendPrompt } = renderSend()
+    await waitFor(() => expect(screen.getByText(/b/)).toBeInTheDocument())
+    vi.spyOn(window, 'getSelection').mockReturnValue({ toString: () => 'picked' } as Selection)
+    vi.useFakeTimers()
+    fireEvent.click(screen.getByRole('button', { name: '发给 s-a' }))
+    act(() => { vi.advanceTimersByTime(UNDO_MS) })
+    expect(sendPrompt).toHaveBeenCalledWith('W[picked]', { withAttachments: false })
+  })
+  it('the tail is the last 200 lines', async () => {
+    const text = Array.from({ length: 250 }, (_, i) => `L${i}`).join('\n')
+    vi.spyOn(api, 'getHistory').mockResolvedValue({ text, truncated: false })
+    const { sendPrompt } = renderSend()
+    await waitFor(() => expect(screen.getByText(/L249/)).toBeInTheDocument())
+    vi.useFakeTimers()
+    fireEvent.click(screen.getByRole('button', { name: '发给 s-a' }))
+    act(() => { vi.advanceTimersByTime(UNDO_MS) })
+    expect(sendPrompt).toHaveBeenCalledWith(`W[${text.split('\n').slice(-200).join('\n')}]`, { withAttachments: false })
+  })
+  it('a rapid double tap sends once (the second tap replaces the pending send)', async () => {
+    vi.spyOn(api, 'getHistory').mockResolvedValue({ text: 'x', truncated: false })
+    const { sendPrompt } = renderSend()
+    await waitFor(() => expect(screen.getByText('x')).toBeInTheDocument())
+    vi.useFakeTimers()
+    const btn = screen.getByRole('button', { name: '发给 s-a' })
+    fireEvent.click(btn, { detail: 1 })
+    act(() => { vi.advanceTimersByTime(200) })
+    fireEvent.click(btn, { detail: 2 })
+    expect(screen.getAllByText('已发给 s-a · 1 行')).toHaveLength(1)
+    act(() => { vi.advanceTimersByTime(UNDO_MS * 2) })
+    expect(sendPrompt).toHaveBeenCalledTimes(1)
+  })
+  it('an aborted press leaves no stale payload: a later keyboard Enter sends the current selection', async () => {
+    vi.spyOn(api, 'getHistory').mockResolvedValue({ text: 'x', truncated: false })
+    const { sendPrompt } = renderSend()
+    await waitFor(() => expect(screen.getByText('x')).toBeInTheDocument())
+    const sel = vi.spyOn(window, 'getSelection').mockReturnValue({ toString: () => 'old' } as Selection)
+    vi.useFakeTimers()
+    const btn = screen.getByRole('button', { name: '发给 s-a' })
+    fireEvent.pointerDown(btn)
+    fireEvent.pointerLeave(btn)          // finger slid off: no click
+    sel.mockReturnValue({ toString: () => 'new' } as Selection)
+    fireEvent.click(btn, { detail: 0 })  // keyboard Enter/Space activation
+    act(() => { vi.advanceTimersByTime(UNDO_MS) })
+    expect(sendPrompt).toHaveBeenCalledWith('W[new]', { withAttachments: false })
+  })
+  it('phone tap order (down → up → leave → selection cleared → click) still sends the picked text', async () => {
+    vi.spyOn(api, 'getHistory').mockResolvedValue({ text: 'x', truncated: false })
+    const { sendPrompt } = renderSend()
+    await waitFor(() => expect(screen.getByText('x')).toBeInTheDocument())
+    const sel = vi.spyOn(window, 'getSelection').mockReturnValue({ toString: () => 'picked' } as Selection)
+    vi.useFakeTimers()
+    const btn = screen.getByRole('button', { name: '发给 s-a' })
+    fireEvent.pointerDown(btn)
+    fireEvent.pointerUp(btn)
+    fireEvent.pointerLeave(btn)
+    sel.mockReturnValue({ toString: () => '' } as Selection)
+    fireEvent.click(btn, { detail: 1 })
+    act(() => { vi.advanceTimersByTime(UNDO_MS) })
+    expect(sendPrompt).toHaveBeenCalledWith('W[picked]', { withAttachments: false })
+  })
+  it('a pointerdown cache older than 1s is ignored: the click reads the current selection', async () => {
+    vi.spyOn(api, 'getHistory').mockResolvedValue({ text: 'x', truncated: false })
+    const { sendPrompt } = renderSend()
+    await waitFor(() => expect(screen.getByText('x')).toBeInTheDocument())
+    const sel = vi.spyOn(window, 'getSelection').mockReturnValue({ toString: () => 'old' } as Selection)
+    vi.useFakeTimers()
+    const btn = screen.getByRole('button', { name: '发给 s-a' })
+    fireEvent.pointerDown(btn)
+    fireEvent.pointerLeave(btn)          // aborted press, no click
+    act(() => { vi.advanceTimersByTime(2000) })
+    sel.mockReturnValue({ toString: () => 'new' } as Selection)
+    fireEvent.click(btn, { detail: 1 })
+    act(() => { vi.advanceTimersByTime(UNDO_MS) })
+    expect(sendPrompt).toHaveBeenCalledWith('W[new]', { withAttachments: false })
+  })
+  it('★ running in interrupt mode: the undo toast says 将打断', async () => {
+    vi.spyOn(api, 'getHistory').mockResolvedValue({ text: 'x', truncated: false })
+    renderSend({ sessions: [mkSession('a', { work_dir: '/w/a', turn_state: 'running' })], queueModes: { a: 'interrupt' } })
+    await waitFor(() => expect(screen.getByText('x')).toBeInTheDocument())
+    vi.useFakeTimers()
+    fireEvent.click(screen.getByRole('button', { name: '发给 s-a' }))
+    expect(screen.getByText('已发给 s-a · 1 行 · 将打断')).toBeInTheDocument()
+  })
+  it('★ running in collect mode: no 将打断', async () => {
+    vi.spyOn(api, 'getHistory').mockResolvedValue({ text: 'x', truncated: false })
+    renderSend({ sessions: [mkSession('a', { work_dir: '/w/a', turn_state: 'running' })], queueModes: { a: 'collect' } })
+    await waitFor(() => expect(screen.getByText('x')).toBeInTheDocument())
+    vi.useFakeTimers()
+    fireEvent.click(screen.getByRole('button', { name: '发给 s-a' }))
+    expect(screen.getByText('已发给 s-a · 1 行')).toBeInTheDocument()
+  })
+  it('long press (500ms) opens SendToMenu and sends nothing by itself', async () => {
+    vi.spyOn(api, 'getHistory').mockResolvedValue({ text: 'x', truncated: false })
+    const { sendPrompt } = renderSend()
+    await waitFor(() => expect(screen.getByText('x')).toBeInTheDocument())
+    const btn = screen.getByRole('button', { name: '发给 s-a' })
+    expect(btn.className).toContain('select-none')
+    expect(btn.className).toContain('[-webkit-touch-callout:none]')
+    vi.useFakeTimers()
+    fireEvent.pointerDown(btn)
+    act(() => { vi.advanceTimersByTime(500) })
+    fireEvent.pointerUp(btn)
+    fireEvent.click(btn)
+    expect(screen.getByRole('menu')).toBeInTheDocument()
+    act(() => { vi.advanceTimersByTime(UNDO_MS) })
+    expect(sendPrompt).not.toHaveBeenCalled()
+    expect(screen.queryByText(/已发给/)).toBeNull()
+  })
+  it('▾ opens SendToMenu; picking sends the wrapped payload', async () => {
+    vi.spyOn(api, 'getHistory').mockResolvedValue({ text: 'x', truncated: false })
+    const { sendPrompt } = renderSend()
+    await waitFor(() => expect(screen.getByText('x')).toBeInTheDocument())
+    fireEvent.click(screen.getByLabelText('选择发送目标'))
+    fireEvent.click(screen.getByRole('menuitem', { name: '发给 s-a' }))
+    expect(sendPrompt).toHaveBeenCalledWith('W[x]', { withAttachments: false })
+  })
+  it('no candidates → 「发给 agent…」 opens the menu (only ＋ 新开…)', async () => {
+    vi.spyOn(api, 'getHistory').mockResolvedValue({ text: 'x', truncated: false })
+    const { onNew } = renderSend({ sessions: [mkSession('t', { type: 'tmux' })] })
+    await waitFor(() => expect(screen.getByText('x')).toBeInTheDocument())
+    fireEvent.click(screen.getByRole('button', { name: '发给 agent…' }))
+    fireEvent.click(screen.getByText('＋ 新开…'))
+    expect(onNew).toHaveBeenCalledWith({ workDir: '/w/a', prompt: 'W[x]' })
+  })
+  it('the secret reminder line sits by the send button; the content area stays selectable', async () => {
+    vi.spyOn(api, 'getHistory').mockResolvedValue({ text: 'x', truncated: false })
+    renderSend()
+    await waitFor(() => expect(screen.getByText('x')).toBeInTheDocument())
+    expect(screen.getByText('发送前请确认内容不含密钥')).toBeInTheDocument()
+    const content = screen.getByText('x').closest('.select-text') as HTMLElement
+    expect(content.className).not.toContain('touch-callout')
+    expect(content.className).not.toContain('select-none')
+  })
+  it('fullscreen (alternate) capture: 「仅当前屏」 sub-label; aria names the target and the scope', async () => {
+    vi.spyOn(api, 'getHistory').mockResolvedValue({ text: 'screen', truncated: false, alternate: true })
+    renderSend()
+    await waitFor(() => expect(screen.getByText(/screen/)).toBeInTheDocument())
+    const btn = screen.getByRole('button', { name: '发给 s-a,仅当前屏' })
+    expect(btn).toHaveTextContent('发给 ★ s-a')
+    expect(screen.getByText('仅当前屏')).toBeInTheDocument()
+  })
+  it('no send button without sendTo', async () => {
+    vi.spyOn(api, 'getHistory').mockResolvedValue({ text: 'x', truncated: false })
+    render(<HistoryView sessionId="s" title="t" onClose={() => {}} />)
+    await waitFor(() => expect(screen.getByText('x')).toBeInTheDocument())
+    expect(screen.queryByRole('button', { name: /发给/ })).toBeNull()
   })
 })

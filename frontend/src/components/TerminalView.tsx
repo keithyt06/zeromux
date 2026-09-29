@@ -5,30 +5,33 @@ import { WebglAddon } from '@xterm/addon-webgl'
 import { ClipboardAddon } from '@xterm/addon-clipboard'
 import { writeOnlyClipboard } from '../lib/clipboard'
 import { SearchAddon } from '@xterm/addon-search'
-import { wsUrl, getSessionStatus, getTmuxHealth, reviveSession } from '../lib/api'
+import { getSessionStatus, reviveSession } from '../lib/api'
 import type { SessionStatus, TmuxHealth } from '../lib/api'
 import type { Theme } from '../lib/theme'
 import { readTerminalTheme } from '../lib/terminalTheme'
-import { b64encode, b64decode } from '../lib/base64'
+import { usePolling } from '../lib/usePolling'
+import { b64encode } from '../lib/base64'
 import { GitBranch, Folder, Circle, ArrowUpToLine, ArrowDownToLine } from 'lucide-react'
 import { attachCommand, copyText } from '../lib/attachCommand'
 import { useIsTouch } from '../lib/useMediaQuery'
 import MobileKeyBar, { type BarKey } from './MobileKeyBar'
 import Composer from './Composer'
 import ConnectionBar from './ConnectionBar'
-import type { WsStatus } from '../lib/wsStatus'
 import HistoryView from './HistoryView'
+import { SendToMenu, type SendToProps } from './SendToMenu'
 import { TmuxHealthBar, LostBanner, EndedOverlay, ReconnectHint } from './TerminalNotices'
 import { arrowSequence, rowHeight, linesFromDrag, bracketedPaste, submitSequence, controlSequence, launchSequence } from '../lib/terminalInput'
 import { shouldStickToBottom } from '../lib/scrollReplay'
-import { ScrollBatcher, inertiaLines, pillFromScrollState, scheduleInertia, shouldCancelBeforeInput, type ScrollMsg } from '../lib/terminalScroll'
-import { shouldShowShiftHint, mousePref, MOUSE_PREF_KEY, mouseToggleApplies, shouldSendMouseOffOnConnect } from '../lib/desktopHints'
+import { APP_PILL_HIDDEN, APP_PILL_IDLE_MS, ScrollBatcher, appPillReducer, inertiaLines, pillFromScrollState, scheduleInertia, shouldCancelBeforeInput, type AppPillEvent, type ScrollMsg } from '../lib/terminalScroll'
+import { shouldShowShiftHint, mousePref, MOUSE_PREF_KEY, mouseToggleApplies } from '../lib/desktopHints'
 import { historyPrompt } from '../lib/historyToAgent'
 import { shouldSendResize } from '../lib/terminalSize'
+import { useTerminalSocket } from '../hooks/useTerminalSocket'
 
 const FONT_SIZE = 14
 
 const LANDSCAPE_MQ = '(orientation: landscape) and (max-height: 500px)'
+const KEYTRAY_KEY = 'zmx_keytray'
 
 interface Props {
   sessionId: string
@@ -36,14 +39,17 @@ interface Props {
   theme: Theme
   tmuxName?: string | null
   tmuxOrigin?: 'own' | 'external' | null
+  /** tmux server health, polled globally by AppShell (§4.6) — a single 30s poll
+   *  shared by every terminal, rather than each view fetching it separately. */
+  tmuxHealth?: TmuxHealth | null
   onClose?: () => void
   /** Bumped (nonce) by the sidebar's ⋯ 查看历史 to open the history drawer. */
   historyRequest?: number
-  /** "发给 agent": open a new Claude session pre-filled with a history prompt. */
-  onAskAgent?: (prompt: string) => void
+  /** 「发给 agent」 (SendToMenu props, from AppShell): history drawer + desktop selection button. */
+  sendTo?: SendToProps
 }
 
-export default function TerminalView({ sessionId, active, theme, tmuxName, tmuxOrigin, onClose, historyRequest, onAskAgent }: Props) {
+export default function TerminalView({ sessionId, active, theme, tmuxName, tmuxOrigin, tmuxHealth, onClose, historyRequest, sendTo }: Props) {
   const containerRef = useRef<HTMLDivElement>(null)
   const termRef = useRef<Terminal | null>(null)
   const fitRef = useRef<FitAddon | null>(null)
@@ -58,7 +64,11 @@ export default function TerminalView({ sessionId, active, theme, tmuxName, tmuxO
   const userScrolledUpRef = useRef(false)
   const scrollDebounceRef = useRef<ReturnType<typeof setTimeout> | undefined>(undefined)
   const [status, setStatus] = useState<SessionStatus | null>(null)
-  const [health, setHealth] = useState<TmuxHealth | null>(null)
+  // Seeded from AppShell's global 30s poll; a tmux_down WS notice (onNotice
+  // below) overrides it locally until the next prop update self-heals it.
+  const [health, setHealth] = useState<TmuxHealth | null>(tmuxHealth ?? null)
+  // eslint-disable-next-line react-hooks/set-state-in-effect -- syncing a prop from a parent-owned poll into local state, same idiom as tmuxRef/tmuxOriginRef below
+  useEffect(() => { setHealth(tmuxHealth ?? null) }, [tmuxHealth])
   const [lost, setLost] = useState(false)
   const [ended, setEnded] = useState(false)
   // Ref twin of `ended` for the WS onclose closure: an Ended session must not
@@ -67,6 +77,9 @@ export default function TerminalView({ sessionId, active, theme, tmuxName, tmuxO
   // Bumped after revive to re-run the Connect WebSocket effect.
   const [wsEpoch, setWsEpoch] = useState(0)
   const [historyOpen, setHistoryOpen] = useState(false)
+  // Desktop: current non-blank xterm selection (drives the floating 「发给…」 button).
+  const [selText, setSelText] = useState<string | null>(null)
+  const [sendMenu, setSendMenu] = useState<{ anchor: HTMLElement | null; text: string } | null>(null)
   const [chipCopied, setChipCopied] = useState(false)
   const [reconnected, setReconnected] = useState(false)
   // True once the WS has opened at least once; a later open is a reconnect (→ ReconnectHint).
@@ -102,8 +115,13 @@ export default function TerminalView({ sessionId, active, theme, tmuxName, tmuxO
   // 软键盘是否弹起：仅触摸端用 VisualViewport 判断（见下方 effect）。只作为重新 fit
   // 的触发器——键盘弹起/收起时 paddingBottom 改变终端可用高度，而 iOS 不发 window.resize。
   const [keyboardOpen, setKeyboardOpen] = useState(false)
-  // Terminal WS status for ConnectionBar (display only; backoff logic untouched).
-  const [wsStatus, setWsStatus] = useState<{ status: WsStatus; since: number }>(() => ({ status: 'connecting', since: Date.now() }))
+  // 键栏收起（持久化，'1' = 收起）。软键盘弹起不自动展开；历史开关不影响它。
+  const [trayCollapsed, setTrayCollapsed] = useState(() => localStorage.getItem(KEYTRAY_KEY) === '1')
+  const toggleTray = useCallback(() => {
+    const next = !trayCollapsed
+    localStorage.setItem(KEYTRAY_KEY, next ? '1' : '0')
+    setTrayCollapsed(next)
+  }, [trayCollapsed])
   // 桌面 Ctrl/Cmd+F：非 tmux 会话本地搜索当前屏；tmux 会话改开历史抽屉
   // （xterm 只保留当前屏，搜索历史要走服务端 capture-pane）。
   const [searchOpen, setSearchOpen] = useState(false)
@@ -113,19 +131,15 @@ export default function TerminalView({ sessionId, active, theme, tmuxName, tmuxO
   // tmux 鼠标交给谁：true=tmux（滚轮/点选窗格），false=浏览器（原生拖选文字）。
   const [mouseOn, setMouseOn] = useState(() => mousePref(localStorage))
 
-  // Fetch status
-  useEffect(() => {
-    let cancelled = false
-    const fetchStatus = () => {
-      getSessionStatus(sessionId).then(s => {
-        if (!cancelled) setStatus(s)
-      }).catch(() => {})
-      if (tmuxName) getTmuxHealth().then(h => { if (!cancelled) setHealth(h) }).catch(() => {})
-    }
-    fetchStatus()
-    const interval = setInterval(fetchStatus, 10000)
-    return () => { cancelled = true; clearInterval(interval) }
-  }, [sessionId, tmuxName])
+  // Fetch status: only while this view is active (hidden terminals don't need
+  // a fresh work_dir/git_branch), fires immediately on becoming active, then
+  // every 10s; paused while the tab itself is hidden (usePolling semantics).
+  // tmux health is a global endpoint — AppShell polls it once for every
+  // terminal and passes the result down via the tmuxHealth prop (§4.6).
+  const fetchStatus = useCallback(() => {
+    return getSessionStatus(sessionId).then(s => { setStatus(s) })
+  }, [sessionId])
+  usePolling(fetchStatus, 10000, { enabled: active })
 
   // tmux copy-mode state (server-authoritative via scroll_state); drives the pill.
   const [scrolling, setScrolling] = useState(false)
@@ -133,6 +147,24 @@ export default function TerminalView({ sessionId, active, theme, tmuxName, tmuxO
   // True while scrolling is routed as wheel events into a fullscreen app
   // (server `app_scroll`, e.g. Claude Code) rather than tmux copy-mode.
   const appScrollRef = useRef(false)
+  // State twin of appScrollRef: picks the pill variant (outlined = app, solid = copy-mode).
+  const [appScroll, setAppScrollState] = useState(false)
+  const setAppScroll = useCallback((v: boolean) => { appScrollRef.current = v; setAppScrollState(v) }, [])
+  // Client-side estimate for the app pill (appPillReducer): net lines scrolled
+  // up since leaving the bottom, plus the idle-degraded flag.
+  const appPillRef = useRef(APP_PILL_HIDDEN)
+  const [appPillDegraded, setAppPillDegraded] = useState(false)
+  const appPillIdleRef = useRef<ReturnType<typeof setTimeout> | undefined>(undefined)
+  const dispatchAppPill = useCallback((e: AppPillEvent) => {
+    const apply = (ev: AppPillEvent) => {
+      appPillRef.current = appPillReducer(appPillRef.current, ev)
+      setAppPillDegraded(appPillRef.current.degraded)
+    }
+    apply(e)
+    clearTimeout(appPillIdleRef.current)
+    if (appPillRef.current.shown) appPillIdleRef.current = setTimeout(() => apply({ type: 'idle' }), APP_PILL_IDLE_MS)
+  }, [])
+  useEffect(() => () => clearTimeout(appPillIdleRef.current), [])
   // Last op sent, so a late app_scroll reply can't reopen a pill we just closed.
   const lastScrollOpRef = useRef<ScrollMsg['op']>('cancel')
   // "↓ N 行新输出": server diffs history_size every 1s while in copy-mode
@@ -143,7 +175,16 @@ export default function TerminalView({ sessionId, active, theme, tmuxName, tmuxO
     if (ws?.readyState === WebSocket.OPEN) ws.send(JSON.stringify({ type: 'scroll', ...m }))
     lastScrollOpRef.current = m.op
     if (m.op === 'up' || m.op === 'top') { scrollingRef.current = true; setScrolling(true) }
-  }, [])
+    dispatchAppPill(m.op === 'up' || m.op === 'down' ? { type: m.op, n: m.n } : m.op === 'top' ? { type: 'top' } : { type: 'reset' })
+    // Fullscreen app scrolled back down to where the gesture started: nothing
+    // to cancel server-side, just drop the pill.
+    if (appScrollRef.current && !appPillRef.current.shown) {
+      scrollingRef.current = false
+      setScrolling(false)
+      setAppScroll(false)
+      lastScrollOpRef.current = 'cancel'
+    }
+  }, [dispatchAppPill, setAppScroll])
   // Ref twin so the once-only init effect's touch batcher always calls the latest sendScroll.
   const sendScrollRef = useRef(sendScroll)
   useEffect(() => { sendScrollRef.current = sendScroll }, [sendScroll])
@@ -182,23 +223,24 @@ export default function TerminalView({ sessionId, active, theme, tmuxName, tmuxO
     if (!cancel) return
     scrollingRef.current = false
     setScrolling(false)
+    dispatchAppPill({ type: 'reset' })
     if (appScrollRef.current) {
       // No copy-mode to leave; typing into the app jumps it to the bottom itself.
-      appScrollRef.current = false
+      setAppScroll(false)
       lastScrollOpRef.current = 'cancel'
       return
     }
     sendScroll({ op: 'cancel', n: 1 })
-  }, [sendScroll, isTouch])
-  // ⤓ pill button: copy-mode → cancel (exitScroll); fullscreen app → wheel to bottom.
+  }, [sendScroll, isTouch, dispatchAppPill, setAppScroll])
+  // "回到底部" pill button: copy-mode → cancel (exitScroll); fullscreen app → wheel to bottom.
   const scrollToBottom = useCallback(() => {
     if (!appScrollRef.current) { exitScroll(); return }
     cancelInertiaRef.current()
-    appScrollRef.current = false
+    setAppScroll(false)
     scrollingRef.current = false
     setScrolling(false)
     sendScroll({ op: 'bottom', n: 1 })
-  }, [exitScroll, sendScroll])
+  }, [exitScroll, sendScroll, setAppScroll])
 
   // 桌面 Shift 拖选提示：tmux mouse=on 时普通拖动交给 tmux（复制模式/选窗格），
   // 只有 Shift+拖动才是浏览器原生选区。首次左键按下（非 Shift）提示一次。
@@ -311,6 +353,11 @@ export default function TerminalView({ sessionId, active, theme, tmuxName, tmuxO
       sendInput(data)
     })
 
+    term.onSelectionChange(() => {
+      const t = term.hasSelection() ? term.getSelection() : ''
+      setSelText(t.trim() ? t : null)
+    })
+
     term.onScroll(() => {
       // User scrolling up during replay (not pinned to bottom) → treat as reading
       // history and stop auto bottom-stick.
@@ -400,7 +447,6 @@ export default function TerminalView({ sessionId, active, theme, tmuxName, tmuxO
       cancelInertiaRef.current = () => {}
       batcher.dispose()
       if (scrollDebounceRef.current) clearTimeout(scrollDebounceRef.current)
-      wsRef.current?.close()
       term.dispose()
     }
   }, [sessionId])
@@ -416,129 +462,65 @@ export default function TerminalView({ sessionId, active, theme, tmuxName, tmuxO
   // 重连首发也要同步它，否则下一次「真实尺寸变回这个旧值」会被误判为冗余而漏发。
   const lastDims = useRef<{ cols: number; rows: number }>({ cols: 0, rows: 0 })
 
-  // Connect WebSocket
-  useEffect(() => {
-    if (!termRef.current) return
-    if (wsRef.current) return
+  const onOpen = useCallback((send: (msg: object) => void) => {
+    // Arm the replay window: the server is about to replay full scrollback.
+    // Only bare-shell PTYs replay scrollback; tmux repaints via refresh-client.
+    replayingRef.current = !tmuxRef.current
+    userScrolledUpRef.current = false
+    // Only a tmux terminal keeps history server-side across a reconnect —
+    // a bare-shell PTY reconnect just gets the same replay it always got.
+    if (openedOnceRef.current && tmuxRef.current) setReconnected(true)
+    openedOnceRef.current = true
+    // A new socket starts outside copy-mode as far as the UI knows: clear the
+    // pill. If we were reading history, the pane may still be in copy-mode
+    // server-side, so cancel it (a no-op outside copy-mode). scroll_watch
+    // is per-connection server-side; the [scrolling] effect disarms it.
+    const wasScrolling = scrollingRef.current || appScrollRef.current
+    scrollingRef.current = false
+    setAppScroll(false)
+    dispatchAppPill({ type: 'reset' })
+    lastScrollOpRef.current = 'cancel'
+    setScrolling(false)
+    setNewLines(0)
+    if (wasScrolling && tmuxRef.current) send({ type: 'scroll', op: 'cancel', n: 1 })
+  }, [dispatchAppPill, setAppScroll])
 
-    let disposed = false
-    let retryTimer: ReturnType<typeof setTimeout> | undefined
-    let stableTimer: ReturnType<typeof setTimeout> | undefined
-    let attempt = 0
+  const onNotice = useCallback((kind: 'tmux_lost' | 'tmux_ended' | 'tmux_down') => {
+    if (kind === 'tmux_lost') setLost(true)
+    if (kind === 'tmux_ended') setEnded(true)
+    if (kind === 'tmux_down') setHealth({ server: false, in_unit: false })
+  }, [])
 
-    const connect = () => {
-      if (disposed) return
-      const ws = new WebSocket(wsUrl(`/ws/term/${sessionId}`))
-      wsRef.current = ws
+  const onScrollState = useCallback((msg: { in_mode?: boolean; app_scroll?: boolean; new_lines?: unknown }) => {
+    const p = pillFromScrollState(msg, lastScrollOpRef.current, scrollingRef.current)
+    // App route: a reply that lands after the net scroll already returned to
+    // the start (fast up→down within one round trip) must not reopen the pill.
+    const scrolling = p.appScroll ? p.scrolling && appPillRef.current.shown : p.scrolling
+    setAppScroll(p.appScroll && scrolling)
+    scrollingRef.current = scrolling
+    setScrolling(scrolling)
+    if (!scrolling) dispatchAppPill({ type: 'reset' })
+    if (typeof msg.new_lines === 'number') setNewLines(msg.new_lines)
+  }, [dispatchAppPill, setAppScroll])
 
-      ws.onopen = () => {
-        setWsStatus({ status: 'open', since: Date.now() })
-        // Reset backoff only after the connection proves STABLE (~3s), not on the
-        // instant it opens — otherwise an accept-then-immediately-close loop resets
-        // attempt→0 every open and the 10s cap is never reached (permanent ~1s
-        // reconnect hammer). A healthy socket outlives the timer. (review 2026-08-05)
-        clearTimeout(stableTimer)
-        stableTimer = setTimeout(() => { attempt = 0 }, 3000)
-        // The server replays full scrollback on (re)connect; reset the terminal
-        // first so a reconnect doesn't double-paint the buffer.
-        termRef.current?.reset()
-        // Arm the replay window: the server is about to replay full scrollback.
-        // Only bare-shell PTYs replay scrollback; tmux repaints via refresh-client.
-        replayingRef.current = !tmuxRef.current
-        userScrolledUpRef.current = false
-        // Only a tmux terminal keeps history server-side across a reconnect —
-        // a bare-shell PTY reconnect just gets the same replay it always got.
-        if (openedOnceRef.current && tmuxRef.current) setReconnected(true)
-        openedOnceRef.current = true
-        // Only the active, visible view may size the PTY: a hidden view's
-        // proposeDimensions() is a ~10x5 fallback that would shrink the shared
-        // tmux window (window-size latest). When skipped, invalidate lastDims so
-        // the `active` effect sends the real size once this view is shown (the
-        // fresh attach may have come up at another client's size).
-        const fit = fitRef.current
-        const el = containerRef.current
-        const dims = fit?.proposeDimensions()
-        if (dims && el && shouldSendResize({
-          active: activeRef.current,
-          containerWidth: el.clientWidth,
-          containerHeight: el.clientHeight,
-          cols: dims.cols,
-          rows: dims.rows,
-          last: { cols: 0, rows: 0 }, // first send on a new socket is never redundant
-        })) {
-          ws.send(JSON.stringify({ type: 'resize', cols: dims.cols, rows: dims.rows }))
-          lastDims.current = { cols: dims.cols, rows: dims.rows }
-        } else {
-          lastDims.current = { cols: 0, rows: 0 }
-        }
-        // tmux 会话默认 mouse=on（tmux.conf）；用户上次关过就在（重）连接时同步关掉，
-        // 否则每次新建/重连的会话又会回到 tmux 接管鼠标。
-        // Own sessions only: External ones (e.g. VSCode's) keep their own option.
-        if (shouldSendMouseOffOnConnect(!!tmuxRef.current, tmuxOriginRef.current, localStorage)) ws.send(JSON.stringify({ type: 'mouse', on: false }))
+  const onOutputSettled = useCallback(() => {
+    if (scrollDebounceRef.current) clearTimeout(scrollDebounceRef.current)
+    scrollDebounceRef.current = setTimeout(() => {
+      if (shouldStickToBottom({ replaying: replayingRef.current, userScrolledUp: userScrolledUpRef.current })) {
+        termRef.current?.scrollToBottom()
       }
+      // First settle after the replay burst closes the window: live
+      // output afterwards must not auto-scroll (user may read scrollback).
+      replayingRef.current = false
+    }, 120)
+  }, [])
 
-      ws.onmessage = (evt) => {
-        try {
-          const msg = JSON.parse(evt.data)
-          if (msg.type === 'notice') {
-            if (msg.kind === 'tmux_lost') setLost(true)
-            if (msg.kind === 'tmux_ended') { endedRef.current = true; setEnded(true) }
-            if (msg.kind === 'tmux_down') setHealth({ server: false, in_unit: false })
-            return
-          }
-          if (msg.type === 'scroll_state') {
-            const p = pillFromScrollState(msg, lastScrollOpRef.current, scrollingRef.current)
-            appScrollRef.current = p.appScroll
-            scrollingRef.current = p.scrolling
-            setScrolling(p.scrolling)
-            if (typeof msg.new_lines === 'number') setNewLines(msg.new_lines)
-            return
-          }
-          if (msg.type === 'output') {
-            termRef.current?.write(b64decode(msg.data), () => {
-              if (scrollDebounceRef.current) clearTimeout(scrollDebounceRef.current)
-              scrollDebounceRef.current = setTimeout(() => {
-                if (shouldStickToBottom({ replaying: replayingRef.current, userScrolledUp: userScrolledUpRef.current })) {
-                  termRef.current?.scrollToBottom()
-                }
-                // First settle after the replay burst closes the window: live
-                // output afterwards must not auto-scroll (user may read scrollback).
-                replayingRef.current = false
-              }, 120)
-            })
-          }
-        } catch { /* ignore */ }
-      }
-
-      ws.onclose = () => {
-        wsRef.current = null
-        // Keep `since` while already reconnecting: resetting it on every failed
-        // retry would re-arm ConnectionBar's delay and blink the bar off each
-        // backoff cycle (same pattern as AcpChatView).
-        if (!disposed) setWsStatus(prev => endedRef.current ? { status: 'ended', since: Date.now() } : prev.status === 'reconnecting' ? prev : { status: 'reconnecting', since: Date.now() })
-        // A close before the stability timer fires means this open did NOT prove
-        // stable — cancel the pending reset so `attempt` keeps escalating.
-        clearTimeout(stableTimer)
-        // Auto-reconnect through idle-timeout proxy drops / transient closes so
-        // the terminal never freezes silently. Exponential backoff, capped at 10s.
-        if (!disposed && !endedRef.current) {
-          const delay = Math.min(1000 * 2 ** attempt, 10000)
-          attempt += 1
-          retryTimer = setTimeout(connect, delay)
-        }
-      }
-      ws.onerror = () => { ws.close() }
-    }
-
-    connect()
-
-    return () => {
-      disposed = true
-      if (retryTimer) clearTimeout(retryTimer)
-      if (stableTimer) clearTimeout(stableTimer)
-      wsRef.current?.close()
-    }
-  }, [sessionId, wsEpoch])
+  // Connect WebSocket. Must stay AFTER the init effect: it relies on termRef
+  // having been set in the same commit (termRef isn't a dep).
+  const { wsStatus, sendRaw } = useTerminalSocket({
+    sessionId, epoch: wsEpoch, wsRef, endedRef, lastDims, termRef, fitRef, containerRef, activeRef, tmuxRef, tmuxOriginRef,
+    onOutputSettled, onScrollState, onNotice, onOpen,
+  })
 
   // Stable identity so ReconnectHint's 3s auto-dismiss timer isn't reset by every
   // parent re-render (a new inline arrow each render would restart the setTimeout).
@@ -601,6 +583,22 @@ export default function TerminalView({ sessionId, active, theme, tmuxName, tmuxO
     return () => window.removeEventListener('resize', handleResize)
   }, [handleResize])
 
+  // ContextPanel expand/collapse (and rail toggle) resize the container without
+  // firing window resize, so watch it directly. Debounced 50ms like the other
+  // refit effects; handleResize's own 0×0 skip + shouldSendResize dedupe (I-12)
+  // still apply — this just adds another trigger, not another send path.
+  useEffect(() => {
+    const el = containerRef.current
+    if (!el || typeof ResizeObserver === 'undefined') return
+    let t: ReturnType<typeof setTimeout> | undefined
+    const ro = new ResizeObserver(() => {
+      if (t) clearTimeout(t)
+      t = setTimeout(handleResize, 50)
+    })
+    ro.observe(el)
+    return () => { if (t) clearTimeout(t); ro.disconnect() }
+  }, [handleResize])
+
   // 键条 / composer 占用高度，改变终端可用区；渲染后重新 fit，
   // 避免底部行被遮 / canvas 尺寸过期。软键盘弹起/收起时 VisualViewport effect 改了
   // paddingBottom（iOS 不发 window.resize），这里是唯一的重算路径：每次切换 fit 一次。
@@ -608,7 +606,7 @@ export default function TerminalView({ sessionId, active, theme, tmuxName, tmuxO
     if (!isTouch) return
     const t = setTimeout(handleResize, 50)
     return () => clearTimeout(t)
-  }, [isTouch, keyboardOpen, handleResize])
+  }, [isTouch, keyboardOpen, trayCollapsed, handleResize])
 
   // ConnectionBar is rendered while not open and removed on open, changing the
   // terminal's height after onopen already measured (rows N-1). Refit once the
@@ -654,15 +652,25 @@ export default function TerminalView({ sessionId, active, theme, tmuxName, tmuxO
     }
   }, [isTouch, active])
 
+  // Terminal output → agent prompt. work_dir comes from SessionInfo (sendTo), not the polled status.
+  const wrapForAgent = (t: string) => historyPrompt({ name: tmuxName ?? '', workDir: sendTo?.workDir ?? '', text: t })
+  // Copy-mode (server-confirmed) = solid accent; fullscreen app (client-estimated)
+  // = outlined, and after APP_PILL_IDLE_MS without scrolling just the icon-only bottom button.
+  const pillDegraded = appScroll && appPillDegraded
   const scrollPill = tmuxName && scrolling ? (
-    <div className={`absolute right-3 z-10 flex gap-1 text-xs ${isTouch ? 'bottom-full mb-2' : 'bottom-28'}`}>
-      <button aria-label="scroll-top" onPointerDown={e => { e.preventDefault(); sendScroll({ op: 'top', n: 1 }) }}
-        className="flex items-center px-2.5 py-1.5 rounded-full bg-[var(--bg-tertiary)] border border-[var(--border)] shadow">
-        <ArrowUpToLine size={14} />
-      </button>
+    <div data-testid="scroll-pill" data-variant={appScroll ? 'app' : 'copy'} data-degraded={pillDegraded ? 'true' : 'false'}
+      className={`absolute right-3 z-10 flex gap-1 text-xs ${isTouch ? 'bottom-full mb-2' : 'bottom-28'}`}>
+      {!pillDegraded && (
+        <button aria-label="scroll-top" onPointerDown={e => { e.preventDefault(); sendScroll({ op: 'top', n: 1 }) }}
+          className="flex items-center px-2.5 py-1.5 rounded-full bg-[var(--bg-tertiary)] border border-[var(--border)] shadow">
+          <ArrowUpToLine size={14} />
+        </button>
+      )}
       <button aria-label="scroll-bottom" onPointerDown={e => { e.preventDefault(); scrollToBottom() }}
-        className="flex items-center gap-1 px-3 py-1.5 rounded-full bg-[var(--accent-blue)] text-white shadow">
-        <ArrowDownToLine size={14} />{newLines > 0 ? `${newLines} 行新输出` : '回到底部'}
+        className={`flex items-center justify-center gap-1 py-1.5 rounded-full shadow transition-[padding,background-color,color] duration-[var(--dur-base)] motion-reduce:transition-none ${
+          pillDegraded ? 'min-w-[var(--hit)] min-h-[var(--hit)] px-1.5' : 'px-3'} ${
+          appScroll ? 'border border-[var(--accent)] text-[var(--accent)] bg-[var(--surface-0)]' : 'bg-[var(--accent-blue)] text-white'}`}>
+        <ArrowDownToLine size={14} />{pillDegraded ? null : newLines > 0 ? `${newLines} 行新输出` : '回到底部'}
       </button>
     </div>
   ) : null
@@ -699,10 +707,14 @@ export default function TerminalView({ sessionId, active, theme, tmuxName, tmuxO
         />
       )}
       {historyOpen && <HistoryView sessionId={sessionId} title={tmuxName ?? ''} split={split} onClose={() => setHistoryOpen(false)}
-        onSendToAgent={onAskAgent ? (t) => {
-          setHistoryOpen(false)
-          onAskAgent(historyPrompt({ name: tmuxName ?? '', workDir: status?.work_dir ?? '', text: t }))
-        } : undefined} />}
+        sendTo={sendTo} wrap={wrapForAgent} />}
+      {!isTouch && sendTo && selText && (
+        <button aria-label="发给…" onClick={e => setSendMenu({ anchor: e.currentTarget, text: wrapForAgent(selText) })}
+          className="absolute right-3 bottom-16 z-sticky min-h-[var(--hit)] px-3 rounded-full border border-[var(--border)] bg-[var(--surface-2)] text-ui-xs text-[var(--fg)] shadow">
+          发给…
+        </button>
+      )}
+      {sendTo && sendMenu && <SendToMenu open anchor={sendMenu.anchor} onClose={() => setSendMenu(null)} text={sendMenu.text} {...sendTo} />}
       {!isTouch && scrollPill}
       {!isTouch && <ConnectionBar status={wsStatus.status} sinceMs={wsStatus.since} />}
       {/* 触摸端：一个底部容器装 胶囊(浮于键栏之上) + 连接条 + 键栏 + 常驻输入框(贴底，最靠近软键盘)。
@@ -711,8 +723,13 @@ export default function TerminalView({ sessionId, active, theme, tmuxName, tmuxO
         <div data-testid="term-bottom" className="relative">
           {scrollPill}
           <ConnectionBar status={wsStatus.status} sinceMs={wsStatus.since} />
-          <MobileKeyBar onKey={handleBarKey} onHistory={tmuxName ? () => setHistoryOpen(true) : undefined} />
-          <div className="px-2 py-1.5 border-t border-[var(--border)] bg-[var(--bg-secondary)]">
+          {!trayCollapsed && (
+            <MobileKeyBar onKey={handleBarKey} onHistory={tmuxName ? () => setHistoryOpen(true) : undefined}
+              onToggleCollapsed={toggleTray} />
+          )}
+          <div data-testid="term-composer-row" className="flex items-end gap-1 px-2 py-1.5 border-t border-[var(--border)] bg-[var(--bg-secondary)]">
+            {trayCollapsed && <MobileKeyBar onKey={handleBarKey} collapsed onToggleCollapsed={toggleTray} />}
+            <div className="flex-1 min-w-0">
             <Composer
               value={composerText}
               onChange={setComposerText}
@@ -720,6 +737,7 @@ export default function TerminalView({ sessionId, active, theme, tmuxName, tmuxO
               submitOnEnter={false}
               placeholder="输入文字，点 ✈ 发送…"
             />
+            </div>
           </div>
         </div>
       )}
@@ -755,8 +773,7 @@ export default function TerminalView({ sessionId, active, theme, tmuxName, tmuxO
               const on = !mouseOn
               setMouseOn(on)
               localStorage.setItem(MOUSE_PREF_KEY, on ? '1' : '0')
-              const ws = wsRef.current
-              if (ws?.readyState === WebSocket.OPEN) ws.send(JSON.stringify({ type: 'mouse', on }))
+              sendRaw({ type: 'mouse', on })
             }}
             title={mouseOn ? '鼠标交给 tmux（滚轮滚动、点选窗格）' : '鼠标交给浏览器（直接拖选文字）'}
             className="ml-auto text-[11px] text-[var(--text-secondary)] hover:text-[var(--text-primary)]">

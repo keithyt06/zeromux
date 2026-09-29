@@ -92,6 +92,13 @@ describe('controlSequence (page 2)', () => {
     expect(controlSequence('pgup')).toBe('\x1b[5~')
     expect(controlSequence('pgdn')).toBe('\x1b[6~')
   })
+  // Home/End hardcoded CSI: tmux re-encodes for the inner app's own mode (4f92c3 §2.1).
+  it('maps ^R ^L Home End', () => {
+    expect(controlSequence('ctrl-r')).toBe('\x12')
+    expect(controlSequence('ctrl-l')).toBe('\x0c')
+    expect(controlSequence('home')).toBe('\x1b[H')
+    expect(controlSequence('end')).toBe('\x1b[F')
+  })
 })
 
 describe('launchSequence', () => {

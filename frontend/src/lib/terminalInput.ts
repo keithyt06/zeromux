@@ -66,6 +66,7 @@ export function submitSequence(bracketedPasteMode: boolean): string {
 
 // 单键 / 控制键 → 直发字节。与方向键分开：这些走 MobileKeyBar，不经 composer。
 export type ControlKey = 'ctrl-c' | 'esc' | 'tab' | 'ctrl-d' | 'ctrl-z' | 'pgup' | 'pgdn'
+  | 'ctrl-r' | 'ctrl-l' | 'home' | 'end'
 
 const CONTROL: Record<ControlKey, string> = {
   'ctrl-c': '\x03',
@@ -75,6 +76,12 @@ const CONTROL: Record<ControlKey, string> = {
   'ctrl-z': '\x1a',
   pgup: '\x1b[5~',
   pgdn: '\x1b[6~',
+  'ctrl-r': '\x12',
+  'ctrl-l': '\x0c',
+  // Home/End 硬编码 CSI：tmux 先解析外层按键，再按内层应用自己的模式重新编码，
+  // 外层发 CSI 还是 SS3 结果一样（实测），所以不按 DECCKM 分派。
+  home: '\x1b[H',
+  end: '\x1b[F',
 }
 
 export function controlSequence(key: ControlKey): string {

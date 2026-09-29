@@ -1,10 +1,11 @@
 import { Suspense, useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { BookOpen, ChevronLeft, PanelLeft, PanelLeftClose, Plus, Search, SkipForward, X } from 'lucide-react'
-import type { SessionInfo, UserInfo } from '../../lib/api'
-import { getVaultMeta } from '../../lib/api'
+import type { SessionInfo, TmuxHealth, UserInfo } from '../../lib/api'
+import { getTmuxHealth, getVaultMeta } from '../../lib/api'
 import { shouldShowVault } from '../../lib/vault'
 import type { useTheme } from '../../lib/theme'
 import { useIsNarrow, useMediaQuery } from '../../lib/useMediaQuery'
+import { usePolling } from '../../lib/usePolling'
 import { groupTriage, needsYouCount, nextNeedsYou, triage, toneOf, labelOf } from '../../lib/triage'
 import { sessionActions } from '../../lib/sessionActions'
 import { peerNamesKey, peerNamesFromKey } from '../../lib/peer'
@@ -54,6 +55,17 @@ export function AppShell({ user, theme, onLogout, onAuthLost }: {
 
   const [vaultEnabled, setVaultEnabled] = useState(false)
   useEffect(() => { getVaultMeta().then(m => setVaultEnabled(shouldShowVault(m))).catch(() => {}) }, [])
+
+  // tmux health is a global endpoint (not per-session): poll it once here and
+  // pass the result down to every terminal's TmuxHealthBar (§4.6), instead of
+  // each TerminalView fetching its own redundant copy. GET /api/tmux/health is
+  // admin-only (403 for others) and pointless with no tmux session open, so
+  // gate the poll on both — otherwise a non-admin OAuth user, or anyone with
+  // zero tmux sessions, would hit it every 30s forever for nothing.
+  const [tmuxHealth, setTmuxHealth] = useState<TmuxHealth | null>(null)
+  const pollTmuxHealth = useCallback(async () => { setTmuxHealth(await getTmuxHealth()) }, [])
+  const hasTmuxSession = sessions.some(s => s.type === 'tmux')
+  usePolling(pollTmuxHealth, 30_000, { enabled: hasTmuxSession && user?.role === 'admin' })
 
   const [palette, setPalette] = useState<PaletteInit | null>(null)
   const [panel, setPanel] = useState<ShellPanel | null>(null)
@@ -105,14 +117,9 @@ export function AppShell({ user, theme, onLogout, onAuthLost }: {
   const toggleContext = (s: SessionInfo) => {
     setContext(s.id, { open: !shell.contextOf(s).open })
   }
-  // The inline column changes the terminal's width: let TerminalView refit via its
-  // existing window-resize path (I-12 dedupe unchanged).
+  // The inline column changes the terminal's width; TerminalView now watches its
+  // own container with a ResizeObserver, so no synthetic window resize is needed.
   const ctxOpen = !!activeCtx?.open
-  useEffect(() => {
-    if (narrow || active?.type !== 'tmux') return
-    const t = setTimeout(() => window.dispatchEvent(new Event('resize')), 50)
-    return () => clearTimeout(t)
-  }, [ctxOpen, railExpanded, narrow, active?.type])
 
   // SendToMenu「＋ 新开…」= ⌘K new mode prefilled (M24).
   const openNewPrefilled = useCallback(({ workDir, prompt }: { workDir: string | null; prompt: string }) => {
@@ -128,6 +135,12 @@ export function AppShell({ user, theme, onLogout, onAuthLost }: {
   const sendTo = (workDir: string) => ({
     workDir, sessions, controls: shell.controls, queueModes: shell.queueModes, onSelectSession: select, onNew: openNewPrefilled,
   })
+  // Terminal output is multi-line (fenced): 「＋ 新开…」 creates directly with the full
+  // prompt — ⌘K's single-line input would strip the newlines (§B7a).
+  const createWithPrompt = ({ workDir, prompt }: { workDir: string | null; prompt: string }) => {
+    const last = loadLastType()
+    shell.create(last === 'tmux' ? 'claude' : last, workDir ?? undefined, undefined, prompt).catch(() => toast.push({ message: '创建会话失败' }))
+  }
 
   const openPrompts = useCallback(() => setPanel('prompts'), [])
   // The callbacks read refs only when an action runs (click / Enter), never during render.
@@ -160,9 +173,9 @@ export function AppShell({ user, theme, onLogout, onAuthLost }: {
         return (
           <div key={s.id} data-session-pane={s.id} data-active={isActive ? '1' : '0'} className={`absolute inset-0 ${isActive ? '' : 'hidden'}`}>
             {s.type === 'tmux' ? (
-              <TerminalView sessionId={s.id} active={isActive} theme={theme.theme} tmuxName={s.tmux_name} tmuxOrigin={s.tmux_origin}
+              <TerminalView sessionId={s.id} active={isActive} theme={theme.theme} tmuxName={s.tmux_name} tmuxOrigin={s.tmux_origin} tmuxHealth={tmuxHealth}
                 onClose={() => shell.close(s.id)} historyRequest={shell.historyReq?.id === s.id ? shell.historyReq.nonce : 0}
-                onAskAgent={(prompt) => { shell.create('claude', s.work_dir, undefined, prompt).catch(() => toast.push({ message: '创建会话失败' })) }} />
+                sendTo={{ ...sendTo(s.work_dir), excludeId: s.id, onNew: createWithPrompt }} />
             ) : (
               <AcpChatView sessionId={s.id} active={isActive} agentType={s.type} onRegisterControls={shell.registerControls}
                 onQueueModeChange={shell.onQueueModeChange} queueMode={shell.queueModes[s.id] ?? 'collect'} onManagePresets={openPrompts} onOpenMemory={s.type === 'crew' ? () => setMemoryOpen(true) : undefined}

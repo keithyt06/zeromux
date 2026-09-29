@@ -5,26 +5,26 @@ import { WebglAddon } from '@xterm/addon-webgl'
 import { ClipboardAddon } from '@xterm/addon-clipboard'
 import { writeOnlyClipboard } from '../lib/clipboard'
 import { SearchAddon } from '@xterm/addon-search'
-import { wsUrl, getSessionStatus, getTmuxHealth, reviveSession } from '../lib/api'
+import { getSessionStatus, getTmuxHealth, reviveSession } from '../lib/api'
 import type { SessionStatus, TmuxHealth } from '../lib/api'
 import type { Theme } from '../lib/theme'
 import { readTerminalTheme } from '../lib/terminalTheme'
-import { b64encode, b64decode } from '../lib/base64'
+import { b64encode } from '../lib/base64'
 import { GitBranch, Folder, Circle, ArrowUpToLine, ArrowDownToLine } from 'lucide-react'
 import { attachCommand, copyText } from '../lib/attachCommand'
 import { useIsTouch } from '../lib/useMediaQuery'
 import MobileKeyBar, { type BarKey } from './MobileKeyBar'
 import Composer from './Composer'
 import ConnectionBar from './ConnectionBar'
-import type { WsStatus } from '../lib/wsStatus'
 import HistoryView from './HistoryView'
 import { TmuxHealthBar, LostBanner, EndedOverlay, ReconnectHint } from './TerminalNotices'
 import { arrowSequence, rowHeight, linesFromDrag, bracketedPaste, submitSequence, controlSequence, launchSequence } from '../lib/terminalInput'
 import { shouldStickToBottom } from '../lib/scrollReplay'
 import { ScrollBatcher, inertiaLines, pillFromScrollState, scheduleInertia, shouldCancelBeforeInput, type ScrollMsg } from '../lib/terminalScroll'
-import { shouldShowShiftHint, mousePref, MOUSE_PREF_KEY, mouseToggleApplies, shouldSendMouseOffOnConnect } from '../lib/desktopHints'
+import { shouldShowShiftHint, mousePref, MOUSE_PREF_KEY, mouseToggleApplies } from '../lib/desktopHints'
 import { historyPrompt } from '../lib/historyToAgent'
 import { shouldSendResize } from '../lib/terminalSize'
+import { useTerminalSocket } from '../hooks/useTerminalSocket'
 
 const FONT_SIZE = 14
 
@@ -102,8 +102,6 @@ export default function TerminalView({ sessionId, active, theme, tmuxName, tmuxO
   // 软键盘是否弹起：仅触摸端用 VisualViewport 判断（见下方 effect）。只作为重新 fit
   // 的触发器——键盘弹起/收起时 paddingBottom 改变终端可用高度，而 iOS 不发 window.resize。
   const [keyboardOpen, setKeyboardOpen] = useState(false)
-  // Terminal WS status for ConnectionBar (display only; backoff logic untouched).
-  const [wsStatus, setWsStatus] = useState<{ status: WsStatus; since: number }>(() => ({ status: 'connecting', since: Date.now() }))
   // 桌面 Ctrl/Cmd+F：非 tmux 会话本地搜索当前屏；tmux 会话改开历史抽屉
   // （xterm 只保留当前屏，搜索历史要走服务端 capture-pane）。
   const [searchOpen, setSearchOpen] = useState(false)
@@ -400,7 +398,6 @@ export default function TerminalView({ sessionId, active, theme, tmuxName, tmuxO
       cancelInertiaRef.current = () => {}
       batcher.dispose()
       if (scrollDebounceRef.current) clearTimeout(scrollDebounceRef.current)
-      wsRef.current?.close()
       term.dispose()
     }
   }, [sessionId])
@@ -416,148 +413,60 @@ export default function TerminalView({ sessionId, active, theme, tmuxName, tmuxO
   // 重连首发也要同步它，否则下一次「真实尺寸变回这个旧值」会被误判为冗余而漏发。
   const lastDims = useRef<{ cols: number; rows: number }>({ cols: 0, rows: 0 })
 
-  // Connect WebSocket
-  useEffect(() => {
-    if (!termRef.current) return
-    if (wsRef.current) return
+  const onOpen = useCallback((send: (msg: object) => void) => {
+    // Arm the replay window: the server is about to replay full scrollback.
+    // Only bare-shell PTYs replay scrollback; tmux repaints via refresh-client.
+    replayingRef.current = !tmuxRef.current
+    userScrolledUpRef.current = false
+    // Only a tmux terminal keeps history server-side across a reconnect —
+    // a bare-shell PTY reconnect just gets the same replay it always got.
+    if (openedOnceRef.current && tmuxRef.current) setReconnected(true)
+    openedOnceRef.current = true
+    // A new socket starts outside copy-mode as far as the UI knows: clear the
+    // pill. If we were reading history, the pane may still be in copy-mode
+    // server-side, so cancel it (a no-op outside copy-mode). scroll_watch
+    // is per-connection server-side; the [scrolling] effect disarms it.
+    const wasScrolling = scrollingRef.current || appScrollRef.current
+    scrollingRef.current = false
+    appScrollRef.current = false
+    lastScrollOpRef.current = 'cancel'
+    setScrolling(false)
+    setNewLines(0)
+    if (wasScrolling && tmuxRef.current) send({ type: 'scroll', op: 'cancel', n: 1 })
+  }, [])
 
-    let disposed = false
-    let retryTimer: ReturnType<typeof setTimeout> | undefined
-    let stableTimer: ReturnType<typeof setTimeout> | undefined
-    let attempt = 0
+  const onNotice = useCallback((kind: 'tmux_lost' | 'tmux_ended' | 'tmux_down') => {
+    if (kind === 'tmux_lost') setLost(true)
+    if (kind === 'tmux_ended') setEnded(true)
+    if (kind === 'tmux_down') setHealth({ server: false, in_unit: false })
+  }, [])
 
-    const connect = () => {
-      if (disposed) return
-      const ws = new WebSocket(wsUrl(`/ws/term/${sessionId}`))
-      wsRef.current = ws
+  const onScrollState = useCallback((msg: { in_mode?: boolean; app_scroll?: boolean; new_lines?: unknown }) => {
+    const p = pillFromScrollState(msg, lastScrollOpRef.current, scrollingRef.current)
+    appScrollRef.current = p.appScroll
+    scrollingRef.current = p.scrolling
+    setScrolling(p.scrolling)
+    if (typeof msg.new_lines === 'number') setNewLines(msg.new_lines)
+  }, [])
 
-      ws.onopen = () => {
-        setWsStatus({ status: 'open', since: Date.now() })
-        // Reset backoff only after the connection proves STABLE (~3s), not on the
-        // instant it opens — otherwise an accept-then-immediately-close loop resets
-        // attempt→0 every open and the 10s cap is never reached (permanent ~1s
-        // reconnect hammer). A healthy socket outlives the timer. (review 2026-08-05)
-        clearTimeout(stableTimer)
-        stableTimer = setTimeout(() => { attempt = 0 }, 3000)
-        // The server replays full scrollback on (re)connect; reset the terminal
-        // first so a reconnect doesn't double-paint the buffer.
-        termRef.current?.reset()
-        // Arm the replay window: the server is about to replay full scrollback.
-        // Only bare-shell PTYs replay scrollback; tmux repaints via refresh-client.
-        replayingRef.current = !tmuxRef.current
-        userScrolledUpRef.current = false
-        // Only a tmux terminal keeps history server-side across a reconnect —
-        // a bare-shell PTY reconnect just gets the same replay it always got.
-        if (openedOnceRef.current && tmuxRef.current) setReconnected(true)
-        openedOnceRef.current = true
-        // Only the active, visible view may size the PTY: a hidden view's
-        // proposeDimensions() is a ~10x5 fallback that would shrink the shared
-        // tmux window (window-size latest). When skipped, invalidate lastDims so
-        // the `active` effect sends the real size once this view is shown (the
-        // fresh attach may have come up at another client's size).
-        const fit = fitRef.current
-        const el = containerRef.current
-        const dims = fit?.proposeDimensions()
-        if (dims && el && shouldSendResize({
-          active: activeRef.current,
-          containerWidth: el.clientWidth,
-          containerHeight: el.clientHeight,
-          cols: dims.cols,
-          rows: dims.rows,
-          last: { cols: 0, rows: 0 }, // first send on a new socket is never redundant
-        })) {
-          ws.send(JSON.stringify({ type: 'resize', cols: dims.cols, rows: dims.rows }))
-          lastDims.current = { cols: dims.cols, rows: dims.rows }
-        } else {
-          lastDims.current = { cols: 0, rows: 0 }
-        }
-        // tmux 会话默认 mouse=on（tmux.conf）；用户上次关过就在（重）连接时同步关掉，
-        // 否则每次新建/重连的会话又会回到 tmux 接管鼠标。
-        // Own sessions only: External ones (e.g. VSCode's) keep their own option.
-        if (shouldSendMouseOffOnConnect(!!tmuxRef.current, tmuxOriginRef.current, localStorage)) ws.send(JSON.stringify({ type: 'mouse', on: false }))
-        // A new socket starts outside copy-mode as far as the UI knows: clear the
-        // pill. If we were reading history, the pane may still be in copy-mode
-        // server-side, so cancel it (a no-op outside copy-mode). scroll_watch
-        // is per-connection server-side; the [scrolling] effect disarms it.
-        const wasScrolling = scrollingRef.current || appScrollRef.current
-        scrollingRef.current = false
-        appScrollRef.current = false
-        lastScrollOpRef.current = 'cancel'
-        setScrolling(false)
-        setNewLines(0)
-        if (wasScrolling && tmuxRef.current) ws.send(JSON.stringify({ type: 'scroll', op: 'cancel', n: 1 }))
+  const onOutputSettled = useCallback(() => {
+    if (scrollDebounceRef.current) clearTimeout(scrollDebounceRef.current)
+    scrollDebounceRef.current = setTimeout(() => {
+      if (shouldStickToBottom({ replaying: replayingRef.current, userScrolledUp: userScrolledUpRef.current })) {
+        termRef.current?.scrollToBottom()
       }
+      // First settle after the replay burst closes the window: live
+      // output afterwards must not auto-scroll (user may read scrollback).
+      replayingRef.current = false
+    }, 120)
+  }, [])
 
-      ws.onmessage = (evt) => {
-        try {
-          const msg = JSON.parse(evt.data)
-          if (msg.type === 'notice') {
-            if (msg.kind === 'tmux_lost') setLost(true)
-            if (msg.kind === 'tmux_ended') { endedRef.current = true; setEnded(true) }
-            if (msg.kind === 'tmux_down') setHealth({ server: false, in_unit: false })
-            return
-          }
-          if (msg.type === 'scroll_state') {
-            const p = pillFromScrollState(msg, lastScrollOpRef.current, scrollingRef.current)
-            appScrollRef.current = p.appScroll
-            scrollingRef.current = p.scrolling
-            setScrolling(p.scrolling)
-            if (typeof msg.new_lines === 'number') setNewLines(msg.new_lines)
-            return
-          }
-          if (msg.type === 'output') {
-            termRef.current?.write(b64decode(msg.data), () => {
-              if (scrollDebounceRef.current) clearTimeout(scrollDebounceRef.current)
-              scrollDebounceRef.current = setTimeout(() => {
-                if (shouldStickToBottom({ replaying: replayingRef.current, userScrolledUp: userScrolledUpRef.current })) {
-                  termRef.current?.scrollToBottom()
-                }
-                // First settle after the replay burst closes the window: live
-                // output afterwards must not auto-scroll (user may read scrollback).
-                replayingRef.current = false
-              }, 120)
-            })
-          }
-        } catch { /* ignore */ }
-      }
-
-      ws.onclose = () => {
-        // Identity guard: a late close from a superseded socket must not null
-        // (orphan) the live one. Unreachable under browser semantics today (one
-        // close per socket; see the effect cleanup below) — defensive (B14).
-        if (wsRef.current !== ws && wsRef.current !== null) return
-        wsRef.current = null
-        // Keep `since` while already reconnecting: resetting it on every failed
-        // retry would re-arm ConnectionBar's delay and blink the bar off each
-        // backoff cycle (same pattern as AcpChatView).
-        if (!disposed) setWsStatus(prev => endedRef.current ? { status: 'ended', since: Date.now() } : prev.status === 'reconnecting' ? prev : { status: 'reconnecting', since: Date.now() })
-        // A close before the stability timer fires means this open did NOT prove
-        // stable — cancel the pending reset so `attempt` keeps escalating.
-        clearTimeout(stableTimer)
-        // Auto-reconnect through idle-timeout proxy drops / transient closes so
-        // the terminal never freezes silently. Exponential backoff, capped at 10s.
-        if (!disposed && !endedRef.current) {
-          const delay = Math.min(1000 * 2 ** attempt, 10000)
-          attempt += 1
-          retryTimer = setTimeout(connect, delay)
-        }
-      }
-      ws.onerror = () => { ws.close() }
-    }
-
-    connect()
-
-    return () => {
-      disposed = true
-      if (retryTimer) clearTimeout(retryTimer)
-      if (stableTimer) clearTimeout(stableTimer)
-      wsRef.current?.close()
-      // close() is async in browsers: clear the ref now so a re-run of this
-      // effect (wsEpoch bump / StrictMode) isn't stopped by `if (wsRef.current)`.
-      // Safe only together with the onclose identity guard above.
-      wsRef.current = null
-    }
-  }, [sessionId, wsEpoch])
+  // Connect WebSocket. Must stay AFTER the init effect: it relies on termRef
+  // having been set in the same commit (termRef isn't a dep).
+  const { wsStatus, sendRaw } = useTerminalSocket({
+    sessionId, epoch: wsEpoch, wsRef, endedRef, lastDims, termRef, fitRef, containerRef, activeRef, tmuxRef, tmuxOriginRef,
+    onOutputSettled, onScrollState, onNotice, onOpen,
+  })
 
   // Stable identity so ReconnectHint's 3s auto-dismiss timer isn't reset by every
   // parent re-render (a new inline arrow each render would restart the setTimeout).
@@ -774,8 +683,7 @@ export default function TerminalView({ sessionId, active, theme, tmuxName, tmuxO
               const on = !mouseOn
               setMouseOn(on)
               localStorage.setItem(MOUSE_PREF_KEY, on ? '1' : '0')
-              const ws = wsRef.current
-              if (ws?.readyState === WebSocket.OPEN) ws.send(JSON.stringify({ type: 'mouse', on }))
+              sendRaw({ type: 'mouse', on })
             }}
             title={mouseOn ? '鼠标交给 tmux（滚轮滚动、点选窗格）' : '鼠标交给浏览器（直接拖选文字）'}
             className="ml-auto text-[11px] text-[var(--text-secondary)] hover:text-[var(--text-primary)]">

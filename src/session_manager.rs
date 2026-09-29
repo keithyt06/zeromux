@@ -2131,6 +2131,10 @@ impl SessionManager {
             s.posture.last_outcome_ms = Some(now_millis());
             s.posture.current_step = None;
             s.posture.approval_ids.clear();
+            // A failed turn has no summary of its own; don't show the previous turn's (A10).
+            if matches!(outcome, crate::run_metrics::RunOutcome::Errored | crate::run_metrics::RunOutcome::Timeout) {
+                s.posture.last_snippet = None;
+            }
         }
     }
 
@@ -7208,6 +7212,22 @@ mod posture_tests {
         assert!(i.last_outcome_ms.unwrap() >= before);
         assert_eq!(i.current_step, None, "settled boundary clears the running step");
         assert_eq!(i.pending_approvals, 0, "turn boundary zeroes approvals (Gateway has no receipt, M5)");
+    }
+
+    #[test]
+    fn errored_or_timed_out_settle_drops_the_previous_snippet() {
+        // A10: the triage second line must not show the last SUCCESSFUL turn's summary
+        // under an 出错 badge.
+        use crate::run_metrics::RunOutcome;
+        for (outcome, cleared) in [(RunOutcome::Errored, true), (RunOutcome::Timeout, true),
+                                   (RunOutcome::Completed, false), (RunOutcome::Cancelled, false)] {
+            let (m, _d) = mgr_one(SessionType::Claude);
+            let r = AcpEvent::Result { text: "All green".into(), turn_id: 0, session_id: String::new(),
+                cost_usd: None, tokens_in: None, tokens_out: None };
+            m.record_and_broadcast("p", "{}".into(), true, posture_delta_of(&r));
+            m.settle_posture("p", outcome);
+            assert_eq!(info(&m).last_snippet.is_none(), cleared, "{:?}", outcome);
+        }
     }
 
     #[test]

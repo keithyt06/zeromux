@@ -380,4 +380,39 @@ describe('AppShell', () => {
     expect(health).toHaveBeenCalledTimes(2)
     void h
   })
+
+  // Task 5 (§B7a): terminal 「＋ 新开…」 creates directly with the full multi-line
+  // prompt — the ⌘K single-line input would strip its newlines and fences.
+  it('terminal 「＋ 新开…」 creates the last-used agent type with the full multi-line prompt, never via ⌘K', async () => {
+    desktop()
+    const api = await import('../../../lib/api')
+    for (const [last, want] of [['codex', 'codex'], ['tmux', 'claude']] as const) {
+      vi.restoreAllMocks(); localStorage.clear()
+      localStorage.setItem('zmx_last_type', last)
+      history.replaceState(null, '', '/?session=t')
+      setupApp({ sessions: [mkSession('t', { name: 'shell', type: 'tmux', tmux_name: 'zmx-t', tmux_origin: 'own', work_dir: '/w/term' })] })
+      vi.spyOn(api, 'getHistory').mockResolvedValue({ text: 'l1\n  l2\n```x```', truncated: false })
+      const create = vi.spyOn(api, 'createSession').mockRejectedValue(new Error('boom'))
+      const { unmount } = render(<App />)
+      await waitFor(() => expect(activePane()).toBe('t'))
+      fireEvent.click(await screen.findByText('历史'))
+      await waitFor(() => expect(screen.getByText(/l2/)).toBeInTheDocument())
+      fireEvent.click(screen.getByRole('button', { name: '发给 agent…' }))
+      await act(async () => { fireEvent.click(screen.getByText('＋ 新开…')) })
+      const { historyPrompt } = await import('../../../lib/historyToAgent')
+      await waitFor(() => expect(create).toHaveBeenCalledWith(want, undefined, '/w/term', undefined,
+        historyPrompt({ name: 'zmx-t', workDir: '/w/term', text: 'l1\n  l2\n```x```' })))
+      expect(screen.queryByRole('combobox')).toBeNull()
+      expect(await screen.findByText('创建会话失败')).toBeInTheDocument()
+      const { toast } = await import('../../ui')
+      act(() => { document.querySelectorAll('[data-toast-id]').forEach(el => toast.dismiss(el.getAttribute('data-toast-id')!)) })
+      unmount()
+    }
+  })
+
+  it('AppShell no longer hard-codes a claude session for terminal output', async () => {
+    const { readFileSync } = await import('node:fs')
+    const { resolve } = await import('node:path')
+    expect(readFileSync(resolve(__dirname, '../AppShell.tsx'), 'utf8')).not.toContain("shell.create('claude'")
+  })
 })

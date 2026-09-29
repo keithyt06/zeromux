@@ -135,6 +135,12 @@ export function AppShell({ user, theme, onLogout, onAuthLost }: {
   const sendTo = (workDir: string) => ({
     workDir, sessions, controls: shell.controls, queueModes: shell.queueModes, onSelectSession: select, onNew: openNewPrefilled,
   })
+  // Terminal output is multi-line (fenced): 「＋ 新开…」 creates directly with the full
+  // prompt — ⌘K's single-line input would strip the newlines (§B7a).
+  const createWithPrompt = ({ workDir, prompt }: { workDir: string | null; prompt: string }) => {
+    const last = loadLastType()
+    shell.create(last === 'tmux' ? 'claude' : last, workDir ?? undefined, undefined, prompt).catch(() => toast.push({ message: '创建会话失败' }))
+  }
 
   const openPrompts = useCallback(() => setPanel('prompts'), [])
   // The callbacks read refs only when an action runs (click / Enter), never during render.
@@ -169,7 +175,7 @@ export function AppShell({ user, theme, onLogout, onAuthLost }: {
             {s.type === 'tmux' ? (
               <TerminalView sessionId={s.id} active={isActive} theme={theme.theme} tmuxName={s.tmux_name} tmuxOrigin={s.tmux_origin} tmuxHealth={tmuxHealth}
                 onClose={() => shell.close(s.id)} historyRequest={shell.historyReq?.id === s.id ? shell.historyReq.nonce : 0}
-                onAskAgent={(prompt) => { shell.create('claude', s.work_dir, undefined, prompt).catch(() => toast.push({ message: '创建会话失败' })) }} />
+                sendTo={{ ...sendTo(s.work_dir), excludeId: s.id, onNew: createWithPrompt }} />
             ) : (
               <AcpChatView sessionId={s.id} active={isActive} agentType={s.type} onRegisterControls={shell.registerControls}
                 onQueueModeChange={shell.onQueueModeChange} queueMode={shell.queueModes[s.id] ?? 'collect'} onManagePresets={openPrompts} onOpenMemory={s.type === 'crew' ? () => setMemoryOpen(true) : undefined}

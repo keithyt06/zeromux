@@ -18,6 +18,7 @@ import MobileKeyBar, { type BarKey } from './MobileKeyBar'
 import Composer from './Composer'
 import ConnectionBar from './ConnectionBar'
 import HistoryView from './HistoryView'
+import { SendToMenu, type SendToProps } from './SendToMenu'
 import { TmuxHealthBar, LostBanner, EndedOverlay, ReconnectHint } from './TerminalNotices'
 import { arrowSequence, rowHeight, linesFromDrag, bracketedPaste, submitSequence, controlSequence, launchSequence } from '../lib/terminalInput'
 import { shouldStickToBottom } from '../lib/scrollReplay'
@@ -44,11 +45,11 @@ interface Props {
   onClose?: () => void
   /** Bumped (nonce) by the sidebar's ⋯ 查看历史 to open the history drawer. */
   historyRequest?: number
-  /** "发给 agent": open a new Claude session pre-filled with a history prompt. */
-  onAskAgent?: (prompt: string) => void
+  /** 「发给 agent」 (SendToMenu props, from AppShell): history drawer + desktop selection button. */
+  sendTo?: SendToProps
 }
 
-export default function TerminalView({ sessionId, active, theme, tmuxName, tmuxOrigin, tmuxHealth, onClose, historyRequest, onAskAgent }: Props) {
+export default function TerminalView({ sessionId, active, theme, tmuxName, tmuxOrigin, tmuxHealth, onClose, historyRequest, sendTo }: Props) {
   const containerRef = useRef<HTMLDivElement>(null)
   const termRef = useRef<Terminal | null>(null)
   const fitRef = useRef<FitAddon | null>(null)
@@ -76,6 +77,9 @@ export default function TerminalView({ sessionId, active, theme, tmuxName, tmuxO
   // Bumped after revive to re-run the Connect WebSocket effect.
   const [wsEpoch, setWsEpoch] = useState(0)
   const [historyOpen, setHistoryOpen] = useState(false)
+  // Desktop: current non-blank xterm selection (drives the floating 「发给…」 button).
+  const [selText, setSelText] = useState<string | null>(null)
+  const [sendMenu, setSendMenu] = useState<{ anchor: HTMLElement | null; text: string } | null>(null)
   const [chipCopied, setChipCopied] = useState(false)
   const [reconnected, setReconnected] = useState(false)
   // True once the WS has opened at least once; a later open is a reconnect (→ ReconnectHint).
@@ -347,6 +351,11 @@ export default function TerminalView({ sessionId, active, theme, tmuxName, tmuxO
       // registration — do NOT add a second onData or input would double-send).
       replayingRef.current = false
       sendInput(data)
+    })
+
+    term.onSelectionChange(() => {
+      const t = term.hasSelection() ? term.getSelection() : ''
+      setSelText(t.trim() ? t : null)
     })
 
     term.onScroll(() => {
@@ -643,6 +652,8 @@ export default function TerminalView({ sessionId, active, theme, tmuxName, tmuxO
     }
   }, [isTouch, active])
 
+  // Terminal output → agent prompt. work_dir comes from SessionInfo (sendTo), not the polled status.
+  const wrapForAgent = (t: string) => historyPrompt({ name: tmuxName ?? '', workDir: sendTo?.workDir ?? '', text: t })
   // Copy-mode (server-confirmed) = solid accent; fullscreen app (client-estimated)
   // = outlined, and after APP_PILL_IDLE_MS without scrolling just the icon-only bottom button.
   const pillDegraded = appScroll && appPillDegraded
@@ -696,10 +707,14 @@ export default function TerminalView({ sessionId, active, theme, tmuxName, tmuxO
         />
       )}
       {historyOpen && <HistoryView sessionId={sessionId} title={tmuxName ?? ''} split={split} onClose={() => setHistoryOpen(false)}
-        onSendToAgent={onAskAgent ? (t) => {
-          setHistoryOpen(false)
-          onAskAgent(historyPrompt({ name: tmuxName ?? '', workDir: status?.work_dir ?? '', text: t }))
-        } : undefined} />}
+        sendTo={sendTo} wrap={wrapForAgent} />}
+      {!isTouch && sendTo && selText && (
+        <button aria-label="发给…" onClick={e => setSendMenu({ anchor: e.currentTarget, text: wrapForAgent(selText) })}
+          className="absolute right-3 bottom-16 z-sticky min-h-[var(--hit)] px-3 rounded-full border border-[var(--border)] bg-[var(--surface-2)] text-ui-xs text-[var(--fg)] shadow">
+          发给…
+        </button>
+      )}
+      {sendTo && sendMenu && <SendToMenu open anchor={sendMenu.anchor} onClose={() => setSendMenu(null)} text={sendMenu.text} {...sendTo} />}
       {!isTouch && scrollPill}
       {!isTouch && <ConnectionBar status={wsStatus.status} sinceMs={wsStatus.since} />}
       {/* 触摸端：一个底部容器装 胶囊(浮于键栏之上) + 连接条 + 键栏 + 常驻输入框(贴底，最靠近软键盘)。

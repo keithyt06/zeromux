@@ -1,4 +1,4 @@
-import type { ReactElement, RefObject } from 'react'
+import type { ComponentProps, ReactElement, RefObject } from 'react'
 import type { SessionInfo, SessionType } from '../lib/api'
 import type { SessionControls } from '../lib/sessionControls'
 import { sendTargets } from '../lib/sendTargets'
@@ -20,6 +20,44 @@ const ICON: Record<SessionType, (p: IconProps) => ReactElement> = {
 function shortDir(p: string): string {
   const parts = p.split('/').filter(Boolean)
   return parts.length <= 2 ? p : `…/${parts.slice(-2).join('/')}`
+}
+
+type SendDeps = { controls: RefObject<Record<string, SessionControls>>; onSelectSession(id: string): void }
+
+/** The ★ target: the first SendToMenu candidate, or null when there is none. */
+// eslint-disable-next-line react-refresh/only-export-components -- shared with HistoryView's one-tap send
+export function defaultTarget(sessions: SessionInfo[], workDir: string | null, excludeId?: string, sameDirOnly = false): SessionInfo | null {
+  return sendTargets(sessions, workDir, excludeId, sameDirOnly)[0] ?? null
+}
+
+/** Send `text` to `target` over its mounted socket and toast the outcome:
+ *  「已发给 〈名〉」+「查看」, or 「未连接,未发送」+「复制」. `key` replaces a pending toast. */
+// eslint-disable-next-line react-refresh/only-export-components -- shared with HistoryView's one-tap send
+export function sendToSession(target: SessionInfo, text: string, { controls, onSelectSession }: SendDeps, key?: string): boolean {
+  if (controls.current?.[target.id]?.sendPrompt(text, { withAttachments: false })) {
+    toast.push({ key, message: `已发给 ${target.name}`, action: { label: '查看', onClick: () => onSelectSession(target.id) } })
+    return true
+  }
+  toast.push({ key, message: '未连接,未发送', action: { label: '复制', onClick: async () => {
+    if (!(await copyText(text))) toast.push({ message: '复制失败' })
+  } } })
+  return false
+}
+
+export const UNDO_MS = 3000
+let undoSeq = 0
+
+/** One-tap send with a 3s undo (replaces the old confirm): toast 「已发给 〈名〉 · N 行」+「撤回」;
+ *  the prompt is only sent once the window elapses without 撤回. Module-level so it
+ *  survives the caller unmounting (e.g. the history drawer closing). */
+// eslint-disable-next-line react-refresh/only-export-components -- shared with HistoryView's one-tap send
+export function sendWithUndo(target: SessionInfo, text: string, lines: number, deps: SendDeps): void {
+  const key = `sendto-undo-${++undoSeq}`
+  const timer = setTimeout(() => { sendToSession(target, text, deps, key) }, UNDO_MS)
+  toast.push({ key, durationMs: UNDO_MS, message: `已发给 ${target.name} · ${lines} 行`, action: { label: '撤回', onClick: () => {
+    clearTimeout(timer)
+    toast.push({ message: '已撤回' })
+  } } })
 }
 
 /** The one 「发给 agent」 menu (S3 §2.4 / V6): Git 「让 agent 处理」 and note ⚡.
@@ -44,13 +82,7 @@ export function SendToMenu(p: {
   const send = async (s: SessionInfo) => {
     const { text, controls, confirmDanger, onSelectSession } = p
     if (confirmDanger && !(await confirm({ title: `${confirmDanger.title} → ${s.name}(${shortDir(s.work_dir)})`, confirmLabel: '发送', danger: true }))) return
-    if (controls.current?.[s.id]?.sendPrompt(text, { withAttachments: false })) {
-      toast.push({ message: `已发给 ${s.name}`, action: { label: '查看', onClick: () => onSelectSession(s.id) } })
-    } else {
-      toast.push({ message: '未连接,未发送', action: { label: '复制', onClick: async () => {
-        if (!(await copyText(text))) toast.push({ message: '复制失败' })
-      } } })
-    }
+    sendToSession(s, text, { controls, onSelectSession })
   }
   const targets = p.open ? sendTargets(p.sessions, p.workDir, p.excludeId, p.sameDirOnly) : []
   const items: MenuItem[] = targets.map((s, i) => {
@@ -72,3 +104,6 @@ export function SendToMenu(p: {
       footer={<p className="px-3 py-1.5 border-t border-[var(--border-subtle)] text-ui-2xs text-[var(--fg-subtle)]">发送前请确认内容不含密钥</p>} />
   )
 }
+
+/** SendToMenu props a host passes down (everything but the per-open state). */
+export type SendToProps = Omit<ComponentProps<typeof SendToMenu>, 'open' | 'anchor' | 'onClose' | 'text'>

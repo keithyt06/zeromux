@@ -3,11 +3,11 @@ import { getGitLog, getGitShow, getGitWorktree, getSessionStatus } from '../lib/
 import type { GitCommit, GitFileChange, GitGraphEntry, WorktreeFile } from '../lib/api'
 import { GitCommit as GitCommitIcon, RefreshCw, FileText, User, Calendar, FolderX } from 'lucide-react'
 import { defaultGitTab, commitPrompt, discardPrompt } from '../lib/gitviewer'
-import { SendToMenu } from './SendToMenu'
+import { SendToMenu, type SendToProps } from './SendToMenu'
 import { confirm } from './ui'
 
 /** Everything SendToMenu needs besides the text (ContextPanel passes it down from the shell). */
-export type GitSendTo = Omit<React.ComponentProps<typeof SendToMenu>, 'open' | 'anchor' | 'onClose' | 'text'>
+export type GitSendTo = SendToProps
 
 interface Props {
   sessionId: string

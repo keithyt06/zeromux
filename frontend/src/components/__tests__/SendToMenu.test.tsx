@@ -1,6 +1,6 @@
 import { render, screen, fireEvent, act } from '@testing-library/react'
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
-import { SendToMenu } from '../SendToMenu'
+import { SendToMenu, defaultTarget } from '../SendToMenu'
 import { Toaster, DialogHost, toast } from '../ui'
 import { mkSession } from '../../test/appHarness'
 import type { SessionControls } from '../../lib/sessionControls'
@@ -164,5 +164,22 @@ describe('SendToMenu', () => {
     setup({ confirmDanger: { title: '撤销?' } })
     fireEvent.click(screen.getByRole('menuitem', { name: '发给 zeromux-fe' }))
     expect(await screen.findByText('撤销? → zeromux-fe(/w/repo)')).toBeInTheDocument()
+  })
+})
+
+describe('defaultTarget', () => {
+  const list = [
+    mkSession('far', { work_dir: '/other', last_activity_ms: 99 }),
+    mkSession('near', { work_dir: '/w/repo', last_activity_ms: 10 }),
+    mkSession('t', { type: 'tmux', work_dir: '/w/repo', last_activity_ms: 200 }),
+  ]
+  it('is the ★ candidate (same dir first, tmux never)', () => {
+    expect(defaultTarget(list, '/w/repo')?.id).toBe('near')
+    expect(defaultTarget(list, '/nowhere')?.id).toBe('far')
+  })
+  it('honours excludeId and sameDirOnly; null when there is no candidate', () => {
+    expect(defaultTarget(list, '/w/repo', 'near')?.id).toBe('far')
+    expect(defaultTarget(list, '/nowhere', undefined, true)).toBeNull()
+    expect(defaultTarget([list[2]], '/w/repo')).toBeNull()
   })
 })

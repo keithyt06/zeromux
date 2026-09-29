@@ -3,16 +3,21 @@ import { ArrowUpToLine, ArrowDownToLine, ChevronUp, ChevronDown, X } from 'lucid
 import { getHistory } from '../lib/api'
 import { parseAnsiLine, stripAnsi, type Span } from '../lib/ansi'
 import { chunkLines, findMatches } from '../lib/historySearch'
-import { confirm, IconButton } from './ui'
+import { IconButton } from './ui'
+import { SendToMenu, defaultTarget, sendWithUndo, type SendToProps } from './SendToMenu'
 
 const CHUNK = 500
+const LONG_PRESS_MS = 500
 
 interface Props {
   sessionId: string
   title: string
   onClose: () => void
   split?: boolean
-  onSendToAgent?: (selectionOrTail: string) => void
+  /** 「发给 agent」: one tap sends to ★ (3s undo); long press / ▾ opens SendToMenu. */
+  sendTo?: SendToProps
+  /** Wraps the selection-or-tail into the prompt actually sent (historyPrompt). */
+  wrap?: (text: string) => string
 }
 
 // Loaded payload remembers which mode it was fetched in, so a mode toggle never
@@ -23,7 +28,7 @@ const parseChunks = (chunks: string[]): Span[][][] => chunks.map(c => c.split('\
 
 // Full tmux history as native, scrollable, long-press-selectable text. Blocks of
 // 500 lines with content-visibility keep 50k lines smooth on phones.
-export default function HistoryView({ sessionId, title, onClose, split, onSendToAgent }: Props) {
+export default function HistoryView({ sessionId, title, onClose, split, sendTo, wrap = t => t }: Props) {
   const [ansi, setAnsi] = useState(false)
   const [loaded, setLoaded] = useState<Loaded | null>(null)
   const [error, setError] = useState<string | null>(null)
@@ -32,6 +37,14 @@ export default function HistoryView({ sessionId, title, onClose, split, onSendTo
   // Worker output tagged with the chunks it was computed from; stale results are ignored.
   const [workerSpans, setWorkerSpans] = useState<{ src: string[]; spans: Span[][][] } | null>(null)
   const scrollRef = useRef<HTMLDivElement>(null)
+  const sendBtnRef = useRef<HTMLButtonElement>(null)
+  const [menu, setMenu] = useState<{ anchor: HTMLElement | null; text: string } | null>(null)
+  // Selection is read on pointerdown and cached: by click time (or once the menu
+  // opens and takes focus) the browser may have cleared it.
+  const pendingPayload = useRef<string | null>(null)
+  const pressTimer = useRef<ReturnType<typeof setTimeout> | undefined>(undefined)
+  const longPressed = useRef(false)
+  useEffect(() => () => clearTimeout(pressTimer.current), [])
 
   useEffect(() => {
     let cancelled = false
@@ -77,6 +90,32 @@ export default function HistoryView({ sessionId, title, onClose, split, onSendTo
   const step = (d: number) => { if (matches.length) setIdx((cur + d + matches.length) % matches.length) }
   const toTop = () => { if (scrollRef.current) scrollRef.current.scrollTop = 0 }
   const toBottom = () => { const el = scrollRef.current; if (el) el.scrollTop = el.scrollHeight }
+  // Selection if any, else the last 200 lines (ANSI stripped in color mode).
+  const readPayload = () => {
+    const sel = window.getSelection()?.toString() ?? ''
+    const raw = colored ? stripAnsi(text ?? '') : (text ?? '')
+    return sel.trim() ? sel : raw.split('\n').slice(-200).join('\n')
+  }
+  const takePayload = () => { const p = pendingPayload.current ?? readPayload(); pendingPayload.current = null; return p }
+  const target = sendTo ? defaultTarget(sendTo.sessions, sendTo.workDir, sendTo.excludeId, sendTo.sameDirOnly) : null
+  const openMenu = (anchor: HTMLElement | null) => setMenu({ anchor, text: wrap(takePayload()) })
+  const cancelPress = () => clearTimeout(pressTimer.current)
+  const onSendDown = () => {
+    pendingPayload.current = readPayload()
+    longPressed.current = false
+    cancelPress()
+    pressTimer.current = setTimeout(() => { longPressed.current = true; openMenu(sendBtnRef.current) }, LONG_PRESS_MS)
+  }
+  const onSendClick = () => {
+    cancelPress()
+    if (longPressed.current) { longPressed.current = false; return }   // the long press already opened the menu
+    if (!sendTo || !target) { openMenu(sendBtnRef.current); return }
+    const payload = takePayload()
+    sendWithUndo(target, wrap(payload), payload.replace(/\s+$/, '').split('\n').length, sendTo)
+  }
+  const alternate = !!loaded?.alternate
+  const sendLabel = target ? `发给 ${target.name}` : '发给 agent…'
+
   const btn = 'px-2.5 py-1.5 rounded border border-[var(--border)] text-ui-xs text-[var(--text-secondary)] active:bg-[var(--bg-hover)]'
   const preCls = 'px-3 m-0 text-ui-2xs leading-[1.35] font-mono whitespace-pre-wrap break-all text-[var(--text-primary)]'
   const preStyle = { contentVisibility: 'auto', containIntrinsicSize: `auto ${CHUNK * 16}px` } as const
@@ -121,20 +160,32 @@ export default function HistoryView({ sessionId, title, onClose, split, onSendTo
         {text === null && !error && <div className="px-3 py-2 text-ui-xs text-[var(--text-muted)]">Loading...</div>}
         {chunks.map((c, i) => <pre key={i} className={preCls} style={preStyle}>{renderChunk(c, i)}</pre>)}
       </div>
-      <div className="flex gap-2 px-3 py-2 border-t border-[var(--border)] bg-[var(--bg-secondary)]">
-        <button className={`${btn} flex items-center gap-1`} onClick={toTop}><ArrowUpToLine size={14} /> 首行</button>
-        <button className={`${btn} flex items-center gap-1`} onClick={toBottom}><ArrowDownToLine size={14} /> 底部</button>
-        <button className={btn} onClick={() => text !== null && navigator.clipboard?.writeText(colored ? stripAnsi(text) : text)}>复制全部</button>
-        <button className={btn} onClick={() => setAnsi(a => !a)}>{ansi ? '纯文本' : '颜色'}</button>
-        {onSendToAgent && (
-          <button className={btn} onClick={async () => {
-            const sel = window.getSelection()?.toString() ?? ''
-            const raw = colored ? stripAnsi(text ?? '') : (text ?? '')
-            const payload = sel.trim() ? sel : raw.split('\n').slice(-200).join('\n')
-            if (await confirm({ title: '发给 agent？', body: '内容可能包含密钥或令牌,请确认后再发送。', confirmLabel: '发送' })) onSendToAgent(payload)
-          }}>发给 agent</button>
-        )}
+      <div className="px-3 py-2 border-t border-[var(--border)] bg-[var(--bg-secondary)]">
+        <div className="flex items-end gap-2">
+          <button className={`${btn} flex items-center gap-1`} onClick={toTop}><ArrowUpToLine size={14} /> 首行</button>
+          <button className={`${btn} flex items-center gap-1`} onClick={toBottom}><ArrowDownToLine size={14} /> 底部</button>
+          <button className={btn} onClick={() => text !== null && navigator.clipboard?.writeText(colored ? stripAnsi(text) : text)}>复制全部</button>
+          <button className={btn} onClick={() => setAnsi(a => !a)}>{ansi ? '纯文本' : '颜色'}</button>
+          {sendTo && (
+            <div className="ml-auto flex flex-col items-end">
+              {alternate && <span className="text-ui-2xs text-[var(--accent-yellow)]">仅当前屏</span>}
+              <div className="flex items-center">
+                {/* touch-callout / select-none only on the button: the history text must stay long-press-copyable. */}
+                <button ref={sendBtnRef} aria-label={alternate ? `${sendLabel},仅当前屏` : sendLabel}
+                  className={`${btn} min-h-[var(--hit)] max-w-[40vw] truncate select-none [-webkit-touch-callout:none]`}
+                  onPointerDown={onSendDown} onPointerUp={cancelPress} onPointerLeave={cancelPress} onPointerCancel={cancelPress}
+                  onContextMenu={e => e.preventDefault()} onClick={onSendClick}>
+                  {target ? `发给 ★ ${target.name}` : '发给 agent…'}
+                </button>
+                {target && <IconButton label="选择发送目标" icon={ChevronDown} size="sm"
+                  onPointerDown={() => { pendingPayload.current = readPayload() }} onClick={e => openMenu(e.currentTarget)} />}
+              </div>
+            </div>
+          )}
+        </div>
+        {sendTo && <p className="pt-1 text-right text-ui-2xs text-[var(--fg-subtle)]">发送前请确认内容不含密钥</p>}
       </div>
+      {sendTo && menu && <SendToMenu open anchor={menu.anchor} onClose={() => setMenu(null)} text={menu.text} {...sendTo} />}
     </div>
   )
 }

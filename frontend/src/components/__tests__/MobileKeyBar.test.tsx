@@ -60,4 +60,44 @@ describe('MobileKeyBar', () => {
     expect(btn.textContent).toBe('')
     expect(btn.querySelector('svg')).not.toBeNull()
   })
+
+  it('page 2 is 12 keys incl. ^R ^L Home End, every key (both pages) ≥ --hit tall', () => {
+    const onKey = vi.fn()
+    render(<MobileKeyBar onKey={onKey} onHistory={() => {}} />)
+    for (const k of ['history', 'up', 'down', 'enter', 'ctrl-c', 'claude', 'codex', 'crew', 'more-keys']) {
+      expect(screen.getByLabelText(k).className).toContain('min-h-[var(--hit)]')
+    }
+    fireEvent.pointerDown(screen.getByLabelText('more-keys'))
+    const page2 = ['esc', 'tab', 'left', 'right', 'ctrl-d', 'ctrl-z', 'pgup', 'pgdn', 'ctrl-r', 'ctrl-l', 'home', 'end']
+    for (const k of page2) {
+      const b = screen.getByLabelText(k)
+      expect(b.className).toContain('min-h-[var(--hit)]')
+      expect(b.style.touchAction).toBe('manipulation')
+    }
+    expect(screen.getByTestId('keybar-page2').querySelectorAll('button')).toHaveLength(12)
+    fireEvent.pointerDown(screen.getByLabelText('home'))
+    expect(onKey).toHaveBeenCalledWith('home')
+  })
+
+  it('expanded: 收起键栏 toggle has aria-expanded=true and calls onToggleCollapsed', () => {
+    const onToggle = vi.fn()
+    render(<MobileKeyBar onKey={() => {}} collapsed={false} onToggleCollapsed={onToggle} />)
+    const btn = screen.getByLabelText('收起键栏')
+    expect(btn.getAttribute('aria-expanded')).toBe('true')
+    fireEvent.click(btn)
+    expect(onToggle).toHaveBeenCalledTimes(1)
+  })
+
+  it('collapsed: only a 「⌃ 键栏」 button (aria-expanded=false, ≥44px), no keys', () => {
+    const onToggle = vi.fn()
+    render(<MobileKeyBar onKey={() => {}} onHistory={() => {}} collapsed onToggleCollapsed={onToggle} />)
+    expect(screen.queryByLabelText('up')).toBeNull()
+    expect(screen.queryByLabelText('history')).toBeNull()
+    const btn = screen.getByRole('button', { name: /键栏/ })
+    expect(btn.textContent).toBe('⌃ 键栏')
+    expect(btn.getAttribute('aria-expanded')).toBe('false')
+    expect(btn.className).toContain('min-h-[var(--hit)]')
+    fireEvent.click(btn)
+    expect(onToggle).toHaveBeenCalledTimes(1)
+  })
 })

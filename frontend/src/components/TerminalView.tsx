@@ -30,6 +30,7 @@ import { useTerminalSocket } from '../hooks/useTerminalSocket'
 const FONT_SIZE = 14
 
 const LANDSCAPE_MQ = '(orientation: landscape) and (max-height: 500px)'
+const KEYTRAY_KEY = 'zmx_keytray'
 
 interface Props {
   sessionId: string
@@ -110,6 +111,13 @@ export default function TerminalView({ sessionId, active, theme, tmuxName, tmuxO
   // 软键盘是否弹起：仅触摸端用 VisualViewport 判断（见下方 effect）。只作为重新 fit
   // 的触发器——键盘弹起/收起时 paddingBottom 改变终端可用高度，而 iOS 不发 window.resize。
   const [keyboardOpen, setKeyboardOpen] = useState(false)
+  // 键栏收起（持久化，'1' = 收起）。软键盘弹起不自动展开；历史开关不影响它。
+  const [trayCollapsed, setTrayCollapsed] = useState(() => localStorage.getItem(KEYTRAY_KEY) === '1')
+  const toggleTray = useCallback(() => {
+    const next = !trayCollapsed
+    localStorage.setItem(KEYTRAY_KEY, next ? '1' : '0')
+    setTrayCollapsed(next)
+  }, [trayCollapsed])
   // 桌面 Ctrl/Cmd+F：非 tmux 会话本地搜索当前屏；tmux 会话改开历史抽屉
   // （xterm 只保留当前屏，搜索历史要走服务端 capture-pane）。
   const [searchOpen, setSearchOpen] = useState(false)
@@ -556,7 +564,7 @@ export default function TerminalView({ sessionId, active, theme, tmuxName, tmuxO
     if (!isTouch) return
     const t = setTimeout(handleResize, 50)
     return () => clearTimeout(t)
-  }, [isTouch, keyboardOpen, handleResize])
+  }, [isTouch, keyboardOpen, trayCollapsed, handleResize])
 
   // ConnectionBar is rendered while not open and removed on open, changing the
   // terminal's height after onopen already measured (rows N-1). Refit once the
@@ -659,8 +667,13 @@ export default function TerminalView({ sessionId, active, theme, tmuxName, tmuxO
         <div data-testid="term-bottom" className="relative">
           {scrollPill}
           <ConnectionBar status={wsStatus.status} sinceMs={wsStatus.since} />
-          <MobileKeyBar onKey={handleBarKey} onHistory={tmuxName ? () => setHistoryOpen(true) : undefined} />
-          <div className="px-2 py-1.5 border-t border-[var(--border)] bg-[var(--bg-secondary)]">
+          {!trayCollapsed && (
+            <MobileKeyBar onKey={handleBarKey} onHistory={tmuxName ? () => setHistoryOpen(true) : undefined}
+              onToggleCollapsed={toggleTray} />
+          )}
+          <div data-testid="term-composer-row" className="flex items-end gap-1 px-2 py-1.5 border-t border-[var(--border)] bg-[var(--bg-secondary)]">
+            {trayCollapsed && <MobileKeyBar onKey={handleBarKey} collapsed onToggleCollapsed={toggleTray} />}
+            <div className="flex-1 min-w-0">
             <Composer
               value={composerText}
               onChange={setComposerText}
@@ -668,6 +681,7 @@ export default function TerminalView({ sessionId, active, theme, tmuxName, tmuxO
               submitOnEnter={false}
               placeholder="输入文字，点 ✈ 发送…"
             />
+            </div>
           </div>
         </div>
       )}

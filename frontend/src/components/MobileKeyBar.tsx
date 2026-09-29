@@ -1,5 +1,6 @@
 import { useState } from 'react'
-import { ArrowUp, ArrowDown, CornerDownLeft, History, MoreHorizontal, Undo2, type LucideIcon } from 'lucide-react'
+import { ArrowUp, ArrowDown, ChevronDown, CornerDownLeft, History, MoreHorizontal, Undo2, type LucideIcon } from 'lucide-react'
+import { IconButton } from './ui'
 import type { AgentKey, ControlKey } from '../lib/terminalInput'
 
 export type BarKey = 'up' | 'down' | 'left' | 'right' | 'enter' | ControlKey | AgentKey
@@ -22,19 +23,37 @@ const AGENT_KEYS: { key: AgentKey; label: string }[] = [
   { key: 'crew', label: 'crew' },
 ]
 
-// 第二页：Esc/Tab/←→/^D/^Z/PgUp/PgDn —— 第一页放不下的控制键。
+// 第二页：第一页放不下的控制键，两行网格（每行 6 个），保证每键够宽。
 const PAGE2: { key: BarKey; label: string }[] = [
   { key: 'esc', label: 'Esc' }, { key: 'tab', label: 'Tab' },
   { key: 'left', label: '←' }, { key: 'right', label: '→' },
   { key: 'ctrl-d', label: '^D' }, { key: 'ctrl-z', label: '^Z' },
   { key: 'pgup', label: 'PgUp' }, { key: 'pgdn', label: 'PgDn' },
+  { key: 'ctrl-r', label: '^R' }, { key: 'ctrl-l', label: '^L' },
+  { key: 'home', label: 'Home' }, { key: 'end', label: 'End' },
 ]
 
-export default function MobileKeyBar({ onKey, onHistory }: { onKey: (key: BarKey) => void; onHistory?: () => void }) {
+// 所有键 min-h 取 --hit（触屏 44px）。
+const btnCls =
+  'flex-1 flex items-center justify-center min-h-[var(--hit)] rounded-md bg-[var(--bg-primary)] border border-[var(--border)] text-[var(--text-secondary)] active:bg-[var(--bg-hover)] active:text-[var(--text-primary)]'
+
+export default function MobileKeyBar({ onKey, onHistory, collapsed = false, onToggleCollapsed }: {
+  onKey: (key: BarKey) => void; onHistory?: () => void
+  /** 收起态只渲染一个「⌃ 键栏」入口（由调用方放在 composer 同一行）。 */
+  collapsed?: boolean; onToggleCollapsed?: () => void
+}) {
   const [page, setPage] = useState(0)
+  // 切换键用 onClick（键盘可达）；pointerDown 只 preventDefault，不抢焦点 / 不弹软键盘。
+  if (collapsed) {
+    return (
+      <button type="button" aria-expanded={false} onPointerDown={(e) => e.preventDefault()} onClick={onToggleCollapsed}
+        style={{ touchAction: 'manipulation' }}
+        className="shrink-0 flex items-center justify-center min-h-[var(--hit)] px-3 rounded-md bg-[var(--bg-primary)] border border-[var(--border)] text-ui-xs text-[var(--text-secondary)] active:bg-[var(--bg-hover)]">
+        ⌃ 键栏
+      </button>
+    )
+  }
   // onPointerDown + preventDefault：手机上避免按钮抢走终端焦点 / 触发软键盘。
-  const btnCls =
-    'flex-1 flex items-center justify-center py-2 rounded-md bg-[var(--bg-primary)] border border-[var(--border)] text-[var(--text-secondary)] active:bg-[var(--bg-hover)] active:text-[var(--text-primary)]'
   return (
     <div className="flex items-stretch gap-1 px-2 py-1.5 border-t border-[var(--border)] bg-[var(--bg-secondary)]">
       {onHistory && (
@@ -67,22 +86,28 @@ export default function MobileKeyBar({ onKey, onHistory }: { onKey: (key: BarKey
           ))}
         </>
       ) : (
-        PAGE2.map(({ key, label }) => (
-          <button
-            key={key}
-            aria-label={key}
-            onPointerDown={(e) => { e.preventDefault(); onKey(key) }}
-            style={{ touchAction: 'manipulation' }}
-            className={`${btnCls} text-ui-xs font-mono`}
-          >
-            {label}
-          </button>
-        ))
+        <div data-testid="keybar-page2" className="flex-[6] grid grid-cols-6 gap-1">
+          {PAGE2.map(({ key, label }) => (
+            <button
+              key={key}
+              aria-label={key}
+              onPointerDown={(e) => { e.preventDefault(); onKey(key) }}
+              style={{ touchAction: 'manipulation' }}
+              className={`${btnCls} text-ui-xs font-mono`}
+            >
+              {label}
+            </button>
+          ))}
+        </div>
       )}
       <button aria-label="more-keys" onPointerDown={(e) => { e.preventDefault(); setPage(p => 1 - p) }}
         style={{ touchAction: 'manipulation' }} className={btnCls}>
         {page === 0 ? <MoreHorizontal size={18} /> : <Undo2 size={18} />}
       </button>
+      {onToggleCollapsed && (
+        <IconButton label="收起键栏" icon={ChevronDown} aria-expanded={true} className="shrink-0"
+          onPointerDown={(e) => e.preventDefault()} onClick={onToggleCollapsed} style={{ touchAction: 'manipulation' }} />
+      )}
     </div>
   )
 }

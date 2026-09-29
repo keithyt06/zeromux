@@ -34,8 +34,10 @@ export const xtermModule = {
 }
 type MockTerminal = { calls: { reset: number; write: number; focus: number }; dataHandlers: ((d: string) => void)[]; binaryHandlers: ((d: string) => void)[]; selectionHandlers: (() => void)[]; cols: number; rows: number }
 export const lastTerminal = () => xtermInstances[xtermInstances.length - 1] as MockTerminal
+/** Call count for characterization assertions (e.g. ResizeObserver-triggered refits). */
+export const fitCalls = { count: 0 }
 export const fitModule = { FitAddon: class {
-  fit() { const t = xtermInstances.length ? lastTerminal() : undefined; if (t) { t.cols = fitDims.cols; t.rows = fitDims.rows } }
+  fit() { fitCalls.count++; const t = xtermInstances.length ? lastTerminal() : undefined; if (t) { t.cols = fitDims.cols; t.rows = fitDims.rows } }
   proposeDimensions() { return { ...fitDims } } activate() {} dispose() {}
 } }
 export const webglModule = { WebglAddon: class { onContextLoss() { return disp } activate() {} dispose() {} } }

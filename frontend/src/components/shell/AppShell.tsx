@@ -117,14 +117,9 @@ export function AppShell({ user, theme, onLogout, onAuthLost }: {
   const toggleContext = (s: SessionInfo) => {
     setContext(s.id, { open: !shell.contextOf(s).open })
   }
-  // The inline column changes the terminal's width: let TerminalView refit via its
-  // existing window-resize path (I-12 dedupe unchanged).
+  // The inline column changes the terminal's width; TerminalView now watches its
+  // own container with a ResizeObserver, so no synthetic window resize is needed.
   const ctxOpen = !!activeCtx?.open
-  useEffect(() => {
-    if (narrow || active?.type !== 'tmux') return
-    const t = setTimeout(() => window.dispatchEvent(new Event('resize')), 50)
-    return () => clearTimeout(t)
-  }, [ctxOpen, railExpanded, narrow, active?.type])
 
   // SendToMenu「＋ 新开…」= ⌘K new mode prefilled (M24).
   const openNewPrefilled = useCallback(({ workDir, prompt }: { workDir: string | null; prompt: string }) => {

@@ -533,6 +533,22 @@ export default function TerminalView({ sessionId, active, theme, tmuxName, tmuxO
     return () => window.removeEventListener('resize', handleResize)
   }, [handleResize])
 
+  // ContextPanel expand/collapse (and rail toggle) resize the container without
+  // firing window resize, so watch it directly. Debounced 50ms like the other
+  // refit effects; handleResize's own 0×0 skip + shouldSendResize dedupe (I-12)
+  // still apply — this just adds another trigger, not another send path.
+  useEffect(() => {
+    const el = containerRef.current
+    if (!el || typeof ResizeObserver === 'undefined') return
+    let t: ReturnType<typeof setTimeout> | undefined
+    const ro = new ResizeObserver(() => {
+      if (t) clearTimeout(t)
+      t = setTimeout(handleResize, 50)
+    })
+    ro.observe(el)
+    return () => { if (t) clearTimeout(t); ro.disconnect() }
+  }, [handleResize])
+
   // 键条 / composer 占用高度，改变终端可用区；渲染后重新 fit，
   // 避免底部行被遮 / canvas 尺寸过期。软键盘弹起/收起时 VisualViewport effect 改了
   // paddingBottom（iOS 不发 window.resize），这里是唯一的重算路径：每次切换 fit 一次。

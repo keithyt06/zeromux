@@ -9,7 +9,7 @@ import { render, screen, act } from '@testing-library/react'
 import { describe, it, expect, beforeEach, afterEach } from 'vitest'
 import TerminalView from '../TerminalView'
 import { installFakeWebSocket } from '../../test/fakeWs'
-import { lastTerminal, fitDims } from '../../test/xtermMock'
+import { lastTerminal, fitDims, fitCalls } from '../../test/xtermMock'
 
 // Characterization of TerminalView's WS lifecycle as it is today (S4 Task 1).
 // happy-dom reports 0×0 for every element; give only the xterm container a real
@@ -80,6 +80,61 @@ describe('TerminalView WS characterization', () => {
     r.rerender(<TerminalView sessionId="t1" active theme="dark" tmuxName="zmx-t1" tmuxOrigin="own" />)
     await act(async () => { vi.advanceTimersByTime(60) })
     expect(resizes(s)).toEqual([{ type: 'resize', cols: 80, rows: 24 }])
+  })
+
+  // S4 Task 3 item 2: ContextPanel expand/collapse resizes the container without
+  // firing window resize; a ResizeObserver on the xterm container must pick it
+  // up. happy-dom's real ResizeObserver never calls back, so stub the global
+  // and invoke the captured callback ourselves.
+  describe('ResizeObserver refit (ContextPanel toggle)', () => {
+    let roCallback: (() => void) | null = null
+    let observedEl: Element | null = null
+    let origRO: typeof ResizeObserver | undefined
+    beforeEach(() => {
+      roCallback = null
+      observedEl = null
+      origRO = globalThis.ResizeObserver
+      globalThis.ResizeObserver = class {
+        constructor(cb: () => void) { roCallback = cb }
+        observe(el: Element) { observedEl = el }
+        unobserve() {}
+        disconnect() {}
+      } as unknown as typeof ResizeObserver
+      fitCalls.count = 0
+    })
+    afterEach(() => {
+      globalThis.ResizeObserver = origRO as typeof ResizeObserver
+    })
+
+    it('observes the xterm container and refits+resends at most once when active', async () => {
+      mount()
+      const s = ws.latest()
+      act(() => { s.fireOpen() })
+      await act(async () => { vi.advanceTimersByTime(60) })
+      expect(observedEl).not.toBeNull()
+      expect(observedEl?.classList.contains('xterm-container')).toBe(true)
+      const before = fitCalls.count
+      fitDims.cols = 100; fitDims.rows = 30
+      act(() => { roCallback?.() })
+      await act(async () => { vi.advanceTimersByTime(60) })
+      expect(fitCalls.count).toBe(before + 1)
+      expect(resizes(s)).toEqual([
+        { type: 'resize', cols: 80, rows: 24 },
+        { type: 'resize', cols: 100, rows: 30 },
+      ])
+    })
+
+    it('does not resend when hidden (I-12 unchanged)', async () => {
+      const h = mount({ sessionId: 't3', active: false })
+      const s = ws.latest()
+      act(() => { s.fireOpen() })
+      await act(async () => { vi.advanceTimersByTime(60) })
+      expect(resizes(s)).toEqual([])
+      act(() => { roCallback?.() })
+      await act(async () => { vi.advanceTimersByTime(60) })
+      expect(resizes(s)).toEqual([])
+      h.unmount()
+    })
   })
 
   it('I-13: typed data is sent only while OPEN', () => {

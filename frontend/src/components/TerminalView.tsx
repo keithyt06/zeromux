@@ -5,10 +5,11 @@ import { WebglAddon } from '@xterm/addon-webgl'
 import { ClipboardAddon } from '@xterm/addon-clipboard'
 import { writeOnlyClipboard } from '../lib/clipboard'
 import { SearchAddon } from '@xterm/addon-search'
-import { getSessionStatus, getTmuxHealth, reviveSession } from '../lib/api'
+import { getSessionStatus, reviveSession } from '../lib/api'
 import type { SessionStatus, TmuxHealth } from '../lib/api'
 import type { Theme } from '../lib/theme'
 import { readTerminalTheme } from '../lib/terminalTheme'
+import { usePolling } from '../lib/usePolling'
 import { b64encode } from '../lib/base64'
 import { GitBranch, Folder, Circle, ArrowUpToLine, ArrowDownToLine } from 'lucide-react'
 import { attachCommand, copyText } from '../lib/attachCommand'
@@ -36,6 +37,9 @@ interface Props {
   theme: Theme
   tmuxName?: string | null
   tmuxOrigin?: 'own' | 'external' | null
+  /** tmux server health, polled globally by AppShell (§4.6) — a single 30s poll
+   *  shared by every terminal, rather than each view fetching it separately. */
+  tmuxHealth?: TmuxHealth | null
   onClose?: () => void
   /** Bumped (nonce) by the sidebar's ⋯ 查看历史 to open the history drawer. */
   historyRequest?: number
@@ -43,7 +47,7 @@ interface Props {
   onAskAgent?: (prompt: string) => void
 }
 
-export default function TerminalView({ sessionId, active, theme, tmuxName, tmuxOrigin, onClose, historyRequest, onAskAgent }: Props) {
+export default function TerminalView({ sessionId, active, theme, tmuxName, tmuxOrigin, tmuxHealth, onClose, historyRequest, onAskAgent }: Props) {
   const containerRef = useRef<HTMLDivElement>(null)
   const termRef = useRef<Terminal | null>(null)
   const fitRef = useRef<FitAddon | null>(null)
@@ -58,7 +62,11 @@ export default function TerminalView({ sessionId, active, theme, tmuxName, tmuxO
   const userScrolledUpRef = useRef(false)
   const scrollDebounceRef = useRef<ReturnType<typeof setTimeout> | undefined>(undefined)
   const [status, setStatus] = useState<SessionStatus | null>(null)
-  const [health, setHealth] = useState<TmuxHealth | null>(null)
+  // Seeded from AppShell's global 30s poll; a tmux_down WS notice (onNotice
+  // below) overrides it locally until the next prop update self-heals it.
+  const [health, setHealth] = useState<TmuxHealth | null>(tmuxHealth ?? null)
+  // eslint-disable-next-line react-hooks/set-state-in-effect -- syncing a prop from a parent-owned poll into local state, same idiom as tmuxRef/tmuxOriginRef above
+  useEffect(() => { setHealth(tmuxHealth ?? null) }, [tmuxHealth])
   const [lost, setLost] = useState(false)
   const [ended, setEnded] = useState(false)
   // Ref twin of `ended` for the WS onclose closure: an Ended session must not
@@ -111,19 +119,15 @@ export default function TerminalView({ sessionId, active, theme, tmuxName, tmuxO
   // tmux 鼠标交给谁：true=tmux（滚轮/点选窗格），false=浏览器（原生拖选文字）。
   const [mouseOn, setMouseOn] = useState(() => mousePref(localStorage))
 
-  // Fetch status
-  useEffect(() => {
-    let cancelled = false
-    const fetchStatus = () => {
-      getSessionStatus(sessionId).then(s => {
-        if (!cancelled) setStatus(s)
-      }).catch(() => {})
-      if (tmuxName) getTmuxHealth().then(h => { if (!cancelled) setHealth(h) }).catch(() => {})
-    }
-    fetchStatus()
-    const interval = setInterval(fetchStatus, 10000)
-    return () => { cancelled = true; clearInterval(interval) }
-  }, [sessionId, tmuxName])
+  // Fetch status: only while this view is active (hidden terminals don't need
+  // a fresh work_dir/git_branch), fires immediately on becoming active, then
+  // every 10s; paused while the tab itself is hidden (usePolling semantics).
+  // tmux health is a global endpoint — AppShell polls it once for every
+  // terminal and passes the result down via the tmuxHealth prop (§4.6).
+  const fetchStatus = useCallback(() => {
+    return getSessionStatus(sessionId).then(s => { setStatus(s) })
+  }, [sessionId])
+  usePolling(fetchStatus, 10000, { enabled: active })
 
   // tmux copy-mode state (server-authoritative via scroll_state); drives the pill.
   const [scrolling, setScrolling] = useState(false)

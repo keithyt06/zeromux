@@ -27,6 +27,7 @@ export function setupApp(opts: { sessions?: SessionInfo[] } = {}) {
   vi.spyOn(api, 'listPrompts').mockResolvedValue([])
   vi.spyOn(api, 'getSessionRuns').mockResolvedValue({ runs: [], stats: null, lifetime: { turns: 0, duration_ms: 0, cost_usd: 0 } } as never)
   vi.spyOn(api, 'getSessionStatus').mockResolvedValue({ work_dir: '/w', git_branch: 'main', git_dirty: 0, is_git: true })
+  vi.spyOn(api, 'getTmuxHealth').mockResolvedValue({ server: true, in_unit: true })
   const del = vi.spyOn(api, 'deleteSession').mockResolvedValue({ pending_until: Date.now() + 5000 })
   vi.spyOn(api, 'closeCheck').mockResolvedValue(null)
   globalThis.fetch = vi.fn(async () => new Response('{}', { status: 200 })) as unknown as typeof fetch

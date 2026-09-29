@@ -1,10 +1,11 @@
 import { Suspense, useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { BookOpen, ChevronLeft, PanelLeft, PanelLeftClose, Plus, Search, SkipForward, X } from 'lucide-react'
-import type { SessionInfo, UserInfo } from '../../lib/api'
-import { getVaultMeta } from '../../lib/api'
+import type { SessionInfo, TmuxHealth, UserInfo } from '../../lib/api'
+import { getTmuxHealth, getVaultMeta } from '../../lib/api'
 import { shouldShowVault } from '../../lib/vault'
 import type { useTheme } from '../../lib/theme'
 import { useIsNarrow, useMediaQuery } from '../../lib/useMediaQuery'
+import { usePolling } from '../../lib/usePolling'
 import { groupTriage, needsYouCount, nextNeedsYou, triage, toneOf, labelOf } from '../../lib/triage'
 import { sessionActions } from '../../lib/sessionActions'
 import { peerNamesKey, peerNamesFromKey } from '../../lib/peer'
@@ -54,6 +55,13 @@ export function AppShell({ user, theme, onLogout, onAuthLost }: {
 
   const [vaultEnabled, setVaultEnabled] = useState(false)
   useEffect(() => { getVaultMeta().then(m => setVaultEnabled(shouldShowVault(m))).catch(() => {}) }, [])
+
+  // tmux health is a global endpoint (not per-session): poll it once here and
+  // pass the result down to every terminal's TmuxHealthBar (§4.6), instead of
+  // each TerminalView fetching its own redundant copy.
+  const [tmuxHealth, setTmuxHealth] = useState<TmuxHealth | null>(null)
+  const pollTmuxHealth = useCallback(async () => { setTmuxHealth(await getTmuxHealth()) }, [])
+  usePolling(pollTmuxHealth, 30_000)
 
   const [palette, setPalette] = useState<PaletteInit | null>(null)
   const [panel, setPanel] = useState<ShellPanel | null>(null)
@@ -160,7 +168,7 @@ export function AppShell({ user, theme, onLogout, onAuthLost }: {
         return (
           <div key={s.id} data-session-pane={s.id} data-active={isActive ? '1' : '0'} className={`absolute inset-0 ${isActive ? '' : 'hidden'}`}>
             {s.type === 'tmux' ? (
-              <TerminalView sessionId={s.id} active={isActive} theme={theme.theme} tmuxName={s.tmux_name} tmuxOrigin={s.tmux_origin}
+              <TerminalView sessionId={s.id} active={isActive} theme={theme.theme} tmuxName={s.tmux_name} tmuxOrigin={s.tmux_origin} tmuxHealth={tmuxHealth}
                 onClose={() => shell.close(s.id)} historyRequest={shell.historyReq?.id === s.id ? shell.historyReq.nonce : 0}
                 onAskAgent={(prompt) => { shell.create('claude', s.work_dir, undefined, prompt).catch(() => toast.push({ message: '创建会话失败' })) }} />
             ) : (

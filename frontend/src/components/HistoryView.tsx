@@ -8,6 +8,7 @@ import { SendToMenu, defaultTarget, sendWithUndo, type SendToProps } from './Sen
 
 const CHUNK = 500
 const LONG_PRESS_MS = 500
+const PAYLOAD_FRESH_MS = 1000
 
 interface Props {
   sessionId: string
@@ -41,7 +42,7 @@ export default function HistoryView({ sessionId, title, onClose, split, sendTo, 
   const [menu, setMenu] = useState<{ anchor: HTMLElement | null; text: string } | null>(null)
   // Selection is read on pointerdown and cached: by click time (or once the menu
   // opens and takes focus) the browser may have cleared it.
-  const pendingPayload = useRef<string | null>(null)
+  const pendingPayload = useRef<{ text: string; at: number } | null>(null)
   const pressTimer = useRef<ReturnType<typeof setTimeout> | undefined>(undefined)
   const longPressed = useRef(false)
   // One pending undo-send per drawer: a double tap replaces (not queues) the first.
@@ -98,16 +99,19 @@ export default function HistoryView({ sessionId, title, onClose, split, sendTo, 
     const raw = colored ? stripAnsi(text ?? '') : (text ?? '')
     return sel.trim() ? sel : raw.split('\n').slice(-200).join('\n')
   }
-  const takePayload = () => { const p = pendingPayload.current ?? readPayload(); pendingPayload.current = null; return p }
+  // The pointerdown cache is trusted only briefly (a tap / long press); anything older is re-read.
+  const takePayload = () => {
+    const c = pendingPayload.current; pendingPayload.current = null
+    return c && Date.now() - c.at < PAYLOAD_FRESH_MS ? c.text : readPayload()
+  }
+  const cachePayload = () => { pendingPayload.current = { text: readPayload(), at: Date.now() } }
   const target = sendTo ? defaultTarget(sendTo.sessions, sendTo.workDir, sendTo.excludeId, sendTo.sameDirOnly) : null
   const openMenu = (anchor: HTMLElement | null) => setMenu({ anchor, text: wrap(takePayload()) })
   const cancelPress = () => clearTimeout(pressTimer.current)
-  // An aborted press (finger slid off / cancelled) must not leave a stale payload for a later click.
-  const abortPress = () => { cancelPress(); if (!longPressed.current) pendingPayload.current = null }
   // Keyboard activation (detail 0) has no pointerdown of its own: read the current payload.
   const freshIfKeyboard = (e: MouseEvent) => { if (e.detail === 0) pendingPayload.current = null }
   const onSendDown = () => {
-    pendingPayload.current = readPayload()
+    cachePayload()
     longPressed.current = false
     cancelPress()
     pressTimer.current = setTimeout(() => { longPressed.current = true; openMenu(sendBtnRef.current) }, LONG_PRESS_MS)
@@ -180,12 +184,12 @@ export default function HistoryView({ sessionId, title, onClose, split, sendTo, 
                 {/* touch-callout / select-none only on the button: the history text must stay long-press-copyable. */}
                 <button ref={sendBtnRef} aria-label={alternate ? `${sendLabel},仅当前屏` : sendLabel}
                   className={`${btn} min-h-[var(--hit)] max-w-[40vw] truncate select-none [-webkit-touch-callout:none]`}
-                  onPointerDown={onSendDown} onPointerUp={cancelPress} onPointerLeave={abortPress} onPointerCancel={abortPress}
+                  onPointerDown={onSendDown} onPointerUp={cancelPress} onPointerLeave={cancelPress} onPointerCancel={cancelPress}
                   onContextMenu={e => e.preventDefault()} onClick={onSendClick}>
                   {target ? `发给 ★ ${target.name}` : '发给 agent…'}
                 </button>
                 {target && <IconButton label="选择发送目标" icon={ChevronDown} size="sm"
-                  onPointerDown={() => { pendingPayload.current = readPayload() }} onClick={e => { freshIfKeyboard(e); openMenu(e.currentTarget) }} />}
+                  onPointerDown={cachePayload} onClick={e => { freshIfKeyboard(e); openMenu(e.currentTarget) }} />}
               </div>
             </div>
           )}

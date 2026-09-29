@@ -19,14 +19,14 @@ describe('chunkLines', () => {
   })
 })
 
-function renderSend(o: { ok?: boolean; sessions?: ReturnType<typeof mkSession>[] } = {}) {
+function renderSend(o: { ok?: boolean; sessions?: ReturnType<typeof mkSession>[]; queueModes?: Record<string, string> } = {}) {
   const sendPrompt = vi.fn(() => o.ok ?? true)
   const ctl = { setQueueMode: vi.fn(), sendPrompt, interrupt: vi.fn(), resolveApproval: vi.fn(), pendingApprovals: () => [] } as unknown as SessionControls
   const onNew = vi.fn(), onSelectSession = vi.fn()
   const sessions = o.sessions ?? [mkSession('a', { work_dir: '/w/a' }), mkSession('t', { type: 'tmux', work_dir: '/w/a' })]
   render(<>
     <HistoryView sessionId="s" title="t" onClose={() => {}} wrap={t => `W[${t}]`}
-      sendTo={{ workDir: '/w/a', excludeId: 't', sessions, controls: { current: { a: ctl } }, queueModes: {}, onSelectSession, onNew }} />
+      sendTo={{ workDir: '/w/a', excludeId: 't', sessions, controls: { current: { a: ctl } }, queueModes: o.queueModes ?? {}, onSelectSession, onNew }} />
     <Toaster /><DialogHost />
   </>)
   return { sendPrompt, onNew, onSelectSession }
@@ -192,6 +192,52 @@ describe('HistoryView', () => {
     fireEvent.click(btn, { detail: 0 })  // keyboard Enter/Space activation
     act(() => { vi.advanceTimersByTime(UNDO_MS) })
     expect(sendPrompt).toHaveBeenCalledWith('W[new]', { withAttachments: false })
+  })
+  it('phone tap order (down → up → leave → selection cleared → click) still sends the picked text', async () => {
+    vi.spyOn(api, 'getHistory').mockResolvedValue({ text: 'x', truncated: false })
+    const { sendPrompt } = renderSend()
+    await waitFor(() => expect(screen.getByText('x')).toBeInTheDocument())
+    const sel = vi.spyOn(window, 'getSelection').mockReturnValue({ toString: () => 'picked' } as Selection)
+    vi.useFakeTimers()
+    const btn = screen.getByRole('button', { name: '发给 s-a' })
+    fireEvent.pointerDown(btn)
+    fireEvent.pointerUp(btn)
+    fireEvent.pointerLeave(btn)
+    sel.mockReturnValue({ toString: () => '' } as Selection)
+    fireEvent.click(btn, { detail: 1 })
+    act(() => { vi.advanceTimersByTime(UNDO_MS) })
+    expect(sendPrompt).toHaveBeenCalledWith('W[picked]', { withAttachments: false })
+  })
+  it('a pointerdown cache older than 1s is ignored: the click reads the current selection', async () => {
+    vi.spyOn(api, 'getHistory').mockResolvedValue({ text: 'x', truncated: false })
+    const { sendPrompt } = renderSend()
+    await waitFor(() => expect(screen.getByText('x')).toBeInTheDocument())
+    const sel = vi.spyOn(window, 'getSelection').mockReturnValue({ toString: () => 'old' } as Selection)
+    vi.useFakeTimers()
+    const btn = screen.getByRole('button', { name: '发给 s-a' })
+    fireEvent.pointerDown(btn)
+    fireEvent.pointerLeave(btn)          // aborted press, no click
+    act(() => { vi.advanceTimersByTime(2000) })
+    sel.mockReturnValue({ toString: () => 'new' } as Selection)
+    fireEvent.click(btn, { detail: 1 })
+    act(() => { vi.advanceTimersByTime(UNDO_MS) })
+    expect(sendPrompt).toHaveBeenCalledWith('W[new]', { withAttachments: false })
+  })
+  it('★ running in interrupt mode: the undo toast says 将打断', async () => {
+    vi.spyOn(api, 'getHistory').mockResolvedValue({ text: 'x', truncated: false })
+    renderSend({ sessions: [mkSession('a', { work_dir: '/w/a', turn_state: 'running' })], queueModes: { a: 'interrupt' } })
+    await waitFor(() => expect(screen.getByText('x')).toBeInTheDocument())
+    vi.useFakeTimers()
+    fireEvent.click(screen.getByRole('button', { name: '发给 s-a' }))
+    expect(screen.getByText('已发给 s-a · 1 行 · 将打断')).toBeInTheDocument()
+  })
+  it('★ running in collect mode: no 将打断', async () => {
+    vi.spyOn(api, 'getHistory').mockResolvedValue({ text: 'x', truncated: false })
+    renderSend({ sessions: [mkSession('a', { work_dir: '/w/a', turn_state: 'running' })], queueModes: { a: 'collect' } })
+    await waitFor(() => expect(screen.getByText('x')).toBeInTheDocument())
+    vi.useFakeTimers()
+    fireEvent.click(screen.getByRole('button', { name: '发给 s-a' }))
+    expect(screen.getByText('已发给 s-a · 1 行')).toBeInTheDocument()
   })
   it('long press (500ms) opens SendToMenu and sends nothing by itself', async () => {
     vi.spyOn(api, 'getHistory').mockResolvedValue({ text: 'x', truncated: false })

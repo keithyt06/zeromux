@@ -22,7 +22,7 @@ function shortDir(p: string): string {
   return parts.length <= 2 ? p : `…/${parts.slice(-2).join('/')}`
 }
 
-type SendDeps = { controls: RefObject<Record<string, SessionControls>>; onSelectSession(id: string): void }
+type SendDeps = { controls: RefObject<Record<string, SessionControls>>; onSelectSession(id: string): void; queueModes?: Record<string, string> }
 
 /** The ★ target: the first SendToMenu candidate, or null when there is none. */
 // eslint-disable-next-line react-refresh/only-export-components -- shared with HistoryView's one-tap send
@@ -57,7 +57,8 @@ export function sendWithUndo(target: SessionInfo, text: string, lines: number, d
   clearTimeout(pendingUndo.get(key))
   const timer = setTimeout(() => { pendingUndo.delete(key); sendToSession(target, text, deps, key) }, UNDO_MS)
   pendingUndo.set(key, timer)
-  toast.push({ key, durationMs: UNDO_MS, message: `已发给 ${target.name} · ${lines} 行`, action: { label: '撤回', onClick: () => {
+  const interrupts = target.turn_state === 'running' && deps.queueModes?.[target.id] === 'interrupt'
+  toast.push({ key, durationMs: UNDO_MS, message: `已发给 ${target.name} · ${lines} 行${interrupts ? ' · 将打断' : ''}`, action: { label: '撤回', onClick: () => {
     clearTimeout(timer); pendingUndo.delete(key)
     toast.push({ message: '已撤回' })
   } } })

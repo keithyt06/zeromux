@@ -396,5 +396,16 @@ describe('CommandPalette', () => {
       key('Enter')
       expect(sh.select).toHaveBeenCalledWith('k')
     })
+    it('a failed search for an EARLIER query does not promote a path-only session', async () => {
+      vi.spyOn(api, 'searchPaths')
+        .mockRejectedValueOnce(new Error('502'))
+        .mockImplementation(() => new Promise(() => {}))   // 'eks' still in flight
+      const { type } = setup({ sh: deep() })
+      type('ek')
+      await flush()
+      type('eks')
+      expect(document.querySelector('[data-palette-item="s:k"]')).not.toBeNull()
+      expect(document.querySelector('[aria-selected="true"]')).toBeNull()
+    })
   })
 })

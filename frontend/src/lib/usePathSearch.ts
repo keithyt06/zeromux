@@ -36,7 +36,7 @@ export function usePathSearch(
           setResult(r); setResultQuery(q); setFailed(false)
           if (requeryWhile(r)) again = setTimeout(() => { if (req.isCurrent(t)) run(q) }, REQUERY_MS)
         })
-        .catch(() => { if (req.isCurrent(t)) { setResult(null); setFailed(true) } })
+        .catch(() => { if (req.isCurrent(t)) { setResult(null); setResultQuery(q); setFailed(true) } })
     }
     const d = setTimeout(() => run(query), debounceMs)
     return () => { clearTimeout(d); if (again) clearTimeout(again) }

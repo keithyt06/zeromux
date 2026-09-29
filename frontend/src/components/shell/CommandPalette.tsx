@@ -200,11 +200,12 @@ function PaletteBody({ onClose, initial, shell, actions, vaultEnabled = false, n
   }
   // Default highlight: name/action match > (Enter falls back to) the first dir/note hit
   // > a path-only session, the last only once this query's search came back empty.
-  const searchCurrent = !!search.result && search.resultQuery === text
-  const searchHits = searchCurrent && ((search.result!.dirs?.items.length ?? 0) + (vaultEnabled ? search.result!.notes?.items.length ?? 0 : 0)) > 0
+  // resultQuery also tags a failure, so both only count for THIS query's search.
+  const searchSettled = search.resultQuery === text && (!!search.result || search.failed)
+  const searchHits = searchSettled && !!search.result && ((search.result.dirs?.items.length ?? 0) + (vaultEnabled ? search.result.notes?.items.length ?? 0 : 0)) > 0
   const allItems = [...items, ...pathItems]
   const hiId = allItems.some(i => i.id === hi) ? hi
-    : items[0]?.id ?? ((searchCurrent || search.failed) && !searchHits ? pathItems[0]?.id ?? null : null)
+    : items[0]?.id ?? (searchSettled && !searchHits ? pathItems[0]?.id ?? null : null)
 
   const pickDirHit = (h: DirHit) => {
     if (h.agent) { runCreate(() => shell.create(h.agent!, h.path)); return }

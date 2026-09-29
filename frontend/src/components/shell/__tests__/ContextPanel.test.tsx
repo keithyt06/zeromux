@@ -7,11 +7,16 @@ import type { ContextTab } from '../useShellState'
 const counts = { files: 0 }
 const gitProps: unknown[] = []
 const runProps: unknown[] = []
+const failFiles = { on: false }
 vi.mock('../lazyPanels', async () => {
   const { useState } = await import('react')
   return {
   // Counts constructions (mounts), not renders.
-  FileBrowser: () => { useState(() => { counts.files++; return 0 }); return <div>FILES</div> },
+  FileBrowser: () => {
+    useState(() => { counts.files++; return 0 })
+    if (failFiles.on) throw new Error('Failed to fetch dynamically imported module')
+    return <div>FILES</div>
+  },
   GitViewer: (p: unknown) => { gitProps.push(p); return <div>GIT</div> },
   RunMetricsPanel: (p: unknown) => { runProps.push(p); return <div>RUNS</div> },
   AgentDashboard: (p: { sessionId: string }) => <div>EVENTS {p.sessionId}</div>,
@@ -60,5 +65,20 @@ describe('ContextPanel', () => {
     render(<Harness />)
     await waitFor(() => expect(gitProps.length).toBeGreaterThan(0))
     expect((gitProps.at(-1) as { initialTab?: string }).initialTab).toBeUndefined()
+  })
+
+  // A1: a failing lazy panel shows the in-place fallback; the rest of the panel stays mounted.
+  it('a panel that throws renders 出错了,点此刷新 in place; tabs and other panes survive', async () => {
+    const err = vi.spyOn(console, 'error').mockImplementation(() => {})
+    failFiles.on = true
+    try {
+      render(<Harness />)
+      expect(screen.getByText('GIT')).toBeInTheDocument()
+      fireEvent.click(screen.getByRole('radio', { name: '文件' }))
+      expect(await screen.findByRole('button', { name: '出错了,点此刷新' })).toBeInTheDocument()
+      fireEvent.click(screen.getByRole('radio', { name: 'Git' }))
+      expect(screen.getByText('GIT')).toBeInTheDocument()
+      expect(screen.getByRole('radio', { name: '文件' })).toBeInTheDocument()
+    } finally { failFiles.on = false; err.mockRestore() }
   })
 })

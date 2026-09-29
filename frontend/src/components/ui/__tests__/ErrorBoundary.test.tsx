@@ -13,11 +13,12 @@ describe('ErrorBoundary (A1)', () => {
   })
 
   it('a throwing child shows a refresh button instead of unmounting the root', () => {
-    vi.spyOn(console, 'error').mockImplementation(() => {})
+    const err = vi.spyOn(console, 'error').mockImplementation(() => {})
     const reload = vi.fn()
     render(<div><span>shell</span><ErrorBoundary onReload={reload}><Boom /></ErrorBoundary></div>)
     expect(screen.getByText('shell')).toBeTruthy()
-    const btn = screen.getByRole('button', { name: '页面已更新,点此刷新' })
+    const btn = screen.getByRole('button', { name: '出错了,点此刷新' })
+    expect(err.mock.calls.some(c => c[0] === 'ErrorBoundary caught' && (c[1] as Error)?.message === 'chunk 404')).toBe(true)
     fireEvent.click(btn)
     expect(reload).toHaveBeenCalledTimes(1)
   })

@@ -46,7 +46,7 @@ describe('SendToMenu', () => {
     expect(items[1].textContent).not.toContain('★')
     expect(document.activeElement).toBe(items[0])
     fireEvent.keyDown(items[0], { key: 'Enter' })
-    expect(controls.current.near.sendPrompt).toHaveBeenCalledWith('PROMPT')
+    expect(controls.current.near.sendPrompt).toHaveBeenCalledWith('PROMPT', { withAttachments: false })   // A7
     expect(onSelectSession).not.toHaveBeenCalled()   // no focus switch
   })
 
@@ -143,7 +143,7 @@ describe('SendToMenu', () => {
       fireEvent.click(screen.getByRole('menuitem', { name: '发给 zeromux-fe' }))
       expect(controls.current.near.sendPrompt).not.toHaveBeenCalled()
       await act(async () => { fireEvent.click(await screen.findByText('发送')) })
-      expect(controls.current.near.sendPrompt).toHaveBeenCalledWith('PROMPT')
+      expect(controls.current.near.sendPrompt).toHaveBeenCalledWith('PROMPT', { withAttachments: false })
       expect(screen.getByText('已发给 zeromux-fe')).toBeInTheDocument()
     })
   })

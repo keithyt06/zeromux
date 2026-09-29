@@ -236,7 +236,7 @@ describe('CommandPalette', () => {
     fireEvent.click(await screen.findByTestId('sr-ask'))
     expect(screen.getAllByRole('menuitem')[0]).toHaveTextContent('★ zeromux-fe')   // most recent agent
     fireEvent.click(screen.getByRole('menuitem', { name: '发给 zeromux-fe' }))
-    expect(sendPrompt).toHaveBeenCalledWith('当前笔记：/v/a/n.md\n\n')
+    expect(sendPrompt).toHaveBeenCalledWith('当前笔记：/v/a/n.md\n\n', { withAttachments: false })
     expect(sh.select).not.toHaveBeenCalled()
   })
   it('folder ⋯ 在此开 agent → new mode in that folder (Sidebar.search:130)', async () => {

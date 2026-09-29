@@ -53,7 +53,7 @@ describe('GitViewer forward feedback', () => {
     const items = screen.getAllByRole('menuitem')
     expect(items[0]).toHaveTextContent('★ this-agent')
     fireEvent.click(items[0])
-    expect(sendPrompt).toHaveBeenCalledWith(COMMIT_PROMPT)
+    expect(sendPrompt).toHaveBeenCalledWith(COMMIT_PROMPT, { withAttachments: false })
     expect(confirmSpy).not.toHaveBeenCalled()
   })
   it('让 agent 撤销改动 → SendToMenu (no native confirm); 新开 carries DISCARD_PROMPT', async () => {
@@ -76,7 +76,7 @@ describe('GitViewer forward feedback', () => {
     fireEvent.click(screen.getByText('让 agent 撤销改动'))
     fireEvent.click(screen.getAllByRole('menuitem')[0])
     await act(async () => { fireEvent.click(await screen.findByText('发送')) })
-    expect(sendPrompt).toHaveBeenCalledWith(DISCARD_PROMPT)
+    expect(sendPrompt).toHaveBeenCalledWith(DISCARD_PROMPT, { withAttachments: false })
     expect(confirmSpy).not.toHaveBeenCalled()
   })
 

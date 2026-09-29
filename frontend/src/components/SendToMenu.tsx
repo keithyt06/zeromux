@@ -44,7 +44,7 @@ export function SendToMenu(p: {
   const send = async (s: SessionInfo) => {
     const { text, controls, confirmDanger, onSelectSession } = p
     if (confirmDanger && !(await confirm({ title: `${confirmDanger.title} → ${s.name}(${shortDir(s.work_dir)})`, confirmLabel: '发送', danger: true }))) return
-    if (controls.current?.[s.id]?.sendPrompt(text)) {
+    if (controls.current?.[s.id]?.sendPrompt(text, { withAttachments: false })) {
       toast.push({ message: `已发给 ${s.name}`, action: { label: '查看', onClick: () => onSelectSession(s.id) } })
     } else {
       toast.push({ message: '未连接,未发送', action: { label: '复制', onClick: async () => {

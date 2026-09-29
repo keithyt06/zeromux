@@ -488,9 +488,10 @@ export function useAcpSocket(o: AcpSocketOptions) {
     }
   }, [pushNotice, appendEvent, bumpMetrics, adoptQueueMode, settleActiveTurn])
 
-  const sendPrompt = useCallback((text: string): boolean => {
+  const sendPrompt = useCallback((text: string, opts?: { withAttachments?: boolean }): boolean => {
     if (!wsRef.current || wsRef.current.readyState !== WebSocket.OPEN) return false
-    const full = buildPromptWithAttachments(text, getPendingRef.current())
+    const withAttachments = opts?.withAttachments ?? true
+    const full = withAttachments ? buildPromptWithAttachments(text, getPendingRef.current()) : text
     // Optimistic bubble: insert immediately with MAX_SAFE_INTEGER turn_id so it
     // sorts last (newest) until the server echo arrives with the true turn_id,
     // at which point we rewrite this entry's turn_id (deduped by client_id).
@@ -500,7 +501,7 @@ export function useAcpSocket(o: AcpSocketOptions) {
     // even if they had scrolled up to read history a moment before.
     appendEvent({ type: 'user_prompt', text: full, turn_id: Number.MAX_SAFE_INTEGER, client_id: cid }, true)
     wsRef.current.send(JSON.stringify({ type: 'prompt', text: full, client_id: cid }))
-    clearPendingRef.current()
+    if (withAttachments) clearPendingRef.current()
     // If a turn is already in flight, a send in the default Collect queue mode is
     // merely enqueued server-side (no interrupt, no new turn) — re-seeding the clocks
     // here would reset the silence baseline of the RUNNING turn, resetting `stuck` and

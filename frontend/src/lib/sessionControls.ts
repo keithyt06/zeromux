@@ -7,7 +7,9 @@ export interface PendingApproval { id: string; tool: string; purpose?: string }
  *  session without opening another socket (a new WS triggers a full replay). */
 export interface SessionControls {
   setQueueMode(mode: string): void
-  sendPrompt(text: string): boolean
+  /** withAttachments (default true): attach + clear this session's pending composer
+   *  uploads. Shell-level senders (SendToMenu) pass false so they never carry them off (A7). */
+  sendPrompt(text: string, opts?: { withAttachments?: boolean }): boolean
   /** false = socket not OPEN; nothing sent, local state untouched. */
   interrupt(): boolean
   /** false = socket not OPEN; nothing sent, approval NOT marked resolved. */

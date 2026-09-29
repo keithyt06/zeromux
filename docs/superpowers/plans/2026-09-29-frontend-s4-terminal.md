@@ -2,7 +2,7 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** 终端会话接入新壳:WS 生命周期先锁住再抽出 `useTerminalSocket`,键栏可收起并去 emoji,「终端输出发给 agent」统一走 SendToMenu(桌面选中文字浮钮 + 手机 HistoryView 一击发给 ★),隐藏终端不再轮询状态,桌面底部状态栏收编进 FocusHeader。
+**Goal:** 先修 S2+S3 上线 review 的 Critical/Important(Task 0),再让终端会话接入新壳:WS 生命周期先锁住再抽出 `useTerminalSocket`,键栏可收起并去 emoji,「终端输出发给 agent」统一走 SendToMenu(桌面选中文字浮钮 + 手机 HistoryView 一击发给 ★),隐藏终端不再轮询状态,桌面底部状态栏收编进 FocusHeader。
 
 **Architecture:** 与 S2+S3 同一套路 —— characterization 先对**现有** TerminalView 写(含 B14 验证),全绿后「只搬不改」抽出 hook;之后每个用户可见改动一个任务、一个提交。WebGL 预算按 V13 **不做**。
 
@@ -39,6 +39,7 @@
 
 | 文件 | 动作 | 职责 |
 |---|---|---|
+| `frontend/src/lib/lazyWithReload.ts`、`components/ui/ErrorBoundary.tsx`、`src/web.rs` 缓存头 | Create/Modify | Task 0 A1 |
 | `frontend/src/components/__tests__/terminalSocket.characterization.test.tsx` | Create | TerminalView WS 生命周期锁定(I-4/I-5/I-12/I-13、tmux_ended、B14、refit 路径) |
 | `frontend/src/hooks/useTerminalSocket.ts` | Create | WS connect/backoff/onmessage/sendInput/sendScroll/resize 发送(原样搬迁) |
 | `frontend/src/components/TerminalView.tsx` | Modify | 使用 hook;选区浮钮;状态栏移除;轮询门控 |
@@ -48,6 +49,26 @@
 | `frontend/src/components/SendToMenu.tsx` | Modify(小) | 导出 `defaultTarget()` 供一击发送 |
 | `frontend/src/components/shell/AppShell.tsx` | Modify | 终端接 SendToMenu,删写死 claude 的 `onAskAgent` |
 | `frontend/src/components/shell/FocusHeader.tsx`、`lib/sessionActions.ts` | Modify | tmux 会话 ⋯ 首行 路径/分支/dirty + 鼠标开关 |
+
+---
+
+### Task 0: S2+S3 上线后修复(zmx-ai-02ca59 review A1–A11)
+
+**依据:** `docs/superpowers/audits/2026-09-29-planb-terminal-analysis.md` §A(Critical A1/A2 已由 reviewer 复核)。本 Task 先于终端工作上线。每项一个小提交,可一次部署。
+
+**Files / 改动:**
+- **A1 部署后懒载 404 白屏(Critical)**:`frontend/src/components/shell/lazyPanels.ts` 改用 `lazyWithReload(() => import(...))`(新 `frontend/src/lib/lazyWithReload.ts`):import 失败时若 `sessionStorage['zmx_chunk_reload']` 距今 > 10s 则写入时间戳并 `location.reload()`,否则抛出;`main.tsx` 监听 `window.addEventListener('vite:preloadError', …)` 走同一逻辑。新增 `frontend/src/components/ui/ErrorBoundary.tsx`(类组件,fallback:「页面已更新,点此刷新」按钮 `location.reload()`),包住 AppShell 根与 ContextPanel/面板 Sheet 的 `<Suspense>`。后端 `src/web.rs` `try_serve_embedded`:`index.html` 与 SPA fallback 返回 `Cache-Control: no-cache`;`/assets/*`(带 hash)返回 `public, max-age=31536000, immutable`;`sw.js` 保持现状。测试:`lazyWithReload.test.ts`(失败→reload 一次;10s 内再失败→抛出);ErrorBoundary 组件测;Rust 测 index.html 头为 `no-cache`、`/assets/x.js` 头含 `immutable`。
+- **A2 撤销/提交改动发到别的仓库(Critical)**:`lib/gitviewer.ts` 的 `COMMIT_PROMPT`/`DISCARD_PROMPT` 改为函数 `commitPrompt(workDir)`/`discardPrompt(workDir)`,文本写明绝对路径(「在 `${workDir}` 下…」);`GitViewer` 调 `SendToMenu` 时新增 prop `sameDirOnly`(SendToMenu 新可选 prop):候选只保留 `work_dir === workDir` 的 agent,无候选时只剩「＋ 新开…」;`confirmDanger` 标题附带目标「→ 〈会话名〉(〈shortDir〉)」(SendToMenu 在 confirm 时拼接)。测试:跨目录 agent 不出现在撤销/提交菜单;prompt 含路径;确认框标题含目标名。
+- **A3 离线期间完成的定时任务不进「需要你」**:`lib/readState.ts` `reconcileLastViewed(prev, sids, now, firstRun)`:仅当 `firstRun`(localStorage 无 `zmx_read`)时新 sid 以 now 为基线;否则新 sid 基线为 0。`useShellState` 传 `firstRun`。测试更新:readState 新用例;triage 行为不变。
+- **A4 ⌘K 目录名回车跳进无关会话**:`CommandPalette` 会话匹配 keys 改为 `[s.name, s.peer_name ?? '', lastSegments(s.work_dir, 2)]`;仅靠路径命中的会话排在目录结果之后且不抢默认高亮(默认高亮取「名称命中的会话」>「目录结果首项」>「路径命中的会话」)。测试:所有会话共享长前缀时输入 `eks` 回车 = 目录结果首项;输入会话名前缀仍选中该会话。
+- **A5 摘要卡只剩标题**:`lib/steps.ts` `conclusion`:首段为 markdown 标题行(`^#{1,6}\s`)或少于 40 字符时继续拼接后续段落直到 ≥ 40 字符或到达 600 上限;「展开全文」显示最后一个 text step 全文。测试:`## 总结\n\n- a\n- b` → 结论含列表。
+- **A7** `SessionControls.sendPrompt(text, opts?: { withAttachments?: boolean })`,默认 true;SendToMenu 与 TriageRow 调用传 `{ withAttachments: false }`(不带走目标 composer 的附件)。测试。
+- **A9** `session_manager.rs`:turn 开始(`mark_turn(Running)` 所在 `apply_turn` Running 分支)时清 `posture.approval_ids`。Rust 测试。
+- **A10** `settle_posture` 在 outcome 为 Errored/Timeout 时清 `last_snippet`。Rust 测试。
+- **A11** `useSessionsPoll` 读取 `?session=` 后 `history.replaceState(null, '', location.pathname)`。App.characterization I-17 不改断言(仍能选中)。
+- 不在本期:A6(Crew 中途重连改非边界,属后端协议,另起)、A8(轮询乱序,记入 deferred)。
+
+- [ ] 每项:失败测试 → 实现 → `npm test`/`cargo test`/`tsc`/`lint`/`build` → commit。全部完成后 push + `./deploy.sh --build` + headless 打开 127.0.0.1:8090 无 pageerror。
 
 ---
 
@@ -77,7 +98,7 @@
     scrollLines() {}
 ```
 
-并 export `lastTerminal = () => xtermInstances[xtermInstances.length - 1] as { calls: {reset:number}; dataHandlers: ((d:string)=>void)[]; cols: number; rows: number }`。FitAddon 的 `proposeDimensions` 返回可配置值:`export const fitDims = { cols: 80, rows: 24 }`,`proposeDimensions() { return { ...fitDims } }`,`fit()` 时把最近 Terminal 的 cols/rows 设为 `fitDims`。
+另补:`hasSelection`/`getSelection` 可配置(`export const selection = { has: false, text: '' }`),`onSelectionChange(h)` 收集 handler 到 `selectionHandlers`。并 export `lastTerminal = () => xtermInstances[xtermInstances.length - 1] as { calls: {reset:number}; dataHandlers: ((d:string)=>void)[]; cols: number; rows: number }`。FitAddon 的 `proposeDimensions` 返回可配置值:`export const fitDims = { cols: 80, rows: 24 }`,`proposeDimensions() { return { ...fitDims } }`,`fit()` 时把最近 Terminal 的 cols/rows 设为 `fitDims`。
 
 Run: `cd frontend && npm test 2>&1 | tail -3` → 既有用例全绿。
 
@@ -220,10 +241,9 @@ describe('TerminalView WS characterization', () => {
 Run: `cd frontend && npx vitest run src/components/__tests__/terminalSocket.characterization.test.tsx`
 Expected: 除 B14 外全部 PASS。若非 B14 的用例失败,**修测试**直到它准确描述现状(mock 细节、等待时序),不改 TerminalView。
 
-- [ ] **Step 4: B14 判定**
+- [ ] **Step 4: B14 防御性修复(浏览器语义下不可达,见分析 §B2)**
 
-- 若 B14 **通过**:代码推演写进 commit message(onclose 置 null 发生在 s1 自己的回调里,之后 connect() 重新赋值;迟到的 s1.onclose 会把 wsRef 置 null → 若这条测试通过说明 happy-dom 路径下不复现,记录原因)。
-- 若 B14 **失败**(预期):在 `ws.onclose` 首行改为 `if (wsRef.current === ws) wsRef.current = null`,并确认迟到的 onclose 不再调度第二次重连:在 onclose 里 `if (wsRef.current !== ws && wsRef.current !== null) return` 之前的状态更新也要跳过(整个 onclose 对非当前 socket 早退)。重跑全绿。
+B14 用例靠手动二次 `s1.onclose?.()` 才红,真实浏览器每个 socket 只 close 一次。仍照加防御:`ws.onclose` 开头 `if (wsRef.current !== ws && wsRef.current !== null) return`,随后 `wsRef.current = null`;并在连接 effect cleanup 的 `close()` 之后 `wsRef.current = null`(修分析 §B2-4 的「effect 重跑后连不上」)。**两处必须同一提交**(cleanup 清空后迟到 onclose 才真可达)。commit message 注明「浏览器语义下不可达,防御性加固」。重跑全绿。
 
 - [ ] **Step 5: 验红**
 
@@ -275,6 +295,8 @@ git commit -m "test(terminal): characterization for WS lifecycle (I-4/5/12/13, t
 
 - [ ] **Step 1: 搬迁**
 
+**硬约束(分析 §B1)**:① init effect 仍留在 TerminalView(本期不抽 `useXterm`,避免跨 hook 循环引用;S3 spec §4.1 的 useXterm 推迟),且 `useTerminalSocket(...)` 调用必须位于 init effect 声明**之后**——连接 effect 依赖同一次提交中 init 已设好 termRef;② `handleBarKey` 留在 TerminalView.tsx(`crewSessionType.test.tsx:89-101` 按源码行 grep `key === 'claude'`);③ `onBinary`/mouse/scroll/scroll_watch 本就绕过 sendInput,改走 hook 的 `sendRaw`,语义不变;④ init cleanup 中的 `wsRef.current?.close()` 删除(连接 effect cleanup 已做同样的事)。
+
 把 TerminalView 的「Connect WebSocket」effect(`if (!termRef.current) return` … cleanup)、`wsStatus` state、`endedRef`、`lastDims` 原样移入 hook;onmessage 里对 `setLost`/`setEnded`/`setHealth`/scroll_state/output-settle 的调用改为调用对应回调(回调用 ref 保存,每渲染同步,与 `useAcpSocket` 的 `onOpenRef` 同构,effect deps 仍为 `[sessionId, epoch]`)。onopen 里 `termRef.current?.reset()`、resize 首发、mouse-off 首发保持在 hook 内**原样**;`replayingRef`/`setReconnected`/`openedOnceRef` 移到 view 的 `onOpen` 回调。`sendInput` 的 `exitScroll()` 前置保留在 view:`const sendInput = useCallback((d: string) => { exitScroll(); return sock.sendInput(d) }, [exitScroll, sock.sendInput])`。
 
 - [ ] **Step 2: 验证只搬不改**
@@ -306,7 +328,7 @@ git commit -m "refactor(terminal): move WS lifecycle into useTerminalSocket (no 
   - FocusHeader:tmux 会话传 `statusLine="…/zeromux · main · 3 处改动"` → 打开 ⋯ 后菜单顶部显示该行(非 menuitem,`role="note"`)。
   - sessionActions:tmux 且 `mouseOn` 返回 true → 有 `{ id: 'mouse', label: '鼠标交给浏览器' }`;false → `'鼠标交给 tmux'`;调用 `run` → `env.toggleMouse(id)`。External tmux(`tmux_origin === 'external'`)无此项(与 `mouseToggleApplies` 一致)。
   - TerminalView 桌面(非触屏)不再渲染 `⧉`/`🖱` 文本(`screen.queryByText(/🖱|⧉/)` 为 null),搜索框关闭按钮 `aria-label="关闭搜索"` 用 lucide `X`。
-- [ ] **Step 2: 实现**:删除桌面状态栏;TerminalView 在 status 变化时调 `onStatus`;`setMouse` 逻辑原样来自状态栏按钮 onClick(写 localStorage `MOUSE_PREF_KEY` + 发 `{type:'mouse', on}`),返回是否送达;AppShell 生成 `statusLine`(`shortDir(work_dir)`、`git_branch`、`git_dirty>0 ? `${n} 处改动` : ''`,用 ` · ` 连接)。「复制接续命令」「查看历史」已在 sessionActions 中,无需新增。
+- [ ] **Step 2: 实现**:删除桌面状态栏(含 🖱×2、⧉ —— lint `emojiIcon` 基线 5 应降到 2,更新 `scripts/lint-tokens.baseline.json`;注释里的 `⤓`(TerminalView)与 `📎`(AcpChatView)也改为文字,基线降到 0);HistoryView `▲▼✕` 换 lucide `ChevronUp/ChevronDown/X`,TerminalView placeholder「点 ✈」改「点发送」;TerminalView 在 status 变化时调 `onStatus`;`setMouse` 逻辑原样来自状态栏按钮 onClick(写 localStorage `MOUSE_PREF_KEY` + 发 `{type:'mouse', on}`),返回是否送达;AppShell 生成 `statusLine`(`shortDir(work_dir)`、`git_branch`、`git_dirty>0 ? `${n} 处改动` : ''`,用 ` · ` 连接)。「复制接续命令」「查看历史」已在 sessionActions 中,无需新增。
 - [ ] **Step 3: 验证 + 截图**(隔离实例 1440×900 tmux 会话 + ⋯ 菜单展开)+ **Commit** `feat(terminal): status line and mouse toggle move into FocusHeader ⋯; drop emoji`
 
 ---
@@ -314,7 +336,7 @@ git commit -m "refactor(terminal): move WS lifecycle into useTerminalSocket (no 
 ### Task 4: 键栏收起 / 第二页补键 / 去 emoji(V4、V16)
 
 **Files:**
-- Modify: `frontend/src/lib/terminalInput.ts`(`ControlKey` += `'ctrl-r' | 'ctrl-l' | 'home' | 'end'`;`CONTROL` 增 `'\x12'`、`'\x0c'`、`'\x1b[H'`、`'\x1b[F'`)
+- Modify: `frontend/src/lib/terminalInput.ts`(`ControlKey` += `'ctrl-r' | 'ctrl-l'`,`CONTROL` 增 `'\x12'`、`'\x0c'`;Home/End **按 DECCKM 分派**:新增 `homeEndSequence(key: 'home'|'end', appCursor: boolean)` → 普通 `\x1b[H`/`\x1b[F`,application 模式 `\x1bOH`/`\x1bOF`,`handleBarKey` 像方向键一样传 `term.modes.applicationCursorKeysMode`)
 - Modify: `frontend/src/components/MobileKeyBar.tsx`
 - Modify: `frontend/src/components/TerminalView.tsx`(键栏收起时 refit)
 - Test: `frontend/src/components/__tests__/MobileKeyBar.test.tsx`(追加;`more-keys flips to page 2 and back` 用例里第二页返回键的可见文本若断言了 `↩︎`,改为断言 `aria-label`——在 commit message 注明)、`frontend/src/lib/__tests__/terminalInput.test.ts`(追加)
@@ -323,7 +345,8 @@ git commit -m "refactor(terminal): move WS lifecycle into useTerminalSocket (no 
 - Produces: `MobileKeyBar` 新 props `collapsed: boolean; onToggleCollapsed(): void`;localStorage key `zmx_keytray`(`'1'` = 收起)。收起形态:一个 44px `IconButton label="展开键栏" icon={ChevronUp}`(与 composer 同一行,放在 Composer 左侧);展开形态末尾加 `IconButton label="收起键栏" icon={ChevronDown}`。`⋯`/`↩︎` 换 lucide `MoreHorizontal` / `Undo2`,aria-label 保持 `more-keys`。
 
 - [ ] **Step 1: 失败测试**
-  - terminalInput:`controlSequence('ctrl-r') === '\x12'`、`'ctrl-l' → '\x0c'`、`home → '\x1b[H'`、`end → '\x1b[F'`。
+  - terminalInput:`controlSequence('ctrl-r') === '\x12'`、`'ctrl-l' → '\x0c'`;`homeEndSequence('home', false) === '\x1b[H'`、`('end', true) === '\x1bOF'`。
+  - 第二页 12 个键在 390px 下不足 44px:第二页改为**两行**(6+6)或横向滚动(`overflow-x-auto`,每键 `min-w-[44px]`);测试断言每个按钮类含 `min-w-[44px]` 或 `min-h-[44px]`。
   - MobileKeyBar:第二页包含 `ctrl-r`、`ctrl-l`、`home`、`end` 四个 aria-label 按钮且 pointerDown 触发 `onKey`;按钮文本不含 emoji(对所有按钮 `textContent` 断言不匹配 `/[\u{1F300}-\u{1FAFF}←-⇿⋯↩]/u`,箭头用 lucide 图标)。
   - TerminalView(触屏):点「收起键栏」→ 键栏按钮消失、出现「展开键栏」;`localStorage.zmx_keytray === '1'`;50ms 后触发一次 refit 且最多发一次 resize;重新挂载后仍收起。
 - [ ] **Step 2: 实现**(TerminalView 持有 `collapsed` state,初值读 localStorage;`[isTouch, keyboardOpen, collapsed]` 合入现有 refit effect 的 deps,不新增 effect)
@@ -348,7 +371,11 @@ git commit -m "refactor(terminal): move WS lifecycle into useTerminalSocket (no 
   - HistoryView:有候选时按钮文本「发给 ★ s-a」;无选区点击 → `sendPrompt` 收到 `wrap(尾部200行)`,无 `dialog[open]`;选中文字时发选区;长按 → 出现 SendToMenu(`role="menu"`);无候选 → 按钮「发给 agent…」点击开菜单;彩色模式 payload 去 ANSI。
   - TerminalView 桌面:mock `term.hasSelection() → true`、`getSelection() → 'err line'`,触发 onSelectionChange → 出现 `button[aria-label="发给…"]`;点击 → 菜单出现,★ Enter → `sendPrompt(historyPrompt({..., text: 'err line'}))`;选区清空(onSelectionChange + hasSelection false)→ 浮钮消失。
   - AppShell:tmux 会话的 TerminalView 不再收到写死 claude 的回调(grep 断言:`src('components/shell/AppShell.tsx')` 不含 `shell.create('claude'`)。
-- [ ] **Step 2: 实现**:浮钮 `<Popover>` 锚定为容器右下角的一个绝对定位 span(不追踪单元格坐标——V2 精简;浮钮 44px,`aria-label="发给…"`);`onSelectionChange` 注册在 init effect 内(xterm 已有该 API)。
+- [ ] **Step 2: 实现**:
+  - **「＋ 新开」不得走 ⌘K 预填**(分析 §B7a:单行 input 会剥换行、`parseNew` 压空白,多行终端输出与 ``` 围栏被压成一行)。终端入口传给 SendToMenu 的 `onNew` 直接 `shell.create(loadLastType() 若为 tmux 则 'claude', workDir, undefined, prompt)`(保留全文),失败 toast「创建会话失败」;测试断言多行 prompt 原样传入 `create`。
+  - HistoryView 的 `wrap` 用 **SessionInfo.work_dir**(经 `sendTo.workDir`),不用 `status?.work_dir`(Task 6 收紧轮询后可能为空)。
+  - 长按按钮加 `select-none` 与 `[-webkit-touch-callout:none]`;选区在 pointerdown 时读取缓存。
+  - 浮钮 `<Popover>` 锚定为容器右下角的一个绝对定位 span(不追踪单元格坐标——V2 精简;浮钮 44px,`aria-label="发给…"`);`onSelectionChange` 注册在 init effect 内(xterm 已有该 API)。
 - [ ] **Step 3: 验证**(`grep -rn "shell.create('claude'" frontend/src` 为空;nativeDialog 棘轮不增)+ **Commit** `feat(terminal): send terminal output to an agent via SendToMenu (one tap to ★ on phones)`
 
 ---
@@ -356,7 +383,8 @@ git commit -m "refactor(terminal): move WS lifecycle into useTerminalSocket (no 
 ### Task 6: 隐藏终端不轮询(§4.6)
 
 **Files:**
-- Modify: `frontend/src/components/TerminalView.tsx`(「Fetch status」effect → `usePolling(fetchStatus, 10_000, { enabled: active })`;切为 active 时立即拉一次)
+- Modify: `frontend/src/components/TerminalView.tsx`(「Fetch status」effect 现为裸 `setInterval`,**不看 active 与页面可见性**——spec §4.6 的前提不成立(分析 §B5);改 `usePolling(fetchStatus, 10_000, { enabled: active })`,切为 active 时立即拉一次)
+- Modify: `frontend/src/components/shell/AppShell.tsx`(tmux health 为全局端点:上提到 AppShell 每 30s 拉一份,经 prop 传给 TerminalView 的 `TmuxHealthBar`;TerminalView 不再各自拉 `getTmuxHealth`)
 - Test: `TerminalView.sendTo.test.tsx` 或新 `TerminalView.polling.test.tsx`
 
 - [ ] **Step 1: 失败测试**:`active={false}` 挂载 → 推进 30s,`getSessionStatus`/`getTmuxHealth` 调用 0 次;rerender `active` → 立即 1 次,之后每 10s 一次;文档 hidden 时不拉(usePolling 已有语义)。

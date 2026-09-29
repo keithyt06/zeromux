@@ -21,7 +21,7 @@ import HistoryView from './HistoryView'
 import { TmuxHealthBar, LostBanner, EndedOverlay, ReconnectHint } from './TerminalNotices'
 import { arrowSequence, rowHeight, linesFromDrag, bracketedPaste, submitSequence, controlSequence, launchSequence } from '../lib/terminalInput'
 import { shouldStickToBottom } from '../lib/scrollReplay'
-import { ScrollBatcher, inertiaLines, pillFromScrollState, scheduleInertia, shouldCancelBeforeInput, type ScrollMsg } from '../lib/terminalScroll'
+import { APP_PILL_HIDDEN, APP_PILL_IDLE_MS, ScrollBatcher, appPillReducer, inertiaLines, pillFromScrollState, scheduleInertia, shouldCancelBeforeInput, type AppPillEvent, type ScrollMsg } from '../lib/terminalScroll'
 import { shouldShowShiftHint, mousePref, MOUSE_PREF_KEY, mouseToggleApplies } from '../lib/desktopHints'
 import { historyPrompt } from '../lib/historyToAgent'
 import { shouldSendResize } from '../lib/terminalSize'
@@ -143,6 +143,24 @@ export default function TerminalView({ sessionId, active, theme, tmuxName, tmuxO
   // True while scrolling is routed as wheel events into a fullscreen app
   // (server `app_scroll`, e.g. Claude Code) rather than tmux copy-mode.
   const appScrollRef = useRef(false)
+  // State twin of appScrollRef: picks the pill variant (outlined = app, solid = copy-mode).
+  const [appScroll, setAppScrollState] = useState(false)
+  const setAppScroll = useCallback((v: boolean) => { appScrollRef.current = v; setAppScrollState(v) }, [])
+  // Client-side estimate for the app pill (appPillReducer): net lines scrolled
+  // up since leaving the bottom, plus the idle-degraded flag.
+  const appPillRef = useRef(APP_PILL_HIDDEN)
+  const [appPillDegraded, setAppPillDegraded] = useState(false)
+  const appPillIdleRef = useRef<ReturnType<typeof setTimeout> | undefined>(undefined)
+  const dispatchAppPill = useCallback((e: AppPillEvent) => {
+    const apply = (ev: AppPillEvent) => {
+      appPillRef.current = appPillReducer(appPillRef.current, ev)
+      setAppPillDegraded(appPillRef.current.degraded)
+    }
+    apply(e)
+    clearTimeout(appPillIdleRef.current)
+    if (appPillRef.current.shown) appPillIdleRef.current = setTimeout(() => apply({ type: 'idle' }), APP_PILL_IDLE_MS)
+  }, [])
+  useEffect(() => () => clearTimeout(appPillIdleRef.current), [])
   // Last op sent, so a late app_scroll reply can't reopen a pill we just closed.
   const lastScrollOpRef = useRef<ScrollMsg['op']>('cancel')
   // "↓ N 行新输出": server diffs history_size every 1s while in copy-mode
@@ -153,7 +171,16 @@ export default function TerminalView({ sessionId, active, theme, tmuxName, tmuxO
     if (ws?.readyState === WebSocket.OPEN) ws.send(JSON.stringify({ type: 'scroll', ...m }))
     lastScrollOpRef.current = m.op
     if (m.op === 'up' || m.op === 'top') { scrollingRef.current = true; setScrolling(true) }
-  }, [])
+    dispatchAppPill(m.op === 'up' || m.op === 'down' ? { type: m.op, n: m.n } : m.op === 'top' ? { type: 'top' } : { type: 'reset' })
+    // Fullscreen app scrolled back down to where the gesture started: nothing
+    // to cancel server-side, just drop the pill.
+    if (appScrollRef.current && !appPillRef.current.shown) {
+      scrollingRef.current = false
+      setScrolling(false)
+      setAppScroll(false)
+      lastScrollOpRef.current = 'cancel'
+    }
+  }, [dispatchAppPill, setAppScroll])
   // Ref twin so the once-only init effect's touch batcher always calls the latest sendScroll.
   const sendScrollRef = useRef(sendScroll)
   useEffect(() => { sendScrollRef.current = sendScroll }, [sendScroll])
@@ -192,23 +219,24 @@ export default function TerminalView({ sessionId, active, theme, tmuxName, tmuxO
     if (!cancel) return
     scrollingRef.current = false
     setScrolling(false)
+    dispatchAppPill({ type: 'reset' })
     if (appScrollRef.current) {
       // No copy-mode to leave; typing into the app jumps it to the bottom itself.
-      appScrollRef.current = false
+      setAppScroll(false)
       lastScrollOpRef.current = 'cancel'
       return
     }
     sendScroll({ op: 'cancel', n: 1 })
-  }, [sendScroll, isTouch])
+  }, [sendScroll, isTouch, dispatchAppPill, setAppScroll])
   // "回到底部" pill button: copy-mode → cancel (exitScroll); fullscreen app → wheel to bottom.
   const scrollToBottom = useCallback(() => {
     if (!appScrollRef.current) { exitScroll(); return }
     cancelInertiaRef.current()
-    appScrollRef.current = false
+    setAppScroll(false)
     scrollingRef.current = false
     setScrolling(false)
     sendScroll({ op: 'bottom', n: 1 })
-  }, [exitScroll, sendScroll])
+  }, [exitScroll, sendScroll, setAppScroll])
 
   // 桌面 Shift 拖选提示：tmux mouse=on 时普通拖动交给 tmux（复制模式/选窗格），
   // 只有 Shift+拖动才是浏览器原生选区。首次左键按下（非 Shift）提示一次。
@@ -440,12 +468,13 @@ export default function TerminalView({ sessionId, active, theme, tmuxName, tmuxO
     // is per-connection server-side; the [scrolling] effect disarms it.
     const wasScrolling = scrollingRef.current || appScrollRef.current
     scrollingRef.current = false
-    appScrollRef.current = false
+    setAppScroll(false)
+    dispatchAppPill({ type: 'reset' })
     lastScrollOpRef.current = 'cancel'
     setScrolling(false)
     setNewLines(0)
     if (wasScrolling && tmuxRef.current) send({ type: 'scroll', op: 'cancel', n: 1 })
-  }, [])
+  }, [dispatchAppPill, setAppScroll])
 
   const onNotice = useCallback((kind: 'tmux_lost' | 'tmux_ended' | 'tmux_down') => {
     if (kind === 'tmux_lost') setLost(true)
@@ -455,11 +484,15 @@ export default function TerminalView({ sessionId, active, theme, tmuxName, tmuxO
 
   const onScrollState = useCallback((msg: { in_mode?: boolean; app_scroll?: boolean; new_lines?: unknown }) => {
     const p = pillFromScrollState(msg, lastScrollOpRef.current, scrollingRef.current)
-    appScrollRef.current = p.appScroll
-    scrollingRef.current = p.scrolling
-    setScrolling(p.scrolling)
+    // App route: a reply that lands after the net scroll already returned to
+    // the start (fast up→down within one round trip) must not reopen the pill.
+    const scrolling = p.appScroll ? p.scrolling && appPillRef.current.shown : p.scrolling
+    setAppScroll(p.appScroll && scrolling)
+    scrollingRef.current = scrolling
+    setScrolling(scrolling)
+    if (!scrolling) dispatchAppPill({ type: 'reset' })
     if (typeof msg.new_lines === 'number') setNewLines(msg.new_lines)
-  }, [])
+  }, [dispatchAppPill, setAppScroll])
 
   const onOutputSettled = useCallback(() => {
     if (scrollDebounceRef.current) clearTimeout(scrollDebounceRef.current)
@@ -610,15 +643,23 @@ export default function TerminalView({ sessionId, active, theme, tmuxName, tmuxO
     }
   }, [isTouch, active])
 
+  // Copy-mode (server-confirmed) = solid accent; fullscreen app (client-estimated)
+  // = outlined, and after APP_PILL_IDLE_MS without scrolling just the icon-only bottom button.
+  const pillDegraded = appScroll && appPillDegraded
   const scrollPill = tmuxName && scrolling ? (
-    <div className={`absolute right-3 z-10 flex gap-1 text-xs ${isTouch ? 'bottom-full mb-2' : 'bottom-28'}`}>
-      <button aria-label="scroll-top" onPointerDown={e => { e.preventDefault(); sendScroll({ op: 'top', n: 1 }) }}
-        className="flex items-center px-2.5 py-1.5 rounded-full bg-[var(--bg-tertiary)] border border-[var(--border)] shadow">
-        <ArrowUpToLine size={14} />
-      </button>
+    <div data-testid="scroll-pill" data-variant={appScroll ? 'app' : 'copy'} data-degraded={pillDegraded ? 'true' : 'false'}
+      className={`absolute right-3 z-10 flex gap-1 text-xs ${isTouch ? 'bottom-full mb-2' : 'bottom-28'}`}>
+      {!pillDegraded && (
+        <button aria-label="scroll-top" onPointerDown={e => { e.preventDefault(); sendScroll({ op: 'top', n: 1 }) }}
+          className="flex items-center px-2.5 py-1.5 rounded-full bg-[var(--bg-tertiary)] border border-[var(--border)] shadow">
+          <ArrowUpToLine size={14} />
+        </button>
+      )}
       <button aria-label="scroll-bottom" onPointerDown={e => { e.preventDefault(); scrollToBottom() }}
-        className="flex items-center gap-1 px-3 py-1.5 rounded-full bg-[var(--accent-blue)] text-white shadow">
-        <ArrowDownToLine size={14} />{newLines > 0 ? `${newLines} 行新输出` : '回到底部'}
+        className={`flex items-center justify-center gap-1 py-1.5 rounded-full shadow transition-[padding,background-color,color] duration-[var(--dur-base)] motion-reduce:transition-none ${
+          pillDegraded ? 'min-w-[var(--hit)] min-h-[var(--hit)] px-1.5' : 'px-3'} ${
+          appScroll ? 'border border-[var(--accent)] text-[var(--accent)] bg-[var(--surface-0)]' : 'bg-[var(--accent-blue)] text-white'}`}>
+        <ArrowDownToLine size={14} />{pillDegraded ? null : newLines > 0 ? `${newLines} 行新输出` : '回到底部'}
       </button>
     </div>
   ) : null

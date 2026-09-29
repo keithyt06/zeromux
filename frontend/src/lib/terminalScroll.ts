@@ -100,3 +100,28 @@ export function pillFromScrollState(
   const reading = lastOp === 'up' || lastOp === 'top' ? true : lastOp === 'down' ? wasUp : false
   return { scrolling: reading, appScroll: reading }
 }
+
+// Fullscreen-CLI (AppWheel) pill, estimated client-side: the app never reports
+// its scroll position, so the pill tracks the net lines scrolled since the
+// gesture left the bottom (up +, down −) and collapses once that reaches ≤ 0.
+// `top` jumps an unknown distance (net = Infinity: only bottom/typing clear it).
+// `idle` (no scroll op for a while) degrades the pill to an icon-only button;
+// any new up restores it. `reset` = the pill was cleared by some other path.
+export type AppPill = { shown: boolean; net: number; degraded: boolean }
+export type AppPillEvent = { type: 'up' | 'down'; n: number } | { type: 'top' | 'idle' | 'reset' }
+export const APP_PILL_HIDDEN: AppPill = { shown: false, net: 0, degraded: false }
+export const APP_PILL_IDLE_MS = 3000
+
+export function appPillReducer(s: AppPill, e: AppPillEvent): AppPill {
+  switch (e.type) {
+    case 'up': return { shown: true, net: (s.shown ? s.net : 0) + e.n, degraded: false }
+    case 'top': return { shown: true, net: Infinity, degraded: false }
+    case 'down': {
+      if (!s.shown) return s
+      const net = s.net - e.n
+      return net <= 0 ? APP_PILL_HIDDEN : { ...s, net }
+    }
+    case 'idle': return s.shown ? { ...s, degraded: true } : s
+    case 'reset': return APP_PILL_HIDDEN
+  }
+}

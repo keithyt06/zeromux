@@ -1,5 +1,5 @@
 import { describe, it, expect, vi } from 'vitest'
-import { dragToScroll, inertiaLines, pillFromScrollState, ScrollBatcher, scheduleInertia, shouldCancelBeforeInput } from '../terminalScroll'
+import { appPillReducer, APP_PILL_HIDDEN, dragToScroll, inertiaLines, pillFromScrollState, ScrollBatcher, scheduleInertia, shouldCancelBeforeInput, type AppPillEvent } from '../terminalScroll'
 
 describe('dragToScroll', () => {
   // linesFromDrag convention: finger moves UP → positive → newer content (scroll down).
@@ -111,5 +111,36 @@ describe('pillFromScrollState', () => {
   it('app-wheel: bottom/cancel clear the pill (late replies cannot reopen it)', () => {
     expect(pillFromScrollState({ in_mode: false, app_scroll: true }, 'bottom', true)).toEqual({ scrolling: false, appScroll: false })
     expect(pillFromScrollState({ in_mode: false, app_scroll: true }, 'cancel', true)).toEqual({ scrolling: false, appScroll: false })
+  })
+})
+
+describe('appPillReducer (fullscreen-CLI pill: client-estimated)', () => {
+  const run = (...evs: AppPillEvent[]) => evs.reduce(appPillReducer, APP_PILL_HIDDEN)
+  it('up 5 then down 5 → collapsed', () => {
+    expect(run({ type: 'up', n: 5 }, { type: 'down', n: 5 }).shown).toBe(false)
+  })
+  it('up 5 then down 3 → still shown', () => {
+    expect(run({ type: 'up', n: 5 }, { type: 'down', n: 3 })).toEqual({ shown: true, net: 2, degraded: false })
+  })
+  it('down past the start also collapses (net < 0)', () => {
+    expect(run({ type: 'up', n: 2 }, { type: 'down', n: 7 }).shown).toBe(false)
+  })
+  it('a new gesture from the bottom starts a fresh accumulator', () => {
+    expect(run({ type: 'up', n: 5 }, { type: 'down', n: 5 }, { type: 'up', n: 2 }, { type: 'down', n: 2 }).shown).toBe(false)
+    expect(run({ type: 'up', n: 5 }, { type: 'reset' }, { type: 'up', n: 2 })).toEqual({ shown: true, net: 2, degraded: false })
+  })
+  it('down while hidden never raises the pill', () => {
+    expect(run({ type: 'down', n: 3 })).toEqual(APP_PILL_HIDDEN)
+  })
+  it('top: distance unknown, so downs alone never collapse it', () => {
+    expect(run({ type: 'top' }, { type: 'down', n: 10000 }).shown).toBe(true)
+  })
+  it('idle degrades a shown pill; a new up restores the full pill', () => {
+    const idle = run({ type: 'up', n: 5 }, { type: 'idle' })
+    expect(idle).toEqual({ shown: true, net: 5, degraded: true })
+    expect(appPillReducer(idle, { type: 'up', n: 1 })).toEqual({ shown: true, net: 6, degraded: false })
+  })
+  it('idle on a hidden pill is a no-op', () => {
+    expect(run({ type: 'idle' })).toEqual(APP_PILL_HIDDEN)
   })
 })

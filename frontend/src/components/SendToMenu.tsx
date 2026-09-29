@@ -35,12 +35,15 @@ export function SendToMenu(p: {
   onNew(prefill: { workDir: string | null; prompt: string }): void
   /** Menu title (defaults to 「发给…」). */
   title?: string
-  /** Irreversible prompts: after a target is picked, ask before sending (cancel = nothing sent). */
+  /** Irreversible prompts: after a target is picked, ask before sending (cancel = nothing sent).
+   *  The dialog title gets 「→ 〈name〉(〈dir〉)」 appended so the target is explicit. */
   confirmDanger?: { title: string }
+  /** Only agents whose work_dir === workDir are offered (repo-scoped prompts: commit / discard). */
+  sameDirOnly?: boolean
 }) {
   const send = async (s: SessionInfo) => {
     const { text, controls, confirmDanger, onSelectSession } = p
-    if (confirmDanger && !(await confirm({ title: confirmDanger.title, confirmLabel: '发送', danger: true }))) return
+    if (confirmDanger && !(await confirm({ title: `${confirmDanger.title} → ${s.name}(${shortDir(s.work_dir)})`, confirmLabel: '发送', danger: true }))) return
     if (controls.current?.[s.id]?.sendPrompt(text)) {
       toast.push({ message: `已发给 ${s.name}`, action: { label: '查看', onClick: () => onSelectSession(s.id) } })
     } else {
@@ -49,7 +52,7 @@ export function SendToMenu(p: {
       } } })
     }
   }
-  const targets = p.open ? sendTargets(p.sessions, p.workDir, p.excludeId) : []
+  const targets = p.open ? sendTargets(p.sessions, p.workDir, p.excludeId, p.sameDirOnly) : []
   const items: MenuItem[] = targets.map((s, i) => {
     const busy = s.turn_state === 'running'
     const mode = p.queueModes[s.id] ?? 'collect'

@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest'
-import { defaultGitTab, COMMIT_PROMPT, DISCARD_PROMPT } from '../../lib/gitviewer'
+import { defaultGitTab, commitPrompt, discardPrompt } from '../../lib/gitviewer'
 
 describe('defaultGitTab', () => {
   it('picks worktree when dirty', () => {
@@ -11,8 +11,10 @@ describe('defaultGitTab', () => {
 })
 
 describe('forward prompts', () => {
-  it('has commit and discard prompt text', () => {
-    expect(COMMIT_PROMPT).toContain('提交')
-    expect(DISCARD_PROMPT).toContain('撤销')
+  it('has commit and discard prompt text naming the absolute work dir (A2)', () => {
+    expect(commitPrompt('/home/u/repo-a')).toContain('提交')
+    expect(commitPrompt('/home/u/repo-a')).toContain('/home/u/repo-a')
+    expect(discardPrompt('/home/u/repo-a')).toContain('撤销')
+    expect(discardPrompt('/home/u/repo-a')).toContain('/home/u/repo-a')
   })
 })

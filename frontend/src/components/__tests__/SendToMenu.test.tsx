@@ -11,7 +11,7 @@ const ctl = (ok: boolean): SessionControls => ({
   resolveApproval: vi.fn(() => ok), pendingApprovals: () => [],
 })
 
-function setup(o: { sessions?: ReturnType<typeof mkSession>[]; controls?: Record<string, SessionControls>; queueModes?: Record<string, string>; workDir?: string | null; confirmDanger?: { title: string }; title?: string } = {}) {
+function setup(o: { sessions?: ReturnType<typeof mkSession>[]; controls?: Record<string, SessionControls>; queueModes?: Record<string, string>; workDir?: string | null; confirmDanger?: { title: string }; title?: string; sameDirOnly?: boolean } = {}) {
   const anchor = document.createElement('button'); document.body.appendChild(anchor)
   const onSelectSession = vi.fn(), onNew = vi.fn(), onClose = vi.fn()
   const sessions = o.sessions ?? [
@@ -23,7 +23,7 @@ function setup(o: { sessions?: ReturnType<typeof mkSession>[]; controls?: Record
   render(<>
     <SendToMenu open anchor={anchor} onClose={onClose} text="PROMPT" workDir={o.workDir === undefined ? '/w/repo' : o.workDir}
       sessions={sessions} controls={controls} queueModes={o.queueModes ?? {}} onSelectSession={onSelectSession} onNew={onNew}
-      confirmDanger={o.confirmDanger} title={o.title} />
+      confirmDanger={o.confirmDanger} title={o.title} sameDirOnly={o.sameDirOnly} />
     <Toaster /><DialogHost />
   </>)
   return { onSelectSession, onNew, onClose, controls }
@@ -133,7 +133,7 @@ describe('SendToMenu', () => {
       const { controls } = setup({ confirmDanger: danger, title: '撤销改动 → 发给…' })
       expect(screen.getByRole('menu', { name: '撤销改动 → 发给…' })).toBeInTheDocument()
       fireEvent.keyDown(screen.getAllByRole('menuitem')[0], { key: 'Enter' })
-      expect(await screen.findByText(danger.title)).toBeInTheDocument()
+      expect(await screen.findByText(`${danger.title} → zeromux-fe(/w/repo)`)).toBeInTheDocument()
       await act(async () => { fireEvent.click(screen.getByText('取消')) })
       expect(controls.current.near.sendPrompt).not.toHaveBeenCalled()
       expect(screen.queryByText(/已发给|未连接/)).toBeNull()
@@ -146,5 +146,23 @@ describe('SendToMenu', () => {
       expect(controls.current.near.sendPrompt).toHaveBeenCalledWith('PROMPT')
       expect(screen.getByText('已发给 zeromux-fe')).toBeInTheDocument()
     })
+  })
+
+  // A2: commit/discard must never reach an agent in another repo.
+  it('sameDirOnly: other-dir agents are not offered', () => {
+    setup({ sameDirOnly: true })
+    expect(screen.getAllByRole('menuitem').map(i => i.getAttribute('aria-label') ?? i.textContent))
+      .toEqual(['发给 zeromux-fe', expect.stringContaining('新开')])
+  })
+  it('sameDirOnly with no same-dir agent → only 「＋ 新开…」', () => {
+    setup({ sameDirOnly: true, workDir: '/nobody-here' })
+    const items = screen.getAllByRole('menuitem')
+    expect(items).toHaveLength(1)
+    expect(items[0]).toHaveTextContent('＋ 新开…')
+  })
+  it('confirmDanger title names the target session and its dir', async () => {
+    setup({ confirmDanger: { title: '撤销?' } })
+    fireEvent.click(screen.getByRole('menuitem', { name: '发给 zeromux-fe' }))
+    expect(await screen.findByText('撤销? → zeromux-fe(/w/repo)')).toBeInTheDocument()
   })
 })

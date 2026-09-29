@@ -2,7 +2,7 @@ import React, { useState, useEffect, useCallback, useRef } from 'react'
 import { getGitLog, getGitShow, getGitWorktree, getSessionStatus } from '../lib/api'
 import type { GitCommit, GitFileChange, GitGraphEntry, WorktreeFile } from '../lib/api'
 import { GitCommit as GitCommitIcon, RefreshCw, FileText, User, Calendar, FolderX } from 'lucide-react'
-import { defaultGitTab, COMMIT_PROMPT, DISCARD_PROMPT } from '../lib/gitviewer'
+import { defaultGitTab, commitPrompt, discardPrompt } from '../lib/gitviewer'
 import { SendToMenu } from './SendToMenu'
 import { confirm } from './ui'
 
@@ -71,6 +71,7 @@ export default function GitViewer({ sessionId, onForward, sendTo, initialTab, on
   const [tab, setTab] = useState<'worktree' | 'history'>(initialTab ?? 'history')
   const [wt, setWt] = useState<{ files: WorktreeFile[]; diff: string; truncated: boolean; is_git: boolean } | null>(null)
   const [wtSelected, setWtSelected] = useState<string | null>(null)
+  const [statusDir, setStatusDir] = useState<string | null>(null)
 
   const loadLog = useCallback(async () => {
     setLoading(true)
@@ -121,6 +122,7 @@ export default function GitViewer({ sessionId, onForward, sendTo, initialTab, on
     let alive = true
     getSessionStatus(sessionId).then(st => {
       if (!alive) return
+      setStatusDir(st.work_dir)
       if (st.is_git === false) setNotGit(true)
       else setTab(defaultGitTab(st.git_dirty))
     }).catch(() => {})
@@ -182,6 +184,7 @@ export default function GitViewer({ sessionId, onForward, sendTo, initialTab, on
           onRefresh={loadWorktree}
           onForward={onForward}
           sendTo={sendTo}
+          workDir={sendTo?.workDir ?? statusDir}
         />
       ) : (
     <div className="flex flex-col @[640px]:flex-row flex-1 min-h-0">
@@ -293,13 +296,15 @@ export default function GitViewer({ sessionId, onForward, sendTo, initialTab, on
 
 const DISCARD_CONFIRM = '让 agent 撤销当前工作区的全部未提交改动?此操作不可恢复。'
 
-function WorktreePanel({ wt, selected, onSelect, onRefresh, onForward, sendTo }: {
+function WorktreePanel({ wt, selected, onSelect, onRefresh, onForward, sendTo, workDir }: {
   wt: { files: WorktreeFile[]; diff: string; truncated: boolean; is_git: boolean } | null
   selected: string | null
   onSelect: (path: string) => void
   onRefresh: () => void
   onForward?: (text: string) => boolean
   sendTo?: GitSendTo
+  /** Absolute dir named in the prompts; buttons stay hidden until it is known (A2). */
+  workDir: string | null
 }) {
   // SendToMenu path; discard still asks (irreversible) after the target is picked.
   const [menu, setMenu] = useState<{ anchor: HTMLElement; text: string; discard?: boolean } | null>(null)
@@ -365,7 +370,7 @@ function WorktreePanel({ wt, selected, onSelect, onRefresh, onForward, sendTo }:
             })
           )}
         </div>
-        {wt?.is_git && wt.files.length > 0 && (sendTo || onForward) && (
+        {wt?.is_git && wt.files.length > 0 && workDir && (sendTo || onForward) && (
           <div className="border-t border-[var(--border)]">
             {sent && (
               <div className="px-2 pt-2 text-[10px] text-[var(--accent-green)]">
@@ -374,13 +379,13 @@ function WorktreePanel({ wt, selected, onSelect, onRefresh, onForward, sendTo }:
             )}
             {failed && <div className="px-2 pt-2"><span className="text-xs text-[var(--accent-red)]">未连接,未发送</span></div>}
             <div className="flex gap-2 p-2">
-              <button onClick={e => (sendTo ? setMenu({ anchor: e.currentTarget, text: COMMIT_PROMPT }) : forward(COMMIT_PROMPT))} disabled={sent}
+              <button onClick={e => (sendTo ? setMenu({ anchor: e.currentTarget, text: commitPrompt(workDir) }) : forward(commitPrompt(workDir)))} disabled={sent}
                 className="px-2 py-1 text-xs rounded bg-[var(--bg-tertiary)] text-[var(--text-primary)] hover:bg-[var(--bg-hover)] disabled:opacity-40 disabled:cursor-not-allowed">让 agent 提交</button>
-              <button onClick={e => (sendTo ? setMenu({ anchor: e.currentTarget, text: DISCARD_PROMPT, discard: true }) : forward(DISCARD_PROMPT, '确认让 agent 撤销当前工作区的全部未提交改动?此操作不可恢复。'))} disabled={sent}
+              <button onClick={e => (sendTo ? setMenu({ anchor: e.currentTarget, text: discardPrompt(workDir), discard: true }) : forward(discardPrompt(workDir), '确认让 agent 撤销当前工作区的全部未提交改动?此操作不可恢复。'))} disabled={sent}
                 className="px-2 py-1 text-xs rounded bg-[var(--bg-tertiary)] text-[var(--accent-red)] hover:bg-[var(--bg-hover)] disabled:opacity-40 disabled:cursor-not-allowed">让 agent 撤销改动</button>
             </div>
             {sendTo && <SendToMenu {...sendTo} open={!!menu} anchor={menu?.anchor ?? null} onClose={() => setMenu(null)} text={menu?.text ?? ''}
-              title={menu?.discard ? '撤销改动 → 发给…' : undefined} confirmDanger={menu?.discard ? { title: DISCARD_CONFIRM } : undefined} />}
+              title={menu?.discard ? '撤销改动 → 发给…' : undefined} confirmDanger={menu?.discard ? { title: DISCARD_CONFIRM } : undefined} sameDirOnly />}
           </div>
         )}
       </div>

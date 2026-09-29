@@ -601,6 +601,9 @@ fn apply_turn(session: &mut Session, state: TurnState, seq: u64) {
                 rp.turn_state = TurnState::Running;
                 rp.turn_started_ms = Some(now);
                 rp.turn_seq = seq;
+                // A superseded turn (interrupt-resend) never settles, and an approval
+                // answered elsewhere sends no receipt: a new turn starts with none (A9).
+                session.posture.approval_ids.clear();
             }
             TurnState::Idle => {
                 // Idempotent: a single turn can emit two boundaries (Claude
@@ -7205,6 +7208,24 @@ mod posture_tests {
         assert!(i.last_outcome_ms.unwrap() >= before);
         assert_eq!(i.current_step, None, "settled boundary clears the running step");
         assert_eq!(i.pending_approvals, 0, "turn boundary zeroes approvals (Gateway has no receipt, M5)");
+    }
+
+    #[test]
+    fn turn_start_clears_stale_approvals() {
+        // A9: interrupt-resend, or an approval answered elsewhere (Gateway dashboard),
+        // leaves no settle for the old turn; a new turn must not inherit 待审批.
+        let (m, _d) = mgr_one(SessionType::Crew);
+        let a = AcpEvent::Approval { id: "old".into(), tool: "t".into(), tool_input: None, tool_purpose: None, slot: "s".into() };
+        m.record_and_broadcast("p", "{}".into(), true, posture_delta_of(&a));
+        assert_eq!(info(&m).pending_approvals, 1);
+        m.mark_turn("p", TurnState::Running, 2);
+        assert_eq!(info(&m).pending_approvals, 0);
+        // An approval raised during the new turn still counts.
+        let b = AcpEvent::Approval { id: "new".into(), tool: "t".into(), tool_input: None, tool_purpose: None, slot: "s".into() };
+        m.record_and_broadcast("p", "{}".into(), true, posture_delta_of(&b));
+        assert_eq!(info(&m).pending_approvals, 1);
+        m.mark_turn("p", TurnState::Idle, 2);
+        assert_eq!(info(&m).pending_approvals, 1, "Idle leaves approvals to settle_posture");
     }
 
     #[test]

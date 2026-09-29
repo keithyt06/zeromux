@@ -337,4 +337,47 @@ describe('AppShell', () => {
     expect(await screen.findByText('GIT')).toBeInTheDocument()
     Reflect.deleteProperty(navigator, 'serviceWorker')
   })
+
+  // §4.6 fix round 1: GET /api/tmux/health is admin-only (403 for non-admins)
+  // and pointless with no tmux session open — the poll must be gated on both.
+  // setupApp()/boot() already mocks getTmuxHealth (admin, resolved); each case
+  // below re-spies it (and checkAuth, where relevant) BEFORE render, since
+  // App reads checkAuth exactly once on mount.
+  it('does not poll tmux health with zero tmux sessions', async () => {
+    desktop()
+    const h = setupApp({ sessions: [mkSession('a', { name: 'alpha' })] })
+    const api = await import('../../../lib/api')
+    const health = vi.spyOn(api, 'getTmuxHealth').mockResolvedValue({ server: true, in_unit: true })
+    render(<App />)
+    await waitFor(() => expect(pane('a')).not.toBeNull())
+    await act(async () => { vi.advanceTimersByTime(60_000) })
+    expect(health).not.toHaveBeenCalled()
+    void h
+  })
+
+  it('does not poll tmux health for a non-admin user, even with a tmux session open', async () => {
+    desktop()
+    const h = setupApp({ sessions: [mkSession('t', { name: 'shell', type: 'tmux', tmux_name: 'zmx-t', tmux_origin: 'own' })] })
+    const api = await import('../../../lib/api')
+    vi.spyOn(api, 'checkAuth').mockResolvedValue({ id: 'u', login: 'u', avatar: null, role: 'user', status: 'active' } as never)
+    const health = vi.spyOn(api, 'getTmuxHealth').mockResolvedValue({ server: true, in_unit: true })
+    render(<App />)
+    await waitFor(() => expect(pane('t')).not.toBeNull())
+    await act(async () => { vi.advanceTimersByTime(60_000) })
+    expect(health).not.toHaveBeenCalled()
+    void h
+  })
+
+  it('polls tmux health for an admin user with a tmux session open', async () => {
+    desktop()
+    const h = setupApp({ sessions: [mkSession('t', { name: 'shell', type: 'tmux', tmux_name: 'zmx-t', tmux_origin: 'own' })] })
+    const api = await import('../../../lib/api')
+    const health = vi.spyOn(api, 'getTmuxHealth').mockResolvedValue({ server: true, in_unit: true })
+    render(<App />)
+    await waitFor(() => expect(pane('t')).not.toBeNull())
+    await waitFor(() => expect(health).toHaveBeenCalledTimes(1))
+    await act(async () => { vi.advanceTimersByTime(30_000) })
+    expect(health).toHaveBeenCalledTimes(2)
+    void h
+  })
 })

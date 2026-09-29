@@ -65,7 +65,7 @@ export default function TerminalView({ sessionId, active, theme, tmuxName, tmuxO
   // Seeded from AppShell's global 30s poll; a tmux_down WS notice (onNotice
   // below) overrides it locally until the next prop update self-heals it.
   const [health, setHealth] = useState<TmuxHealth | null>(tmuxHealth ?? null)
-  // eslint-disable-next-line react-hooks/set-state-in-effect -- syncing a prop from a parent-owned poll into local state, same idiom as tmuxRef/tmuxOriginRef above
+  // eslint-disable-next-line react-hooks/set-state-in-effect -- syncing a prop from a parent-owned poll into local state, same idiom as tmuxRef/tmuxOriginRef below
   useEffect(() => { setHealth(tmuxHealth ?? null) }, [tmuxHealth])
   const [lost, setLost] = useState(false)
   const [ended, setEnded] = useState(false)

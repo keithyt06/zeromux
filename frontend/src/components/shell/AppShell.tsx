@@ -58,10 +58,14 @@ export function AppShell({ user, theme, onLogout, onAuthLost }: {
 
   // tmux health is a global endpoint (not per-session): poll it once here and
   // pass the result down to every terminal's TmuxHealthBar (§4.6), instead of
-  // each TerminalView fetching its own redundant copy.
+  // each TerminalView fetching its own redundant copy. GET /api/tmux/health is
+  // admin-only (403 for others) and pointless with no tmux session open, so
+  // gate the poll on both — otherwise a non-admin OAuth user, or anyone with
+  // zero tmux sessions, would hit it every 30s forever for nothing.
   const [tmuxHealth, setTmuxHealth] = useState<TmuxHealth | null>(null)
   const pollTmuxHealth = useCallback(async () => { setTmuxHealth(await getTmuxHealth()) }, [])
-  usePolling(pollTmuxHealth, 30_000)
+  const hasTmuxSession = sessions.some(s => s.type === 'tmux')
+  usePolling(pollTmuxHealth, 30_000, { enabled: hasTmuxSession && user?.role === 'admin' })
 
   const [palette, setPalette] = useState<PaletteInit | null>(null)
   const [panel, setPanel] = useState<ShellPanel | null>(null)

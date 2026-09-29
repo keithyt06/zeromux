@@ -97,4 +97,19 @@ describe('TerminalView status polling (§4.6)', () => {
     act(() => { ws.latest().emit({ type: 'notice', kind: 'tmux_down' }) })
     expect(r.container.querySelector('[role="alert"]')).not.toBeNull()
   })
+
+  it('a subsequent healthy tmuxHealth prop self-heals a tmux_down override (next AppShell poll tick)', async () => {
+    vi.spyOn(api, 'getSessionStatus').mockResolvedValue({ work_dir: '/w', git_branch: 'main', git_dirty: 0, is_git: true })
+    const ws = installFakeWebSocket({ startConnecting: true })
+    let r!: ReturnType<typeof render>
+    await act(async () => { r = render(<TerminalView sessionId="t1" active theme="dark" tmuxName="zmx-t1" tmuxOrigin="own" tmuxHealth={{ server: true, in_unit: true }} />) })
+    act(() => { ws.latest().fireOpen() })
+    act(() => { ws.latest().emit({ type: 'notice', kind: 'tmux_down' }) })
+    expect(r.container.querySelector('[role="alert"]')).not.toBeNull()
+    // AppShell's next 30s poll comes back healthy again — the prop re-syncs
+    // local `health` and clears the banner, even though the prop *value*
+    // ({server:true,in_unit:true}) is unchanged from the initial mount.
+    act(() => { r.rerender(<TerminalView sessionId="t1" active theme="dark" tmuxName="zmx-t1" tmuxOrigin="own" tmuxHealth={{ server: true, in_unit: true }} />) })
+    expect(r.container.querySelector('[role="alert"]')).toBeNull()
+  })
 })

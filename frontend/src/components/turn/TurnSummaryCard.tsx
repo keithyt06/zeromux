@@ -3,20 +3,24 @@ import { ChevronDown } from 'lucide-react'
 import MarkdownContent from '../markdown/MarkdownContent'
 import { formatCost } from '../../lib/format'
 
-export function TurnSummaryCard({ conclusionText, files, steps, cost, errored, expanded, onExpand, onOpenChanges }: {
-  conclusionText: string; files: { path: string; label: string }[]; steps: number; cost?: number; errored?: boolean; expanded?: boolean
+export function TurnSummaryCard({ conclusionText, fullText, files, steps, cost, errored, expanded, onExpand, onOpenChanges }: {
+  conclusionText: string
+  /** The last text step in full, shown by 「展开全文」 (A5). Defaults to the conclusion. */
+  fullText?: string
+  files: { path: string; label: string }[]; steps: number; cost?: number; errored?: boolean; expanded?: boolean
   onExpand: () => void; onOpenChanges?: () => void
 }) {
   const shown = files.slice(0, 3)
   // Text heuristic for "exceeds 6 lines" (spec §3.4): jsdom can't measure layout,
   // and a measured overflow would need setState-in-effect.
   const long = conclusionText.length > 280 || conclusionText.split('\n').length > 6
+    || (!!fullText && fullText !== conclusionText)
   const [full, setFull] = useState(false)
   return (
     <div data-testid="turn-summary" data-errored={errored ? '1' : '0'}
       className={`rounded-[var(--r-lg)] p-3 space-y-2 ${errored ? 'bg-[var(--danger)]/[0.04]' : 'bg-[var(--surface-2)]'}`}>
       {errored && <p className="text-ui-xs font-medium text-[var(--danger)]">本轮出错结束</p>}
-      {conclusionText && <div data-testid="turn-conclusion" className={`text-ui-base text-[var(--fg)] leading-relaxed ${full ? '' : 'line-clamp-6'}`}><MarkdownContent text={conclusionText} isComplete /></div>}
+      {conclusionText && <div data-testid="turn-conclusion" className={`text-ui-base text-[var(--fg)] leading-relaxed ${full ? '' : 'line-clamp-6'}`}><MarkdownContent text={full && fullText ? fullText : conclusionText} isComplete /></div>}
       {conclusionText && long && !full && (
         <button type="button" onClick={() => setFull(true)} className="ctl px-2 -mx-2 text-ui-xs text-[var(--fg-muted)] hover:text-[var(--fg)]">展开全文</button>
       )}

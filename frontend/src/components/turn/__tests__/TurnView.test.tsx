@@ -13,8 +13,8 @@ const running = fold([
 const done = fold([
   { type: 'user_prompt', text: '修复 sidebar', turn_id: 1 },
   { type: 'content_block', block_type: 'tool_use', name: 'Edit', summary: 'x', input: { file_path: '/r/src/Sidebar.tsx' }, turn_id: 1 },
-  { type: 'content_block', block_type: 'text', text: 'Fixed the double tap.\n\nMore detail.', turn_id: 1 },
-  { type: 'result', turn_id: 1, text: 'Fixed the double tap.\n\nMore detail.', cost_usd: 0.4213 },
+  { type: 'content_block', block_type: 'text', text: 'Fixed the double tap on the session list.\n\nMore detail.', turn_id: 1 },
+  { type: 'result', turn_id: 1, text: 'Fixed the double tap on the session list.\n\nMore detail.', cost_usd: 0.4213 },
 ])
 
 describe('TurnView', () => {
@@ -28,7 +28,7 @@ describe('TurnView', () => {
   })
   it('complete: summary card with conclusion, touched file, steps and cost', () => {
     render(<TurnView group={done} agentName="Claude" />)
-    expect(screen.getByText('Fixed the double tap.')).toBeInTheDocument()
+    expect(screen.getByText('Fixed the double tap on the session list.')).toBeInTheDocument()
     expect(screen.queryByText('More detail.')).toBeNull()
     expect(screen.getByRole('button', { name: 'src/Sidebar.tsx' })).toBeInTheDocument()
     expect(screen.getByText(/1 步/)).toBeInTheDocument()
@@ -87,8 +87,18 @@ describe('TurnView', () => {
     expect(screen.getByTestId('turn-conclusion').className).not.toMatch(/line-clamp/)
     expect(screen.queryByRole('button', { name: '展开全文' })).toBeNull()
   })
-  it('short conclusion has no 展开全文', () => {
-    render(<TurnView group={done} agentName="Claude" />)
+  it('a heading-only first paragraph still shows the list; 展开全文 reveals the full last text (A5)', () => {
+    const text = '## 总结\n\n- 修了侧栏会话列表的双击重复触发问题\n- 为 TurnView 摘要卡补充了回归测试用例\n\n' + 'Long tail paragraph. '.repeat(20).trim()
+    const g = fold([{ type: 'content_block', block_type: 'tool_use', name: 'Read', summary: 'a', turn_id: 7 }, { type: 'content_block', block_type: 'text', text, turn_id: 7 }, { type: 'result', turn_id: 7, text: '' }])
+    render(<TurnView group={g} agentName="Claude" />)
+    expect(screen.getByText('修了侧栏会话列表的双击重复触发问题')).toBeInTheDocument()
+    expect(screen.queryByText(/Long tail paragraph/)).toBeNull()
+    fireEvent.click(screen.getByRole('button', { name: '展开全文' }))
+    expect(screen.getByText(/Long tail paragraph/)).toBeInTheDocument()
+  })
+  it('short conclusion has no 展开全文 (nothing hidden)', () => {
+    const g = fold([{ type: 'content_block', block_type: 'tool_use', name: 'Read', summary: 'a', turn_id: 8 }, { type: 'content_block', block_type: 'text', text: 'Fixed the double tap on the session list.', turn_id: 8 }, { type: 'result', turn_id: 8, text: '' }])
+    render(<TurnView group={g} agentName="Claude" />)
     expect(screen.queryByRole('button', { name: '展开全文' })).toBeNull()
   })
   it('collapsing the step that pinned a turn returns the completed turn to its card', () => {

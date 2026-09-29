@@ -91,9 +91,24 @@ export function touchedFiles(steps: Step[]): { path: string; label: string }[] {
   return out
 }
 
-export function conclusion(group: TurnGroup): string {
+/** Full text of the turn's last non-empty text step (the card's 「展开全文」). */
+export function lastText(group: TurnGroup): string {
   const texts = toSteps(group.blocks, group.complete).filter(s => s.kind === 'text' && (s.text ?? '').trim())
-  const last = texts[texts.length - 1]?.text ?? ''
-  const para = last.trim().split(/\n\s*\n/)[0] ?? ''
-  return [...para].slice(0, 600).join('')
+  return (texts[texts.length - 1]?.text ?? '').trim()
+}
+
+const CONCLUSION_MIN = 40
+const CONCLUSION_MAX = 600
+const HEADING = /^#{1,6}\s/
+
+/** First paragraph of the last text step; a heading (`## 总结`) or a < 40-char
+ *  first paragraph keeps pulling in the next paragraphs until >= 40 chars (A5).
+ *  Capped at 600 chars. */
+export function conclusion(group: TurnGroup): string {
+  const paras = lastText(group).split(/\n\s*\n/)
+  let out = paras[0] ?? ''
+  for (let i = 1; i < paras.length && (HEADING.test(out.split('\n').pop() ?? '') || [...out].length < CONCLUSION_MIN) && [...out].length < CONCLUSION_MAX; i++) {
+    out += `\n\n${paras[i]}`
+  }
+  return [...out].slice(0, CONCLUSION_MAX).join('')
 }

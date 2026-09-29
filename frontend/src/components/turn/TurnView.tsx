@@ -1,6 +1,6 @@
 import { memo, useMemo, useRef, useState } from 'react'
 import type { TurnGroup } from '../../lib/transcript'
-import { toSteps, touchedFiles, conclusion, stepCount } from '../../lib/steps'
+import { toSteps, touchedFiles, conclusion, lastText, stepCount } from '../../lib/steps'
 import { peerLabel } from '../../lib/peer'
 import { formatCost } from '../../lib/format'
 import { TurnTimeline } from './TurnTimeline'
@@ -48,7 +48,7 @@ function TurnViewImpl({ group, agentName, resolvedApprovals, onResolveApproval, 
       {steps.length > 0 && (
         <div className="space-y-1">
           <p className="text-ui-2xs font-semibold text-[var(--peer)]">{agentName}</p>
-          {showCard && <TurnSummaryCard conclusionText={conclusion(group)} files={files} steps={nSteps}
+          {showCard && <TurnSummaryCard conclusionText={conclusion(group)} fullText={lastText(group)} files={files} steps={nSteps}
             cost={group.cost} errored={group.errored} expanded={expanded} onExpand={() => { if (expanded) openRows.current = 0; setExpanded(!expanded) }} onOpenChanges={onOpenChanges} />}
           {showTimeline && <TurnTimeline steps={steps} complete={group.complete} resolved={resolvedApprovals} onResolve={onResolveApproval}
             onToggleStep={onToggleStep} />}

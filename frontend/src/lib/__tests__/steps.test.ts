@@ -75,8 +75,17 @@ describe('touchedFiles', () => {
 
 describe('conclusion', () => {
   it('first paragraph of the last text step, capped at 600 chars', () => {
-    expect(conclusion(grp([tx('early'), tu('Read'), tx('Fixed it.\n\nDetails follow')]))).toBe('Fixed it.')
+    const first = 'Fixed the double-tap bug in the sidebar list.'
+    expect(conclusion(grp([tx('early'), tu('Read'), tx(`${first}\n\nDetails follow`)]))).toBe(first)
     expect(conclusion(grp([tx('y'.repeat(900))])).length).toBe(600)
+  })
+  // A5: Claude's 「## 总结」 layout left the card with just the heading.
+  it('a heading or a < 40-char first paragraph keeps the following paragraphs', () => {
+    expect(conclusion(grp([tu('Read'), tx('## 总结\n\n- a\n- b')]))).toBe('## 总结\n\n- a\n- b')
+    expect(conclusion(grp([tx('Fixed it.\n\nDetails follow')]))).toBe('Fixed it.\n\nDetails follow')
+    const body = 'The sidebar no longer fires twice on a double tap.'
+    expect(conclusion(grp([tx(`## 总结\n\n${body}\n\nMore later.`)]))).toBe(`## 总结\n\n${body}`)
+    expect(conclusion(grp([tx(`## 总结\n\n${'z'.repeat(900)}`)])).length).toBe(600)
   })
   it('empty when there is no text', () => {
     expect(conclusion(grp([tu('Read')]))).toBe('')

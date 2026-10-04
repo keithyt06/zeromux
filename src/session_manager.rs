@@ -690,12 +690,7 @@ fn session_info_of(s: &Session) -> SessionInfo {
         tmux_origin: s.tmux_origin,
         other_clients: 0,
         peer_name: (s.session_type == SessionType::Claude).then(|| peer_name_for(&s.id)),
-        last_outcome: s.posture.last_outcome.map(|o| match o {
-            crate::run_metrics::RunOutcome::Completed => "completed",
-            crate::run_metrics::RunOutcome::Errored => "errored",
-            crate::run_metrics::RunOutcome::Timeout => "timeout",
-            crate::run_metrics::RunOutcome::Cancelled => "cancelled",
-        }),
+        last_outcome: s.posture.last_outcome.map(crate::run_metrics::RunOutcome::as_str),
         last_outcome_ms: s.posture.last_outcome_ms,
         last_snippet: s.posture.last_snippet.clone(),
         current_step: s.posture.current_step.clone(),
@@ -2125,8 +2120,9 @@ impl SessionManager {
     /// A turn truly settled (not a Claude SkipBoundary): record its outcome and
     /// clear per-turn posture. Called beside `record_run_metric` in each fan-out.
     fn settle_posture(&self, sid: &str, outcome: crate::run_metrics::RunOutcome) {
-        let mut map = self.sessions.lock().unwrap();
-        if let Some(s) = map.get_mut(sid) {
+        {
+            let mut map = self.sessions.lock().unwrap();
+            let Some(s) = map.get_mut(sid) else { return };
             s.posture.last_outcome = Some(outcome);
             s.posture.last_outcome_ms = Some(now_millis());
             s.posture.current_step = None;
@@ -2135,6 +2131,22 @@ impl SessionManager {
             if matches!(outcome, crate::run_metrics::RunOutcome::Errored | crate::run_metrics::RunOutcome::Timeout) {
                 s.posture.last_snippet = None;
             }
+        }
+        // U3: lock released above — never hold `sessions` across SQLite I/O.
+        self.persist_posture(sid);
+    }
+
+    /// U3: snapshot the persisted posture subset under the sessions lock, then write
+    /// it OUTSIDE the lock (SQLite on JuiceFS can be slow). Best-effort: a failed
+    /// write only warns — the fan-out must never stall on persistence.
+    fn persist_posture(&self, sid: &str) {
+        let snap = {
+            let map = self.sessions.lock().unwrap();
+            let Some(s) = map.get(sid) else { return };
+            persisted_posture_of(&s.posture)
+        };
+        if let Err(e) = self.store.update_posture(sid, &snap) {
+            tracing::warn!("persist posture {} failed: {}", sid, e);
         }
     }
 
@@ -2334,7 +2346,14 @@ impl SessionManager {
                     lifetime_turns: 0,
                     lifetime_duration_ms: 0,
                     lifetime_cost_usd: 0.0,
-                    posture: Posture::default(),
+                    posture: Posture {
+                        last_outcome: p.posture.last_outcome.as_deref()
+                            .and_then(crate::run_metrics::RunOutcome::parse_lenient),
+                        last_outcome_ms: p.posture.last_outcome_ms,
+                        last_snippet: p.posture.last_snippet,
+                        awaiting_input: p.posture.awaiting_input,
+                        ..Posture::default()
+                    },
                     running: None,
                     scrollback: VecDeque::new(),
                     scrollback_bytes: 0,
@@ -2661,6 +2680,10 @@ fn persisted_of(s: &Session) -> PersistedSession {
         cols: s.cols,
         rows: s.rows,
         pending_kill_until: s.pending_kill_until,
+        posture: persisted_posture_of(&s.posture),
+        crew_mode: String::new(),
+        crew_agent: String::new(),
+        crew_origin: "zeromux".into(),
     }
 }
 
@@ -3602,7 +3625,8 @@ fn emit_queue_mode(event_tx: &broadcast::Sender<String>, mode: QueueMode) {
 /// Precomputed "at a glance" state for the triage list (spec v3 §0.5.1 M2/M3/M5).
 /// Maintained only under the sessions lock from `record_and_broadcast` /
 /// `settle_posture` / `approval_resolved`; `session_info_of` just copies it.
-/// In-memory only: a restart resets it (accepted, M8).
+/// `last_outcome*` / `last_snippet` / `awaiting_input` are persisted once per settled
+/// turn by `persist_posture` (S5 U3); `current_step` / `approval_ids` stay in memory.
 #[derive(Default, Clone, Debug, PartialEq)]
 struct Posture {
     last_outcome: Option<crate::run_metrics::RunOutcome>,
@@ -3611,6 +3635,17 @@ struct Posture {
     current_step: Option<String>,
     /// Unresolved Crew approval ids, deduped (M9b). Exported as `len()`.
     approval_ids: Vec<String>,
+    /// 「待回答」 (S6 G3 writes it; S5 only persists and restores it).
+    awaiting_input: bool,
+}
+
+fn persisted_posture_of(p: &Posture) -> crate::session_store::PersistedPosture {
+    crate::session_store::PersistedPosture {
+        last_outcome: p.last_outcome.map(|o| o.as_str().to_string()),
+        last_outcome_ms: p.last_outcome_ms,
+        last_snippet: p.last_snippet.clone(),
+        awaiting_input: p.awaiting_input,
+    }
 }
 
 /// What one event changes in `Posture`. Computed in `emit` from the typed event,
@@ -7052,6 +7087,8 @@ mod terminal_size_tests {
             resume_token: Some(ResumeToken::Tmux(format!("zmx-{id}"))), worktree_path: None,
             created_ms: 0, source_task_id: None, name_is_auto: true,
             tmux_origin: Some("own".into()), cols, rows, pending_kill_until: None,
+            posture: Default::default(),
+            crew_mode: String::new(), crew_agent: String::new(), crew_origin: "zeromux".into(),
         }
     }
 
@@ -7284,5 +7321,145 @@ mod posture_tests {
         let json = serde_json::to_value(&i).unwrap();
         assert_eq!(json["pending_approvals"], 0);
         assert!(json["last_outcome"].is_null());
+    }
+}
+
+#[cfg(test)]
+mod posture_persist_tests {
+    use super::*;
+    use crate::run_metrics::RunOutcome;
+
+    /// Shared fixture (also used by later S5 tasks): an idle, in-memory Claude session.
+    pub(super) fn session(id: &str) -> Session {
+        Session {
+            id: id.into(), name: "n".into(), session_type: SessionType::Claude, cols: 80, rows: 24,
+            work_dir: "/tmp".into(), owner_id: "o".into(), description: String::new(),
+            name_is_auto: true, status: SessionMeta::Idle, resume_token: None, tmux_origin: None,
+            pending_kill_until: None, worktree_path: None, created_ms: 0, source_task_id: None,
+            spawning: false, last_activity_ms: 0, turns_completed: 0, run_metrics: VecDeque::new(),
+            lifetime_turns: 0, lifetime_duration_ms: 0, lifetime_cost_usd: 0.0, posture: Posture::default(),
+            running: None, scrollback: VecDeque::new(), scrollback_bytes: 0,
+        }
+    }
+
+    /// Shared fixture: a manager whose event/session DBs live in `dir`, so a second
+    /// `mgr_at(dir)` + `load_persisted()` simulates a restart.
+    pub(super) fn mgr_at(dir: &std::path::Path) -> Arc<SessionManager> {
+        let events = Arc::new(crate::events::EventStore::open(dir).unwrap());
+        let store = Arc::new(crate::session_store::SessionStore::open(dir).unwrap());
+        SessionManager::new(events, store, "claude".into(), "codex".into(), "off".into(),
+            5476, "/tmp/crew".into(), "bash".into(), false,
+            crate::tmux::TmuxCtl::new(Some("zmx-test-unused".into())))
+    }
+
+    /// Shared fixture: put `s` both in the store and in memory.
+    pub(super) fn seed(m: &SessionManager, s: Session) {
+        m.store.upsert(&persisted_of(&s)).unwrap();
+        m.sessions.lock().unwrap().insert(s.id.clone(), s);
+    }
+
+    fn result(text: &str) -> AcpEvent {
+        AcpEvent::Result { text: text.into(), turn_id: 0, session_id: String::new(),
+            cost_usd: None, tokens_in: None, tokens_out: None }
+    }
+
+    pub(super) fn reloaded_info(dir: &std::path::Path, id: &str) -> SessionInfo {
+        let m = mgr_at(dir);
+        m.load_persisted();
+        let map = m.sessions.lock().unwrap();
+        session_info_of(map.get(id).unwrap())
+    }
+
+    #[test]
+    fn completed_settle_survives_restart() {
+        let d = tempfile::tempdir().unwrap();
+        let m = mgr_at(d.path());
+        seed(&m, session("p"));
+        m.record_and_broadcast("p", "{}".into(), true, posture_delta_of(&result("All green\nShipped")));
+        m.settle_posture("p", RunOutcome::Completed);
+        let before = session_info_of(m.sessions.lock().unwrap().get("p").unwrap());
+        drop(m);
+        let after = reloaded_info(d.path(), "p");
+        assert_eq!(after.last_outcome, Some("completed"));
+        assert_eq!(after.last_outcome_ms, before.last_outcome_ms, "timestamp survives verbatim");
+        assert_eq!(after.last_snippet.as_deref(), Some("Shipped"));
+    }
+
+    #[test]
+    fn errored_settle_persists_a_null_snippet() {
+        // D9 / A10: a failed turn must not resurrect the previous turn's summary after restart.
+        let d = tempfile::tempdir().unwrap();
+        let m = mgr_at(d.path());
+        seed(&m, session("p"));
+        m.record_and_broadcast("p", "{}".into(), true, posture_delta_of(&result("old summary")));
+        m.settle_posture("p", RunOutcome::Completed);
+        m.settle_posture("p", RunOutcome::Errored);
+        drop(m);
+        let after = reloaded_info(d.path(), "p");
+        assert_eq!(after.last_outcome, Some("errored"));
+        assert_eq!(after.last_snippet, None);
+    }
+
+    #[test]
+    fn current_step_and_approvals_are_not_restored() {
+        let d = tempfile::tempdir().unwrap();
+        let m = mgr_at(d.path());
+        seed(&m, session("p"));
+        m.settle_posture("p", RunOutcome::Completed);
+        // A new turn is mid-flight when the process dies.
+        let tool = AcpEvent::ContentBlock { block_type: std::borrow::Cow::Borrowed("tool_use"), turn_id: 0,
+            text: None, name: Some("Bash".into()), input: None, streaming: None, summary: None };
+        m.record_and_broadcast("p", "{}".into(), true, posture_delta_of(&tool));
+        let ap = AcpEvent::Approval { id: "a".into(), tool: "t".into(), tool_input: None, tool_purpose: None, slot: "s".into() };
+        m.record_and_broadcast("p", "{}".into(), true, posture_delta_of(&ap));
+        m.persist_posture("p");
+        drop(m);
+        let after = reloaded_info(d.path(), "p");
+        assert_eq!(after.current_step, None);
+        assert_eq!(after.pending_approvals, 0);
+        assert_eq!(after.last_outcome, Some("completed"));
+    }
+
+    #[test]
+    fn awaiting_input_round_trips() {
+        let d = tempfile::tempdir().unwrap();
+        let m = mgr_at(d.path());
+        seed(&m, session("p"));
+        m.sessions.lock().unwrap().get_mut("p").unwrap().posture.awaiting_input = true;
+        m.persist_posture("p");
+        drop(m);
+        let m2 = mgr_at(d.path());
+        m2.load_persisted();
+        assert!(m2.sessions.lock().unwrap().get("p").unwrap().posture.awaiting_input);
+    }
+
+    #[test]
+    fn unknown_outcome_string_loads_as_none_without_panic() {
+        let d = tempfile::tempdir().unwrap();
+        let m = mgr_at(d.path());
+        seed(&m, session("p"));
+        m.store.update_posture("p", &crate::session_store::PersistedPosture {
+            last_outcome: Some("exploded".into()), last_outcome_ms: Some(7), ..Default::default()
+        }).unwrap();
+        drop(m);
+        let after = reloaded_info(d.path(), "p");
+        assert_eq!(after.last_outcome, None);
+        assert_eq!(after.last_outcome_ms, Some(7));
+    }
+
+    #[test]
+    fn persist_for_a_session_missing_from_the_store_is_a_silent_noop() {
+        // In-memory-only sessions (every other test module) must not error or panic.
+        let d = tempfile::tempdir().unwrap();
+        let m = mgr_at(d.path());
+        m.sessions.lock().unwrap().insert("ghost".into(), session("ghost"));
+        m.settle_posture("ghost", RunOutcome::Completed);
+        m.persist_posture("nope");
+        // Nothing was written to the store (UPDATE on a missing row affects zero rows) …
+        assert_eq!(m.store.load_all().unwrap().len(), 0);
+        // … yet the in-memory posture still settled normally.
+        let info = session_info_of(m.sessions.lock().unwrap().get("ghost").unwrap());
+        assert_eq!(info.last_outcome, Some("completed"));
+        assert!(info.last_outcome_ms.is_some());
     }
 }

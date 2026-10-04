@@ -11,6 +11,30 @@ pub enum RunOutcome {
     Cancelled,
 }
 
+impl RunOutcome {
+    /// Same spelling as the serde snake_case wire form (and SessionInfo.last_outcome).
+    pub fn as_str(self) -> &'static str {
+        match self {
+            RunOutcome::Completed => "completed",
+            RunOutcome::Errored => "errored",
+            RunOutcome::Timeout => "timeout",
+            RunOutcome::Cancelled => "cancelled",
+        }
+    }
+
+    /// Inverse of `as_str` for rows read back from SQLite. Unknown → None, never panic
+    /// (a newer binary may have written a value this one does not know).
+    pub fn parse_lenient(s: &str) -> Option<RunOutcome> {
+        match s {
+            "completed" => Some(RunOutcome::Completed),
+            "errored" => Some(RunOutcome::Errored),
+            "timeout" => Some(RunOutcome::Timeout),
+            "cancelled" => Some(RunOutcome::Cancelled),
+            _ => None,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum VerdictSource {
@@ -412,5 +436,17 @@ mod tests {
         assert_eq!(d, Some(0.28));
         assert_eq!(p, Some(0.28));
         assert!(f);
+    }
+
+    #[test]
+    fn outcome_str_round_trips_and_unknown_is_none() {
+        for o in [RunOutcome::Completed, RunOutcome::Errored, RunOutcome::Timeout, RunOutcome::Cancelled] {
+            assert_eq!(RunOutcome::parse_lenient(o.as_str()), Some(o));
+        }
+        // Must match the serde snake_case wire form the frontend already reads.
+        assert_eq!(RunOutcome::Completed.as_str(), "completed");
+        assert_eq!(serde_json::to_string(&RunOutcome::Timeout).unwrap(), "\"timeout\"");
+        assert_eq!(RunOutcome::parse_lenient("exploded"), None);
+        assert_eq!(RunOutcome::parse_lenient(""), None);
     }
 }

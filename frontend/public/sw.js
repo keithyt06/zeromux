@@ -18,9 +18,10 @@ self.addEventListener('push', (event) => {
     // shown. We MUST NOT re-gate by the local level cache: that cache is evictable
     // on iOS, and a cache miss would turn a server-approved routine push into a
     // silent push (no showNotification) — the exact iOS "3-strike" revocation this
-    // feature exists to eliminate. Show every push; only foreground-suppress turn_done.
-    // 前台抑制:仅 turn_done。实时问所有可见 client 的 active
-    if (kind === 'turn_done') {
+    // feature exists to eliminate. Show every push; only foreground-suppress turn_done / run_done.
+    // 前台抑制:routine 的两类(turn_done / run_done)。实时问所有可见 client 的 active
+    const routine = kind === 'turn_done' || kind === 'run_done'
+    if (routine) {
       const wins = await self.clients.matchAll({ type: 'window' })
       const visibleActives = wins
         .filter(c => c.visibilityState === 'visible')
@@ -28,7 +29,8 @@ self.addEventListener('push', (event) => {
         .filter(Boolean)
       if (visibleActives.includes(session_id)) return  // 用户正看着 → 抑制
     }
-    const tag = kind === 'turn_done' ? session_id : `${session_id}:${kind}`
+    // Routine kinds share one tag per session: the newest result replaces the older.
+    const tag = routine ? session_id : `${session_id}:${kind}`
     await self.registration.showNotification(title || 'zeromux', {
       body: body || '', tag, data: { session_id },
     })

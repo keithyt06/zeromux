@@ -2856,9 +2856,10 @@ fn run_done_push_allowed(intent: Option<crate::run_metrics::RunOutcome>) -> bool
     !intent_suppresses_push(intent)
 }
 
-/// F2: a scheduled run finished successfully. Routine band (D8); fired ONLY from the
-/// `finalize_run(…, "succeeded", …)` arm, so a Cancelled/Timeout run (which never
-/// reaches that arm) cannot push. Body: verdict > this turn's snippet > default.
+/// F2: a scheduled run finished successfully. Routine band (D8); called only from the
+/// `finalize_run(…, "succeeded", …)` arm, and the caller gates it on
+/// `run_done_push_allowed(intent)` because a Cancelled/Timeout run can still reach
+/// that arm via a Result. Body: verdict > this turn's snippet > default.
 /// Dedupes against turn_done's (uid,sid) debounce map (spec §2.2): suppressed if
 /// that session pushed within the last 30s, then marks the map. A scheduled turn
 /// never also fires turn_done (gated on `active_run_id.is_none()`), so in practice

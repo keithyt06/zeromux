@@ -6806,7 +6806,7 @@ async fn push_test(
     user: axum::Extension<CurrentUser>,
 ) -> Result<Json<serde_json::Value>, StatusCode> {
     let p = state.push.as_ref().ok_or(StatusCode::SERVICE_UNAVAILABLE)?;
-    let payload = crate::push::payload_for("test", "ZeroMux", "", None);
+    let payload = crate::push::payload_for("test", "ZeroMux", "", None, None);
     p.send_to_user(&user.id, &payload).await;
     Ok(Json(serde_json::json!({ "ok": true })))
 }

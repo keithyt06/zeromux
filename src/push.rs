@@ -308,6 +308,12 @@ pub fn should_push_turn_done(now_ms: i64, last_push_ms: Option<i64>, turn_dur_ms
     }
 }
 
+/// run_done shares turn_done's (uid,sid) debounce map and 30s window (spec §2.2),
+/// but has no duration gate: a scheduled run is unattended by definition.
+pub fn should_push_run_done(now_ms: i64, last_push_ms: Option<i64>) -> bool {
+    !matches!(last_push_ms, Some(l) if now_ms - l < 30_000)
+}
+
 /// Debounce for stuck pushes: at least 5 minutes between pushes per session.
 /// The silence-threshold (600s) gating is done by the caller; this only
 /// suppresses repeats. Uses a SEPARATE debounce map from turn_done so the two
@@ -340,9 +346,22 @@ fn failure_kind_zh(fk: Option<&str>) -> &'static str {
     }
 }
 
-pub fn payload_for(kind: &str, name: &str, session_id: &str, fk: Option<&str>) -> PushPayload {
-    let (title, body) = match kind {
+/// Lock-screen body from free agent text (D7): whitespace (incl. newlines) folded to
+/// single spaces, capped at 120 CHARS (never bytes — CJK/emoji safe) + `…`.
+pub fn push_body_of(s: &str) -> Option<String> {
+    let folded = s.split_whitespace().collect::<Vec<_>>().join(" ");
+    if folded.is_empty() { return None; }
+    let mut it = folded.chars();
+    let head: String = it.by_ref().take(120).collect();
+    Some(if it.next().is_some() { format!("{head}…") } else { head })
+}
+
+/// U4: `body` = Some(non-blank) overrides the kind's default text verbatim (callers
+/// pass it through `push_body_of` when it is free agent text).
+pub fn payload_for(kind: &str, name: &str, session_id: &str, fk: Option<&str>, body: Option<&str>) -> PushPayload {
+    let (title, default_body) = match kind {
         "turn_done" => (format!("✅ {name} 完成"), "本轮已结束".to_string()),
+        "run_done" => (format!("⏰ {name} 完成"), "定时任务已完成".to_string()),
         "run_failed" => (
             format!("⚠️ {name} 失败"),
             // strip leading "因" for body, keep the rest
@@ -365,6 +384,10 @@ pub fn payload_for(kind: &str, name: &str, session_id: &str, fk: Option<&str>) -
         ),
         _ => (name.to_string(), String::new()),
     };
+    let body = match body {
+        Some(b) if !b.trim().is_empty() => b.to_string(),
+        _ => default_body,
+    };
     PushPayload {
         kind: kind.to_string(),
         session_id: session_id.to_string(),
@@ -378,7 +401,7 @@ pub fn payload_for(kind: &str, name: &str, session_id: &str, fk: Option<&str>) -
 pub fn kind_allowed_by_levels(kind: &str, lvl_important: bool, lvl_routine: bool) -> bool {
     match kind {
         "test" => true,
-        "turn_done" | "term_ended" => lvl_routine,
+        "turn_done" | "run_done" | "term_ended" => lvl_routine,
         _ => lvl_important, // run_failed / confirm / stuck
     }
 }
@@ -626,12 +649,12 @@ mod tests {
 
     #[test]
     fn payload_text_by_kind() {
-        let t = payload_for("turn_done", "重构会话", "s1", None);
+        let t = payload_for("turn_done", "重构会话", "s1", None, None);
         assert!(t.title.contains("重构会话") && t.title.contains("完成"));
-        let f = payload_for("run_failed", "夜跑", "s2", Some("idle_timeout"));
+        let f = payload_for("run_failed", "夜跑", "s2", Some("idle_timeout"), None);
         assert!(f.title.contains("失败"));
         assert!(f.body.contains("空闲") || f.body.contains("超时")); // failure_kind 中文
-        let c = payload_for("confirm", "备份任务", "s3", Some("watchdog_timeout"));
+        let c = payload_for("confirm", "备份任务", "s3", Some("watchdog_timeout"), None);
         assert!(c.title.contains("需确认"));
         assert!(c.body.contains("中断")); // 含中断原因
         let batch = confirm_batch_payload(3);
@@ -640,7 +663,7 @@ mod tests {
 
     #[test]
     fn term_ended_payload_and_level() {
-        let p = payload_for("term_ended", "api", "sid", None);
+        let p = payload_for("term_ended", "api", "sid", None, None);
         assert_eq!(p.title, "⏹ api 已结束");
         assert_eq!(p.body, "终端会话已退出");
         assert!(kind_allowed_by_levels("term_ended", false, true));
@@ -791,7 +814,7 @@ mod tests {
 
     #[test]
     fn stuck_payload_shape() {
-        let p = payload_for("stuck", "my-sess", "sid123", None);
+        let p = payload_for("stuck", "my-sess", "sid123", None, None);
         assert!(p.title.contains("卡住"));
         assert_eq!(p.kind, "stuck");
     }
@@ -921,7 +944,7 @@ mod tests {
 
     #[test]
     fn test_payload_shape() {
-        let p = payload_for("test", "ZeroMux", "", None);
+        let p = payload_for("test", "ZeroMux", "", None, None);
         assert_eq!(p.kind, "test");
         // Must produce the dedicated test-push title, not the generic _ => name fallback
         assert_eq!(p.title, "🔔 测试推送");
@@ -941,5 +964,51 @@ mod tests {
         assert!(!a.public_key_b64url.contains('+') && !a.public_key_b64url.contains('/')); // base64url 无 +/
         assert!(a.public_key_b64url.len() > 80); // uncompressed P-256 point = 65 bytes → ~87 b64url chars
         fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn body_overrides_default_text_when_non_blank() {
+        let t = payload_for("turn_done", "重构会话", "s1", None, Some("修好了 3 个测试"));
+        assert_eq!(t.title, "✅ 重构会话 完成");
+        assert_eq!(t.body, "修好了 3 个测试");
+        assert_eq!(payload_for("turn_done", "a", "s", None, None).body, "本轮已结束");
+        assert_eq!(payload_for("turn_done", "a", "s", None, Some("  \n ")).body, "本轮已结束", "blank = None");
+        // run_failed keeps its failure-kind default unless a body is given.
+        let f = payload_for("run_failed", "夜跑", "s2", Some("idle_timeout"), None);
+        assert!(f.body.contains("空闲") || f.body.contains("超时"));
+    }
+
+    #[test]
+    fn run_done_payload_and_level() {
+        let p = payload_for("run_done", "夜巡", "s", None, Some("无新告警"));
+        assert_eq!(p.title, "⏰ 夜巡 完成");
+        assert_eq!(p.body, "无新告警");
+        assert_eq!(payload_for("run_done", "夜巡", "s", None, None).body, "定时任务已完成");
+        // D8: routine, same band as turn_done.
+        assert!(kind_allowed_by_levels("run_done", false, true));
+        assert!(!kind_allowed_by_levels("run_done", true, false));
+    }
+
+    #[test]
+    fn push_body_folds_whitespace_and_caps_by_chars() {
+        assert_eq!(push_body_of("第一行\n第二行\t\t尾").as_deref(), Some("第一行 第二行 尾"));
+        assert_eq!(push_body_of("  \n\t ").as_deref(), None);
+        let long: String = "中".repeat(200);
+        let b = push_body_of(&long).unwrap();
+        assert_eq!(b.chars().count(), 121, "120 chars + ellipsis, never a byte slice (CJK safe)");
+        assert!(b.ends_with('…'));
+        let exact: String = "a".repeat(120);
+        assert_eq!(push_body_of(&exact).unwrap(), exact, "exactly 120 → no ellipsis");
+        // Emoji / 4-byte chars at the boundary must not panic.
+        let emoji: String = "😀".repeat(130);
+        assert_eq!(push_body_of(&emoji).unwrap().chars().count(), 121);
+    }
+
+    #[test]
+    fn run_done_shares_turn_done_30s_window() {
+        // M1 / spec §2.2: run_done dedupes against the same (uid,sid) turn_done map.
+        assert!(should_push_run_done(100_000, None));
+        assert!(!should_push_run_done(100_000, Some(80_000)), "within 30s → suppressed");
+        assert!(should_push_run_done(100_000, Some(70_000)), "30s elapsed → sends");
     }
 }

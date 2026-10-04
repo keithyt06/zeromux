@@ -1037,7 +1037,7 @@ pub(crate) fn confirm_push_plan(
     for (owner_id, owner_entries) in by_owner {
         let payload = if owner_entries.len() == 1 {
             let (run_id, task_name, failure_kind) = &owner_entries[0];
-            crate::push::payload_for("confirm", task_name, run_id, failure_kind.as_deref())
+            crate::push::payload_for("confirm", task_name, run_id, failure_kind.as_deref(), None)
         } else {
             crate::push::confirm_batch_payload(owner_entries.len())
         };
@@ -1144,7 +1144,7 @@ pub fn spawn_scheduler(
                                 push.last_stuck_push(&owner, &sid),
                             ) {
                                 push.mark_stuck_pushed(&owner, &sid, now.timestamp_millis());
-                                let payload = crate::push::payload_for("stuck", &name, &sid, None);
+                                let payload = crate::push::payload_for("stuck", &name, &sid, None, None);
                                 // Fire-and-forget (mirror spawn_confirm_pushes): never .await a
                                 // push inside the scheduler tick. A single unresponsive push
                                 // endpoint (accepted TCP, no reply) would otherwise block this

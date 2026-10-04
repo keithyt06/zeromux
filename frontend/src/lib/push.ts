@@ -16,8 +16,9 @@ export type PushLevels = { important: boolean; routine: boolean }
 
 export function levelAllows(kind: string, levels: PushLevels): boolean {
   if (kind === 'test') return true
-  if (kind === 'turn_done') return levels.routine
-  return levels.important  // run_failed / confirm
+  // Mirrors src/push.rs kind_allowed_by_levels.
+  if (kind === 'turn_done' || kind === 'run_done' || kind === 'term_ended') return levels.routine
+  return levels.important  // run_failed / confirm / stuck
 }
 
 export function shouldSuppress(visibleActiveSessions: string[], payloadSessionId: string): boolean {

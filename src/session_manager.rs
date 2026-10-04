@@ -604,6 +604,7 @@ fn apply_turn(session: &mut Session, state: TurnState, seq: u64) {
                 // A superseded turn (interrupt-resend) never settles, and an approval
                 // answered elsewhere sends no receipt: a new turn starts with none (A9).
                 session.posture.approval_ids.clear();
+                session.posture.turn_snippet = None;
             }
             TurnState::Idle => {
                 // Idempotent: a single turn can emit two boundaries (Claude
@@ -1091,7 +1092,7 @@ impl SessionManager {
                                 let title = m.session_name(&sid_for_exit).unwrap_or_default();
                                 let sid3 = sid_for_exit.clone();
                                 tokio::spawn(async move {
-                                    p.send_to_user(&owner, &crate::push::payload_for("term_ended", &title, &sid3, None)).await;
+                                    p.send_to_user(&owner, &crate::push::payload_for("term_ended", &title, &sid3, None, None)).await;
                                 });
                             }
                         }
@@ -2136,6 +2137,11 @@ impl SessionManager {
         self.persist_posture(sid);
     }
 
+    /// Push body source: this turn's own Result snippet, if any.
+    fn push_snippet(&self, sid: &str) -> Option<String> {
+        self.sessions.lock().unwrap().get(sid).and_then(|s| s.posture.turn_snippet.clone())
+    }
+
     /// U3: snapshot the persisted posture subset under the sessions lock, then write
     /// it OUTSIDE the lock (SQLite on JuiceFS can be slow). Best-effort: a failed
     /// write only warns — the fan-out must never stall on persistence.
@@ -2830,16 +2836,40 @@ fn maybe_push_turn_done(
         if let Some(p) = m.push_handle() {
             let now = now_millis();
             let name = m.session_name(sid).unwrap_or_default();
+            let body = m.push_snippet(sid).and_then(|s| crate::push::push_body_of(&s));
             let uid = owner_id.to_string();
             let sid2 = sid.to_string();
             tokio::spawn(async move {
                 if crate::push::should_push_turn_done(now, p.last_turn_push(&uid, &sid2), dur_ms) {
                     p.mark_turn_pushed(&uid, &sid2, now);
-                    p.send_to_user(&uid, &crate::push::payload_for("turn_done", &name, &sid2, None)).await;
+                    p.send_to_user(&uid, &crate::push::payload_for("turn_done", &name, &sid2, None, body.as_deref())).await;
                 }
             });
         }
     }
+}
+
+/// F2: a scheduled run finished successfully. Routine band (D8); fired ONLY from the
+/// `finalize_run(…, "succeeded", …)` arm, so a Cancelled/Timeout run (which never
+/// reaches that arm) cannot push. Body: verdict > this turn's snippet > default.
+/// Dedupes against turn_done's (uid,sid) debounce map (spec §2.2): suppressed if
+/// that session pushed within the last 30s, then marks the map. A scheduled turn
+/// never also fires turn_done (gated on `active_run_id.is_none()`), so in practice
+/// this throttles back-to-back runs / a just-preceding interactive turn_done.
+fn maybe_push_run_done(mgr: &Weak<SessionManager>, sid: &str, owner_id: &str, verdict: Option<&str>) {
+    let Some(m) = mgr.upgrade() else { return };
+    let Some(p) = m.push_handle() else { return };
+    let name = m.session_name(sid).unwrap_or_default();
+    let body = verdict.and_then(crate::push::push_body_of)
+        .or_else(|| m.push_snippet(sid).and_then(|s| crate::push::push_body_of(&s)));
+    let (uid, sid2, now) = (owner_id.to_string(), sid.to_string(), now_millis());
+    tokio::spawn(async move {
+        if !crate::push::should_push_run_done(now, p.last_turn_push(&uid, &sid2)) {
+            return;
+        }
+        p.mark_turn_pushed(&uid, &sid2, now);
+        p.send_to_user(&uid, &crate::push::payload_for("run_done", &name, &sid2, None, body.as_deref())).await;
+    });
 }
 
 fn spawn_acp_fanout(
@@ -3034,6 +3064,7 @@ fn spawn_acp_fanout(
                                                 let verdict = crate::scheduled_tasks::extract_verdict(text);
                                                 m.finalize_run(&rid, "succeeded", verdict.as_deref(),
                                                     if verdict.is_some() { None } else { Some("no_verdict") });
+                                                maybe_push_run_done(&mgr, &sid, &owner_id, verdict.as_deref());
                                             }
                                             AcpEvent::Error { .. } => {
                                                 m.finalize_run(&rid, "failed", None, Some("cli_error"));
@@ -3047,7 +3078,7 @@ fn spawn_acp_fanout(
                                                         let uid = owner_id.clone();
                                                         let sid2 = sid.clone();
                                                         tokio::spawn(async move {
-                                                            p2.send_to_user(&uid, &crate::push::payload_for("run_failed", &name, &sid2, Some("cli_error"))).await;
+                                                            p2.send_to_user(&uid, &crate::push::payload_for("run_failed", &name, &sid2, Some("cli_error"), None)).await;
                                                         });
                                                     }
                                                 }
@@ -3064,7 +3095,7 @@ fn spawn_acp_fanout(
                                                         let uid = owner_id.clone();
                                                         let sid2 = sid.clone();
                                                         tokio::spawn(async move {
-                                                            p2.send_to_user(&uid, &crate::push::payload_for("run_failed", &name, &sid2, Some("cli_exited"))).await;
+                                                            p2.send_to_user(&uid, &crate::push::payload_for("run_failed", &name, &sid2, Some("cli_exited"), None)).await;
                                                         });
                                                     }
                                                 }
@@ -3637,6 +3668,10 @@ struct Posture {
     approval_ids: Vec<String>,
     /// 「待回答」 (S6 G3 writes it; S5 only persists and restores it).
     awaiting_input: bool,
+    /// THIS turn's Result snippet, for the push body only (Review Focus 1): cleared
+    /// when a turn starts, so an errored turn never pushes the previous summary.
+    /// Never persisted.
+    turn_snippet: Option<String>,
 }
 
 fn persisted_posture_of(p: &Posture) -> crate::session_store::PersistedPosture {
@@ -3702,7 +3737,7 @@ fn posture_settles(boundary_count: u64, turn_seq: u64, settled: bool) -> bool {
 fn apply_posture_delta(p: &mut Posture, d: PostureDelta) {
     match d {
         PostureDelta::Step(s) => p.current_step = Some(s),
-        PostureDelta::Snippet(s) => p.last_snippet = Some(s),
+        PostureDelta::Snippet(s) => { p.turn_snippet = Some(s.clone()); p.last_snippet = Some(s) }
         PostureDelta::ApprovalAdded(id) => { if !p.approval_ids.contains(&id) { p.approval_ids.push(id) } }
     }
 }
@@ -7461,5 +7496,59 @@ mod posture_persist_tests {
         let info = session_info_of(m.sessions.lock().unwrap().get("ghost").unwrap());
         assert_eq!(info.last_outcome, Some("completed"));
         assert!(info.last_outcome_ms.is_some());
+    }
+
+    fn running(mut s: Session) -> Session {
+        let (event_tx, _) = broadcast::channel(BROADCAST_CAPACITY);
+        let (input_tx, _rx) = mpsc::channel::<SessionInput>(8);
+        s.running = Some(RunningProcess { event_tx, input_tx, pty_pid: None, turn_state: TurnState::Idle,
+            turn_started_ms: None, turn_seq: 0, queue_mode: QueueMode::Collect });
+        s
+    }
+
+    #[test]
+    fn push_snippet_is_this_turns_result_only() {
+        // Review Focus 1: Claude calls maybe_push_turn_done BEFORE settle_posture, so an
+        // errored turn still holds the previous turn's last_snippet at push time.
+        let d = tempfile::tempdir().unwrap();
+        let m = mgr_at(d.path());
+        seed(&m, running(session("p")));
+        m.mark_turn("p", TurnState::Running, 1);
+        m.record_and_broadcast("p", "{}".into(), true, posture_delta_of(&result("全部测试通过")));
+        assert_eq!(m.push_snippet("p").as_deref(), Some("全部测试通过"));
+        m.settle_posture("p", RunOutcome::Completed);
+        // Turn 2 errors without a Result of its own.
+        m.mark_turn("p", TurnState::Running, 2);
+        assert_eq!(m.push_snippet("p"), None, "a new turn starts with no push snippet");
+        assert_eq!(
+            session_info_of(m.sessions.lock().unwrap().get("p").unwrap()).last_snippet.as_deref(),
+            Some("全部测试通过"),
+            "the triage second line is unchanged until settle"
+        );
+    }
+
+    #[test]
+    fn push_snippet_is_not_persisted() {
+        let d = tempfile::tempdir().unwrap();
+        let m = mgr_at(d.path());
+        seed(&m, running(session("p")));
+        m.record_and_broadcast("p", "{}".into(), true, posture_delta_of(&result("done")));
+        m.settle_posture("p", RunOutcome::Completed);
+        drop(m);
+        let m2 = mgr_at(d.path());
+        m2.load_persisted();
+        assert_eq!(m2.push_snippet("p"), None);
+    }
+
+    #[tokio::test]
+    async fn maybe_push_run_done_is_safe_noop_without_push_service() {
+        let d = tempfile::tempdir().unwrap();
+        let m = mgr_at(d.path());
+        seed(&m, running(session("p")));
+        assert!(m.push_handle().is_none(), "premise: no PushService wired");
+        let weak = Arc::downgrade(&m);
+        maybe_push_run_done(&weak, "p", "o", Some("无新告警"));
+        maybe_push_run_done(&weak, "p", "o", None);
+        maybe_push_run_done(&Weak::new(), "p", "o", None);
     }
 }

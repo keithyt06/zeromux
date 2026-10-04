@@ -1,3 +1,16 @@
 [
-  {"type": "chat_message", "data": {"slot": "zmxprobe", "role": "assistant", "content": "已创建 hello.txt，内容为：hi", "cls": "msg msg-a crew-reply", "meta": {"crew_reply": true, "mid": "m-00000000000000r1"}, "kind": "crew_result"}}
+  {
+    "type": "chat_message",
+    "data": {
+      "slot": "zmxprobe",
+      "role": "assistant",
+      "content": "已创建 hello.txt，内容为：hi",
+      "cls": "msg msg-a crew-reply",
+      "meta": {
+        "crew_reply": true,
+        "mid": "m-00000000000000r1"
+      },
+      "kind": "crew_result"
+    }
+  }
 ]

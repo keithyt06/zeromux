@@ -382,8 +382,17 @@ async fn post_json_ok(
     if status.is_success() { Ok(()) } else { Err(format!("Gateway 拒绝 {path}（HTTP {}）", status.as_u16())) }
 }
 
-async fn create_slot(http: &reqwest::Client, base: &str, secret: &str, key: &str) -> Result<(), String> {
-    post_json_ok(http, base, secret, "/api/chat/slots", serde_json::json!({ "name": key }), REST_TIMEOUT).await
+/// G2: POST body for a new slot. With empty mode/agent this is byte-identical to the
+/// pre-S5 `{"name":k}` so default sessions are untouched.
+pub fn slot_create_body(key: &str, mode: &str, agent: &str) -> serde_json::Value {
+    let mut b = serde_json::json!({ "name": key });
+    if !mode.is_empty() { b["mode"] = serde_json::Value::String(mode.to_string()); }
+    if !agent.is_empty() { b["agent"] = serde_json::Value::String(agent.to_string()); }
+    b
+}
+
+async fn create_slot(http: &reqwest::Client, base: &str, secret: &str, body: serde_json::Value) -> Result<(), String> {
+    post_json_ok(http, base, secret, "/api/chat/slots", body, REST_TIMEOUT).await
 }
 
 async fn set_slot_project(http: &reqwest::Client, base: &str, secret: &str, key: &str, project: &str) -> Result<(), String> {
@@ -666,10 +675,9 @@ impl CrewProcess {
                 }
                 (key, owns, false, resume_plan(owns).set_project)
             }
-            SlotInit::New { mode: _, agent: _ } => {
-                // mode/agent reach the request body in G2 (slot_create_body).
+            SlotInit::New { mode, agent } => {
                 let k = new_slot_key();
-                create_slot(&http, &cfg.http_base, &secret, &k).await?;
+                create_slot(&http, &cfg.http_base, &secret, slot_create_body(&k, &mode, &agent)).await?;
                 let p = new_slot_plan();
                 (k, p.owns, p.created, p.set_project)
             }
@@ -1190,5 +1198,22 @@ mod tests {
         assert!(p.owns, "a slot zeromux creates is always owned");
         assert!(p.created);
         assert!(p.set_project);
+    }
+
+    // ── G2 · create_slot 请求体（默认逐字不变）──
+    #[test]
+    fn g2_default_slot_body_is_byte_identical_to_before() {
+        assert_eq!(serde_json::to_string(&slot_create_body("zmx-ab12cd34", "", "")).unwrap(),
+                   r#"{"name":"zmx-ab12cd34"}"#);
+    }
+
+    #[test]
+    fn g2_mode_and_agent_are_added_only_when_set() {
+        let b = slot_create_body("k", "crew", "");
+        assert_eq!(b, json!({"name":"k","mode":"crew"}));
+        let b = slot_create_body("k", "", "kirocrew-conductor");
+        assert_eq!(b, json!({"name":"k","agent":"kirocrew-conductor"}));
+        let b = slot_create_body("k", "crew", "kirocrew-conductor");
+        assert_eq!(b, json!({"name":"k","mode":"crew","agent":"kirocrew-conductor"}));
     }
 }

@@ -413,6 +413,14 @@ pub struct SessionInfo {
     pub current_step: Option<String>,
     pub pending_approvals: u32,
     pub lifetime_cost_usd: f64,
+    /// S5 U1 raw Crew values; the frontend derives chat / topics / goal. Omitted for
+    /// non-Crew sessions.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub crew_mode: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub crew_agent: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub crew_origin: Option<String>,
 }
 
 // ── Git worktree helpers ──
@@ -765,6 +773,9 @@ fn session_info_of(s: &Session) -> SessionInfo {
         current_step: s.posture.current_step.clone(),
         pending_approvals: s.posture.approval_ids.len() as u32,
         lifetime_cost_usd: s.lifetime_cost_usd,
+        crew_mode: s.crew.as_ref().map(|c| c.mode.clone()),
+        crew_agent: s.crew.as_ref().map(|c| c.agent.clone()),
+        crew_origin: s.crew.as_ref().map(|c| c.origin.clone()),
     }
 }
 
@@ -1778,6 +1789,8 @@ impl SessionManager {
         cols: u16,
         rows: u16,
         owner_id: &str,
+        crew_mode: &str,
+        crew_agent: &str,
     ) -> Result<String, String> {
         let id = uuid::Uuid::new_v4().to_string();
         // worktree 隔离对 Crew **不适用**：cwd 由 Gateway 管（我们 POST project），
@@ -1786,7 +1799,7 @@ impl SessionManager {
 
         let running = self
             .spawn_crew(&id, &effective_dir.to_string_lossy(), owner_id,
-                crate::acp::crew_process::SlotInit::New { mode: String::new(), agent: String::new() })
+                crate::acp::crew_process::SlotInit::New { mode: crew_mode.to_string(), agent: crew_agent.to_string() })
             .await
             .map_err(|e| {
                 if let Some(wt) = &worktree_path {
@@ -1821,7 +1834,7 @@ impl SessionManager {
             lifetime_duration_ms: 0,
             lifetime_cost_usd: 0.0,
             posture: Posture::default(),
-            crew: Some(CrewMeta { mode: String::new(), agent: String::new(), origin: "zeromux".into() }),
+            crew: Some(CrewMeta { mode: crew_mode.to_string(), agent: crew_agent.to_string(), origin: "zeromux".into() }),
             running: Some(running),
             scrollback: VecDeque::new(),
             scrollback_bytes: 0,
@@ -1829,6 +1842,8 @@ impl SessionManager {
 
         self.persist_meta(&session);
         self.sessions.lock().unwrap().insert(id.clone(), session);
+        // U5: gate-T input (journalctl -u zeromux | grep zmx_usage).
+        tracing::info!(target: "zmx_usage", "{}", crew_create_usage(&id, crew_mode, crew_agent));
         Ok(id)
     }
 
@@ -4054,6 +4069,20 @@ pub fn sanitize_title(raw: &str) -> Option<String> {
     }
 }
 
+/// U5 `crew_create` usage line (logged under `target: "zmx_usage"`); gate T greps
+/// the `crew_create sid=` prefix.
+fn crew_create_usage(id: &str, mode: &str, agent: &str) -> String {
+    format!("crew_create sid={id} mode={mode} agent={agent}")
+}
+
+/// U5 first-prompt metric gate: true exactly once per fan-out, for the first
+/// user (non-scheduled) prompt.
+fn take_first_prompt(logged: &mut bool, scheduled: bool) -> bool {
+    if scheduled || *logged { return false; }
+    *logged = true;
+    true
+}
+
 /// Crew fan-out. Mirrors `spawn_acp_fanout` byte-for-byte in structure — the
 /// only differences are the resume-token source (`crew_slot_key` → `ResumeToken::Crew`)
 /// and the backend name in log lines. The fan-out no longer owns a child process but
@@ -4084,6 +4113,8 @@ fn spawn_crew_fanout(
         // Per-turn (start, intent) FIFO; intent stamped on the live turn via
         // set_live_intent from the input branch (Cancel/Timeout). See TurnStarts.
         let mut turn_starts = TurnStarts::default();
+        // U5: one crew_first_prompt line per fan-out (S6 topics branch reuses this flag).
+        let mut first_prompt_logged = false;
         loop {
             tokio::select! {
                 event = process.event_rx.recv() => {
@@ -4186,6 +4217,9 @@ fn spawn_crew_fanout(
                 input = input_rx.recv() => {
                     match input {
                         Some(SessionInput::Prompt { text, run_id, client_id }) => {
+                            if take_first_prompt(&mut first_prompt_logged, run_id.is_some()) {
+                                tracing::info!(target: "zmx_usage", "crew_first_prompt sid={}", sid);
+                            }
                             // Echo each user prompt as its own UserPrompt event (P1):
                             // N collect-merged messages still surface as N bubbles.
                             // turn_id = the turn this prompt will belong to. In the
@@ -7846,5 +7880,49 @@ mod crew_meta_tests {
         assert_eq!(map.get("old").unwrap().crew,
             Some(CrewMeta { mode: String::new(), agent: String::new(), origin: "zeromux".into() }),
             "pre-S5 Crew rows are ours (DEFAULT 'zeromux')");
+    }
+
+    #[test]
+    fn info_exports_crew_fields_only_for_crew_sessions() {
+        let s = crew_session("c", Some(CrewMeta { mode: String::new(), agent: "kirocrew-conductor".into(), origin: "zeromux".into() }));
+        let i = session_info_of(&s);
+        assert_eq!(i.crew_agent.as_deref(), Some("kirocrew-conductor"));
+        assert_eq!(i.crew_mode.as_deref(), Some(""));
+        assert_eq!(i.crew_origin.as_deref(), Some("zeromux"));
+        let mut k = crew_session("k", None);
+        k.session_type = SessionType::Claude;
+        let json = serde_json::to_value(session_info_of(&k)).unwrap();
+        assert!(json.get("crew_mode").is_none() && json.get("crew_agent").is_none() && json.get("crew_origin").is_none(),
+            "non-Crew sessions omit the three keys: {json}");
+    }
+
+    #[test]
+    fn conductor_agent_survives_restart_in_session_info() {
+        let dir = tempfile::tempdir().unwrap();
+        let m = mgr_at(dir.path());
+        let s = crew_session("c", Some(CrewMeta { mode: String::new(), agent: "kirocrew-conductor".into(), origin: "zeromux".into() }));
+        m.persist_meta(&s);
+        drop(m);
+        let m2 = mgr_at(dir.path());
+        m2.load_persisted();
+        let info = session_info_of(m2.sessions.lock().unwrap().get("c").unwrap());
+        assert_eq!(info.crew_agent.as_deref(), Some("kirocrew-conductor"));
+    }
+
+    #[test]
+    fn first_prompt_is_logged_once_and_never_for_scheduled_prompts() {
+        let mut logged = false;
+        assert!(!take_first_prompt(&mut logged, true), "a scheduled prompt is not a user adopting Crew");
+        assert!(take_first_prompt(&mut logged, false));
+        assert!(!take_first_prompt(&mut logged, false));
+        assert!(logged);
+    }
+
+    #[test]
+    fn crew_create_usage_line_has_the_gate_t_prefix() {
+        // U5: journalctl counting (gate T) greps this exact prefix under target zmx_usage.
+        assert_eq!(crew_create_usage("abc", "crew", "kirocrew-conductor"),
+                   "crew_create sid=abc mode=crew agent=kirocrew-conductor");
+        assert_eq!(crew_create_usage("abc", "", ""), "crew_create sid=abc mode= agent=");
     }
 }

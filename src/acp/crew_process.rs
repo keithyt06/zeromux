@@ -291,6 +291,32 @@ enum Cmd {
     Stop,
 }
 
+/// How `spawn` obtains its slot (R4). Ownership is decided by the caller from the
+/// PERSISTED origin (U2) — never inferred from "is this a resume": our own slots are
+/// resumed with a key after every restart too.
+pub enum SlotInit {
+    /// Create a fresh slot. `mode` / `agent` are Gateway raw values; empty = omit.
+    New { mode: String, agent: String },
+    /// Re-attach to an existing slot. `owns=false` for slots zeromux did not create.
+    Resume { key: String, owns: bool },
+}
+
+/// Drop removes the Gateway slot only if we own it (U2).
+pub fn should_delete_on_drop(owns_slot: bool) -> bool { owns_slot }
+
+/// What a resume may touch. A foreign slot keeps its own project/cwd (S7 D-G6).
+#[derive(Debug, PartialEq)]
+pub struct ResumePlan { pub set_project: bool }
+
+pub fn resume_plan(owns: bool) -> ResumePlan { ResumePlan { set_project: owns } }
+
+/// What `spawn`'s `SlotInit::New` branch does (pure, so Review Focus 4 is testable):
+/// a slot zeromux creates — including the resume-failed fresh fallback — is ours.
+#[derive(Debug, PartialEq)]
+pub struct NewSlotPlan { pub owns: bool, pub created: bool, pub set_project: bool }
+
+pub fn new_slot_plan() -> NewSlotPlan { NewSlotPlan { owns: true, created: true, set_project: true } }
+
 /// 形状与 `CodexProcess`（codex_process.rs:375-378）逐字对齐：私有 `cmd_tx` +
 /// `pub event_rx`，所以 `spawn_crew_fanout` 可以照抄 `spawn_codex_fanout`。
 pub struct CrewProcess {
@@ -298,6 +324,9 @@ pub struct CrewProcess {
     pub event_rx: mpsc::Receiver<AcpEvent>,
     cfg: CrewConfig,
     slot_key: String,
+    /// R4: false for slots zeromux did not create — Drop then stops the loop but
+    /// never DELETEs the slot. Only S7 G6 ever constructs `owns_slot=false`.
+    owns_slot: bool,
 }
 
 /// 读 Gateway 的 internal secret：优先 `<crew_home>/run/gateway-<port>.secret`，
@@ -620,7 +649,7 @@ async fn run_event_loop(
 }
 
 impl CrewProcess {
-    pub async fn spawn(cfg: CrewConfig, work_dir: &str, resume: Option<&str>)
+    pub async fn spawn(cfg: CrewConfig, work_dir: &str, init: SlotInit)
         -> Result<Self, Box<dyn std::error::Error + Send + Sync>>
     {
         let secret = read_gateway_secret(&cfg.crew_home, cfg.port)?;   // fail fast
@@ -630,34 +659,38 @@ impl CrewProcess {
             .redirect(reqwest::redirect::Policy::none())
             .build().map_err(|e| format!("build crew http client: {e}"))?;
 
-        let slot_key = match resume {
-            Some(k) => {
-                if !slot_alive(&http, &cfg.http_base, &secret, k).await {
-                    return Err(format!("Crew slot 已不存在（{k}），需重建会话").into());
+        let (slot_key, owns_slot, created, set_project) = match init {
+            SlotInit::Resume { key, owns } => {
+                if !slot_alive(&http, &cfg.http_base, &secret, &key).await {
+                    return Err(format!("Crew slot 已不存在（{key}），需重建会话").into());
                 }
-                k.to_string()
+                (key, owns, false, resume_plan(owns).set_project)
             }
-            None => {
+            SlotInit::New { mode: _, agent: _ } => {
+                // mode/agent reach the request body in G2 (slot_create_body).
                 let k = new_slot_key();
                 create_slot(&http, &cfg.http_base, &secret, &k).await?;
-                k
+                let p = new_slot_plan();
+                (k, p.owns, p.created, p.set_project)
             }
         };
 
         // project 就是 agent 的真实 cwd（实测 agent `pwd` 与设定值逐字相同）。
         // work_dir=="." 解析成绝对路径 —— Gateway 逐字传给 ACP session/new 的 cwd，
         // 相对路径无意义（照 kiro_process.rs:134-138）。
-        let project = if work_dir == "." {
-            std::env::current_dir()?.to_string_lossy().to_string()
-        } else {
-            work_dir.to_string()
-        };
-        if let Err(e) = set_slot_project(&http, &cfg.http_base, &secret, &slot_key, &project).await {
-            if resume.is_none() {
-                // 建了 slot 但设 project 失败 → 清掉，别留孤儿
-                delete_slot(&http, &cfg.http_base, &secret, &slot_key).await;
+        if set_project {
+            let project = if work_dir == "." {
+                std::env::current_dir()?.to_string_lossy().to_string()
+            } else {
+                work_dir.to_string()
+            };
+            if let Err(e) = set_slot_project(&http, &cfg.http_base, &secret, &slot_key, &project).await {
+                if created {
+                    // 建了 slot 但设 project 失败 → 清掉，别留孤儿
+                    delete_slot(&http, &cfg.http_base, &secret, &slot_key).await;
+                }
+                return Err(e.into());
             }
-            return Err(e.into());
         }
 
         let (event_tx, event_rx) = mpsc::channel::<AcpEvent>(256);   // 与 kiro:164 / codex:407 同容量
@@ -672,7 +705,7 @@ impl CrewProcess {
         }).await;
 
         tokio::spawn(run_event_loop(cfg.clone(), http, slot_key.clone(), event_tx, cmd_rx));
-        Ok(Self { cmd_tx, event_rx, cfg, slot_key })
+        Ok(Self { cmd_tx, event_rx, cfg, slot_key, owns_slot })
     }
 
     pub fn slot_key(&self) -> &str { &self.slot_key }
@@ -703,6 +736,9 @@ impl Drop for CrewProcess {
         // 运行时关停时 spawn 的任务可能永不执行，把 cmd_tx clone 钉死在未完成的
         // future 里，循环就永远卡在 recv()。
         let _ = self.cmd_tx.try_send(Cmd::Stop);
+
+        // R4: never delete a slot we did not create (U2).
+        if !should_delete_on_drop(self.owns_slot) { return; }
 
         // 清远端 slot。必须 spawn（Drop 不能 await），但 secret 在 **Drop 的同步栈上**
         // 现读、再 move 进那个 future —— 不缓存在 self 里，也**不在 async 任务里做
@@ -1131,5 +1167,28 @@ mod tests {
         let evts: Vec<_> = frames(F_NORMAL).iter().flat_map(|f| normalize_frame(f, "zmxprobe", &mut st)).collect();
         assert!(matches!(evts.last(), Some(AcpEvent::Result { .. })), "{evts:?}");
         assert!(!evts.iter().any(|e| matches!(e, AcpEvent::ContentBlock { summary: Some(k), .. } if k.starts_with("crew_"))));
+    }
+
+    // ── R4 · owns_slot（U2：只看持久化的 origin，禁止从 resume.is_none() 推断）──
+    #[test]
+    fn r4_drop_deletes_only_owned_slots() {
+        assert!(should_delete_on_drop(true));
+        assert!(!should_delete_on_drop(false));
+    }
+
+    #[test]
+    fn r4_resume_of_a_foreign_slot_never_touches_its_project() {
+        // S7 D-G6: attaching an external slot must not overwrite its cwd.
+        assert!(resume_plan(true).set_project, "our own slot: re-point project on resume (unchanged behaviour)");
+        assert!(!resume_plan(false).set_project, "external slot: leave its project alone");
+    }
+
+    #[test]
+    fn r4_new_slot_is_owned_created_and_project_set() {
+        // Review Focus 4 / M4: a freshly created slot (incl. the resume-failed fallback) is ours.
+        let p = new_slot_plan();
+        assert!(p.owns, "a slot zeromux creates is always owned");
+        assert!(p.created);
+        assert!(p.set_project);
     }
 }

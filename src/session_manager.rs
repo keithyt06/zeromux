@@ -331,6 +331,8 @@ pub struct Session {
     lifetime_cost_usd: f64,
     /// Triage "at a glance" fields (spec v3 M2). In-memory, lock-only.
     posture: Posture,
+    /// S5 U1 / R4: Some only for SessionType::Crew. Persisted in the crew_* columns.
+    pub crew: Option<CrewMeta>,
     /// 运行态；None = 未运行（可按 resume_token 重生）。
     running: Option<RunningProcess>,
     /// Output history for replay on reconnect (base64 for PTY, JSON for ACP agents)
@@ -527,6 +529,51 @@ fn resolve_work_dir(work_dir: &str, session_id: &str, isolation: bool) -> (PathB
     }
 }
 
+/// S5 U1: Crew slot metadata, persisted in the `crew_*` columns. Some only for Crew
+/// sessions. The three display variants (chat / topics / goal) are derived by the
+/// frontend from these raw values.
+#[derive(Debug, Clone, PartialEq)]
+pub struct CrewMeta {
+    /// Gateway raw value: "" | "crew".
+    pub mode: String,
+    /// Gateway raw value, e.g. "kirocrew-conductor"; "" = default agent.
+    pub agent: String,
+    /// "zeromux" | "external".
+    pub origin: String,
+}
+
+impl CrewMeta {
+    /// U2: ownership comes ONLY from the persisted origin.
+    pub fn owns_slot(&self) -> bool { self.origin != "external" }
+}
+
+/// Pure: how to (re)attach a Crew session's slot. A Crew token → resume it, owned per
+/// origin; anything else (no token, the fresh-fallback retry, a stray non-Crew token)
+/// → a new slot carrying the persisted mode/agent, which we own by construction.
+fn crew_slot_init(token: Option<&ResumeToken>, crew: Option<&CrewMeta>) -> crate::acp::crew_process::SlotInit {
+    use crate::acp::crew_process::SlotInit;
+    match token {
+        Some(ResumeToken::Crew(k)) => SlotInit::Resume {
+            key: k.clone(),
+            owns: crew.map(|c| c.owns_slot()).unwrap_or(true),
+        },
+        _ => SlotInit::New {
+            mode: crew.map(|c| c.mode.clone()).unwrap_or_default(),
+            agent: crew.map(|c| c.agent.clone()).unwrap_or_default(),
+        },
+    }
+}
+
+/// Phase-3 bookkeeping after a resume-failed fresh fallback (pure, lock-held caller):
+/// drop the stale token, and — for Crew — adopt the freshly created slot as ours
+/// (mode/agent kept), so after a restart it is still owned and deleted on Drop.
+fn adopt_fresh_slot(s: &mut Session) {
+    s.resume_token = None;
+    if let Some(c) = s.crew.as_mut() {
+        c.origin = "zeromux".into();
+    }
+}
+
 /// What `ensure_running` should do for one session, decided under the lock.
 struct SpawnPlan {
     stype: SessionType,
@@ -536,6 +583,7 @@ struct SpawnPlan {
     cols: u16,
     rows: u16,
     source_task_id: Option<String>,
+    crew: Option<CrewMeta>,
 }
 
 enum SpawnDecision {
@@ -586,6 +634,7 @@ fn decide_spawn(s: &mut Session) -> SpawnDecision {
             cols: s.cols,
             rows: s.rows,
             source_task_id: s.source_task_id.clone(),
+            crew: s.crew.clone(),
         })
     }
 }
@@ -1183,6 +1232,7 @@ impl SessionManager {
             lifetime_duration_ms: 0,
             lifetime_cost_usd: 0.0,
             posture: Posture::default(),
+            crew: None,
             running: Some(running),
             scrollback: VecDeque::new(),
             scrollback_bytes: 0,
@@ -1302,6 +1352,7 @@ impl SessionManager {
             lifetime_duration_ms: 0,
             lifetime_cost_usd: 0.0,
             posture: Posture::default(),
+            crew: None,
             running: Some(running),
             scrollback: VecDeque::new(),
             scrollback_bytes: 0,
@@ -1648,6 +1699,7 @@ impl SessionManager {
             lifetime_duration_ms: 0,
             lifetime_cost_usd: 0.0,
             posture: Posture::default(),
+            crew: None,
             running: Some(running),
             scrollback: VecDeque::new(),
             scrollback_bytes: 0,
@@ -1658,22 +1710,19 @@ impl SessionManager {
         Ok(id)
     }
 
-    /// Spawn a Crew session for `id` at `work_dir`, start its fan-out, return the
-    /// live handle. `resume` carries a slot key from a previous run.
+    /// Spawn a Crew session for `id` at `work_dir`, start its fan-out, return the live handle. `init` says whether to create or resume the slot (R4).
     async fn spawn_crew(
         &self,
         id: &str,
         work_dir: &str,
         owner_id: &str,
-        resume: Option<String>,
+        init: crate::acp::crew_process::SlotInit,
     ) -> Result<RunningProcess, String> {
         let cfg = crate::acp::crew_process::CrewConfig::new(
             std::path::PathBuf::from(&self.crew_home),
             self.crew_port,
         );
-        let process = crate::acp::crew_process::CrewProcess::spawn(
-            cfg, work_dir, resume.as_deref(),
-        )
+        let process = crate::acp::crew_process::CrewProcess::spawn(cfg, work_dir, init)
         .await
         .map_err(|e| format!("Failed to start Crew session: {}", e))?;
 
@@ -1717,7 +1766,8 @@ impl SessionManager {
         let (effective_dir, worktree_path) = resolve_work_dir(work_dir, &id, false);
 
         let running = self
-            .spawn_crew(&id, &effective_dir.to_string_lossy(), owner_id, None)
+            .spawn_crew(&id, &effective_dir.to_string_lossy(), owner_id,
+                crate::acp::crew_process::SlotInit::New { mode: String::new(), agent: String::new() })
             .await
             .map_err(|e| {
                 if let Some(wt) = &worktree_path {
@@ -1752,6 +1802,7 @@ impl SessionManager {
             lifetime_duration_ms: 0,
             lifetime_cost_usd: 0.0,
             posture: Posture::default(),
+            crew: Some(CrewMeta { mode: String::new(), agent: String::new(), origin: "zeromux".into() }),
             running: Some(running),
             scrollback: VecDeque::new(),
             scrollback_bytes: 0,
@@ -1777,7 +1828,7 @@ impl SessionManager {
         };
 
         // 别人在 spawn：锁外轮询等待 running 出现（最多 ~30s）。
-        let Some(SpawnPlan { stype, resume_token: token, work_dir, owner_id, cols, rows, source_task_id }) = plan else {
+        let Some(SpawnPlan { stype, resume_token: token, work_dir, owner_id, cols, rows, source_task_id, crew }) = plan else {
             for _ in 0..300 {
                 tokio::time::sleep(std::time::Duration::from_millis(100)).await;
                 let map = self.sessions.lock().unwrap();
@@ -1826,11 +1877,7 @@ impl SessionManager {
                 self.spawn_codex(id, &work_dir, &owner_id, r).await
             }
             SessionType::Crew => {
-                let r = match &token {
-                    Some(ResumeToken::Crew(s)) => Some(s.clone()),
-                    _ => None,
-                };
-                self.spawn_crew(id, &work_dir, &owner_id, r).await
+                self.spawn_crew(id, &work_dir, &owner_id, crew_slot_init(token.as_ref(), crew.as_ref())).await
             }
             SessionType::Tmux => {
                 let t = match &token {
@@ -1859,7 +1906,7 @@ impl SessionManager {
                 let fresh = match stype {
                     SessionType::Claude => self.spawn_claude(id, &work_dir, &owner_id, None, source_task_id.as_deref()).await,
                     SessionType::Codex => self.spawn_codex(id, &work_dir, &owner_id, None).await,
-                    SessionType::Crew => self.spawn_crew(id, &work_dir, &owner_id, None).await,
+                    SessionType::Crew => self.spawn_crew(id, &work_dir, &owner_id, crew_slot_init(None, crew.as_ref())).await,
                     // tmux: no bare-shell fallback — a bare shell silently loses
                     // persistence. Preflight already decided Lost/Ended/ServerDown.
                     SessionType::Tmux => Err(e.clone()),
@@ -1889,6 +1936,7 @@ impl SessionManager {
 
         // 阶段 3：锁内装回 + 清 spawning。
         let mut map = self.sessions.lock().unwrap();
+        let mut fallback_snapshot = None;
         let outcome = match map.get_mut(id) {
             Some(s) => {
                 s.spawning = false;
@@ -1898,7 +1946,11 @@ impl SessionManager {
                             // Drop the stale resume token in memory before `running`
                             // is observable. The fresh fan-out re-backfills a new
                             // token on the new session's first id-bearing event.
-                            s.resume_token = None;
+                            // Crew: the fresh slot is ours now (origin → zeromux).
+                            adopt_fresh_slot(s);
+                            if s.crew.is_some() {
+                                fallback_snapshot = Some(persisted_of(s));
+                            }
                         }
                         s.running = Some(rp);
                         s.status = SessionMeta::Running;
@@ -1936,6 +1988,13 @@ impl SessionManager {
             // memory keeps the new token. Self-heals on next restart (SQLite is
             // authoritative) and is harmless in-session (the live process is fresh).
             let _ = self.store.update_resume_token(id, None);
+            // Crew: persist the adopted origin too (same residual race as above;
+            // the snapshot's token is None, matching the clear).
+            if let Some(snap) = fallback_snapshot {
+                if let Err(e) = self.store.upsert(&snap) {
+                    tracing::warn!("persist crew fallback {} failed: {}", id, e);
+                }
+            }
         }
         outcome
     }
@@ -2321,6 +2380,9 @@ impl SessionManager {
             } else {
                 (DEFAULT_COLS, DEFAULT_ROWS)
             };
+            let crew = (p.session_type == SessionType::Crew).then(|| CrewMeta {
+                mode: p.crew_mode.clone(), agent: p.crew_agent.clone(), origin: p.crew_origin.clone(),
+            });
             map.insert(
                 id,
                 Session {
@@ -2360,6 +2422,7 @@ impl SessionManager {
                         awaiting_input: p.posture.awaiting_input,
                         ..Posture::default()
                     },
+                    crew,
                     running: None,
                     scrollback: VecDeque::new(),
                     scrollback_bytes: 0,
@@ -2687,9 +2750,9 @@ fn persisted_of(s: &Session) -> PersistedSession {
         rows: s.rows,
         pending_kill_until: s.pending_kill_until,
         posture: persisted_posture_of(&s.posture),
-        crew_mode: String::new(),
-        crew_agent: String::new(),
-        crew_origin: "zeromux".into(),
+        crew_mode: s.crew.as_ref().map(|c| c.mode.clone()).unwrap_or_default(),
+        crew_agent: s.crew.as_ref().map(|c| c.agent.clone()).unwrap_or_default(),
+        crew_origin: s.crew.as_ref().map(|c| c.origin.clone()).unwrap_or_else(|| "zeromux".into()),
     }
 }
 
@@ -4769,6 +4832,7 @@ mod decide_spawn_tests {
             lifetime_duration_ms: 0,
             lifetime_cost_usd: 0.0,
             posture: Posture::default(),
+            crew: None,
             running: None,
             scrollback: VecDeque::new(),
             scrollback_bytes: 0,
@@ -4959,6 +5023,7 @@ mod turn_state_tests {
             lifetime_duration_ms: 0,
             lifetime_cost_usd: 0.0,
             posture: Posture::default(),
+            crew: None,
             running: Some(RunningProcess {
                 event_tx, input_tx, pty_pid: None,
                 turn_state: TurnState::Idle,
@@ -5676,6 +5741,7 @@ mod running_summary_tests {
             lifetime_duration_ms: 0,
             lifetime_cost_usd: 0.0,
             posture: Posture::default(),
+            crew: None,
             running: Some(RunningProcess {
                 event_tx,
                 input_tx,
@@ -6507,6 +6573,7 @@ mod lifetime_tests {
             lifetime_duration_ms: 0,
             lifetime_cost_usd: 0.0,
             posture: Posture::default(),
+            crew: None,
             running: None,
             scrollback: VecDeque::new(),
             scrollback_bytes: 0,
@@ -7106,6 +7173,7 @@ mod tmux_session_tests {
             last_activity_ms: 0, turns_completed: 0, run_metrics: VecDeque::new(),
             lifetime_turns: 0, lifetime_duration_ms: 0, lifetime_cost_usd: 0.0,
             posture: Posture::default(),
+            crew: None,
             running: None, scrollback: VecDeque::new(), scrollback_bytes: 0,
         }
     }
@@ -7245,6 +7313,7 @@ mod posture_tests {
             pending_kill_until: None, worktree_path: None, created_ms: 0, source_task_id: None,
             spawning: false, last_activity_ms: 0, turns_completed: 0, run_metrics: VecDeque::new(),
             lifetime_turns: 0, lifetime_duration_ms: 0, lifetime_cost_usd: 0.0, posture: Posture::default(),
+            crew: None,
             running: None, scrollback: VecDeque::new(), scrollback_bytes: 0,
         }
     }
@@ -7384,6 +7453,7 @@ mod posture_persist_tests {
             pending_kill_until: None, worktree_path: None, created_ms: 0, source_task_id: None,
             spawning: false, last_activity_ms: 0, turns_completed: 0, run_metrics: VecDeque::new(),
             lifetime_turns: 0, lifetime_duration_ms: 0, lifetime_cost_usd: 0.0, posture: Posture::default(),
+            crew: None,
             running: None, scrollback: VecDeque::new(), scrollback_bytes: 0,
         }
     }
@@ -7571,5 +7641,165 @@ mod posture_persist_tests {
         assert!(!run_done_push_allowed(Some(RunOutcome::Timeout)));
         assert!(run_done_push_allowed(None), "a normal Result boundary pushes");
         assert!(run_done_push_allowed(Some(RunOutcome::Completed)));
+    }
+}
+
+#[cfg(test)]
+mod crew_meta_tests {
+    use super::*;
+    use super::posture_persist_tests::{mgr_at, seed};
+    use crate::acp::crew_process::SlotInit;
+
+    fn meta(origin: &str) -> CrewMeta {
+        CrewMeta { mode: String::new(), agent: "kirocrew-conductor".into(), origin: origin.into() }
+    }
+
+    #[test]
+    fn owns_slot_is_origin_not_resume_presence() {
+        assert!(meta("zeromux").owns_slot());
+        assert!(!meta("external").owns_slot());
+        // Unknown origin strings are treated as ours: only an explicit "external" disowns.
+        assert!(meta("").owns_slot());
+    }
+
+    #[test]
+    fn own_slot_resumed_after_restart_is_still_owned() {
+        // CTO M2: self-made slots restart via resume=Some(k) too; they must still be deleted on close.
+        let tok = ResumeToken::Crew("zmx-k".into());
+        match crew_slot_init(Some(&tok), Some(&meta("zeromux"))) {
+            SlotInit::Resume { key, owns } => { assert_eq!(key, "zmx-k"); assert!(owns); }
+            _ => panic!("expected Resume"),
+        }
+        match crew_slot_init(Some(&tok), Some(&meta("external"))) {
+            SlotInit::Resume { owns, .. } => assert!(!owns),
+            _ => panic!("expected Resume"),
+        }
+    }
+
+    #[test]
+    fn no_token_means_a_new_slot_with_the_persisted_mode_and_agent() {
+        match crew_slot_init(None, Some(&CrewMeta { mode: "crew".into(), agent: String::new(), origin: "zeromux".into() })) {
+            SlotInit::New { mode, agent } => { assert_eq!(mode, "crew"); assert_eq!(agent, ""); }
+            _ => panic!("expected New"),
+        }
+        // Pre-S5 rows (crew: None) and a non-Crew token behave like a plain new slot.
+        assert!(matches!(crew_slot_init(None, None), SlotInit::New { ref mode, ref agent } if mode.is_empty() && agent.is_empty()));
+        let claude = ResumeToken::Claude("x".into());
+        assert!(matches!(crew_slot_init(Some(&claude), None), SlotInit::New { .. }));
+    }
+
+    fn crew_session(id: &str, crew: Option<CrewMeta>) -> Session {
+        let mut s = posture_persist_tests::session(id);
+        s.session_type = SessionType::Crew;
+        s.name = "c".into();
+        s.resume_token = Some(ResumeToken::Crew("zmx-k".into()));
+        s.crew = crew;
+        s
+    }
+
+    #[test]
+    fn fresh_fallback_keeps_mode_and_agent_and_owns() {
+        // Review Focus 4: when resume fails, ensure_running retries with token=None.
+        // The fresh slot must keep the session's mode/agent — and is ours by construction.
+        let m = CrewMeta { mode: "crew".into(), agent: "kirocrew-conductor".into(), origin: "external".into() };
+        match crew_slot_init(None, Some(&m)) {
+            SlotInit::New { mode, agent } => {
+                assert_eq!(mode, "crew");
+                assert_eq!(agent, "kirocrew-conductor");
+            }
+            _ => panic!("expected New"),
+        }
+        // CrewProcess::spawn's New branch: owned, created, project set.
+        let plan = crate::acp::crew_process::new_slot_plan();
+        assert!(plan.owns && plan.created && plan.set_project);
+
+        // ...and the session adopts the fresh slot: origin flips to "zeromux"
+        // (mode/agent kept), so it is still owned — and deleted on Drop — after a restart.
+        let d = tempfile::tempdir().unwrap();
+        let mgr = mgr_at(d.path());
+        seed(&mgr, crew_session("c", Some(m.clone())));
+        {
+            let mut map = mgr.sessions.lock().unwrap();
+            let s = map.get_mut("c").unwrap();
+            adopt_fresh_slot(s);
+            assert_eq!(s.resume_token, None);
+            let snap = persisted_of(s);
+            drop(map);
+            mgr.store.upsert(&snap).unwrap();
+        }
+        drop(mgr);
+        let m2 = mgr_at(d.path());
+        m2.load_persisted();
+        let map = m2.sessions.lock().unwrap();
+        let c = map.get("c").unwrap().crew.clone().unwrap();
+        assert_eq!(c, CrewMeta { mode: "crew".into(), agent: "kirocrew-conductor".into(), origin: "zeromux".into() });
+        assert!(c.owns_slot());
+    }
+
+    #[test]
+    fn adopt_fresh_slot_leaves_non_crew_sessions_alone() {
+        let mut s = posture_persist_tests::session("k");
+        s.resume_token = Some(ResumeToken::Claude("x".into()));
+        adopt_fresh_slot(&mut s);
+        assert_eq!(s.resume_token, None);
+        assert_eq!(s.crew, None);
+    }
+
+    #[test]
+    fn metadata_upsert_keeps_external_origin_and_mode_agent() {
+        // persisted_of must source crew_* from s.crew, not hard-code them: a metadata
+        // upsert (persist_meta) of an external slot must not silently re-own it.
+        let d = tempfile::tempdir().unwrap();
+        let mgr = mgr_at(d.path());
+        let ext = CrewMeta { mode: "crew".into(), agent: "kirocrew-conductor".into(), origin: "external".into() };
+        seed(&mgr, crew_session("e", Some(ext.clone())));
+        {
+            let mut map = mgr.sessions.lock().unwrap();
+            let s = map.get_mut("e").unwrap();
+            s.name = "renamed".into();
+            let s = map.get("e").unwrap();
+            mgr.persist_meta(s);
+        }
+        drop(mgr);
+        let m2 = mgr_at(d.path());
+        m2.load_persisted();
+        let map = m2.sessions.lock().unwrap();
+        let s = map.get("e").unwrap();
+        assert_eq!(s.name, "renamed");
+        assert_eq!(s.crew, Some(ext));
+    }
+
+    #[test]
+    fn decide_spawn_carries_crew_meta() {
+        let m = CrewMeta { mode: "crew".into(), agent: String::new(), origin: "zeromux".into() };
+        let mut s = crew_session("c", Some(m.clone()));
+        match decide_spawn(&mut s) {
+            SpawnDecision::Spawn(plan) => assert_eq!(plan.crew, Some(m)),
+            _ => panic!("expected Spawn"),
+        }
+    }
+
+    #[test]
+    fn crew_meta_round_trips_through_the_store_and_non_crew_rows_get_none() {
+        let dir = tempfile::tempdir().unwrap();
+        let m = mgr_at(dir.path());
+        let conductor = CrewMeta { mode: String::new(), agent: "kirocrew-conductor".into(), origin: "zeromux".into() };
+        m.store.upsert(&persisted_of(&crew_session("c", Some(conductor.clone())))).unwrap();
+        let mut claude = crew_session("k", None);
+        claude.session_type = SessionType::Claude;
+        claude.resume_token = None;
+        m.store.upsert(&persisted_of(&claude)).unwrap();
+        // A pre-S5 Crew row: crew columns at their DEFAULTs.
+        m.store.upsert(&persisted_of(&crew_session("old", None))).unwrap();
+        drop(m);
+
+        let m = mgr_at(dir.path());
+        m.load_persisted();
+        let map = m.sessions.lock().unwrap();
+        assert_eq!(map.get("c").unwrap().crew, Some(conductor));
+        assert_eq!(map.get("k").unwrap().crew, None, "non-Crew sessions never carry CrewMeta");
+        assert_eq!(map.get("old").unwrap().crew,
+            Some(CrewMeta { mode: String::new(), agent: String::new(), origin: "zeromux".into() }),
+            "pre-S5 Crew rows are ours (DEFAULT 'zeromux')");
     }
 }

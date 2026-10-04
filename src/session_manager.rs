@@ -2849,6 +2849,13 @@ fn maybe_push_turn_done(
     }
 }
 
+/// Gate for the run_done push at the scheduled `Result` arm: that arm is entered by
+/// EVENT TYPE, so a Cancelled/Timeout-killed run whose CLI still emits a Result
+/// would otherwise push "⏰ 完成" (spec §2.3). Same intent source as turn_done.
+fn run_done_push_allowed(intent: Option<crate::run_metrics::RunOutcome>) -> bool {
+    !intent_suppresses_push(intent)
+}
+
 /// F2: a scheduled run finished successfully. Routine band (D8); fired ONLY from the
 /// `finalize_run(…, "succeeded", …)` arm, so a Cancelled/Timeout run (which never
 /// reaches that arm) cannot push. Body: verdict > this turn's snippet > default.
@@ -3054,7 +3061,8 @@ fn spawn_acp_fanout(
                                 // exact intent-vs-event-type gap (2026-08-07 F3 / 08-08 F2);
                                 // this closes the sibling on the scheduled run_failed path.
                                 // (review 2026-08-12, F-RUNFAILED-INTENT.)
-                                let intent_aborted = intent_suppresses_push(turn_starts.front_intent());
+                                let run_intent = turn_starts.front_intent();
+                                let intent_aborted = intent_suppresses_push(run_intent);
                                 // Finalize a scheduled run exactly once, keyed
                                 // on active_run_id, mapped by terminal event type.
                                 if let Some(rid) = active_run_id.take() {
@@ -3064,7 +3072,9 @@ fn spawn_acp_fanout(
                                                 let verdict = crate::scheduled_tasks::extract_verdict(text);
                                                 m.finalize_run(&rid, "succeeded", verdict.as_deref(),
                                                     if verdict.is_some() { None } else { Some("no_verdict") });
-                                                maybe_push_run_done(&mgr, &sid, &owner_id, verdict.as_deref());
+                                                if run_done_push_allowed(run_intent) {
+                                                    maybe_push_run_done(&mgr, &sid, &owner_id, verdict.as_deref());
+                                                }
                                             }
                                             AcpEvent::Error { .. } => {
                                                 m.finalize_run(&rid, "failed", None, Some("cli_error"));
@@ -7550,5 +7560,15 @@ mod posture_persist_tests {
         maybe_push_run_done(&weak, "p", "o", Some("无新告警"));
         maybe_push_run_done(&weak, "p", "o", None);
         maybe_push_run_done(&Weak::new(), "p", "o", None);
+    }
+
+    #[test]
+    fn result_boundary_with_aborted_intent_does_not_push_run_done() {
+        // Review fix: a Cancelled/Timeout scheduled run can still end on a Result
+        // (partial text) → finalize_run("succeeded") arm; it must not push "⏰ 完成".
+        assert!(!run_done_push_allowed(Some(RunOutcome::Cancelled)));
+        assert!(!run_done_push_allowed(Some(RunOutcome::Timeout)));
+        assert!(run_done_push_allowed(None), "a normal Result boundary pushes");
+        assert!(run_done_push_allowed(Some(RunOutcome::Completed)));
     }
 }

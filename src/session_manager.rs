@@ -564,13 +564,32 @@ fn crew_slot_init(token: Option<&ResumeToken>, crew: Option<&CrewMeta>) -> crate
     }
 }
 
-/// Phase-3 bookkeeping after a resume-failed fresh fallback (pure, lock-held caller):
-/// drop the stale token, and — for Crew — adopt the freshly created slot as ours
-/// (mode/agent kept), so after a restart it is still owned and deleted on Drop.
-fn adopt_fresh_slot(s: &mut Session) {
-    s.resume_token = None;
+/// What the resume-failed fallback must write to SQLite once the sessions lock is
+/// released; computed from the IN-LOCK state by `adopt_fresh_slot`.
+struct FallbackPersist {
+    /// Clear the stored token — only when memory still holds no token (nothing
+    /// backfilled yet); otherwise the fan-out already persisted the new one.
+    clear_token: bool,
+    /// Crew: full row with the adopted origin and the current (in-lock) token.
+    snapshot: Option<PersistedSession>,
+}
+
+/// Phase-3 bookkeeping after a resume-failed fresh fallback (pure, lock-held caller).
+/// Drops the token only if it is still the pre-spawn `stale` one: the fresh fan-out
+/// may already have backfilled the NEW token (Crew's init event usually wins the
+/// race to phase 3), and that one must survive. Crew: the freshly created slot is
+/// ours (origin → zeromux, mode/agent kept), so after a restart it is still owned
+/// and deleted on Drop.
+fn adopt_fresh_slot(s: &mut Session, stale: Option<&ResumeToken>) -> FallbackPersist {
+    if s.resume_token.as_ref() == stale {
+        s.resume_token = None;
+    }
     if let Some(c) = s.crew.as_mut() {
         c.origin = "zeromux".into();
+    }
+    FallbackPersist {
+        clear_token: s.resume_token.is_none(),
+        snapshot: s.crew.is_some().then(|| persisted_of(s)),
     }
 }
 
@@ -1936,7 +1955,7 @@ impl SessionManager {
 
         // 阶段 3：锁内装回 + 清 spawning。
         let mut map = self.sessions.lock().unwrap();
-        let mut fallback_snapshot = None;
+        let mut fallback_persist = None;
         let outcome = match map.get_mut(id) {
             Some(s) => {
                 s.spawning = false;
@@ -1944,13 +1963,10 @@ impl SessionManager {
                     Ok(rp) => {
                         if fell_back {
                             // Drop the stale resume token in memory before `running`
-                            // is observable. The fresh fan-out re-backfills a new
-                            // token on the new session's first id-bearing event.
-                            // Crew: the fresh slot is ours now (origin → zeromux).
-                            adopt_fresh_slot(s);
-                            if s.crew.is_some() {
-                                fallback_snapshot = Some(persisted_of(s));
-                            }
+                            // is observable — unless the fresh fan-out already
+                            // backfilled a new one (kept). Crew: the fresh slot is
+                            // ours now (origin → zeromux).
+                            fallback_persist = Some(adopt_fresh_slot(s, token.as_ref()));
                         }
                         s.running = Some(rp);
                         s.status = SessionMeta::Running;
@@ -1981,22 +1997,28 @@ impl SessionManager {
             })
             .to_string();
             self.push_scrollback(id, evt_json);
-            // Clear the stale token in SQLite. Done after phase 3 (not at fallback
-            // time) to keep the SQLite + memory clears adjacent. Residual race: a
-            // fast fresh fan-out may have already backfilled a NEW token into both
-            // memory and SQLite before this line; this clear then wipes SQLite while
-            // memory keeps the new token. Self-heals on next restart (SQLite is
-            // authoritative) and is harmless in-session (the live process is fresh).
-            let _ = self.store.update_resume_token(id, None);
-            // Crew: persist the adopted origin too (same residual race as above;
-            // the snapshot's token is None, matching the clear).
-            if let Some(snap) = fallback_snapshot {
-                if let Err(e) = self.store.upsert(&snap) {
-                    tracing::warn!("persist crew fallback {} failed: {}", id, e);
-                }
+            if let Some(p) = fallback_persist {
+                self.persist_fallback(id, p);
             }
         }
         outcome
+    }
+
+    /// Post-phase-3 half of the resume-failed fallback (no sessions lock held).
+    /// Writes reflect the in-lock state `adopt_fresh_slot` saw: if the fresh fan-out
+    /// had already backfilled a new token (memory + SQLite), it is neither cleared
+    /// nor overwritten. Remaining window: a backfill landing between phase 3 and
+    /// these writes has its SQLite write race ours; memory always keeps the new
+    /// token, and the next restart's resume-failed fallback self-heals.
+    fn persist_fallback(&self, id: &str, p: FallbackPersist) {
+        if p.clear_token {
+            let _ = self.store.update_resume_token(id, None);
+        }
+        if let Some(snap) = p.snapshot {
+            if let Err(e) = self.store.upsert(&snap) {
+                tracing::warn!("persist crew fallback {} failed: {}", id, e);
+            }
+        }
     }
 
     /// List sessions, optionally filtered by owner. Pass None for all (admin).
@@ -7721,11 +7743,10 @@ mod crew_meta_tests {
         {
             let mut map = mgr.sessions.lock().unwrap();
             let s = map.get_mut("c").unwrap();
-            adopt_fresh_slot(s);
+            let p = adopt_fresh_slot(s, Some(&ResumeToken::Crew("zmx-k".into())));
             assert_eq!(s.resume_token, None);
-            let snap = persisted_of(s);
             drop(map);
-            mgr.store.upsert(&snap).unwrap();
+            mgr.persist_fallback("c", p);
         }
         drop(mgr);
         let m2 = mgr_at(d.path());
@@ -7740,9 +7761,33 @@ mod crew_meta_tests {
     fn adopt_fresh_slot_leaves_non_crew_sessions_alone() {
         let mut s = posture_persist_tests::session("k");
         s.resume_token = Some(ResumeToken::Claude("x".into()));
-        adopt_fresh_slot(&mut s);
+        let p = adopt_fresh_slot(&mut s, Some(&ResumeToken::Claude("x".into())));
         assert_eq!(s.resume_token, None);
         assert_eq!(s.crew, None);
+        assert!(p.clear_token && p.snapshot.is_none());
+    }
+
+    #[test]
+    fn fallback_keeps_a_token_backfilled_before_phase_3() {
+        // Crew's spawn enqueues System{init, session_id: new key} before returning, so
+        // the fresh fan-out usually backfills the NEW key (memory + SQLite) before
+        // ensure_running's phase 3. Phase 3 must not wipe it, or the fresh owned slot
+        // is lost and orphaned after a restart.
+        let d = tempfile::tempdir().unwrap();
+        let mgr = mgr_at(d.path());
+        let stale = ResumeToken::Crew("zmx-k".into());
+        let fresh = ResumeToken::Crew("zmx-new".into());
+        seed(&mgr, crew_session("c", Some(meta("zeromux"))));
+        mgr.set_resume_token("c", fresh.clone());          // fan-out backfill wins the race
+        let p = {
+            let mut map = mgr.sessions.lock().unwrap();
+            adopt_fresh_slot(map.get_mut("c").unwrap(), Some(&stale))
+        };
+        mgr.persist_fallback("c", p);
+        assert_eq!(mgr.sessions.lock().unwrap().get("c").unwrap().resume_token, Some(fresh.clone()));
+        let row = mgr.store.load_all().unwrap().into_iter().find(|r| r.id == "c").unwrap();
+        assert_eq!(row.resume_token, Some(fresh));
+        assert_eq!(row.crew_origin, "zeromux");
     }
 
     #[test]

@@ -14,6 +14,8 @@ export interface Step {
   text?: string
   approvalId?: string
   count?: number
+  /** Crew Mode reply kind (G1): ask = a question for the user, meta = a routing note. */
+  crew?: 'crew_ask' | 'crew_meta'
 }
 
 export function toSteps(blocks: Block[], complete: boolean): Step[] {
@@ -40,10 +42,13 @@ export function toSteps(blocks: Block[], complete: boolean): Step[] {
         if (last?.kind === 'thinking') { last.text = `${last.text}\n\n${b.text ?? ''}`; last.count = (last.count ?? 1) + 1 }
         else { closeOpenTools(); out.push({ kind: 'thinking', text: b.text ?? '', status: 'done', count: 1 }) }
         break
-      case 'text':
-        if (last?.kind === 'text') last.text = `${last.text}${b.text ?? ''}`
-        else { closeOpenTools(); out.push({ kind: 'text', text: b.text ?? '', status: 'done' }) }
+      case 'text': {
+        const crew = b.summary === 'crew_ask' || b.summary === 'crew_meta' ? b.summary : undefined
+        // Crew ask/meta are standalone messages: never merge them into neighbouring prose.
+        if (!crew && last?.kind === 'text' && !last.crew) last.text = `${last.text}${b.text ?? ''}`
+        else { closeOpenTools(); out.push({ kind: 'text', text: b.text ?? '', status: 'done', ...(crew ? { crew } : {}) }) }
         break
+      }
       case 'error':
         out.push({ kind: 'error', text: b.text ?? '', status: 'error' })
         break

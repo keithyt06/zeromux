@@ -91,4 +91,19 @@ describe('T14 Crew 新事件变体在前端有 case（防静默丢弃）', () =>
     expect(ws().sent.map(s => JSON.parse(s)))
       .toContainEqual({ type: 'approval', approval_id: 'ap9', action: 'approve' })
   })
+
+  it('G1: crew_ack 显示灰色一行，crew_ask 显示问题卡，crew_meta 显示灰色提示', async () => {
+    mount()
+    await act(async () => {
+      ws().emit({ type: 'user_prompt', text: '建 hello.txt', turn_id: 1 })
+      ws().emit({ type: 'system', subtype: 'crew_ack' })
+      ws().emit({ type: 'content_block', block_type: 'text', text: '要写到哪个目录？', summary: 'crew_ask', turn_id: 1 })
+      ws().emit({ type: 'content_block', block_type: 'text', text: 'nothing was started', summary: 'crew_meta', turn_id: 1 })
+    })
+    expect(await screen.findByText('Crew 已接收')).toBeInTheDocument()
+    const ask = screen.getByTestId('crew-ask')
+    expect(ask).toHaveTextContent('Crew 在问你')
+    expect(ask).toHaveTextContent('要写到哪个目录？')
+    expect(screen.getByTestId('crew-meta')).toHaveTextContent('nothing was started')
+  })
 })

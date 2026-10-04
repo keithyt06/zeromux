@@ -46,6 +46,21 @@ describe('toSteps', () => {
   it('stepCount counts tools and approvals only', () => {
     expect(stepCount(toSteps([th('x'), tu('Read'), tx('y'), { type: 'approval', approvalId: 'a' }], true))).toBe(2)
   })
+  it('Crew crew_ask / crew_meta text blocks stay separate steps tagged by kind; crew_result is plain text', () => {
+    const st = toSteps([
+      { type: 'text', text: 'On it?', summary: 'crew_ask' },
+      { type: 'text', text: 'again?', summary: 'crew_ask' },
+      { type: 'text', text: 'nothing started', summary: 'crew_meta' },
+      { type: 'text', text: '已创建 hello.txt', summary: 'crew_result' },
+      tx(' 内容为 hi'),
+    ], false)
+    expect(st.map(s => [s.kind, s.crew, s.text])).toEqual([
+      ['text', 'crew_ask', 'On it?'],
+      ['text', 'crew_ask', 'again?'],
+      ['text', 'crew_meta', 'nothing started'],
+      ['text', undefined, '已创建 hello.txt 内容为 hi'],
+    ])
+  })
 })
 
 describe('touchedFiles', () => {

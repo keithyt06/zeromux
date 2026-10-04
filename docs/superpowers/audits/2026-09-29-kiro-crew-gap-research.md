@@ -205,3 +205,15 @@ slots → activity_event(status 'Creating session…') → slots → activity_ev
 **对设计的影响**：
 - G1：`normalize_frame` 新增 `chat_message` 分支，仅当 `kind` 以 `crew_` 开头时映射为**非边界** ContentBlock（text）；`crew_ack` 可降为灰色 System 提示。普通模式不受影响（R1）。
 - G3：crew 会话的 busy / turn 结束改由 `GET /api/chat/slots/{slot}`（或 `slots` 帧）里的 `running` / 队列深度 / 运行中话题数驱动；`POST /api/chat` 的即时返回不能视为 turn 结束，也不能等 `chat_done`。工作量 **M**（已确定）。
+
+### S5 SP 补测（2026-10-04）
+
+经用户授权，建临时 slot `zmxprobe<6位>`（crew mode，真实小任务）与 `zmxprobe<6位>`（agent=kirocrew-conductor，普通模式），测完 DELETE → 200、GET → 404。secret/token 只在进程内存中，未输出、未落盘。脱敏帧存为 `src/acp/testdata/crew_frames_*.json`（slot 统一改写为 `zmxprobe`）。
+
+- `CONDUCTOR_CHAT_DONE = yes`：b_seq `activity_event(status) → activity_event(session) → mcp_report_update → activity_event(context) → chat_status → activity_event(status) → chat_chunk 'OK' → context_usage → activity_event(stats) → chat_done`（发 prompt 后约 4s 出 `chat_done`），与 R1 普通模式同形，无 `chat_message`
+- `CREATE_WITH_MODE = unverified`：建 slot 时带 `mode:"crew"`（POST → 200），但 `GET /api/chat/slots/{slot}` 回读的键只有 `key/title/running/stopping/messages/queue/total/has_more/next_before`，无 `mode` 字段。旁证：之后 `POST /api/chat` 的帧序列是 crew 形态（`crew_ack` → `crew_ask`×3 → `crew_meta`，无 `chat_chunk`/`chat_done`），说明 mode 很可能已生效，但未直接回读确认。注：列表接口 `GET /api/chat/slots` 的元素含 `mode`/`agent` 键，下次可从列表回读
+- `CREATE_WITH_AGENT = unverified`：建 slot 时带 `agent:"kirocrew-conductor"`（POST → 200），GET 回读同样无 `agent` 字段
+- `crew_result` 字段：本次仍未出现（data 键 —；meta 键 —）。真实小任务「在当前目录创建 hello.txt 写入 hi，然后告诉我文件内容」同样以 `crew_ask`×3 → `crew_meta`（路由失败）收尾，`hello.txt` 未创建。夹具 `crew_frames_crew_result.json` 为**构造**（按 `crew_ask`/`crew_meta` 同形态：`content` + `meta.mid` + `meta.crew_reply`）；`crew_ack` / `crew_ask` / `crew_meta` / `normal_turn` 四个夹具为实测帧
+- 附带发现：`context_usage` 实测字段为 `used_tokens` / `window_tokens` / `pct`，而 `normalize_frame` 读的是 `used` / `total|limit` → 当前 Crew 的 ctx% 恒不显示。不在 S5 范围，记入 deferred。
+
+对 S5 的影响：`CONDUCTOR_CHAT_DONE = yes` → D1 前提成立，「目标指挥」chip 在 S5 开放（Task 10 取 `GOAL_ENABLED = true`）；`CREATE_WITH_MODE != yes` → Task 7 在建 slot 后补一次 `PATCH …/mode`（`CREATE_WITH_AGENT` 未验证，Task 7 同理按兜底分支处理）。crew 路由连续两次失败（R2 极简 prompt + 本次真实小任务）说明 Crew 决策路由本身在本机不稳，`crew_result` 形态仍需等真实使用中抓到后核对。

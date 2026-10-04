@@ -1,0 +1,32 @@
+[
+  {
+    "type": "chat_status",
+    "data": {
+      "slot": "zmxprobe",
+      "status": "Thinking…"
+    }
+  },
+  {
+    "type": "chat_chunk",
+    "data": {
+      "slot": "zmxprobe",
+      "content": "OK",
+      "seq": 1
+    }
+  },
+  {
+    "type": "context_usage",
+    "data": {
+      "slot": "zmxprobe",
+      "pct": 6.2,
+      "used_tokens": 62271,
+      "window_tokens": 1000000
+    }
+  },
+  {
+    "type": "chat_done",
+    "data": {
+      "slot": "zmxprobe"
+    }
+  }
+]

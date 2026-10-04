@@ -1,0 +1,44 @@
+[
+  {
+    "type": "chat_message",
+    "data": {
+      "slot": "zmxprobe",
+      "role": "assistant",
+      "content": "Couldn't start that one — say the word and I'll retry.",
+      "cls": "msg msg-a crew-reply",
+      "meta": {
+        "crew_reply": true,
+        "mid": "m-06f1fcbfb1cc4540"
+      },
+      "kind": "crew_ask"
+    }
+  },
+  {
+    "type": "chat_message",
+    "data": {
+      "slot": "zmxprobe",
+      "role": "assistant",
+      "content": "Couldn't start that one — say the word and I'll retry.",
+      "cls": "msg msg-a crew-reply",
+      "meta": {
+        "crew_reply": true,
+        "mid": "m-69bdca66eeef4ad7"
+      },
+      "kind": "crew_ask"
+    }
+  },
+  {
+    "type": "chat_message",
+    "data": {
+      "slot": "zmxprobe",
+      "role": "assistant",
+      "content": "Couldn't start that one — say the word and I'll retry.",
+      "cls": "msg msg-a crew-reply",
+      "meta": {
+        "crew_reply": true,
+        "mid": "m-dd1d448c89814d6d"
+      },
+      "kind": "crew_ask"
+    }
+  }
+]

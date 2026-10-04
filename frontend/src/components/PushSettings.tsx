@@ -112,7 +112,7 @@ export default function PushSettings({ open, onClose }: Props) {
             />
             <LevelRow
               label="常规通知"
-              hint="每轮完成"
+              hint="每轮完成、定时任务完成"
               checked={levels.routine}
               onChange={v => updateLevel('routine', v)}
             />

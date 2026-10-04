@@ -1,0 +1,15 @@
+[
+  {
+    "type": "chat_message",
+    "data": {
+      "slot": "zmxprobe",
+      "role": "assistant",
+      "content": "Got it — working on that.",
+      "cls": "msg msg-a",
+      "meta": {
+        "mid": "m-21725d12080f4cfe"
+      },
+      "kind": "crew_ack"
+    }
+  }
+]

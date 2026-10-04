@@ -1,0 +1,16 @@
+[
+  {
+    "type": "chat_message",
+    "data": {
+      "slot": "zmxprobe",
+      "role": "assistant",
+      "content": "I could not work out how to route this request after several attempts, so nothing was started. Please rephrase and send again.",
+      "cls": "msg msg-a crew-reply",
+      "meta": {
+        "crew_reply": true,
+        "mid": "m-bd252adb6e5d424b"
+      },
+      "kind": "crew_meta"
+    }
+  }
+]

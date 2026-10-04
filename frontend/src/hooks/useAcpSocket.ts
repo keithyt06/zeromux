@@ -324,6 +324,7 @@ export function useAcpSocket(o: AcpSocketOptions) {
         // 不进消息气泡。只有真正需要用户知道的 subtype 才弹 notice。
         const labelMap: Record<string, string> = {
           resume_failed: '⚠ 上下文恢复失败，已重置为新会话',
+          crew_ack: 'Crew 已接收',
         }
         const label = labelMap[evt.subtype || '']
         if (!label) break

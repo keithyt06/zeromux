@@ -16,6 +16,15 @@ export function StepRow({ step, complete, decision, onResolve, onToggle }: {
   const [open, setOpen] = useState(false)
   // Notify outside the state updater (updaters must stay pure).
   const toggle = () => { const next = !open; setOpen(next); onToggle?.(next) }
+  if (step.kind === 'text' && step.crew === 'crew_ask') return (
+    <div data-testid="crew-ask" className="rounded-[var(--r-md)] border border-[var(--attention)]/40 bg-[var(--attention)]/5 p-2 text-ui-sm">
+      <div className="flex items-center gap-1.5 text-ui-xs font-medium text-[var(--attention)]"><StatusDot tone="attention" label="待回答" />Crew 在问你</div>
+      <p className="mt-1 text-[var(--fg)] whitespace-pre-wrap break-words">{step.text}</p>
+    </div>
+  )
+  if (step.kind === 'text' && step.crew === 'crew_meta') return (
+    <p data-testid="crew-meta" className="text-ui-xs italic text-[var(--fg-subtle)] whitespace-pre-wrap break-words">{step.text}</p>
+  )
   if (step.kind === 'text') return <div className="text-ui-base text-[var(--fg)] leading-relaxed"><MarkdownContent text={step.text ?? ''} isComplete={complete} /></div>
   if (step.kind === 'error') return (
     <div className="flex items-start gap-1.5 text-ui-xs text-[var(--danger)]"><AlertCircle size={13} className="shrink-0 mt-0.5" /><span className="whitespace-pre-wrap break-words">{step.text || 'Error'}</span></div>

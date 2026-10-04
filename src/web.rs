@@ -833,10 +833,27 @@ struct CreateSessionReq {
     work_dir: Option<String>,
     tmux_target: Option<String>,
     initial_prompt: Option<String>,   // 仅 agent 会话有意义；tmux 忽略
+    /// S5 G2: Gateway slot mode ("" | "crew") and agent ("" | "kirocrew-conductor").
+    /// Crew only; default "" keeps old clients and the default slot body unchanged.
+    #[serde(default)]
+    crew_mode: String,
+    #[serde(default)]
+    crew_agent: String,
 }
 
 fn default_session_type() -> crate::session_manager::SessionType {
     crate::session_manager::SessionType::Tmux
+}
+
+/// S5 §7.2 whitelist. `pipeline-conductor` is Stage 4 and deliberately absent.
+fn validate_crew_opts(t: crate::session_manager::SessionType, mode: &str, agent: &str) -> Result<(), String> {
+    if t != crate::session_manager::SessionType::Crew {
+        return if mode.is_empty() && agent.is_empty() { Ok(()) }
+               else { Err("crew_mode/crew_agent only apply to crew sessions".into()) };
+    }
+    if !matches!(mode, "" | "crew") { return Err(format!("invalid crew_mode: {mode}")); }
+    if !matches!(agent, "" | "kirocrew-conductor") { return Err(format!("invalid crew_agent: {agent}")); }
+    Ok(())
 }
 
 /// 启动 Prompt 的 gating 决策（纯函数，便于测试）：
@@ -901,6 +918,8 @@ async fn create_session(
     let work_dir = req.work_dir.unwrap_or_else(|| state.work_dir.clone());
 
     validate_work_dir_under_home(&work_dir)?;
+    validate_crew_opts(req.session_type, &req.crew_mode, &req.crew_agent)
+        .map_err(|e| (StatusCode::BAD_REQUEST, e))?;
 
     let name = req.name.or_else(|| req.tmux_target.clone()).unwrap_or_else(|| {
         // Use directory basename as part of session name
@@ -939,7 +958,8 @@ async fn create_session(
         }
         crate::session_manager::SessionType::Crew => {
             state.sessions
-                .create_crew_session(name.clone(), &work_dir, state.default_cols, state.default_rows, &owner_id)
+                .create_crew_session(name.clone(), &work_dir, state.default_cols, state.default_rows, &owner_id,
+                    &req.crew_mode, &req.crew_agent)
                 .await
                 .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?
         }
@@ -6806,7 +6826,7 @@ async fn push_test(
     user: axum::Extension<CurrentUser>,
 ) -> Result<Json<serde_json::Value>, StatusCode> {
     let p = state.push.as_ref().ok_or(StatusCode::SERVICE_UNAVAILABLE)?;
-    let payload = crate::push::payload_for("test", "ZeroMux", "", None);
+    let payload = crate::push::payload_for("test", "ZeroMux", "", None, None);
     p.send_to_user(&user.id, &payload).await;
     Ok(Json(serde_json::json!({ "ok": true })))
 }
@@ -6829,7 +6849,7 @@ async fn push_unsubscribe(
 
 #[cfg(test)]
 mod create_session_req_tests {
-    use super::CreateSessionReq;
+    use super::{CreateSessionReq, validate_crew_opts};
     use super::should_send_initial_prompt;
     use crate::session_manager::SessionType;
 
@@ -6865,6 +6885,27 @@ mod create_session_req_tests {
         let json = r#"{"type":"claude","initial_prompt":"hello"}"#;
         let req: CreateSessionReq = serde_json::from_str(json).unwrap();
         assert_eq!(req.initial_prompt.as_deref(), Some("hello"));
+    }
+
+    #[test]
+    fn crew_fields_default_to_empty_for_old_clients() {
+        let req: CreateSessionReq = serde_json::from_str(r#"{"type":"crew"}"#).unwrap();
+        assert_eq!((req.crew_mode.as_str(), req.crew_agent.as_str()), ("", ""));
+        let req: CreateSessionReq = serde_json::from_str(r#"{"type":"crew","crew_agent":"kirocrew-conductor"}"#).unwrap();
+        assert_eq!(req.crew_agent, "kirocrew-conductor");
+    }
+
+    #[test]
+    fn crew_opts_whitelist() {
+        assert!(validate_crew_opts(SessionType::Crew, "", "").is_ok());
+        assert!(validate_crew_opts(SessionType::Crew, "crew", "").is_ok());
+        assert!(validate_crew_opts(SessionType::Crew, "", "kirocrew-conductor").is_ok());
+        assert!(validate_crew_opts(SessionType::Crew, "chat", "").is_err());
+        assert!(validate_crew_opts(SessionType::Crew, "", "pipeline-conductor").is_err(), "Stage 4, not S5");
+        assert!(validate_crew_opts(SessionType::Crew, "CREW", "").is_err(), "exact match, no case folding");
+        // Crew options on any other type are a client bug.
+        assert!(validate_crew_opts(SessionType::Claude, "crew", "").is_err());
+        assert!(validate_crew_opts(SessionType::Claude, "", "").is_ok());
     }
 }
 

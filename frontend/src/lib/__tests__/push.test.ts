@@ -2,6 +2,11 @@ import { describe, it, expect, vi } from 'vitest'
 import { vapidKeyToUint8Array, levelAllows, shouldSuppress, pickApplicationServerKey, shouldResyncNow, enablePush } from '../push'
 
 describe('push pure fns', () => {
+  it('levelAllows mirrors the server: run_done and term_ended are routine', () => {
+    expect(levelAllows('run_done', { important: true, routine: false })).toBe(false)
+    expect(levelAllows('run_done', { important: false, routine: true })).toBe(true)
+    expect(levelAllows('term_ended', { important: false, routine: true })).toBe(true)
+  })
   it('vapidKeyToUint8Array decodes base64url to 65-byte P-256 point', () => {
     // 65 字节 uncompressed point 的 base64url(0x04 + 32 + 32),用一个已知长度向量
     const b64url = 'B' + 'A'.repeat(86)  // 87 chars ≈ 65 bytes

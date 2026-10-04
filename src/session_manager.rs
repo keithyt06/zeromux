@@ -331,6 +331,8 @@ pub struct Session {
     lifetime_cost_usd: f64,
     /// Triage "at a glance" fields (spec v3 M2). In-memory, lock-only.
     posture: Posture,
+    /// S5 U1 / R4: Some only for SessionType::Crew. Persisted in the crew_* columns.
+    pub crew: Option<CrewMeta>,
     /// 运行态；None = 未运行（可按 resume_token 重生）。
     running: Option<RunningProcess>,
     /// Output history for replay on reconnect (base64 for PTY, JSON for ACP agents)
@@ -411,6 +413,14 @@ pub struct SessionInfo {
     pub current_step: Option<String>,
     pub pending_approvals: u32,
     pub lifetime_cost_usd: f64,
+    /// S5 U1 raw Crew values; the frontend derives chat / topics / goal. Omitted for
+    /// non-Crew sessions.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub crew_mode: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub crew_agent: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub crew_origin: Option<String>,
 }
 
 // ── Git worktree helpers ──
@@ -527,6 +537,70 @@ fn resolve_work_dir(work_dir: &str, session_id: &str, isolation: bool) -> (PathB
     }
 }
 
+/// S5 U1: Crew slot metadata, persisted in the `crew_*` columns. Some only for Crew
+/// sessions. The three display variants (chat / topics / goal) are derived by the
+/// frontend from these raw values.
+#[derive(Debug, Clone, PartialEq)]
+pub struct CrewMeta {
+    /// Gateway raw value: "" | "crew".
+    pub mode: String,
+    /// Gateway raw value, e.g. "kirocrew-conductor"; "" = default agent.
+    pub agent: String,
+    /// "zeromux" | "external".
+    pub origin: String,
+}
+
+impl CrewMeta {
+    /// U2: ownership comes ONLY from the persisted origin.
+    pub fn owns_slot(&self) -> bool { self.origin != "external" }
+}
+
+/// Pure: how to (re)attach a Crew session's slot. A Crew token → resume it, owned per
+/// origin; anything else (no token, the fresh-fallback retry, a stray non-Crew token)
+/// → a new slot carrying the persisted mode/agent, which we own by construction.
+fn crew_slot_init(token: Option<&ResumeToken>, crew: Option<&CrewMeta>) -> crate::acp::crew_process::SlotInit {
+    use crate::acp::crew_process::SlotInit;
+    match token {
+        Some(ResumeToken::Crew(k)) => SlotInit::Resume {
+            key: k.clone(),
+            owns: crew.map(|c| c.owns_slot()).unwrap_or(true),
+        },
+        _ => SlotInit::New {
+            mode: crew.map(|c| c.mode.clone()).unwrap_or_default(),
+            agent: crew.map(|c| c.agent.clone()).unwrap_or_default(),
+        },
+    }
+}
+
+/// What the resume-failed fallback must write to SQLite once the sessions lock is
+/// released; computed from the IN-LOCK state by `adopt_fresh_slot`.
+struct FallbackPersist {
+    /// Clear the stored token — only when memory still holds no token (nothing
+    /// backfilled yet); otherwise the fan-out already persisted the new one.
+    clear_token: bool,
+    /// Crew: full row with the adopted origin and the current (in-lock) token.
+    snapshot: Option<PersistedSession>,
+}
+
+/// Phase-3 bookkeeping after a resume-failed fresh fallback (pure, lock-held caller).
+/// Drops the token only if it is still the pre-spawn `stale` one: the fresh fan-out
+/// may already have backfilled the NEW token (Crew's init event usually wins the
+/// race to phase 3), and that one must survive. Crew: the freshly created slot is
+/// ours (origin → zeromux, mode/agent kept), so after a restart it is still owned
+/// and deleted on Drop.
+fn adopt_fresh_slot(s: &mut Session, stale: Option<&ResumeToken>) -> FallbackPersist {
+    if s.resume_token.as_ref() == stale {
+        s.resume_token = None;
+    }
+    if let Some(c) = s.crew.as_mut() {
+        c.origin = "zeromux".into();
+    }
+    FallbackPersist {
+        clear_token: s.resume_token.is_none(),
+        snapshot: s.crew.is_some().then(|| persisted_of(s)),
+    }
+}
+
 /// What `ensure_running` should do for one session, decided under the lock.
 struct SpawnPlan {
     stype: SessionType,
@@ -536,6 +610,7 @@ struct SpawnPlan {
     cols: u16,
     rows: u16,
     source_task_id: Option<String>,
+    crew: Option<CrewMeta>,
 }
 
 enum SpawnDecision {
@@ -586,6 +661,7 @@ fn decide_spawn(s: &mut Session) -> SpawnDecision {
             cols: s.cols,
             rows: s.rows,
             source_task_id: s.source_task_id.clone(),
+            crew: s.crew.clone(),
         })
     }
 }
@@ -604,6 +680,7 @@ fn apply_turn(session: &mut Session, state: TurnState, seq: u64) {
                 // A superseded turn (interrupt-resend) never settles, and an approval
                 // answered elsewhere sends no receipt: a new turn starts with none (A9).
                 session.posture.approval_ids.clear();
+                session.posture.turn_snippet = None;
             }
             TurnState::Idle => {
                 // Idempotent: a single turn can emit two boundaries (Claude
@@ -690,17 +767,15 @@ fn session_info_of(s: &Session) -> SessionInfo {
         tmux_origin: s.tmux_origin,
         other_clients: 0,
         peer_name: (s.session_type == SessionType::Claude).then(|| peer_name_for(&s.id)),
-        last_outcome: s.posture.last_outcome.map(|o| match o {
-            crate::run_metrics::RunOutcome::Completed => "completed",
-            crate::run_metrics::RunOutcome::Errored => "errored",
-            crate::run_metrics::RunOutcome::Timeout => "timeout",
-            crate::run_metrics::RunOutcome::Cancelled => "cancelled",
-        }),
+        last_outcome: s.posture.last_outcome.map(crate::run_metrics::RunOutcome::as_str),
         last_outcome_ms: s.posture.last_outcome_ms,
         last_snippet: s.posture.last_snippet.clone(),
         current_step: s.posture.current_step.clone(),
         pending_approvals: s.posture.approval_ids.len() as u32,
         lifetime_cost_usd: s.lifetime_cost_usd,
+        crew_mode: s.crew.as_ref().map(|c| c.mode.clone()),
+        crew_agent: s.crew.as_ref().map(|c| c.agent.clone()),
+        crew_origin: s.crew.as_ref().map(|c| c.origin.clone()),
     }
 }
 
@@ -1096,7 +1171,7 @@ impl SessionManager {
                                 let title = m.session_name(&sid_for_exit).unwrap_or_default();
                                 let sid3 = sid_for_exit.clone();
                                 tokio::spawn(async move {
-                                    p.send_to_user(&owner, &crate::push::payload_for("term_ended", &title, &sid3, None)).await;
+                                    p.send_to_user(&owner, &crate::push::payload_for("term_ended", &title, &sid3, None, None)).await;
                                 });
                             }
                         }
@@ -1187,6 +1262,7 @@ impl SessionManager {
             lifetime_duration_ms: 0,
             lifetime_cost_usd: 0.0,
             posture: Posture::default(),
+            crew: None,
             running: Some(running),
             scrollback: VecDeque::new(),
             scrollback_bytes: 0,
@@ -1306,6 +1382,7 @@ impl SessionManager {
             lifetime_duration_ms: 0,
             lifetime_cost_usd: 0.0,
             posture: Posture::default(),
+            crew: None,
             running: Some(running),
             scrollback: VecDeque::new(),
             scrollback_bytes: 0,
@@ -1652,6 +1729,7 @@ impl SessionManager {
             lifetime_duration_ms: 0,
             lifetime_cost_usd: 0.0,
             posture: Posture::default(),
+            crew: None,
             running: Some(running),
             scrollback: VecDeque::new(),
             scrollback_bytes: 0,
@@ -1662,22 +1740,19 @@ impl SessionManager {
         Ok(id)
     }
 
-    /// Spawn a Crew session for `id` at `work_dir`, start its fan-out, return the
-    /// live handle. `resume` carries a slot key from a previous run.
+    /// Spawn a Crew session for `id` at `work_dir`, start its fan-out, return the live handle. `init` says whether to create or resume the slot (R4).
     async fn spawn_crew(
         &self,
         id: &str,
         work_dir: &str,
         owner_id: &str,
-        resume: Option<String>,
+        init: crate::acp::crew_process::SlotInit,
     ) -> Result<RunningProcess, String> {
         let cfg = crate::acp::crew_process::CrewConfig::new(
             std::path::PathBuf::from(&self.crew_home),
             self.crew_port,
         );
-        let process = crate::acp::crew_process::CrewProcess::spawn(
-            cfg, work_dir, resume.as_deref(),
-        )
+        let process = crate::acp::crew_process::CrewProcess::spawn(cfg, work_dir, init)
         .await
         .map_err(|e| format!("Failed to start Crew session: {}", e))?;
 
@@ -1714,6 +1789,8 @@ impl SessionManager {
         cols: u16,
         rows: u16,
         owner_id: &str,
+        crew_mode: &str,
+        crew_agent: &str,
     ) -> Result<String, String> {
         let id = uuid::Uuid::new_v4().to_string();
         // worktree 隔离对 Crew **不适用**：cwd 由 Gateway 管（我们 POST project），
@@ -1721,7 +1798,8 @@ impl SessionManager {
         let (effective_dir, worktree_path) = resolve_work_dir(work_dir, &id, false);
 
         let running = self
-            .spawn_crew(&id, &effective_dir.to_string_lossy(), owner_id, None)
+            .spawn_crew(&id, &effective_dir.to_string_lossy(), owner_id,
+                crate::acp::crew_process::SlotInit::New { mode: crew_mode.to_string(), agent: crew_agent.to_string() })
             .await
             .map_err(|e| {
                 if let Some(wt) = &worktree_path {
@@ -1756,6 +1834,7 @@ impl SessionManager {
             lifetime_duration_ms: 0,
             lifetime_cost_usd: 0.0,
             posture: Posture::default(),
+            crew: Some(CrewMeta { mode: crew_mode.to_string(), agent: crew_agent.to_string(), origin: "zeromux".into() }),
             running: Some(running),
             scrollback: VecDeque::new(),
             scrollback_bytes: 0,
@@ -1763,6 +1842,8 @@ impl SessionManager {
 
         self.persist_meta(&session);
         self.sessions.lock().unwrap().insert(id.clone(), session);
+        // U5: gate-T input (journalctl -u zeromux | grep zmx_usage).
+        tracing::info!(target: "zmx_usage", "{}", crew_create_usage(&id, crew_mode, crew_agent));
         Ok(id)
     }
 
@@ -1781,7 +1862,7 @@ impl SessionManager {
         };
 
         // 别人在 spawn：锁外轮询等待 running 出现（最多 ~30s）。
-        let Some(SpawnPlan { stype, resume_token: token, work_dir, owner_id, cols, rows, source_task_id }) = plan else {
+        let Some(SpawnPlan { stype, resume_token: token, work_dir, owner_id, cols, rows, source_task_id, crew }) = plan else {
             for _ in 0..300 {
                 tokio::time::sleep(std::time::Duration::from_millis(100)).await;
                 let map = self.sessions.lock().unwrap();
@@ -1830,11 +1911,7 @@ impl SessionManager {
                 self.spawn_codex(id, &work_dir, &owner_id, r).await
             }
             SessionType::Crew => {
-                let r = match &token {
-                    Some(ResumeToken::Crew(s)) => Some(s.clone()),
-                    _ => None,
-                };
-                self.spawn_crew(id, &work_dir, &owner_id, r).await
+                self.spawn_crew(id, &work_dir, &owner_id, crew_slot_init(token.as_ref(), crew.as_ref())).await
             }
             SessionType::Tmux => {
                 let t = match &token {
@@ -1863,7 +1940,7 @@ impl SessionManager {
                 let fresh = match stype {
                     SessionType::Claude => self.spawn_claude(id, &work_dir, &owner_id, None, source_task_id.as_deref()).await,
                     SessionType::Codex => self.spawn_codex(id, &work_dir, &owner_id, None).await,
-                    SessionType::Crew => self.spawn_crew(id, &work_dir, &owner_id, None).await,
+                    SessionType::Crew => self.spawn_crew(id, &work_dir, &owner_id, crew_slot_init(None, crew.as_ref())).await,
                     // tmux: no bare-shell fallback — a bare shell silently loses
                     // persistence. Preflight already decided Lost/Ended/ServerDown.
                     SessionType::Tmux => Err(e.clone()),
@@ -1893,6 +1970,7 @@ impl SessionManager {
 
         // 阶段 3：锁内装回 + 清 spawning。
         let mut map = self.sessions.lock().unwrap();
+        let mut fallback_persist = None;
         let outcome = match map.get_mut(id) {
             Some(s) => {
                 s.spawning = false;
@@ -1900,9 +1978,10 @@ impl SessionManager {
                     Ok(rp) => {
                         if fell_back {
                             // Drop the stale resume token in memory before `running`
-                            // is observable. The fresh fan-out re-backfills a new
-                            // token on the new session's first id-bearing event.
-                            s.resume_token = None;
+                            // is observable — unless the fresh fan-out already
+                            // backfilled a new one (kept). Crew: the fresh slot is
+                            // ours now (origin → zeromux).
+                            fallback_persist = Some(adopt_fresh_slot(s, token.as_ref()));
                         }
                         s.running = Some(rp);
                         s.status = SessionMeta::Running;
@@ -1933,15 +2012,28 @@ impl SessionManager {
             })
             .to_string();
             self.push_scrollback(id, evt_json);
-            // Clear the stale token in SQLite. Done after phase 3 (not at fallback
-            // time) to keep the SQLite + memory clears adjacent. Residual race: a
-            // fast fresh fan-out may have already backfilled a NEW token into both
-            // memory and SQLite before this line; this clear then wipes SQLite while
-            // memory keeps the new token. Self-heals on next restart (SQLite is
-            // authoritative) and is harmless in-session (the live process is fresh).
-            let _ = self.store.update_resume_token(id, None);
+            if let Some(p) = fallback_persist {
+                self.persist_fallback(id, p);
+            }
         }
         outcome
+    }
+
+    /// Post-phase-3 half of the resume-failed fallback (no sessions lock held).
+    /// Writes reflect the in-lock state `adopt_fresh_slot` saw: if the fresh fan-out
+    /// had already backfilled a new token (memory + SQLite), it is neither cleared
+    /// nor overwritten. Remaining window: a backfill landing between phase 3 and
+    /// these writes has its SQLite write race ours; memory always keeps the new
+    /// token, and the next restart's resume-failed fallback self-heals.
+    fn persist_fallback(&self, id: &str, p: FallbackPersist) {
+        if p.clear_token {
+            let _ = self.store.update_resume_token(id, None);
+        }
+        if let Some(snap) = p.snapshot {
+            if let Err(e) = self.store.upsert(&snap) {
+                tracing::warn!("persist crew fallback {} failed: {}", id, e);
+            }
+        }
     }
 
     /// List sessions, optionally filtered by owner. Pass None for all (admin).
@@ -2125,8 +2217,9 @@ impl SessionManager {
     /// A turn truly settled (not a Claude SkipBoundary): record its outcome and
     /// clear per-turn posture. Called beside `record_run_metric` in each fan-out.
     fn settle_posture(&self, sid: &str, outcome: crate::run_metrics::RunOutcome) {
-        let mut map = self.sessions.lock().unwrap();
-        if let Some(s) = map.get_mut(sid) {
+        {
+            let mut map = self.sessions.lock().unwrap();
+            let Some(s) = map.get_mut(sid) else { return };
             s.posture.last_outcome = Some(outcome);
             s.posture.last_outcome_ms = Some(now_millis());
             s.posture.current_step = None;
@@ -2135,6 +2228,27 @@ impl SessionManager {
             if matches!(outcome, crate::run_metrics::RunOutcome::Errored | crate::run_metrics::RunOutcome::Timeout) {
                 s.posture.last_snippet = None;
             }
+        }
+        // U3: lock released above — never hold `sessions` across SQLite I/O.
+        self.persist_posture(sid);
+    }
+
+    /// Push body source: this turn's own Result snippet, if any.
+    fn push_snippet(&self, sid: &str) -> Option<String> {
+        self.sessions.lock().unwrap().get(sid).and_then(|s| s.posture.turn_snippet.clone())
+    }
+
+    /// U3: snapshot the persisted posture subset under the sessions lock, then write
+    /// it OUTSIDE the lock (SQLite on JuiceFS can be slow). Best-effort: a failed
+    /// write only warns — the fan-out must never stall on persistence.
+    fn persist_posture(&self, sid: &str) {
+        let snap = {
+            let map = self.sessions.lock().unwrap();
+            let Some(s) = map.get(sid) else { return };
+            persisted_posture_of(&s.posture)
+        };
+        if let Err(e) = self.store.update_posture(sid, &snap) {
+            tracing::warn!("persist posture {} failed: {}", sid, e);
         }
     }
 
@@ -2303,6 +2417,9 @@ impl SessionManager {
             } else {
                 (DEFAULT_COLS, DEFAULT_ROWS)
             };
+            let crew = (p.session_type == SessionType::Crew).then(|| CrewMeta {
+                mode: p.crew_mode.clone(), agent: p.crew_agent.clone(), origin: p.crew_origin.clone(),
+            });
             map.insert(
                 id,
                 Session {
@@ -2334,7 +2451,15 @@ impl SessionManager {
                     lifetime_turns: 0,
                     lifetime_duration_ms: 0,
                     lifetime_cost_usd: 0.0,
-                    posture: Posture::default(),
+                    posture: Posture {
+                        last_outcome: p.posture.last_outcome.as_deref()
+                            .and_then(crate::run_metrics::RunOutcome::parse_lenient),
+                        last_outcome_ms: p.posture.last_outcome_ms,
+                        last_snippet: p.posture.last_snippet,
+                        awaiting_input: p.posture.awaiting_input,
+                        ..Posture::default()
+                    },
+                    crew,
                     running: None,
                     scrollback: VecDeque::new(),
                     scrollback_bytes: 0,
@@ -2661,6 +2786,10 @@ fn persisted_of(s: &Session) -> PersistedSession {
         cols: s.cols,
         rows: s.rows,
         pending_kill_until: s.pending_kill_until,
+        posture: persisted_posture_of(&s.posture),
+        crew_mode: s.crew.as_ref().map(|c| c.mode.clone()).unwrap_or_default(),
+        crew_agent: s.crew.as_ref().map(|c| c.agent.clone()).unwrap_or_default(),
+        crew_origin: s.crew.as_ref().map(|c| c.origin.clone()).unwrap_or_else(|| "zeromux".into()),
     }
 }
 
@@ -2807,16 +2936,48 @@ fn maybe_push_turn_done(
         if let Some(p) = m.push_handle() {
             let now = now_millis();
             let name = m.session_name(sid).unwrap_or_default();
+            let body = m.push_snippet(sid).and_then(|s| crate::push::push_body_of(&s));
             let uid = owner_id.to_string();
             let sid2 = sid.to_string();
             tokio::spawn(async move {
                 if crate::push::should_push_turn_done(now, p.last_turn_push(&uid, &sid2), dur_ms) {
                     p.mark_turn_pushed(&uid, &sid2, now);
-                    p.send_to_user(&uid, &crate::push::payload_for("turn_done", &name, &sid2, None)).await;
+                    p.send_to_user(&uid, &crate::push::payload_for("turn_done", &name, &sid2, None, body.as_deref())).await;
                 }
             });
         }
     }
+}
+
+/// Gate for the run_done push at the scheduled `Result` arm: that arm is entered by
+/// EVENT TYPE, so a Cancelled/Timeout-killed run whose CLI still emits a Result
+/// would otherwise push "⏰ 完成" (spec §2.3). Same intent source as turn_done.
+fn run_done_push_allowed(intent: Option<crate::run_metrics::RunOutcome>) -> bool {
+    !intent_suppresses_push(intent)
+}
+
+/// F2: a scheduled run finished successfully. Routine band (D8); called only from the
+/// `finalize_run(…, "succeeded", …)` arm, and the caller gates it on
+/// `run_done_push_allowed(intent)` because a Cancelled/Timeout run can still reach
+/// that arm via a Result. Body: verdict > this turn's snippet > default.
+/// Dedupes against turn_done's (uid,sid) debounce map (spec §2.2): suppressed if
+/// that session pushed within the last 30s, then marks the map. A scheduled turn
+/// never also fires turn_done (gated on `active_run_id.is_none()`), so in practice
+/// this throttles back-to-back runs / a just-preceding interactive turn_done.
+fn maybe_push_run_done(mgr: &Weak<SessionManager>, sid: &str, owner_id: &str, verdict: Option<&str>) {
+    let Some(m) = mgr.upgrade() else { return };
+    let Some(p) = m.push_handle() else { return };
+    let name = m.session_name(sid).unwrap_or_default();
+    let body = verdict.and_then(crate::push::push_body_of)
+        .or_else(|| m.push_snippet(sid).and_then(|s| crate::push::push_body_of(&s)));
+    let (uid, sid2, now) = (owner_id.to_string(), sid.to_string(), now_millis());
+    tokio::spawn(async move {
+        if !crate::push::should_push_run_done(now, p.last_turn_push(&uid, &sid2)) {
+            return;
+        }
+        p.mark_turn_pushed(&uid, &sid2, now);
+        p.send_to_user(&uid, &crate::push::payload_for("run_done", &name, &sid2, None, body.as_deref())).await;
+    });
 }
 
 fn spawn_acp_fanout(
@@ -3001,7 +3162,8 @@ fn spawn_acp_fanout(
                                 // exact intent-vs-event-type gap (2026-08-07 F3 / 08-08 F2);
                                 // this closes the sibling on the scheduled run_failed path.
                                 // (review 2026-08-12, F-RUNFAILED-INTENT.)
-                                let intent_aborted = intent_suppresses_push(turn_starts.front_intent());
+                                let run_intent = turn_starts.front_intent();
+                                let intent_aborted = intent_suppresses_push(run_intent);
                                 // Finalize a scheduled run exactly once, keyed
                                 // on active_run_id, mapped by terminal event type.
                                 if let Some(rid) = active_run_id.take() {
@@ -3011,6 +3173,9 @@ fn spawn_acp_fanout(
                                                 let verdict = crate::scheduled_tasks::extract_verdict(text);
                                                 m.finalize_run(&rid, "succeeded", verdict.as_deref(),
                                                     if verdict.is_some() { None } else { Some("no_verdict") });
+                                                if run_done_push_allowed(run_intent) {
+                                                    maybe_push_run_done(&mgr, &sid, &owner_id, verdict.as_deref());
+                                                }
                                             }
                                             AcpEvent::Error { .. } => {
                                                 m.finalize_run(&rid, "failed", None, Some("cli_error"));
@@ -3024,7 +3189,7 @@ fn spawn_acp_fanout(
                                                         let uid = owner_id.clone();
                                                         let sid2 = sid.clone();
                                                         tokio::spawn(async move {
-                                                            p2.send_to_user(&uid, &crate::push::payload_for("run_failed", &name, &sid2, Some("cli_error"))).await;
+                                                            p2.send_to_user(&uid, &crate::push::payload_for("run_failed", &name, &sid2, Some("cli_error"), None)).await;
                                                         });
                                                     }
                                                 }
@@ -3041,7 +3206,7 @@ fn spawn_acp_fanout(
                                                         let uid = owner_id.clone();
                                                         let sid2 = sid.clone();
                                                         tokio::spawn(async move {
-                                                            p2.send_to_user(&uid, &crate::push::payload_for("run_failed", &name, &sid2, Some("cli_exited"))).await;
+                                                            p2.send_to_user(&uid, &crate::push::payload_for("run_failed", &name, &sid2, Some("cli_exited"), None)).await;
                                                         });
                                                     }
                                                 }
@@ -3602,7 +3767,8 @@ fn emit_queue_mode(event_tx: &broadcast::Sender<String>, mode: QueueMode) {
 /// Precomputed "at a glance" state for the triage list (spec v3 §0.5.1 M2/M3/M5).
 /// Maintained only under the sessions lock from `record_and_broadcast` /
 /// `settle_posture` / `approval_resolved`; `session_info_of` just copies it.
-/// In-memory only: a restart resets it (accepted, M8).
+/// `last_outcome*` / `last_snippet` / `awaiting_input` are persisted once per settled
+/// turn by `persist_posture` (S5 U3); `current_step` / `approval_ids` stay in memory.
 #[derive(Default, Clone, Debug, PartialEq)]
 struct Posture {
     last_outcome: Option<crate::run_metrics::RunOutcome>,
@@ -3611,6 +3777,21 @@ struct Posture {
     current_step: Option<String>,
     /// Unresolved Crew approval ids, deduped (M9b). Exported as `len()`.
     approval_ids: Vec<String>,
+    /// 「待回答」 (S6 G3 writes it; S5 only persists and restores it).
+    awaiting_input: bool,
+    /// THIS turn's Result snippet, for the push body only (Review Focus 1): cleared
+    /// when a turn starts, so an errored turn never pushes the previous summary.
+    /// Never persisted.
+    turn_snippet: Option<String>,
+}
+
+fn persisted_posture_of(p: &Posture) -> crate::session_store::PersistedPosture {
+    crate::session_store::PersistedPosture {
+        last_outcome: p.last_outcome.map(|o| o.as_str().to_string()),
+        last_outcome_ms: p.last_outcome_ms,
+        last_snippet: p.last_snippet.clone(),
+        awaiting_input: p.awaiting_input,
+    }
 }
 
 /// What one event changes in `Posture`. Computed in `emit` from the typed event,
@@ -3667,7 +3848,7 @@ fn posture_settles(boundary_count: u64, turn_seq: u64, settled: bool) -> bool {
 fn apply_posture_delta(p: &mut Posture, d: PostureDelta) {
     match d {
         PostureDelta::Step(s) => p.current_step = Some(s),
-        PostureDelta::Snippet(s) => p.last_snippet = Some(s),
+        PostureDelta::Snippet(s) => { p.turn_snippet = Some(s.clone()); p.last_snippet = Some(s) }
         PostureDelta::ApprovalAdded(id) => { if !p.approval_ids.contains(&id) { p.approval_ids.push(id) } }
     }
 }
@@ -3888,6 +4069,20 @@ pub fn sanitize_title(raw: &str) -> Option<String> {
     }
 }
 
+/// U5 `crew_create` usage line (logged under `target: "zmx_usage"`); gate T greps
+/// the `crew_create sid=` prefix.
+fn crew_create_usage(id: &str, mode: &str, agent: &str) -> String {
+    format!("crew_create sid={id} mode={mode} agent={agent}")
+}
+
+/// U5 first-prompt metric gate: true exactly once per fan-out, for the first
+/// user (non-scheduled) prompt.
+fn take_first_prompt(logged: &mut bool, scheduled: bool) -> bool {
+    if scheduled || *logged { return false; }
+    *logged = true;
+    true
+}
+
 /// Crew fan-out. Mirrors `spawn_acp_fanout` byte-for-byte in structure — the
 /// only differences are the resume-token source (`crew_slot_key` → `ResumeToken::Crew`)
 /// and the backend name in log lines. The fan-out no longer owns a child process but
@@ -3918,6 +4113,8 @@ fn spawn_crew_fanout(
         // Per-turn (start, intent) FIFO; intent stamped on the live turn via
         // set_live_intent from the input branch (Cancel/Timeout). See TurnStarts.
         let mut turn_starts = TurnStarts::default();
+        // U5: one crew_first_prompt line per fan-out (S6 topics branch reuses this flag).
+        let mut first_prompt_logged = false;
         loop {
             tokio::select! {
                 event = process.event_rx.recv() => {
@@ -4020,6 +4217,9 @@ fn spawn_crew_fanout(
                 input = input_rx.recv() => {
                     match input {
                         Some(SessionInput::Prompt { text, run_id, client_id }) => {
+                            if take_first_prompt(&mut first_prompt_logged, run_id.is_some()) {
+                                tracing::info!(target: "zmx_usage", "crew_first_prompt sid={}", sid);
+                            }
                             // Echo each user prompt as its own UserPrompt event (P1):
                             // N collect-merged messages still surface as N bubbles.
                             // turn_id = the turn this prompt will belong to. In the
@@ -4688,6 +4888,7 @@ mod decide_spawn_tests {
             lifetime_duration_ms: 0,
             lifetime_cost_usd: 0.0,
             posture: Posture::default(),
+            crew: None,
             running: None,
             scrollback: VecDeque::new(),
             scrollback_bytes: 0,
@@ -4878,6 +5079,7 @@ mod turn_state_tests {
             lifetime_duration_ms: 0,
             lifetime_cost_usd: 0.0,
             posture: Posture::default(),
+            crew: None,
             running: Some(RunningProcess {
                 event_tx, input_tx, pty_pid: None,
                 turn_state: TurnState::Idle,
@@ -5595,6 +5797,7 @@ mod running_summary_tests {
             lifetime_duration_ms: 0,
             lifetime_cost_usd: 0.0,
             posture: Posture::default(),
+            crew: None,
             running: Some(RunningProcess {
                 event_tx,
                 input_tx,
@@ -6426,6 +6629,7 @@ mod lifetime_tests {
             lifetime_duration_ms: 0,
             lifetime_cost_usd: 0.0,
             posture: Posture::default(),
+            crew: None,
             running: None,
             scrollback: VecDeque::new(),
             scrollback_bytes: 0,
@@ -7025,6 +7229,7 @@ mod tmux_session_tests {
             last_activity_ms: 0, turns_completed: 0, run_metrics: VecDeque::new(),
             lifetime_turns: 0, lifetime_duration_ms: 0, lifetime_cost_usd: 0.0,
             posture: Posture::default(),
+            crew: None,
             running: None, scrollback: VecDeque::new(), scrollback_bytes: 0,
         }
     }
@@ -7052,6 +7257,8 @@ mod terminal_size_tests {
             resume_token: Some(ResumeToken::Tmux(format!("zmx-{id}"))), worktree_path: None,
             created_ms: 0, source_task_id: None, name_is_auto: true,
             tmux_origin: Some("own".into()), cols, rows, pending_kill_until: None,
+            posture: Default::default(),
+            crew_mode: String::new(), crew_agent: String::new(), crew_origin: "zeromux".into(),
         }
     }
 
@@ -7162,6 +7369,7 @@ mod posture_tests {
             pending_kill_until: None, worktree_path: None, created_ms: 0, source_task_id: None,
             spawning: false, last_activity_ms: 0, turns_completed: 0, run_metrics: VecDeque::new(),
             lifetime_turns: 0, lifetime_duration_ms: 0, lifetime_cost_usd: 0.0, posture: Posture::default(),
+            crew: None,
             running: None, scrollback: VecDeque::new(), scrollback_bytes: 0,
         }
     }
@@ -7284,5 +7492,437 @@ mod posture_tests {
         let json = serde_json::to_value(&i).unwrap();
         assert_eq!(json["pending_approvals"], 0);
         assert!(json["last_outcome"].is_null());
+    }
+}
+
+#[cfg(test)]
+mod posture_persist_tests {
+    use super::*;
+    use crate::run_metrics::RunOutcome;
+
+    /// Shared fixture (also used by later S5 tasks): an idle, in-memory Claude session.
+    pub(super) fn session(id: &str) -> Session {
+        Session {
+            id: id.into(), name: "n".into(), session_type: SessionType::Claude, cols: 80, rows: 24,
+            work_dir: "/tmp".into(), owner_id: "o".into(), description: String::new(),
+            name_is_auto: true, status: SessionMeta::Idle, resume_token: None, tmux_origin: None,
+            pending_kill_until: None, worktree_path: None, created_ms: 0, source_task_id: None,
+            spawning: false, last_activity_ms: 0, turns_completed: 0, run_metrics: VecDeque::new(),
+            lifetime_turns: 0, lifetime_duration_ms: 0, lifetime_cost_usd: 0.0, posture: Posture::default(),
+            crew: None,
+            running: None, scrollback: VecDeque::new(), scrollback_bytes: 0,
+        }
+    }
+
+    /// Shared fixture: a manager whose event/session DBs live in `dir`, so a second
+    /// `mgr_at(dir)` + `load_persisted()` simulates a restart.
+    pub(super) fn mgr_at(dir: &std::path::Path) -> Arc<SessionManager> {
+        let events = Arc::new(crate::events::EventStore::open(dir).unwrap());
+        let store = Arc::new(crate::session_store::SessionStore::open(dir).unwrap());
+        SessionManager::new(events, store, "claude".into(), "codex".into(), "off".into(),
+            5476, "/tmp/crew".into(), "bash".into(), false,
+            crate::tmux::TmuxCtl::new(Some("zmx-test-unused".into())))
+    }
+
+    /// Shared fixture: put `s` both in the store and in memory.
+    pub(super) fn seed(m: &SessionManager, s: Session) {
+        m.store.upsert(&persisted_of(&s)).unwrap();
+        m.sessions.lock().unwrap().insert(s.id.clone(), s);
+    }
+
+    fn result(text: &str) -> AcpEvent {
+        AcpEvent::Result { text: text.into(), turn_id: 0, session_id: String::new(),
+            cost_usd: None, tokens_in: None, tokens_out: None }
+    }
+
+    pub(super) fn reloaded_info(dir: &std::path::Path, id: &str) -> SessionInfo {
+        let m = mgr_at(dir);
+        m.load_persisted();
+        let map = m.sessions.lock().unwrap();
+        session_info_of(map.get(id).unwrap())
+    }
+
+    #[test]
+    fn completed_settle_survives_restart() {
+        let d = tempfile::tempdir().unwrap();
+        let m = mgr_at(d.path());
+        seed(&m, session("p"));
+        m.record_and_broadcast("p", "{}".into(), true, posture_delta_of(&result("All green\nShipped")));
+        m.settle_posture("p", RunOutcome::Completed);
+        let before = session_info_of(m.sessions.lock().unwrap().get("p").unwrap());
+        drop(m);
+        let after = reloaded_info(d.path(), "p");
+        assert_eq!(after.last_outcome, Some("completed"));
+        assert_eq!(after.last_outcome_ms, before.last_outcome_ms, "timestamp survives verbatim");
+        assert_eq!(after.last_snippet.as_deref(), Some("Shipped"));
+    }
+
+    #[test]
+    fn errored_settle_persists_a_null_snippet() {
+        // D9 / A10: a failed turn must not resurrect the previous turn's summary after restart.
+        let d = tempfile::tempdir().unwrap();
+        let m = mgr_at(d.path());
+        seed(&m, session("p"));
+        m.record_and_broadcast("p", "{}".into(), true, posture_delta_of(&result("old summary")));
+        m.settle_posture("p", RunOutcome::Completed);
+        m.settle_posture("p", RunOutcome::Errored);
+        drop(m);
+        let after = reloaded_info(d.path(), "p");
+        assert_eq!(after.last_outcome, Some("errored"));
+        assert_eq!(after.last_snippet, None);
+    }
+
+    #[test]
+    fn current_step_and_approvals_are_not_restored() {
+        let d = tempfile::tempdir().unwrap();
+        let m = mgr_at(d.path());
+        seed(&m, session("p"));
+        m.settle_posture("p", RunOutcome::Completed);
+        // A new turn is mid-flight when the process dies.
+        let tool = AcpEvent::ContentBlock { block_type: std::borrow::Cow::Borrowed("tool_use"), turn_id: 0,
+            text: None, name: Some("Bash".into()), input: None, streaming: None, summary: None };
+        m.record_and_broadcast("p", "{}".into(), true, posture_delta_of(&tool));
+        let ap = AcpEvent::Approval { id: "a".into(), tool: "t".into(), tool_input: None, tool_purpose: None, slot: "s".into() };
+        m.record_and_broadcast("p", "{}".into(), true, posture_delta_of(&ap));
+        m.persist_posture("p");
+        drop(m);
+        let after = reloaded_info(d.path(), "p");
+        assert_eq!(after.current_step, None);
+        assert_eq!(after.pending_approvals, 0);
+        assert_eq!(after.last_outcome, Some("completed"));
+    }
+
+    #[test]
+    fn awaiting_input_round_trips() {
+        let d = tempfile::tempdir().unwrap();
+        let m = mgr_at(d.path());
+        seed(&m, session("p"));
+        m.sessions.lock().unwrap().get_mut("p").unwrap().posture.awaiting_input = true;
+        m.persist_posture("p");
+        drop(m);
+        let m2 = mgr_at(d.path());
+        m2.load_persisted();
+        assert!(m2.sessions.lock().unwrap().get("p").unwrap().posture.awaiting_input);
+    }
+
+    #[test]
+    fn unknown_outcome_string_loads_as_none_without_panic() {
+        let d = tempfile::tempdir().unwrap();
+        let m = mgr_at(d.path());
+        seed(&m, session("p"));
+        m.store.update_posture("p", &crate::session_store::PersistedPosture {
+            last_outcome: Some("exploded".into()), last_outcome_ms: Some(7), ..Default::default()
+        }).unwrap();
+        drop(m);
+        let after = reloaded_info(d.path(), "p");
+        assert_eq!(after.last_outcome, None);
+        assert_eq!(after.last_outcome_ms, Some(7));
+    }
+
+    #[test]
+    fn persist_for_a_session_missing_from_the_store_is_a_silent_noop() {
+        // In-memory-only sessions (every other test module) must not error or panic.
+        let d = tempfile::tempdir().unwrap();
+        let m = mgr_at(d.path());
+        m.sessions.lock().unwrap().insert("ghost".into(), session("ghost"));
+        m.settle_posture("ghost", RunOutcome::Completed);
+        m.persist_posture("nope");
+        // Nothing was written to the store (UPDATE on a missing row affects zero rows) …
+        assert_eq!(m.store.load_all().unwrap().len(), 0);
+        // … yet the in-memory posture still settled normally.
+        let info = session_info_of(m.sessions.lock().unwrap().get("ghost").unwrap());
+        assert_eq!(info.last_outcome, Some("completed"));
+        assert!(info.last_outcome_ms.is_some());
+    }
+
+    fn running(mut s: Session) -> Session {
+        let (event_tx, _) = broadcast::channel(BROADCAST_CAPACITY);
+        let (input_tx, _rx) = mpsc::channel::<SessionInput>(8);
+        s.running = Some(RunningProcess { event_tx, input_tx, pty_pid: None, turn_state: TurnState::Idle,
+            turn_started_ms: None, turn_seq: 0, queue_mode: QueueMode::Collect });
+        s
+    }
+
+    #[test]
+    fn push_snippet_is_this_turns_result_only() {
+        // Review Focus 1: Claude calls maybe_push_turn_done BEFORE settle_posture, so an
+        // errored turn still holds the previous turn's last_snippet at push time.
+        let d = tempfile::tempdir().unwrap();
+        let m = mgr_at(d.path());
+        seed(&m, running(session("p")));
+        m.mark_turn("p", TurnState::Running, 1);
+        m.record_and_broadcast("p", "{}".into(), true, posture_delta_of(&result("全部测试通过")));
+        assert_eq!(m.push_snippet("p").as_deref(), Some("全部测试通过"));
+        m.settle_posture("p", RunOutcome::Completed);
+        // Turn 2 errors without a Result of its own.
+        m.mark_turn("p", TurnState::Running, 2);
+        assert_eq!(m.push_snippet("p"), None, "a new turn starts with no push snippet");
+        assert_eq!(
+            session_info_of(m.sessions.lock().unwrap().get("p").unwrap()).last_snippet.as_deref(),
+            Some("全部测试通过"),
+            "the triage second line is unchanged until settle"
+        );
+    }
+
+    #[test]
+    fn push_snippet_is_not_persisted() {
+        let d = tempfile::tempdir().unwrap();
+        let m = mgr_at(d.path());
+        seed(&m, running(session("p")));
+        m.record_and_broadcast("p", "{}".into(), true, posture_delta_of(&result("done")));
+        m.settle_posture("p", RunOutcome::Completed);
+        drop(m);
+        let m2 = mgr_at(d.path());
+        m2.load_persisted();
+        assert_eq!(m2.push_snippet("p"), None);
+    }
+
+    #[tokio::test]
+    async fn maybe_push_run_done_is_safe_noop_without_push_service() {
+        let d = tempfile::tempdir().unwrap();
+        let m = mgr_at(d.path());
+        seed(&m, running(session("p")));
+        assert!(m.push_handle().is_none(), "premise: no PushService wired");
+        let weak = Arc::downgrade(&m);
+        maybe_push_run_done(&weak, "p", "o", Some("无新告警"));
+        maybe_push_run_done(&weak, "p", "o", None);
+        maybe_push_run_done(&Weak::new(), "p", "o", None);
+    }
+
+    #[test]
+    fn result_boundary_with_aborted_intent_does_not_push_run_done() {
+        // Review fix: a Cancelled/Timeout scheduled run can still end on a Result
+        // (partial text) → finalize_run("succeeded") arm; it must not push "⏰ 完成".
+        assert!(!run_done_push_allowed(Some(RunOutcome::Cancelled)));
+        assert!(!run_done_push_allowed(Some(RunOutcome::Timeout)));
+        assert!(run_done_push_allowed(None), "a normal Result boundary pushes");
+        assert!(run_done_push_allowed(Some(RunOutcome::Completed)));
+    }
+}
+
+#[cfg(test)]
+mod crew_meta_tests {
+    use super::*;
+    use super::posture_persist_tests::{mgr_at, seed};
+    use crate::acp::crew_process::SlotInit;
+
+    fn meta(origin: &str) -> CrewMeta {
+        CrewMeta { mode: String::new(), agent: "kirocrew-conductor".into(), origin: origin.into() }
+    }
+
+    #[test]
+    fn owns_slot_is_origin_not_resume_presence() {
+        assert!(meta("zeromux").owns_slot());
+        assert!(!meta("external").owns_slot());
+        // Unknown origin strings are treated as ours: only an explicit "external" disowns.
+        assert!(meta("").owns_slot());
+    }
+
+    #[test]
+    fn own_slot_resumed_after_restart_is_still_owned() {
+        // CTO M2: self-made slots restart via resume=Some(k) too; they must still be deleted on close.
+        let tok = ResumeToken::Crew("zmx-k".into());
+        match crew_slot_init(Some(&tok), Some(&meta("zeromux"))) {
+            SlotInit::Resume { key, owns } => { assert_eq!(key, "zmx-k"); assert!(owns); }
+            _ => panic!("expected Resume"),
+        }
+        match crew_slot_init(Some(&tok), Some(&meta("external"))) {
+            SlotInit::Resume { owns, .. } => assert!(!owns),
+            _ => panic!("expected Resume"),
+        }
+    }
+
+    #[test]
+    fn no_token_means_a_new_slot_with_the_persisted_mode_and_agent() {
+        match crew_slot_init(None, Some(&CrewMeta { mode: "crew".into(), agent: String::new(), origin: "zeromux".into() })) {
+            SlotInit::New { mode, agent } => { assert_eq!(mode, "crew"); assert_eq!(agent, ""); }
+            _ => panic!("expected New"),
+        }
+        // Pre-S5 rows (crew: None) and a non-Crew token behave like a plain new slot.
+        assert!(matches!(crew_slot_init(None, None), SlotInit::New { ref mode, ref agent } if mode.is_empty() && agent.is_empty()));
+        let claude = ResumeToken::Claude("x".into());
+        assert!(matches!(crew_slot_init(Some(&claude), None), SlotInit::New { .. }));
+    }
+
+    fn crew_session(id: &str, crew: Option<CrewMeta>) -> Session {
+        let mut s = posture_persist_tests::session(id);
+        s.session_type = SessionType::Crew;
+        s.name = "c".into();
+        s.resume_token = Some(ResumeToken::Crew("zmx-k".into()));
+        s.crew = crew;
+        s
+    }
+
+    #[test]
+    fn fresh_fallback_keeps_mode_and_agent_and_owns() {
+        // Review Focus 4: when resume fails, ensure_running retries with token=None.
+        // The fresh slot must keep the session's mode/agent — and is ours by construction.
+        let m = CrewMeta { mode: "crew".into(), agent: "kirocrew-conductor".into(), origin: "external".into() };
+        match crew_slot_init(None, Some(&m)) {
+            SlotInit::New { mode, agent } => {
+                assert_eq!(mode, "crew");
+                assert_eq!(agent, "kirocrew-conductor");
+            }
+            _ => panic!("expected New"),
+        }
+        // CrewProcess::spawn's New branch: owned, created, project set.
+        let plan = crate::acp::crew_process::new_slot_plan();
+        assert!(plan.owns && plan.created && plan.set_project);
+
+        // ...and the session adopts the fresh slot: origin flips to "zeromux"
+        // (mode/agent kept), so it is still owned — and deleted on Drop — after a restart.
+        let d = tempfile::tempdir().unwrap();
+        let mgr = mgr_at(d.path());
+        seed(&mgr, crew_session("c", Some(m.clone())));
+        {
+            let mut map = mgr.sessions.lock().unwrap();
+            let s = map.get_mut("c").unwrap();
+            let p = adopt_fresh_slot(s, Some(&ResumeToken::Crew("zmx-k".into())));
+            assert_eq!(s.resume_token, None);
+            drop(map);
+            mgr.persist_fallback("c", p);
+        }
+        drop(mgr);
+        let m2 = mgr_at(d.path());
+        m2.load_persisted();
+        let map = m2.sessions.lock().unwrap();
+        let c = map.get("c").unwrap().crew.clone().unwrap();
+        assert_eq!(c, CrewMeta { mode: "crew".into(), agent: "kirocrew-conductor".into(), origin: "zeromux".into() });
+        assert!(c.owns_slot());
+    }
+
+    #[test]
+    fn adopt_fresh_slot_leaves_non_crew_sessions_alone() {
+        let mut s = posture_persist_tests::session("k");
+        s.resume_token = Some(ResumeToken::Claude("x".into()));
+        let p = adopt_fresh_slot(&mut s, Some(&ResumeToken::Claude("x".into())));
+        assert_eq!(s.resume_token, None);
+        assert_eq!(s.crew, None);
+        assert!(p.clear_token && p.snapshot.is_none());
+    }
+
+    #[test]
+    fn fallback_keeps_a_token_backfilled_before_phase_3() {
+        // Crew's spawn enqueues System{init, session_id: new key} before returning, so
+        // the fresh fan-out usually backfills the NEW key (memory + SQLite) before
+        // ensure_running's phase 3. Phase 3 must not wipe it, or the fresh owned slot
+        // is lost and orphaned after a restart.
+        let d = tempfile::tempdir().unwrap();
+        let mgr = mgr_at(d.path());
+        let stale = ResumeToken::Crew("zmx-k".into());
+        let fresh = ResumeToken::Crew("zmx-new".into());
+        seed(&mgr, crew_session("c", Some(meta("zeromux"))));
+        mgr.set_resume_token("c", fresh.clone());          // fan-out backfill wins the race
+        let p = {
+            let mut map = mgr.sessions.lock().unwrap();
+            adopt_fresh_slot(map.get_mut("c").unwrap(), Some(&stale))
+        };
+        mgr.persist_fallback("c", p);
+        assert_eq!(mgr.sessions.lock().unwrap().get("c").unwrap().resume_token, Some(fresh.clone()));
+        let row = mgr.store.load_all().unwrap().into_iter().find(|r| r.id == "c").unwrap();
+        assert_eq!(row.resume_token, Some(fresh));
+        assert_eq!(row.crew_origin, "zeromux");
+    }
+
+    #[test]
+    fn metadata_upsert_keeps_external_origin_and_mode_agent() {
+        // persisted_of must source crew_* from s.crew, not hard-code them: a metadata
+        // upsert (persist_meta) of an external slot must not silently re-own it.
+        let d = tempfile::tempdir().unwrap();
+        let mgr = mgr_at(d.path());
+        let ext = CrewMeta { mode: "crew".into(), agent: "kirocrew-conductor".into(), origin: "external".into() };
+        seed(&mgr, crew_session("e", Some(ext.clone())));
+        {
+            let mut map = mgr.sessions.lock().unwrap();
+            let s = map.get_mut("e").unwrap();
+            s.name = "renamed".into();
+            let s = map.get("e").unwrap();
+            mgr.persist_meta(s);
+        }
+        drop(mgr);
+        let m2 = mgr_at(d.path());
+        m2.load_persisted();
+        let map = m2.sessions.lock().unwrap();
+        let s = map.get("e").unwrap();
+        assert_eq!(s.name, "renamed");
+        assert_eq!(s.crew, Some(ext));
+    }
+
+    #[test]
+    fn decide_spawn_carries_crew_meta() {
+        let m = CrewMeta { mode: "crew".into(), agent: String::new(), origin: "zeromux".into() };
+        let mut s = crew_session("c", Some(m.clone()));
+        match decide_spawn(&mut s) {
+            SpawnDecision::Spawn(plan) => assert_eq!(plan.crew, Some(m)),
+            _ => panic!("expected Spawn"),
+        }
+    }
+
+    #[test]
+    fn crew_meta_round_trips_through_the_store_and_non_crew_rows_get_none() {
+        let dir = tempfile::tempdir().unwrap();
+        let m = mgr_at(dir.path());
+        let conductor = CrewMeta { mode: String::new(), agent: "kirocrew-conductor".into(), origin: "zeromux".into() };
+        m.store.upsert(&persisted_of(&crew_session("c", Some(conductor.clone())))).unwrap();
+        let mut claude = crew_session("k", None);
+        claude.session_type = SessionType::Claude;
+        claude.resume_token = None;
+        m.store.upsert(&persisted_of(&claude)).unwrap();
+        // A pre-S5 Crew row: crew columns at their DEFAULTs.
+        m.store.upsert(&persisted_of(&crew_session("old", None))).unwrap();
+        drop(m);
+
+        let m = mgr_at(dir.path());
+        m.load_persisted();
+        let map = m.sessions.lock().unwrap();
+        assert_eq!(map.get("c").unwrap().crew, Some(conductor));
+        assert_eq!(map.get("k").unwrap().crew, None, "non-Crew sessions never carry CrewMeta");
+        assert_eq!(map.get("old").unwrap().crew,
+            Some(CrewMeta { mode: String::new(), agent: String::new(), origin: "zeromux".into() }),
+            "pre-S5 Crew rows are ours (DEFAULT 'zeromux')");
+    }
+
+    #[test]
+    fn info_exports_crew_fields_only_for_crew_sessions() {
+        let s = crew_session("c", Some(CrewMeta { mode: String::new(), agent: "kirocrew-conductor".into(), origin: "zeromux".into() }));
+        let i = session_info_of(&s);
+        assert_eq!(i.crew_agent.as_deref(), Some("kirocrew-conductor"));
+        assert_eq!(i.crew_mode.as_deref(), Some(""));
+        assert_eq!(i.crew_origin.as_deref(), Some("zeromux"));
+        let mut k = crew_session("k", None);
+        k.session_type = SessionType::Claude;
+        let json = serde_json::to_value(session_info_of(&k)).unwrap();
+        assert!(json.get("crew_mode").is_none() && json.get("crew_agent").is_none() && json.get("crew_origin").is_none(),
+            "non-Crew sessions omit the three keys: {json}");
+    }
+
+    #[test]
+    fn conductor_agent_survives_restart_in_session_info() {
+        let dir = tempfile::tempdir().unwrap();
+        let m = mgr_at(dir.path());
+        let s = crew_session("c", Some(CrewMeta { mode: String::new(), agent: "kirocrew-conductor".into(), origin: "zeromux".into() }));
+        m.persist_meta(&s);
+        drop(m);
+        let m2 = mgr_at(dir.path());
+        m2.load_persisted();
+        let info = session_info_of(m2.sessions.lock().unwrap().get("c").unwrap());
+        assert_eq!(info.crew_agent.as_deref(), Some("kirocrew-conductor"));
+    }
+
+    #[test]
+    fn first_prompt_is_logged_once_and_never_for_scheduled_prompts() {
+        let mut logged = false;
+        assert!(!take_first_prompt(&mut logged, true), "a scheduled prompt is not a user adopting Crew");
+        assert!(take_first_prompt(&mut logged, false));
+        assert!(!take_first_prompt(&mut logged, false));
+        assert!(logged);
+    }
+
+    #[test]
+    fn crew_create_usage_line_has_the_gate_t_prefix() {
+        // U5: journalctl counting (gate T) greps this exact prefix under target zmx_usage.
+        assert_eq!(crew_create_usage("abc", "crew", "kirocrew-conductor"),
+                   "crew_create sid=abc mode=crew agent=kirocrew-conductor");
+        assert_eq!(crew_create_usage("abc", "", ""), "crew_create sid=abc mode= agent=");
     }
 }

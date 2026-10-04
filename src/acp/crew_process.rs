@@ -198,12 +198,49 @@ pub fn normalize_frame(
             }
         }
 
+        // ── chat_message：仅 Crew Mode 的 crew_* 回答（R1 实测：普通模式不发此帧）──
+        // 白名单 kind，不按 role 放行（KC/state.py:2296-2348 普通模式在无 HTTP reader
+        // 时也可能发 assistant chat_message → 会与 chat_chunk 双渲染）。
+        // 非边界：不进 turn_text，不产 Result —— 否则会混进下一轮 chat_done 的正文。
+        "chat_message" => crew_message_events(data),
+
         // ── 其余全部丢弃 ──
         // slots / dashboard / heartbeat / refresh / mcp_report_update / slot_title /
-        // chat_segment / chat_message_update / activity_event：全局帧，或已被上面的
+        // chat_segment / chat_message_update / activity_event /
+        // chat_message（非 crew_* kind 由 crew_message_events 丢弃）：全局帧，或已被上面的
         // 专用帧覆盖（chat_segment / chat_message_update 是 chat_chunk 的重复表述，
         // 一起处理会让同一段正文渲染两次）。
         _ => { tracing::debug!("crew: dropped frame type {kind}"); vec![] }
+    }
+}
+
+/// G1 (S5 spec §6.2). `data` is the frame's `data` object, already slot-filtered.
+/// Lenient on purpose (K2, upstream is experimental): kind from `data.kind` or
+/// `data.meta.kind`; body from `data.content` or `data.text`. Anything outside the
+/// whitelist — other kinds, non-assistant roles, junk types — maps to nothing.
+pub fn crew_message_events(data: &serde_json::Value) -> Vec<AcpEvent> {
+    if data.get("role").and_then(|v| v.as_str()) != Some("assistant") { return vec![] }
+    let kind = data.get("kind").and_then(|v| v.as_str())
+        .or_else(|| data.get("meta").and_then(|m| m.get("kind")).and_then(|v| v.as_str()));
+    let body = data.get("content").and_then(|v| v.as_str())
+        .or_else(|| data.get("text").and_then(|v| v.as_str()))
+        .filter(|s| !s.trim().is_empty());
+    match (kind, body) {
+        // D2: an ack is not an answer — a grey system line, never an assistant bubble.
+        (Some("crew_ack"), _) => vec![AcpEvent::System {
+            subtype: Cow::Borrowed("crew_ack"), session_id: None, count: None,
+        }],
+        // D3: non-boundary text blocks; the frontend styles them by `summary`.
+        (Some(k @ ("crew_ask" | "crew_result" | "crew_meta")), Some(text)) => vec![AcpEvent::ContentBlock {
+            block_type: Cow::Borrowed("text"),
+            turn_id: 0,
+            text: Some(text.to_string()),
+            name: None,
+            input: None,
+            streaming: None,
+            summary: Some(k.to_string()),
+        }],
+        _ => vec![],
     }
 }
 
@@ -254,6 +291,32 @@ enum Cmd {
     Stop,
 }
 
+/// How `spawn` obtains its slot (R4). Ownership is decided by the caller from the
+/// PERSISTED origin (U2) — never inferred from "is this a resume": our own slots are
+/// resumed with a key after every restart too.
+pub enum SlotInit {
+    /// Create a fresh slot. `mode` / `agent` are Gateway raw values; empty = omit.
+    New { mode: String, agent: String },
+    /// Re-attach to an existing slot. `owns=false` for slots zeromux did not create.
+    Resume { key: String, owns: bool },
+}
+
+/// Drop removes the Gateway slot only if we own it (U2).
+pub fn should_delete_on_drop(owns_slot: bool) -> bool { owns_slot }
+
+/// What a resume may touch. A foreign slot keeps its own project/cwd (S7 D-G6).
+#[derive(Debug, PartialEq)]
+pub struct ResumePlan { pub set_project: bool }
+
+pub fn resume_plan(owns: bool) -> ResumePlan { ResumePlan { set_project: owns } }
+
+/// What `spawn`'s `SlotInit::New` branch does (pure, so Review Focus 4 is testable):
+/// a slot zeromux creates — including the resume-failed fresh fallback — is ours.
+#[derive(Debug, PartialEq)]
+pub struct NewSlotPlan { pub owns: bool, pub created: bool, pub set_project: bool }
+
+pub fn new_slot_plan() -> NewSlotPlan { NewSlotPlan { owns: true, created: true, set_project: true } }
+
 /// 形状与 `CodexProcess`（codex_process.rs:375-378）逐字对齐：私有 `cmd_tx` +
 /// `pub event_rx`，所以 `spawn_crew_fanout` 可以照抄 `spawn_codex_fanout`。
 pub struct CrewProcess {
@@ -261,6 +324,9 @@ pub struct CrewProcess {
     pub event_rx: mpsc::Receiver<AcpEvent>,
     cfg: CrewConfig,
     slot_key: String,
+    /// R4: false for slots zeromux did not create — Drop then stops the loop but
+    /// never DELETEs the slot. Only S7 G6 ever constructs `owns_slot=false`.
+    owns_slot: bool,
 }
 
 /// 读 Gateway 的 internal secret：优先 `<crew_home>/run/gateway-<port>.secret`，
@@ -316,8 +382,17 @@ async fn post_json_ok(
     if status.is_success() { Ok(()) } else { Err(format!("Gateway 拒绝 {path}（HTTP {}）", status.as_u16())) }
 }
 
-async fn create_slot(http: &reqwest::Client, base: &str, secret: &str, key: &str) -> Result<(), String> {
-    post_json_ok(http, base, secret, "/api/chat/slots", serde_json::json!({ "name": key }), REST_TIMEOUT).await
+/// G2: POST body for a new slot. With empty mode/agent this is byte-identical to the
+/// pre-S5 `{"name":k}` so default sessions are untouched.
+pub fn slot_create_body(key: &str, mode: &str, agent: &str) -> serde_json::Value {
+    let mut b = serde_json::json!({ "name": key });
+    if !mode.is_empty() { b["mode"] = serde_json::Value::String(mode.to_string()); }
+    if !agent.is_empty() { b["agent"] = serde_json::Value::String(agent.to_string()); }
+    b
+}
+
+async fn create_slot(http: &reqwest::Client, base: &str, secret: &str, body: serde_json::Value) -> Result<(), String> {
+    post_json_ok(http, base, secret, "/api/chat/slots", body, REST_TIMEOUT).await
 }
 
 async fn set_slot_project(http: &reqwest::Client, base: &str, secret: &str, key: &str, project: &str) -> Result<(), String> {
@@ -583,7 +658,7 @@ async fn run_event_loop(
 }
 
 impl CrewProcess {
-    pub async fn spawn(cfg: CrewConfig, work_dir: &str, resume: Option<&str>)
+    pub async fn spawn(cfg: CrewConfig, work_dir: &str, init: SlotInit)
         -> Result<Self, Box<dyn std::error::Error + Send + Sync>>
     {
         let secret = read_gateway_secret(&cfg.crew_home, cfg.port)?;   // fail fast
@@ -593,34 +668,37 @@ impl CrewProcess {
             .redirect(reqwest::redirect::Policy::none())
             .build().map_err(|e| format!("build crew http client: {e}"))?;
 
-        let slot_key = match resume {
-            Some(k) => {
-                if !slot_alive(&http, &cfg.http_base, &secret, k).await {
-                    return Err(format!("Crew slot 已不存在（{k}），需重建会话").into());
+        let (slot_key, owns_slot, created, set_project) = match init {
+            SlotInit::Resume { key, owns } => {
+                if !slot_alive(&http, &cfg.http_base, &secret, &key).await {
+                    return Err(format!("Crew slot 已不存在（{key}），需重建会话").into());
                 }
-                k.to_string()
+                (key, owns, false, resume_plan(owns).set_project)
             }
-            None => {
+            SlotInit::New { mode, agent } => {
                 let k = new_slot_key();
-                create_slot(&http, &cfg.http_base, &secret, &k).await?;
-                k
+                create_slot(&http, &cfg.http_base, &secret, slot_create_body(&k, &mode, &agent)).await?;
+                let p = new_slot_plan();
+                (k, p.owns, p.created, p.set_project)
             }
         };
 
         // project 就是 agent 的真实 cwd（实测 agent `pwd` 与设定值逐字相同）。
         // work_dir=="." 解析成绝对路径 —— Gateway 逐字传给 ACP session/new 的 cwd，
         // 相对路径无意义（照 kiro_process.rs:134-138）。
-        let project = if work_dir == "." {
-            std::env::current_dir()?.to_string_lossy().to_string()
-        } else {
-            work_dir.to_string()
-        };
-        if let Err(e) = set_slot_project(&http, &cfg.http_base, &secret, &slot_key, &project).await {
-            if resume.is_none() {
-                // 建了 slot 但设 project 失败 → 清掉，别留孤儿
-                delete_slot(&http, &cfg.http_base, &secret, &slot_key).await;
+        if set_project {
+            let project = if work_dir == "." {
+                std::env::current_dir()?.to_string_lossy().to_string()
+            } else {
+                work_dir.to_string()
+            };
+            if let Err(e) = set_slot_project(&http, &cfg.http_base, &secret, &slot_key, &project).await {
+                if created {
+                    // 建了 slot 但设 project 失败 → 清掉，别留孤儿
+                    delete_slot(&http, &cfg.http_base, &secret, &slot_key).await;
+                }
+                return Err(e.into());
             }
-            return Err(e.into());
         }
 
         let (event_tx, event_rx) = mpsc::channel::<AcpEvent>(256);   // 与 kiro:164 / codex:407 同容量
@@ -635,7 +713,7 @@ impl CrewProcess {
         }).await;
 
         tokio::spawn(run_event_loop(cfg.clone(), http, slot_key.clone(), event_tx, cmd_rx));
-        Ok(Self { cmd_tx, event_rx, cfg, slot_key })
+        Ok(Self { cmd_tx, event_rx, cfg, slot_key, owns_slot })
     }
 
     pub fn slot_key(&self) -> &str { &self.slot_key }
@@ -666,6 +744,9 @@ impl Drop for CrewProcess {
         // 运行时关停时 spawn 的任务可能永不执行，把 cmd_tx clone 钉死在未完成的
         // future 里，循环就永远卡在 recv()。
         let _ = self.cmd_tx.try_send(Cmd::Stop);
+
+        // R4: never delete a slot we did not create (U2).
+        if !should_delete_on_drop(self.owns_slot) { return; }
 
         // 清远端 slot。必须 spawn（Drop 不能 await），但 secret 在 **Drop 的同步栈上**
         // 现读、再 move 进那个 future —— 不缓存在 self 里，也**不在 async 任务里做
@@ -996,5 +1077,143 @@ mod tests {
         assert!(err.contains("gateway-5476.secret") && err.contains(".local_secret"));
         assert!(!err.contains("SECRET"), "错误信息绝不能回显 secret 内容：{err}");
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    // ── G1 · chat_message 白名单（夹具来自 S5 SP，slot 已改写为 zmxprobe）──
+    const F_ACK: &str = include_str!("testdata/crew_frames_crew_ack.json");
+    const F_ASK: &str = include_str!("testdata/crew_frames_crew_ask.json");
+    const F_META: &str = include_str!("testdata/crew_frames_crew_meta.json");
+    // constructed — no live crew_result captured (gap-research §7 S5 SP)
+    const F_RESULT: &str = include_str!("testdata/crew_frames_crew_result.json");
+    const F_NORMAL: &str = include_str!("testdata/crew_frames_normal_turn.json");
+    fn frames(src: &str) -> Vec<serde_json::Value> { serde_json::from_str(src).expect("fixture is a JSON array") }
+
+    #[test]
+    fn g1_normal_mode_assistant_chat_message_without_kind_is_dropped() {
+        // Defensive regression (spec §6.3 must-have): KC may emit an assistant chat_message in
+        // normal mode when no HTTP reader is attached; letting it through double-renders
+        // alongside chat_chunk.
+        let mut st = NormState::new();
+        let f = json!({"type":"chat_message","data":{"slot":"s1","role":"assistant","content":"dup of the chunks"}});
+        assert!(normalize_frame(&f, "s1", &mut st).is_empty());
+    }
+
+    #[test]
+    fn g1_crew_ack_maps_to_a_system_notice() {
+        let mut st = NormState::new();
+        let evts: Vec<_> = frames(F_ACK).iter().flat_map(|f| normalize_frame(f, "zmxprobe", &mut st)).collect();
+        assert!(!evts.is_empty());
+        for e in &evts {
+            assert!(matches!(e, AcpEvent::System { subtype, session_id: None, count: None } if subtype.as_ref() == "crew_ack"), "{e:?}");
+        }
+    }
+
+    #[test]
+    fn g1_ask_result_meta_become_non_boundary_text_blocks_tagged_by_kind() {
+        // crew_result fixture is constructed — no live crew_result captured (gap-research §7 S5 SP)
+        for (src, kind) in [(F_ASK, "crew_ask"), (F_RESULT, "crew_result"), (F_META, "crew_meta")] {
+            let mut st = NormState::new();
+            let fs = frames(src);
+            let evts: Vec<_> = fs.iter().flat_map(|f| normalize_frame(f, "zmxprobe", &mut st)).collect();
+            assert_eq!(evts.len(), fs.len(), "one block per {kind} frame");
+            for (e, f) in evts.iter().zip(&fs) {
+                let want = f["data"]["content"].as_str().or(f["data"]["text"].as_str()).unwrap();
+                match e {
+                    AcpEvent::ContentBlock { block_type, text, summary, streaming, turn_id, .. } => {
+                        assert_eq!(block_type.as_ref(), "text");
+                        assert_eq!(text.as_deref(), Some(want));
+                        assert_eq!(summary.as_deref(), Some(kind));
+                        assert_eq!(*streaming, None);
+                        assert_eq!(*turn_id, 0);
+                    }
+                    other => panic!("{kind}: expected ContentBlock (never a boundary), got {other:?}"),
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn g1_crew_frames_never_enter_turn_text() {
+        // Non-boundary: a crew_* body must not leak into the next chat_done's Result.
+        // crew_result fixture is constructed — no live crew_result captured (gap-research §7 S5 SP)
+        let mut st = NormState::new();
+        let _ = normalize_frame(&chunk("zmxprobe", "a", 1), "zmxprobe", &mut st);
+        for f in frames(F_RESULT).iter().chain(frames(F_ASK).iter()) { let _ = normalize_frame(f, "zmxprobe", &mut st); }
+        match normalize_frame(&done("zmxprobe"), "zmxprobe", &mut st).last().unwrap() {
+            AcpEvent::Result { text, .. } => assert_eq!(text, "a"),
+            other => panic!("expected Result, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn g1_another_slots_crew_result_is_filtered() {
+        // constructed — no live crew_result captured (gap-research §7 S5 SP)
+        let mut st = NormState::new();
+        for f in frames(F_RESULT) { assert!(normalize_frame(&f, "someone-else", &mut st).is_empty()); }
+    }
+
+    #[test]
+    fn g1_lenient_fields_empty_bodies_and_foreign_kinds() {
+        // text fallback + kind under meta (K2: upstream is experimental).
+        let d = json!({"role":"assistant","text":"from text","meta":{"kind":"crew_result"}});
+        assert!(matches!(&crew_message_events(&d)[..],
+            [AcpEvent::ContentBlock { text: Some(t), summary: Some(k), .. }] if t == "from text" && k == "crew_result"));
+        // Blank body → dropped (ack carries no body of interest and is kept).
+        assert!(crew_message_events(&json!({"role":"assistant","kind":"crew_ask","content":"  "})).is_empty());
+        assert_eq!(crew_message_events(&json!({"role":"assistant","kind":"crew_ack"})).len(), 1);
+        // Unknown kind, user role, missing role → dropped.
+        assert!(crew_message_events(&json!({"role":"assistant","kind":"crew_plan","content":"x"})).is_empty());
+        assert!(crew_message_events(&json!({"role":"user","kind":"crew_result","content":"x"})).is_empty());
+        assert!(crew_message_events(&json!({"kind":"crew_result","content":"x"})).is_empty());
+        // Non-string junk never panics.
+        assert!(crew_message_events(&json!({"role":"assistant","kind":7,"content":["x"]})).is_empty());
+    }
+
+    #[test]
+    fn g1_normal_turn_fixture_still_ends_in_one_result_and_no_crew_blocks() {
+        let mut st = NormState::new();
+        let evts: Vec<_> = frames(F_NORMAL).iter().flat_map(|f| normalize_frame(f, "zmxprobe", &mut st)).collect();
+        assert!(matches!(evts.last(), Some(AcpEvent::Result { .. })), "{evts:?}");
+        assert!(!evts.iter().any(|e| matches!(e, AcpEvent::ContentBlock { summary: Some(k), .. } if k.starts_with("crew_"))));
+    }
+
+    // ── R4 · owns_slot（U2：只看持久化的 origin，禁止从 resume.is_none() 推断）──
+    #[test]
+    fn r4_drop_deletes_only_owned_slots() {
+        assert!(should_delete_on_drop(true));
+        assert!(!should_delete_on_drop(false));
+    }
+
+    #[test]
+    fn r4_resume_of_a_foreign_slot_never_touches_its_project() {
+        // S7 D-G6: attaching an external slot must not overwrite its cwd.
+        assert!(resume_plan(true).set_project, "our own slot: re-point project on resume (unchanged behaviour)");
+        assert!(!resume_plan(false).set_project, "external slot: leave its project alone");
+    }
+
+    #[test]
+    fn r4_new_slot_is_owned_created_and_project_set() {
+        // Review Focus 4 / M4: a freshly created slot (incl. the resume-failed fallback) is ours.
+        let p = new_slot_plan();
+        assert!(p.owns, "a slot zeromux creates is always owned");
+        assert!(p.created);
+        assert!(p.set_project);
+    }
+
+    // ── G2 · create_slot 请求体（默认逐字不变）──
+    #[test]
+    fn g2_default_slot_body_is_byte_identical_to_before() {
+        assert_eq!(serde_json::to_string(&slot_create_body("zmx-ab12cd34", "", "")).unwrap(),
+                   r#"{"name":"zmx-ab12cd34"}"#);
+    }
+
+    #[test]
+    fn g2_mode_and_agent_are_added_only_when_set() {
+        let b = slot_create_body("k", "crew", "");
+        assert_eq!(b, json!({"name":"k","mode":"crew"}));
+        let b = slot_create_body("k", "", "kirocrew-conductor");
+        assert_eq!(b, json!({"name":"k","agent":"kirocrew-conductor"}));
+        let b = slot_create_body("k", "crew", "kirocrew-conductor");
+        assert_eq!(b, json!({"name":"k","mode":"crew","agent":"kirocrew-conductor"}));
     }
 }

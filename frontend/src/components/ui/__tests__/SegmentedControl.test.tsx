@@ -11,4 +11,8 @@ describe('SegmentedControl', () => {
     fireEvent.keyDown(screen.getByRole('radio', { name: '跟随系统' }), { key: 'ArrowRight' })
     expect(onChange).toHaveBeenCalledWith('light')
   })
+  it('every option is a ≥44px touch target on coarse pointers (min-h --hit, not the 36px --ctl-h)', () => {
+    render(<SegmentedControl label="面板" value="a" onChange={() => {}} options={[{ value: 'a', label: 'A' }, { value: 'b', label: 'B' }]} />)
+    for (const r of screen.getAllByRole('radio')) expect(r).toHaveClass('min-h-[var(--hit)]')
+  })
 })

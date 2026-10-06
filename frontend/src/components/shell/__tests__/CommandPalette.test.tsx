@@ -452,6 +452,14 @@ describe('CommandPalette', () => {
     })
   })
 
+  it('会话类型 and Crew 模式 chips are ≥44px touch targets (min-h --hit)', async () => {
+    const { type } = setup({ initial: { mode: 'new' } })
+    type('crew ~/w')
+    await flush()
+    const groups = ['会话类型', 'Crew 模式'].map(name => screen.getByRole('radiogroup', { name }))
+    for (const g of groups) for (const r of g.querySelectorAll('[role=radio]')) expect(r).toHaveClass('min-h-[var(--hit)]')
+  })
+
   it('non-crew types show no Crew 模式 control and pass no crew opts', async () => {
     const { sh, type, key } = setup()
     type('tmux ~/x')

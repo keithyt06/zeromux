@@ -1,16 +1,18 @@
-import { useState, useEffect, useRef, useCallback, useMemo } from 'react'
+import { useState, useEffect, useRef, useCallback, useMemo, Suspense } from 'react'
 import { uploadSessionFile, getSessionRuns, getCrewMemory, putCrewSemantic, deleteCrewSemantic } from '../lib/api'
 import type { SemanticEntry } from '../lib/api'
 import { normalizeMemoryKey, parseSemanticValue } from '../lib/crewMemory'
-import { Brain, AlertCircle, Paperclip, Plus, X } from 'lucide-react'
+import { Brain, AlertCircle, ClipboardCheck, Paperclip, Plus, X } from 'lucide-react'
 import Composer from './Composer'
 import ConnectionBar from './ConnectionBar'
 import { usePromptPresets } from '../lib/usePromptPresets'
 import { resolvePresetPick, splitSlash } from '../lib/presetPick'
 import type { PromptPreset } from '../lib/api'
-import { IconButton, Menu, Popover, type MenuItem } from './ui'
+import { ErrorBoundary, IconButton, Menu, Popover, toast, type MenuItem } from './ui'
+import { lazyWithReload } from '../lib/lazyWithReload'
 import { QueueChip } from './composer/QueueChip'
 import { PresetPicker } from './composer/PresetPicker'
+import { conventionPrompt, lastOwnPrompt } from '../lib/conventionPrompt'
 import { SessionLifetimeBadge } from './SessionLifetimeBadge'
 import { foldTranscript, stabilizeGroups, type TurnGroup } from '../lib/transcript'
 import { shouldStickToBottom, shouldAutoScrollOnAppend, shouldTrackScrollUp } from '../lib/scrollReplay'
@@ -18,6 +20,10 @@ import type { PendingApproval, RegisterControls } from '../lib/sessionControls'
 import { useAcpSocket, newId, type Notice } from '../hooks/useAcpSocket'
 import { TurnView } from './turn/TurnView'
 import { TurnStatusBar } from './turn/TurnStatusBar'
+
+// F4 first-screen budget (≤0.5KB br): the 记为约定 editor loads on first open.
+// lazyWithReload + local ErrorBoundary: a post-deploy chunk 404 must not take down the shell (A1).
+const ConventionDialog = lazyWithReload(() => import('./composer/ConventionDialog').then(m => ({ default: m.ConventionDialog })))
 
 interface Props {
   sessionId: string
@@ -176,6 +182,8 @@ export default function AcpChatView({ sessionId, active, agentType = 'claude', o
   }, [slashQuery])
   const [plusAnchor, setPlusAnchor] = useState<HTMLButtonElement | null>(null)
   const [plusOpen, setPlusOpen] = useState(false)
+  // 「记为约定…」 (F4): prefill = composer text, else this session's last own prompt.
+  const [convention, setConvention] = useState<string | null>(null)
   // ── 就地记忆写入（composer 第 3 个按钮）──
   // 人只在「被冒犯的那一刻」想纠正记忆（agent 刚用了 npm 而你说过 pnpm），那一刻
   // 拇指在输入框上。要求用户「打开设置去配置偏好」= 问卷 = 没人填。
@@ -311,9 +319,10 @@ export default function AcpChatView({ sessionId, active, agentType = 'claude', o
     return () => onRegisterControls?.(sessionId, null)
   }, [sessionId, setQueueMode, sendPrompt, interrupt, resolveApproval, pendingApprovals, onRegisterControls])
 
-  // 「＋」 menu (V8): 附件 upload, and ⌘ memory for Crew only.
+  // 「＋」 menu (V8): 附件 upload, 记为约定 (F4, every agent), and ⌘ memory for Crew only.
   const plusItems: MenuItem[] = [
     { label: '附件', icon: Paperclip, onSelect: () => fileInputRef.current?.click() },
+    { label: '记为约定…', icon: ClipboardCheck, onSelect: () => setConvention(input.trim() ? input : lastOwnPrompt(events)) },
     ...(agentType === 'crew' ? [{ label: '记忆', ariaLabel: 'memory', icon: Brain, onSelect: () => {
       setMemConfirming(null)
       setMemOpen(true)
@@ -482,6 +491,15 @@ export default function AcpChatView({ sessionId, active, agentType = 'claude', o
               <span className="flex-1" />
               <IconButton ref={setPlusAnchor} label="更多" icon={Plus} onClick={() => { setSlashDismissed(true); closeMem(); setPlusOpen(o => !o) }} aria-haspopup="menu" aria-expanded={plusOpen} />
               <Menu open={plusOpen} onClose={() => setPlusOpen(false)} anchor={plusAnchor} items={plusItems} title="更多" />
+              {convention !== null && <ErrorBoundary onReload={() => setConvention(null)}><Suspense fallback={null}>
+                <ConventionDialog open initial={convention} onClose={() => setConvention(null)}
+                  onSend={t => {
+                    // Same sendPrompt this view registers as sessionControls; never carry composer attachments.
+                    const ok = sendPrompt(conventionPrompt(t), { withAttachments: false })
+                    toast.push({ message: ok ? '已交给 agent 记录' : '未连接，稍后再试' })
+                    return ok
+                  }} />
+              </Suspense></ErrorBoundary>}
             </>
           }
         />

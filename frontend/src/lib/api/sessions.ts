@@ -30,6 +30,10 @@ export interface SessionInfo {
   current_step?: string | null
   pending_approvals?: number
   lifetime_cost_usd?: number
+  // Crew only (S5 U1): raw Gateway values; see lib/crewVariant.ts. Absent for other types.
+  crew_mode?: string
+  crew_agent?: string
+  crew_origin?: 'zeromux' | 'external' | string
 }
 
 export interface SessionStatus {
@@ -66,10 +70,11 @@ export async function listSessions(): Promise<SessionInfo[]> {
   return (await listSessionsWithHost()).sessions
 }
 
-export async function createSession(type: SessionType, name?: string, workDir?: string, tmuxTarget?: string, initialPrompt?: string): Promise<SessionInfo> {
+export async function createSession(type: SessionType, name?: string, workDir?: string, tmuxTarget?: string, initialPrompt?: string,
+  crew?: { crew_mode: string; crew_agent: string }): Promise<SessionInfo> {
   const res = await api('/api/sessions', {
     method: 'POST',
-    body: JSON.stringify({ type, name: name || null, work_dir: workDir || null, tmux_target: tmuxTarget || null, initial_prompt: initialPrompt || null }),
+    body: JSON.stringify({ type, name: name || null, work_dir: workDir || null, tmux_target: tmuxTarget || null, initial_prompt: initialPrompt || null, ...(crew ?? {}) }),
   })
   if (!res.ok) throw new Error(await res.text())
   return res.json()

@@ -1,17 +1,23 @@
 import type { SessionType } from './api'
+import { CREW_VARIANT_WORDS, type CrewVariant } from './crewVariant'
 
 export type NewType = SessionType | 'vault'
-export interface ParsedNew { type: NewType | null; dir: string; prompt: string; literalPath: boolean }
+export interface ParsedNew { type: NewType | null; dir: string; prompt: string; literalPath: boolean; crewVariant?: CrewVariant }
 
 export const TYPE_WORDS: Record<string, NewType> = { claude: 'claude', codex: 'codex', crew: 'crew', tmux: 'tmux', term: 'tmux', vault: 'vault' }
 
-/** Rule-based, no LLM (spec §4.6). The preview row is what disambiguates. */
+/** Rule-based, no LLM (spec §4.6). The preview row is what disambiguates.
+ *  `crew:<variant>` (G2) is a crew keyword that also picks the Crew variant. */
 export function parseNew(input: string): ParsedNew {
   const toks = input.trim().split(/\s+/).filter(Boolean)
   let type: NewType | null = null
-  if (toks.length && TYPE_WORDS[toks[0].toLowerCase()]) type = TYPE_WORDS[toks.shift()!.toLowerCase()]
+  let crewVariant: CrewVariant | undefined
+  const first = toks[0]?.toLowerCase()
+  if (first && TYPE_WORDS[first]) { type = TYPE_WORDS[first]; toks.shift() }
+  else if (first && CREW_VARIANT_WORDS[first]) { type = 'crew'; crewVariant = CREW_VARIANT_WORDS[first]; toks.shift() }
   const dir = toks.shift() ?? ''
-  return { type, dir, prompt: toks.join(' '), literalPath: dir.startsWith('/') || dir.startsWith('~') }
+  const out: ParsedNew = { type, dir, prompt: toks.join(' '), literalPath: dir.startsWith('/') || dir.startsWith('~') }
+  return crewVariant ? { ...out, crewVariant } : out
 }
 
 export const LAST_TYPE_KEY = 'zmx_last_type'

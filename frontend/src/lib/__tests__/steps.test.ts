@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest'
-import { toSteps, touchedFiles, conclusion, stepCount } from '../steps'
+import { toSteps, touchedFiles, conclusion, lastText, stepCount } from '../steps'
 import type { Block, TurnGroup } from '../transcript'
 
 const tu = (name: string, summary?: string, input?: unknown): Block => ({ type: 'tool_use', name, summary, input })
@@ -104,5 +104,16 @@ describe('conclusion', () => {
   })
   it('empty when there is no text', () => {
     expect(conclusion(grp([tu('Read')]))).toBe('')
+  })
+})
+
+describe('lastText skips Crew ask/meta steps', () => {
+  const ck = (kind: string, text: string): Block => ({ type: 'text', text, summary: kind })
+  // crew_ack is a System event, not a text block, so the turn's blocks are ask×3 → meta.
+  it('route failure (ack → ask×3 → meta) has no conclusion; a crew_result is one', () => {
+    const fail = grp([ck('crew_ask', 'On it?'), ck('crew_ask', 'again?'), ck('crew_ask', 'still?'), ck('crew_meta', 'nothing started')])
+    expect(lastText(fail)).toBe('')
+    expect(conclusion(fail)).toBe('')
+    expect(lastText(grp([ck('crew_ask', 'On it?'), ck('crew_result', '已创建 hello.txt'), ck('crew_meta', 'done')]))).toBe('已创建 hello.txt')
   })
 })

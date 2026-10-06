@@ -1,5 +1,5 @@
 import { render, screen, fireEvent } from '@testing-library/react'
-import { describe, it, expect, vi } from 'vitest'
+import { describe, it, expect, vi, afterEach } from 'vitest'
 import { TriageList } from '../TriageList'
 import { Toaster } from '../../ui'
 import { mkSession } from '../../../test/appHarness'
@@ -119,5 +119,48 @@ describe('TriageList', () => {
   it('shows other-clients count with a Monitor badge', () => {
     setup([mkSession('x', { name: 'watched', other_clients: 2 })])
     expect(screen.getByTitle('其他终端也在查看')).toHaveTextContent('2')
+  })
+})
+
+describe('TriageList away card (F3)', () => {
+  afterEach(() => localStorage.clear())
+  it('shows above 需要你 after ≥30 min away with events; × hides it', () => {
+    localStorage.setItem('zmx_left_ms', String(Date.now() - 2 * 3_600_000))
+    // `err` is baselined at 0 by setup() → it sits in 需要你; `done` has no baseline → 空闲.
+    setup([
+      mkSession('err', { name: 'api-refactor', last_outcome: 'errored', last_outcome_ms: Date.now() - 60_000 }),
+      mkSession('done', { name: 'nightly', last_outcome: 'completed', last_outcome_ms: Date.now() - 3_600_000 }),
+    ])
+    const card = screen.getByRole('region', { name: '离开期间' })
+    expect(card).toHaveTextContent('出错 1')
+    expect(card).toHaveTextContent('完成 1')
+    const needs = screen.getByRole('list', { name: '需要你' })
+    expect(card.compareDocumentPosition(needs) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy()
+    fireEvent.click(screen.getByRole('button', { name: '关闭离开摘要' }))
+    expect(screen.queryByRole('region', { name: '离开期间' })).toBeNull()
+  })
+  it('no stored left time → no card', () => {
+    setup()
+    expect(screen.queryByRole('region', { name: '离开期间' })).toBeNull()
+  })
+  it('remounting TriageList does not bring back a dismissed card (I3)', () => {
+    localStorage.setItem('zmx_left_ms', String(Date.now() - 3 * 3_600_000))
+    const sessions = [mkSession('err', { last_outcome: 'errored', last_outcome_ms: Date.now() - 60_000 })]
+    const first = setup(sessions)
+    fireEvent.click(screen.getByRole('button', { name: '关闭离开摘要' }))
+    first.unmount()
+    setup(sessions)
+    expect(screen.queryByRole('region', { name: '离开期间' })).toBeNull()
+  })
+})
+
+describe('Crew variant badge (G2)', () => {
+  it('a conductor session shows the 目标指挥 badge; chat shows none', () => {
+    setup([
+      mkSession('g', { name: 'goal', type: 'crew', crew_mode: '', crew_agent: 'kirocrew-conductor', crew_origin: 'zeromux' }),
+      mkSession('c', { name: 'chat', type: 'crew', crew_mode: '', crew_agent: '', crew_origin: 'zeromux' }),
+    ])
+    expect(screen.getAllByRole('img', { name: '目标指挥' })).toHaveLength(1)
+    expect(screen.queryByRole('img', { name: '并行话题' })).toBeNull()
   })
 })

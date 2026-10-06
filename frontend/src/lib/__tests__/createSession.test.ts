@@ -23,4 +23,14 @@ describe('createSession initial_prompt', () => {
     const body = JSON.parse(fetchMock.mock.calls[0][1].body)
     expect(body.initial_prompt).toBeNull()
   })
+
+  it('sends crew_mode / crew_agent only when crew opts are given', async () => {
+    await createSession('crew', undefined, '/tmp/x', undefined, undefined, { crew_mode: '', crew_agent: 'kirocrew-conductor' })
+    const body = JSON.parse(fetchMock.mock.calls[0][1].body)
+    expect(body.crew_agent).toBe('kirocrew-conductor')
+    expect(body.crew_mode).toBe('')
+    await createSession('claude', undefined, '/tmp/x')
+    const plain = JSON.parse(fetchMock.mock.calls[1][1].body)
+    expect('crew_mode' in plain || 'crew_agent' in plain).toBe(false)
+  })
 })

@@ -32,9 +32,15 @@ describe('summarizeAway', () => {
     expect(summarizeAway(s, {}, null, BACK)).toBeNull()
     expect(summarizeAway([mkSession('o', { last_outcome: 'completed', last_outcome_ms: LEFT - H })], {}, LEFT, BACK)).toBeNull()
   })
-  it('pending confirms alone are enough to show the card', () => {
-    const r = summarizeAway([mkSession('a')], { a: 1 }, LEFT, BACK)!
-    expect(r.items).toEqual([{ key: 'confirm', label: '待确认', count: 1, firstId: 'a' }])
+  it('only a stale out-of-window confirm → null (confirms carry no timestamp, so they never trigger the card alone)', () => {
+    expect(summarizeAway([mkSession('a')], { a: 1 }, LEFT, BACK)).toBeNull()
+  })
+  it('pending confirms ride along once an in-window event shows the card', () => {
+    const r = summarizeAway([mkSession('a'), mkSession('d', { last_outcome: 'completed', last_outcome_ms: LEFT + H })], { a: 1 }, LEFT, BACK)!
+    expect(r.items).toEqual([
+      { key: 'confirm', label: '待确认', count: 1, firstId: 'a' },
+      { key: 'completed', label: '完成', count: 1, firstId: 'd' },
+    ])
   })
   it('Codex / Crew in the window mark the cost as partial; tmux is ignored', () => {
     const r = summarizeAway([

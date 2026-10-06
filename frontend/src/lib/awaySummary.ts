@@ -21,6 +21,9 @@ export function summarizeAway(sessions: SessionInfo[], confirms: Record<string, 
   const bucket = (pred: (s: SessionInfo) => boolean) => inWindow.filter(pred)
   const errored = bucket(s => s.last_outcome === 'errored' || s.last_outcome === 'timeout')
   const completed = bucket(s => s.last_outcome === 'completed')
+  // Pending confirms carry no timestamp here, so they can't prove something
+  // happened in the window: they only ride along once an in-window event exists.
+  if (errored.length + completed.length === 0) return null
   const confirmIds = sessions.filter(s => (confirms[s.id] ?? 0) > 0).map(s => s.id)
   const confirmCount = confirmIds.reduce((n, id) => n + confirms[id], 0)
   const counts: Partial<Record<AwayKey, { count: number; firstId: string | null }>> = {
@@ -32,7 +35,6 @@ export function summarizeAway(sessions: SessionInfo[], confirms: Record<string, 
     const c = counts[key]
     return c && c.count > 0 ? [{ key, label: LABEL[key], count: c.count, firstId: c.firstId }] : []
   })
-  if (items.length === 0) return null
   return {
     awayMs: nowMs - leftMs,
     items,

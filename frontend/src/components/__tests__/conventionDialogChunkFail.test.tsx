@@ -31,4 +31,16 @@ describe('记为约定 chunk load failure', () => {
     expect(screen.getByLabelText('更多')).toBeInTheDocument()
     expect(screen.getByRole('textbox')).toBeInTheDocument()
   })
+
+  it('the boundary button dismisses it (lazy caches the rejection; closing, not retry)', async () => {
+    const { default: AcpChatView } = await import('../AcpChatView')
+    render(<AcpChatView sessionId="s1" active agentType="claude" />)
+    await act(async () => { screen.getByLabelText('更多').click() })
+    await act(async () => { screen.getByRole('menuitem', { name: '记为约定…' }).click() })
+    const btn = await screen.findByRole('button', { name: /出错了/ })
+    await act(async () => { btn.click() })
+    expect(screen.queryByRole('button', { name: /出错了/ })).toBeNull()
+    expect(screen.getByLabelText('更多')).toBeInTheDocument()
+    expect(screen.getByRole('textbox')).toBeInTheDocument()
+  })
 })

@@ -491,7 +491,7 @@ export default function AcpChatView({ sessionId, active, agentType = 'claude', o
               <span className="flex-1" />
               <IconButton ref={setPlusAnchor} label="更多" icon={Plus} onClick={() => { setSlashDismissed(true); closeMem(); setPlusOpen(o => !o) }} aria-haspopup="menu" aria-expanded={plusOpen} />
               <Menu open={plusOpen} onClose={() => setPlusOpen(false)} anchor={plusAnchor} items={plusItems} title="更多" />
-              {convention !== null && <ErrorBoundary><Suspense fallback={null}>
+              {convention !== null && <ErrorBoundary onReload={() => setConvention(null)}><Suspense fallback={null}>
                 <ConventionDialog open initial={convention} onClose={() => setConvention(null)}
                   onSend={t => {
                     // Same sendPrompt this view registers as sessionControls; never carry composer attachments.

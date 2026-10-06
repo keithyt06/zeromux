@@ -8,6 +8,9 @@ import type { SessionControls } from '../../lib/sessionControls'
 import type { SessionAction } from '../../lib/sessionActions'
 import { IconButton, Menu } from '../ui'
 import { TriageRow } from './TriageRow'
+import { useAwayWindow } from '../../lib/awayClock'
+import { summarizeAway } from '../../lib/awaySummary'
+import { AwayCard } from './AwayCard'
 
 export interface TriageListProps {
   sessions: SessionInfo[]
@@ -59,6 +62,10 @@ export function TriageList(p: TriageListProps) {
   const { sessions, activeId, lastViewedMs, confirmsBySession, now, hostTmux = [], docTabs = [] } = p
   const groups = useMemo(() => groupTriage(sessions, { now, activeId, lastViewedMs, confirmsBySession }),
     [sessions, now, activeId, lastViewedMs, confirmsBySession])
+  const away = useAwayWindow()
+  const awaySummary = useMemo(
+    () => (away.dismissed ? null : summarizeAway(sessions, confirmsBySession, away.leftMs, away.backMs)),
+    [away.dismissed, away.leftMs, away.backMs, sessions, confirmsBySession])
 
   // Rows are memoized on data only; hand them stable identities that forward to
   // the latest props so an unchanged row never re-renders for a new closure (I-9).
@@ -77,6 +84,7 @@ export function TriageList(p: TriageListProps) {
 
   return (
     <div className="pb-2">
+      <AwayCard summary={awaySummary} onSelect={onSelect} onDismiss={away.dismiss} />
       <Group title="需要你" items={groups.needsYou} render={row} />
       <Group title="运行中" items={groups.running} render={row} />
       <Group title="空闲" items={groups.idle} render={row} />

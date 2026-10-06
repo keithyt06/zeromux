@@ -308,13 +308,13 @@ function PaletteBody({ onClose, initial, shell, actions, vaultEnabled = false, n
           <div role="radiogroup" aria-label="会话类型" className="flex flex-wrap gap-1">
             {TYPE_CHOICES.map(t => (
               <button key={t} type="button" role="radio" aria-checked={newType === t} onClick={() => setType(t)}
-                className={`ctl min-h-[var(--hit)] inline-flex items-center gap-1.5 px-3 rounded-[var(--r-md)] text-ui-xs border ${newType === t ? 'border-[var(--accent)] text-[var(--fg-strong)] bg-[var(--surface-3)]' : 'border-[var(--border)] text-[var(--fg-muted)]'}`}>
+                className={`min-h-[var(--hit)] inline-flex items-center gap-1.5 px-3 rounded-[var(--r-md)] text-ui-xs border ${newType === t ? 'border-[var(--accent)] text-[var(--fg-strong)] bg-[var(--surface-3)]' : 'border-[var(--border)] text-[var(--fg-muted)]'}`}>
                 <TypeIcon type={t} size={14} />{TYPE_LABEL[t]}
               </button>
             ))}
             {vaultEnabled && (
               <button type="button" role="radio" aria-checked={newType === 'vault'} onClick={() => setType('vault')}
-                className={`ctl min-h-[var(--hit)] inline-flex items-center gap-1.5 px-3 rounded-[var(--r-md)] text-ui-xs border ${newType === 'vault' ? 'border-[var(--accent)] text-[var(--fg-strong)] bg-[var(--surface-3)]' : 'border-[var(--border)] text-[var(--fg-muted)]'}`}>
+                className={`min-h-[var(--hit)] inline-flex items-center gap-1.5 px-3 rounded-[var(--r-md)] text-ui-xs border ${newType === 'vault' ? 'border-[var(--accent)] text-[var(--fg-strong)] bg-[var(--surface-3)]' : 'border-[var(--border)] text-[var(--fg-muted)]'}`}>
                 <BookOpen size={14} />{TYPE_LABEL.vault}
               </button>
             )}

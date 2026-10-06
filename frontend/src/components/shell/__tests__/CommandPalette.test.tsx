@@ -457,7 +457,8 @@ describe('CommandPalette', () => {
     type('crew ~/w')
     await flush()
     const groups = ['会话类型', 'Crew 模式'].map(name => screen.getByRole('radiogroup', { name }))
-    for (const g of groups) for (const r of g.querySelectorAll('[role=radio]')) expect(r).toHaveClass('min-h-[var(--hit)]')
+    // Unlayered `.ctl` (min-height: --ctl-h, 36px coarse) beats Tailwind's @layer utilities, so `ctl` must be absent (jsdom has no cascade).
+    for (const g of groups) for (const r of g.querySelectorAll('[role=radio]')) { expect(r).toHaveClass('min-h-[var(--hit)]'); expect(r).not.toHaveClass('ctl') }
   })
 
   it('non-crew types show no Crew 模式 control and pass no crew opts', async () => {

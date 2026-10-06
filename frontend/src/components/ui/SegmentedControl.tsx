@@ -10,7 +10,7 @@ export function SegmentedControl<T extends string>({ value, options, onChange, l
       {options.map(o => (
         <button key={o.value} type="button" role="radio" aria-checked={o.value === value} tabIndex={o.value === value ? 0 : -1}
           onKeyDown={onKey} onClick={() => onChange(o.value)}
-          className={`ctl min-h-[var(--hit)] px-3 rounded-[calc(var(--r-md)-2px)] text-ui-xs transition-colors duration-[var(--dur-fast)] ${o.value === value ? 'bg-[var(--surface-3)] text-[var(--fg-strong)]' : 'text-[var(--fg-muted)] hover:text-[var(--fg)]'}`}>
+          className={`min-h-[var(--hit)] px-3 rounded-[calc(var(--r-md)-2px)] text-ui-xs transition-colors duration-[var(--dur-fast)] ${o.value === value ? 'bg-[var(--surface-3)] text-[var(--fg-strong)]' : 'text-[var(--fg-muted)] hover:text-[var(--fg)]'}`}>
           {o.label}
         </button>
       ))}

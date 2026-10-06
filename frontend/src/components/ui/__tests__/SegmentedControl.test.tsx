@@ -13,6 +13,7 @@ describe('SegmentedControl', () => {
   })
   it('every option is a ≥44px touch target on coarse pointers (min-h --hit, not the 36px --ctl-h)', () => {
     render(<SegmentedControl label="面板" value="a" onChange={() => {}} options={[{ value: 'a', label: 'A' }, { value: 'b', label: 'B' }]} />)
-    for (const r of screen.getAllByRole('radio')) expect(r).toHaveClass('min-h-[var(--hit)]')
+    // Unlayered `.ctl` (min-height: --ctl-h, 36px coarse) beats Tailwind's @layer utilities, so `ctl` must be absent (jsdom has no cascade).
+    for (const r of screen.getAllByRole('radio')) { expect(r).toHaveClass('min-h-[var(--hit)]'); expect(r).not.toHaveClass('ctl') }
   })
 })

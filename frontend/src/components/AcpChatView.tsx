@@ -1,4 +1,4 @@
-import { useState, useEffect, useRef, useCallback, useMemo, lazy, Suspense } from 'react'
+import { useState, useEffect, useRef, useCallback, useMemo, Suspense } from 'react'
 import { uploadSessionFile, getSessionRuns, getCrewMemory, putCrewSemantic, deleteCrewSemantic } from '../lib/api'
 import type { SemanticEntry } from '../lib/api'
 import { normalizeMemoryKey, parseSemanticValue } from '../lib/crewMemory'
@@ -8,7 +8,8 @@ import ConnectionBar from './ConnectionBar'
 import { usePromptPresets } from '../lib/usePromptPresets'
 import { resolvePresetPick, splitSlash } from '../lib/presetPick'
 import type { PromptPreset } from '../lib/api'
-import { IconButton, Menu, Popover, toast, type MenuItem } from './ui'
+import { ErrorBoundary, IconButton, Menu, Popover, toast, type MenuItem } from './ui'
+import { lazyWithReload } from '../lib/lazyWithReload'
 import { QueueChip } from './composer/QueueChip'
 import { PresetPicker } from './composer/PresetPicker'
 import { conventionPrompt, lastOwnPrompt } from '../lib/conventionPrompt'
@@ -21,7 +22,8 @@ import { TurnView } from './turn/TurnView'
 import { TurnStatusBar } from './turn/TurnStatusBar'
 
 // F4 first-screen budget (≤0.5KB br): the 记为约定 editor loads on first open.
-const ConventionDialog = lazy(() => import('./composer/ConventionDialog').then(m => ({ default: m.ConventionDialog })))
+// lazyWithReload + local ErrorBoundary: a post-deploy chunk 404 must not take down the shell (A1).
+const ConventionDialog = lazyWithReload(() => import('./composer/ConventionDialog').then(m => ({ default: m.ConventionDialog })))
 
 interface Props {
   sessionId: string
@@ -489,7 +491,7 @@ export default function AcpChatView({ sessionId, active, agentType = 'claude', o
               <span className="flex-1" />
               <IconButton ref={setPlusAnchor} label="更多" icon={Plus} onClick={() => { setSlashDismissed(true); closeMem(); setPlusOpen(o => !o) }} aria-haspopup="menu" aria-expanded={plusOpen} />
               <Menu open={plusOpen} onClose={() => setPlusOpen(false)} anchor={plusAnchor} items={plusItems} title="更多" />
-              {convention !== null && <Suspense fallback={null}>
+              {convention !== null && <ErrorBoundary><Suspense fallback={null}>
                 <ConventionDialog open initial={convention} onClose={() => setConvention(null)}
                   onSend={t => {
                     // Same sendPrompt this view registers as sessionControls; never carry composer attachments.
@@ -497,7 +499,7 @@ export default function AcpChatView({ sessionId, active, agentType = 'claude', o
                     toast.push({ message: ok ? '已交给 agent 记录' : '未连接，稍后再试' })
                     return ok
                   }} />
-              </Suspense>}
+              </Suspense></ErrorBoundary>}
             </>
           }
         />

@@ -153,3 +153,14 @@ describe('TriageList away card (F3)', () => {
     expect(screen.queryByRole('region', { name: '离开期间' })).toBeNull()
   })
 })
+
+describe('Crew variant badge (G2)', () => {
+  it('a conductor session shows the 目标指挥 badge; chat shows none', () => {
+    setup([
+      mkSession('g', { name: 'goal', type: 'crew', crew_mode: '', crew_agent: 'kirocrew-conductor', crew_origin: 'zeromux' }),
+      mkSession('c', { name: 'chat', type: 'crew', crew_mode: '', crew_agent: '', crew_origin: 'zeromux' }),
+    ])
+    expect(screen.getAllByRole('img', { name: '目标指挥' })).toHaveLength(1)
+    expect(screen.queryByRole('img', { name: '并行话题' })).toBeNull()
+  })
+})

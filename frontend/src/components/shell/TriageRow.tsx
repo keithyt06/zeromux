@@ -7,6 +7,7 @@ import type { SessionAction } from '../../lib/sessionActions'
 import { formatCost, formatDuration, formatRelative } from '../../lib/format'
 import { IconButton, Menu, StatusDot, toast } from '../ui'
 import { TypeIcon } from './TypeIcon'
+import { CrewVariantBadge } from './CrewVariantBadge'
 
 export interface TriageRowProps {
   item: TriageItem
@@ -64,6 +65,7 @@ function TriageRowImpl({ item, active, onSelect, controls, actions, now, onOpenC
           <TypeIcon type={s.type} size={14} />
           {s.source_task_id && <Clock size={10} aria-label="定时任务" className="absolute -bottom-1 -right-1 text-[var(--fg-subtle)]" />}
         </span>
+        <CrewVariantBadge session={s} />
         <span data-row-name className="flex-1 min-w-0 truncate text-ui-sm text-[var(--fg-strong)]"
           onDoubleClick={e => { e.stopPropagation(); actions.find(a => a.id === 'rename')?.run() }}>{s.name}</span>
         {s.other_clients > 0 && (
@@ -133,6 +135,7 @@ function same(a: TriageRowProps, b: TriageRowProps): boolean {
     && a.active === b.active && timeLabel(x, a.now) === timeLabel(y, b.now)
     && x.turn_state === y.turn_state && (x.pending_approvals ?? 0) === (y.pending_approvals ?? 0) && x.type === y.type
     && x.source_task_id === y.source_task_id && x.tmux_name === y.tmux_name && x.peer_name === y.peer_name
+    && x.crew_mode === y.crew_mode && x.crew_agent === y.crew_agent
     && a.actions.length === b.actions.length
     && a.onSelect === b.onSelect && a.controls === b.controls && a.onOpenConfirm === b.onOpenConfirm
 }

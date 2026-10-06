@@ -96,9 +96,10 @@ export function touchedFiles(steps: Step[]): { path: string; label: string }[] {
   return out
 }
 
-/** Full text of the turn's last non-empty text step (the card's 「展开全文」). */
+/** Full text of the turn's last non-empty text step (the card's 「展开全文」).
+ *  Crew ask/meta steps are routing chatter, never the conclusion; crew_result is plain text. */
 export function lastText(group: TurnGroup): string {
-  const texts = toSteps(group.blocks, group.complete).filter(s => s.kind === 'text' && (s.text ?? '').trim())
+  const texts = toSteps(group.blocks, group.complete).filter(s => s.kind === 'text' && !s.crew && (s.text ?? '').trim())
   return (texts[texts.length - 1]?.text ?? '').trim()
 }
 

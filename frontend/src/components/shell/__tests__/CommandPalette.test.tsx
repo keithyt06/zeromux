@@ -408,4 +408,56 @@ describe('CommandPalette', () => {
       expect(document.querySelector('[aria-selected="true"]')).toBeNull()
     })
   })
+
+  // M12: GOAL_ENABLED (lib/crewVariant) is kept for S6; S5 runs these unconditionally.
+  describe('Crew variant (G2)', () => {
+    it('picking crew shows 聊天 | 目标指挥; 目标指挥 creates a conductor session', async () => {
+      const { sh, type, key } = setup({ initial: { mode: 'new' } })
+      type('crew ~/w 查 CI')
+      await flush()
+      const seg = screen.getByRole('radiogroup', { name: 'Crew 模式' })
+      expect([...seg.querySelectorAll('[role=radio]')].map(r => r.textContent)).toEqual(['聊天', '目标指挥'])
+      fireEvent.click(screen.getByRole('radio', { name: '目标指挥' }))
+      expect(screen.getByTestId('palette-preview')).toHaveTextContent('Crew · 目标指挥 · ~/w · "查 CI"')
+      key('Enter')
+      await waitFor(() => expect(sh.create).toHaveBeenCalledWith('crew', '~/w', undefined, '查 CI', { crew_mode: '', crew_agent: 'kirocrew-conductor' }))
+    })
+    it('crew:goal preselects 目标指挥', async () => {
+      const { sh, type, key } = setup()
+      type('crew:goal ~/w')
+      await flush()
+      expect(screen.getByRole('radio', { name: '目标指挥' })).toHaveAttribute('aria-checked', 'true')
+      key('Enter')
+      await waitFor(() => expect(sh.create).toHaveBeenCalledWith('crew', '~/w', undefined, undefined, { crew_mode: '', crew_agent: 'kirocrew-conductor' }))
+    })
+    it('chip click overrides the crew:goal keyword', async () => {
+      // Review Focus 3: the last explicit choice wins.
+      const { sh, type, key } = setup()
+      type('crew:goal ~/w')
+      await flush()
+      fireEvent.click(screen.getByRole('radio', { name: '聊天' }))
+      key('Enter')
+      await waitFor(() => expect(sh.create).toHaveBeenCalledWith('crew', '~/w', undefined, undefined, { crew_mode: '', crew_agent: '' }))
+    })
+    it('typing crew:goal after a chip click wins (last explicit choice)', async () => {
+      const { sh, type, key } = setup()
+      type('crew ~/w')
+      await flush()
+      fireEvent.click(screen.getByRole('radio', { name: '聊天' }))
+      type('crew:goal ~/w')
+      await flush()
+      expect(screen.getByRole('radio', { name: '目标指挥' })).toHaveAttribute('aria-checked', 'true')
+      key('Enter')
+      await waitFor(() => expect(sh.create).toHaveBeenCalledWith('crew', '~/w', undefined, undefined, { crew_mode: '', crew_agent: 'kirocrew-conductor' }))
+    })
+  })
+
+  it('non-crew types show no Crew 模式 control and pass no crew opts', async () => {
+    const { sh, type, key } = setup()
+    type('tmux ~/x')
+    await flush()
+    expect(screen.queryByRole('radiogroup', { name: 'Crew 模式' })).toBeNull()
+    key('Enter')
+    await waitFor(() => expect(sh.create).toHaveBeenCalledWith('tmux', '~/x', undefined, undefined))
+  })
 })

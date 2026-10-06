@@ -10,6 +10,7 @@ import { loadLastViewed, reconcileLastViewed, markViewed, saveLastViewed, hasRea
 import { useControlsRegistry, type SessionControls, type RegisterControls } from '../../lib/sessionControls'
 import { toast, confirm } from '../ui'
 import { useSessionsPoll } from './useSessionsPoll'
+import type { CrewOpts } from '../../lib/crewVariant'
 
 export type ContextTab = 'git' | 'files' | 'runs'
 /** tabChosen: the tab was set explicitly (user pick / deep link), so defaults must not override it. */
@@ -26,7 +27,7 @@ export interface ShellState {
   ctxUsage: Record<string, { used: number; total: number } | null>; onCtxUsage(sid: string, u: { used: number; total: number } | null): void
   confirmRuns: TaskRun[]; confirmsBySession: Record<string, number>; orphanConfirms: number; schedulerHealthy: boolean
   controls: React.RefObject<Record<string, SessionControls>>; registerControls: RegisterControls
-  create(type: SessionType | 'vault', workDir?: string, tmuxTarget?: string, prompt?: string): Promise<void>
+  create(type: SessionType | 'vault', workDir?: string, tmuxTarget?: string, prompt?: string, crew?: CrewOpts): Promise<void>
   close(id: string): Promise<void>; rename(id: string, name: string, description: string): Promise<void>
   openVault(t: VaultTarget): void; docTargets: Record<string, VaultTarget & { nonce: number }>
   closeDocTab(id: string): void; updateDocTabTitle(id: string, title: string | null): void
@@ -154,14 +155,16 @@ export function useShellState(authActive: boolean, onAuthLost: () => void, { nar
     return { confirmsBySession: by, orphanConfirms: orphan }
   }, [confirmRuns, sessions])
 
-  const create = useCallback(async (type: SessionType | 'vault', workDir?: string, tmuxTarget?: string, initialPrompt?: string) => {
+  const create = useCallback(async (type: SessionType | 'vault', workDir?: string, tmuxTarget?: string, initialPrompt?: string, crew?: CrewOpts) => {
     if (type === 'vault') {
       const tab = newDocTab(DEFAULT_DOC_TITLE)
       setDocTabs(prev => [...prev, tab])
       setActiveId(tab.id)
       return
     }
-    const s = await createSession(type, undefined, workDir, tmuxTarget, initialPrompt)
+    // Only Crew creates carry a 6th arg, so non-Crew call shapes stay exactly as before.
+    const s = await (crew ? createSession(type, undefined, workDir, tmuxTarget, initialPrompt, crew)
+      : createSession(type, undefined, workDir, tmuxTarget, initialPrompt))
     notifyQuickTargetsChanged()   // the backend just bumped; re-rank any mounted quick lists
     setSessions(prev => [...prev, s])
     // Attached host tmux is tracked now: drop it from the group before the next poll.

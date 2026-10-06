@@ -7,6 +7,7 @@ import type { SessionAction } from '../../lib/sessionActions'
 import { formatCost, formatDuration } from '../../lib/format'
 import { IconButton, Menu, StatusDot } from '../ui'
 import { TypeIcon } from './TypeIcon'
+import { CrewVariantBadge } from './CrewVariantBadge'
 
 /** The single session top bar (spec M20 / S3 §2.1). Status, elapsed and cost come
  *  from the triage data; ⋯ renders the sessionActions registry (V15). */
@@ -42,6 +43,7 @@ export function FocusHeader({ session, attention, now, narrow, needsYou, onBack,
       {!narrow && elapsed && <span className="num shrink-0 text-ui-xs text-[var(--fg-muted)]">{elapsed}</span>}
       {!narrow && cost && <span className="num shrink-0 text-ui-xs text-[var(--fg-subtle)]">{cost}</span>}
       <TypeIcon type={session.type} size={14} className="shrink-0 text-[var(--fg-muted)]" />
+      <CrewVariantBadge session={session} />
       <span className="min-w-0 truncate text-ui-sm font-medium text-[var(--fg-strong)]" title={session.description || session.name}>{session.name}</span>
       {narrow && <StatusDot tone={toneOf(attention)} label={labelOf(attention)} />}
       {ctxPct != null && <span className="num shrink-0 text-ui-2xs text-[var(--fg-subtle)]" title="上下文用量(Crew 提供)">{`ctx ${ctxPct}%`}</span>}

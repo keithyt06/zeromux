@@ -20,10 +20,13 @@ import { TypeIcon } from './TypeIcon'
 import { SendToMenu } from '../SendToMenu'
 import { askAgentPaletteText, type PaletteAction } from './paletteActions'
 import type { ShellState } from './useShellState'
+import { CREW_VARIANT_FIELDS, CREW_VARIANT_OPTIONS, type CrewVariant } from '../../lib/crewVariant'
+import { SegmentedControl } from '../ui/SegmentedControl'
 
 // The session types ⌘K new mode offers (Kiro is gone; vault is a doc tab, not a session).
 const TYPE_CHOICES = ['claude', 'codex', 'crew', 'tmux'] as const
 const TYPE_LABEL: Record<NewType, string> = { claude: 'Claude', codex: 'Codex', crew: 'Crew', tmux: '终端', vault: '笔记库' }
+const CREW_VARIANT_LABEL: Record<CrewVariant, string> = { chat: '聊天', topics: '并行话题', goal: '目标指挥' }
 
 // Still building (indexing) or rebuilding with no hits → re-query in 4s so the
 // user never has to retype after a restart. Dirs: re-query on refreshing+empty
@@ -98,6 +101,12 @@ function PaletteBody({ onClose, initial, shell, actions, vaultEnabled = false, n
   // A bare type word ("tmux") still searches; a type word followed by more text is new mode.
   const newMode = forcedNew || forced || (parsed.type !== null && /\s/.test(rest.trimStart()))
   const newType: NewType = parsed.type ?? loadLastType()
+  // Crew variant (G2). A chip click is an explicit choice and beats the keyword
+  // (Review Focus 3); typing a different keyword afterwards clears the pick (onChange), so
+  // whichever came last wins.
+  const [crewPick, setCrewPick] = useState<CrewVariant | null>(null)
+  const offered = (v: CrewVariant | undefined) => (v && CREW_VARIANT_OPTIONS.some(o => o.value === v) ? v : undefined)
+  const crewVariant: CrewVariant = crewPick ?? offered(parsed.crewVariant) ?? 'chat'
 
   // ── new mode `/` presets (V7: same picker as the composer) ──
   const presetStore = usePromptPresets()
@@ -224,8 +233,11 @@ function PaletteBody({ onClose, initial, shell, actions, vaultEnabled = false, n
     if (resolvedDir === null) return
     const type = newType
     const prompt = parsed.prompt
+    const crew = type === 'crew' ? CREW_VARIANT_FIELDS[crewVariant] : undefined
     runCreate(
-      () => (type === 'vault' ? shell.create('vault') : shell.create(type, resolvedDir || undefined, undefined, prompt || undefined)),
+      () => (type === 'vault' ? shell.create('vault')
+        : crew ? shell.create(type, resolvedDir || undefined, undefined, prompt || undefined, crew)
+        : shell.create(type, resolvedDir || undefined, undefined, prompt || undefined)),
       () => { if (type !== 'vault') saveLastType(type as SessionType); onClose() },
     )
   }
@@ -260,6 +272,7 @@ function PaletteBody({ onClose, initial, shell, actions, vaultEnabled = false, n
 
   const setType = (t: NewType) => {
     const body = parsed.type ? rest.trimStart().replace(/^\S+\s*/, '') : rest.trimStart()
+    setCrewPick(null)
     goNew(`${t} ${body}`)
   }
 
@@ -271,7 +284,8 @@ function PaletteBody({ onClose, initial, shell, actions, vaultEnabled = false, n
     const dir = resolvedDir === null
       ? (dirSearch.result && dirSearch.resultQuery === parsed.dir ? '未找到目录' : '搜索目录…')
       : resolvedDir || '默认目录'
-    return `${TYPE_LABEL[newType]} · ${dir}${parsed.prompt ? ` · "${parsed.prompt}"` : ''}`
+    const variant = newType === 'crew' && crewVariant !== 'chat' ? ` · ${CREW_VARIANT_LABEL[crewVariant]}` : ''
+    return `${TYPE_LABEL[newType]}${variant} · ${dir}${parsed.prompt ? ` · "${parsed.prompt}"` : ''}`
   })()
 
   const row = 'row w-full flex items-center gap-2.5 px-3 text-left rounded-[var(--r-md)]'
@@ -281,7 +295,7 @@ function PaletteBody({ onClose, initial, shell, actions, vaultEnabled = false, n
       <div ref={setInputBox} className="flex items-center gap-2 px-3 border-b border-[var(--border-subtle)]">
         <Search size={16} className="shrink-0 text-[var(--fg-subtle)]" />
         <input ref={inputRef} autoFocus value={text} onKeyDown={onKey} maxLength={512}
-          onChange={e => { setText(e.target.value); setDirPick(0); setCreateError(null); setSlashDismissed(false); if (!e.target.value) setForcedNew(initial?.mode === 'new') }}
+          onChange={e => { if (parseNew(stripNewPrefix(e.target.value).rest).crewVariant !== parsed.crewVariant) setCrewPick(null); setText(e.target.value); setDirPick(0); setCreateError(null); setSlashDismissed(false); if (!e.target.value) setForcedNew(initial?.mode === 'new') }}
           placeholder={forcedNew ? '类型 目录 prompt,如 codex zeromux 修 bug' : '搜索会话、动作、目录…  以 + 开头新建'}
           aria-label="命令" role="combobox" aria-expanded aria-controls={`${titleId}-list`}
           className="flex-1 min-w-0 min-h-[48px] bg-transparent outline-none text-ui-input text-[var(--fg)] placeholder:text-[var(--fg-subtle)]" />
@@ -305,6 +319,10 @@ function PaletteBody({ onClose, initial, shell, actions, vaultEnabled = false, n
               </button>
             )}
           </div>
+          {newType === 'crew' && CREW_VARIANT_OPTIONS.length > 1 && (
+            <SegmentedControl label="Crew 模式" value={crewVariant} options={CREW_VARIANT_OPTIONS}
+              onChange={v => { setCrewPick(v); inputRef.current?.focus() }} />
+          )}
           {dirCandidates.length > 1 && (
             <p className="px-1 text-ui-2xs text-[var(--fg-subtle)]">{`Tab 切换目录候选 (${(dirPick % dirCandidates.length) + 1}/${dirCandidates.length})`}</p>
           )}

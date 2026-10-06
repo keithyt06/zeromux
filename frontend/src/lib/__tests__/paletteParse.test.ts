@@ -21,6 +21,12 @@ describe('parseNew', () => {
     expect(parseNew('zeromux claude').type).toBeNull()
   })
   it('blank input', () => { expect(parseNew('   ')).toEqual({ type: null, dir: '', prompt: '', literalPath: false }) })
+  it('crew:goal is a crew keyword carrying the 目标指挥 variant', () => {
+    expect(parseNew('crew:goal ~/w 查一下 CI')).toEqual({ type: 'crew', dir: '~/w', prompt: '查一下 CI', literalPath: true, crewVariant: 'goal' })
+    expect(parseNew('CREW:GOAL zeromux').crewVariant).toBe('goal')
+    expect(parseNew('crew zeromux').crewVariant).toBeUndefined()
+    expect(parseNew('crew:nope zeromux').type).toBeNull()      // unknown variant is not a keyword
+  })
 })
 
 describe('last type', () => {
